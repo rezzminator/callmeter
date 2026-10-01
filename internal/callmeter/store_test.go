@@ -3,6 +3,7 @@ package callmeter
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -190,9 +191,10 @@ var storeColumns = map[string]string{
 		"reason,trigger,error_type,load_reason,memory_type,file_path,tool_name,command_name,task_id,prompt_bytes," +
 		"detail,seat_dir",
 	"sessions": "session_id,first_ts,last_ts,engine,model,start_source,end_reason,cwd,transcript_path,seat_dir," +
-		"config_dir,host,tz_name,tz_offset_minutes",
+		"config_dir,host,tz_name,tz_offset_minutes,cwd_ts,transcript_path_ts,seat_dir_ts,config_dir_ts,host_ts,tz_name_ts," +
+		"tz_offset_minutes_ts",
 	"command_parts": "tool_use_id,seq,lang,program,args,files,parse_status,conditional,parser",
-	"faults":        "ts,session_id,tool_use_id,stage,error",
+	"faults":        "fault_id,ts,session_id,tool_use_id,stage,error",
 }
 
 // TestOpenFreshStoreCreatesTheVersionOneTables pins the on-disk schema a new
@@ -205,7 +207,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 			t.Errorf("%s columns = %s, want %s", table, got, want)
 		}
 	}
-	gotTables := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+	gotTables := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	if want := "agent_turns,agents,calls,command_parts,events,faults,requests,sessions,turns"; gotTables != want {
 		t.Errorf("tables = %s, want %s", gotTables, want)
 	}
@@ -595,9 +597,10 @@ func TestPruneArchivesEveryTableBeforeDeleting(t *testing.T) {
 	}
 }
 
-// TestPruneCopiesARowAnEarlierPruneAlreadyArchived: a prune that crashed after
-// its archive step left rows in both places; the next one must not fail on
-// them.
+// TestPruneCopiesARowAnEarlierPruneAlreadyArchived: rows an earlier prune
+// archived come back under the same keys; the next prune must not fail on them
+// nor keep a second copy. A fault has no natural key, so the second seed's fault
+// is a new fault with its own fault_id and a second archive row.
 func TestPruneCopiesARowAnEarlierPruneAlreadyArchived(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -612,10 +615,322 @@ func TestPruneCopiesARowAnEarlierPruneAlreadyArchived(t *testing.T) {
 		t.Fatalf("Prune over rows already archived: %v", err)
 	}
 	archive := openArchive(t, store)
-	for _, table := range []string{"calls", "requests", "agents", "agent_turns", "sessions", "command_parts"} {
-		if got := countIn(t, archive, table); got != 1 {
-			t.Errorf("archive %s holds %d rows after two prunes of one row, want 1", table, got)
+	for table, want := range map[string]int{
+		"calls": 1, "requests": 1, "agents": 1, "agent_turns": 1, "sessions": 1, "command_parts": 1, "turns": 1, "events": 3,
+		"faults": 2,
+	} {
+		if got := countIn(t, archive, table); got != want {
+			t.Errorf("archive %s holds %d rows after two prunes of one row, want %d", table, got, want)
 		}
+	}
+}
+
+// errStopPrune is the error the test seam returns between the two phases.
+var errStopPrune = errors.New("stop between the prune phases")
+
+// setPruneAfterArchive installs f as the seam between the two phases for the
+// test; a test using it stays serial, the seam being a package variable.
+func setPruneAfterArchive(t *testing.T, f func() error) {
+	t.Helper()
+	pruneAfterArchive = f
+	t.Cleanup(func() { pruneAfterArchive = nil })
+}
+
+// seededRowsPerTable is what seedEveryTable writes into each table.
+var seededRowsPerTable = map[string]int{
+	"calls": 1, "requests": 1, "turns": 1, "events": 3, "faults": 1, "agents": 1, "agent_turns": 1, "sessions": 1,
+	"command_parts": 1,
+}
+
+// stopPruneBetweenPhases seeds an expired row into every table and runs a
+// prune that stops once phase 1 has committed, so the rows sit in both files.
+func stopPruneBetweenPhases(t *testing.T, store *Store, cutoff time.Time) {
+	t.Helper()
+	seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+	setPruneAfterArchive(t, func() error { return errStopPrune })
+	removed, err := store.Prune(context.Background(), cutoff)
+	if !errors.Is(err, errStopPrune) {
+		t.Fatalf("Prune stopped between the phases returned %v, want %v", err, errStopPrune)
+	}
+	if removed != 0 {
+		t.Errorf("Prune stopped between the phases reports %d rows removed, want 0", removed)
+	}
+	if !strings.Contains(err.Error(), store.path) {
+		t.Errorf("error %q does not name the store path %s", err, store.path)
+	}
+	setPruneAfterArchive(t, nil)
+}
+
+// TestPruneStopBetweenPhasesLeavesEveryRowInBothFilesAndTheNextPruneConverges:
+// a prune that stops after phase 1 has archived every expired row and deleted
+// none; running it again deletes them from the store and keeps one archive row
+// each, faults included.
+func TestPruneStopBetweenPhasesLeavesEveryRowInBothFilesAndTheNextPruneConverges(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	stopPruneBetweenPhases(t, store, cutoff)
+	archive := openArchive(t, store)
+	for table, want := range seededRowsPerTable {
+		if got := countIn(t, archive, table); got != want {
+			t.Errorf("after the stop, archive %s holds %d rows, want %d", table, got, want)
+		}
+		if got := count(t, store, table); got != want {
+			t.Errorf("after the stop, store %s holds %d rows, want %d", table, got, want)
+		}
+	}
+
+	removed, err := store.Prune(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("Prune after the stop: %v", err)
+	}
+	want := 0
+	for table, n := range seededRowsPerTable {
+		want += n
+		if got := count(t, store, table); got != 0 {
+			t.Errorf("after the second prune, store %s holds %d rows, want 0", table, got)
+		}
+		if got := countIn(t, archive, table); got != n {
+			t.Errorf("after the second prune, archive %s holds %d rows, want %d", table, got, n)
+		}
+	}
+	if int(removed) != want {
+		t.Errorf("the second Prune removed %d rows, want %d", removed, want)
+	}
+}
+
+// TestPruneDeletesARowInBothFilesAndKeepsTheArchivedCopy: an expired row whose
+// key the archive already holds leaves the store and the archive keeps the
+// copy it has, never overwritten. A fault is never updated, so its archived
+// copy carries the store row's own columns, every one of them its key.
+func TestPruneDeletesARowInBothFilesAndKeepsTheArchivedCopy(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	stopPruneBetweenPhases(t, store, cutoff)
+	archive := openArchive(t, store)
+	if _, err := archive.Exec("UPDATE calls SET tool = 'archived copy'"); err != nil {
+		t.Fatalf("mark the archived call: %v", err)
+	}
+	if _, err := store.Prune(ctx, cutoff); err != nil {
+		t.Fatalf("Prune over rows in both files: %v", err)
+	}
+	for _, table := range []string{"calls", "faults"} {
+		if got := count(t, store, table); got != 0 {
+			t.Errorf("store %s holds %d rows, want 0", table, got)
+		}
+		if got := countIn(t, archive, table); got != 1 {
+			t.Errorf("archive %s holds %d rows, want its one copy", table, got)
+		}
+	}
+	if got := keys(t, archive, "SELECT tool FROM calls"); got != "archived copy" {
+		t.Errorf("the archived call's tool = %q, want the archive's own copy, not the store's", got)
+	}
+}
+
+// TestPruneLeavesAnExpiredRowTheArchiveLacks: an expired row whose archive copy
+// is gone when phase 2 runs stays in the store, with the parts of its call,
+// until the next prune archives it again and deletes it.
+func TestPruneLeavesAnExpiredRowTheArchiveLacks(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+	// The store keeps one connection and Prune holds it, so the seam reaches the
+	// archive through a handle of its own.
+	setPruneAfterArchive(t, func() error {
+		archive := openArchive(t, store)
+		for _, table := range []string{"calls", "command_parts"} {
+			if _, err := archive.Exec("DELETE FROM " + table); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	removed, err := store.Prune(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if want := 9; int(removed) != want { // the 11 seeded rows less the call and its part
+		t.Errorf("Prune removed %d rows, want %d", removed, want)
+	}
+	archive := openArchive(t, store)
+	for _, table := range []string{"calls", "command_parts"} {
+		if got := count(t, store, table); got != 1 {
+			t.Errorf("store %s holds %d rows, want the 1 the archive lacks", table, got)
+		}
+		if got := countIn(t, archive, table); got != 0 {
+			t.Errorf("archive %s holds %d rows, want 0", table, got)
+		}
+	}
+
+	setPruneAfterArchive(t, nil)
+	if removed, err = store.Prune(ctx, cutoff); err != nil {
+		t.Fatalf("second Prune: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("the second Prune removed %d rows, want the call and its part", removed)
+	}
+	for _, table := range []string{"calls", "command_parts"} {
+		if got := count(t, store, table); got != 0 {
+			t.Errorf("store %s holds %d rows after the second prune, want 0", table, got)
+		}
+		if got := countIn(t, archive, table); got != 1 {
+			t.Errorf("archive %s holds %d rows after the second prune, want 1", table, got)
+		}
+	}
+}
+
+// TestPruneArchivesCommandPartsOfExpiringCallsAndOrphansInPhaseOne: the parts of
+// a call about to be pruned and the parts of no call at all are copied by phase
+// 1 and deleted by phase 2 with their call; the parts of a recent call stay.
+func TestPruneArchivesCommandPartsOfExpiringCallsAndOrphansInPhaseOne(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	old, recent := cutoff.Add(-time.Hour).UnixMilli(), cutoff.Add(time.Hour).UnixMilli()
+	for id, ts := range map[string]*int64{"toolu_old": &old, "toolu_new": &recent, "toolu_orphan": nil} {
+		if ts != nil {
+			if err := store.UpsertCall(ctx, Call{ToolUseID: id, TS: ts}, Overwrite); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.ReplaceCommandParts(ctx, id, []CommandPart{
+			{Seq: 0, Lang: "sh", Program: "cat"}, {Seq: 1, Lang: "sh", Program: "wc"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPruneAfterArchive(t, func() error { return errStopPrune })
+	if _, err := store.Prune(ctx, cutoff); !errors.Is(err, errStopPrune) {
+		t.Fatalf("Prune stopped between the phases returned %v, want %v", err, errStopPrune)
+	}
+	archive := openArchive(t, store)
+	const partsQuery = "SELECT tool_use_id || ':' || seq FROM command_parts ORDER BY tool_use_id, seq"
+	if got := keys(t, archive, partsQuery); got != "toolu_old:0,toolu_old:1,toolu_orphan:0,toolu_orphan:1" {
+		t.Errorf("archive command_parts after phase 1 = %s, want the expiring call's and the orphan's parts", got)
+	}
+	if got := count(t, store, "command_parts"); got != 6 {
+		t.Errorf("store command_parts after phase 1 = %d, want all 6", got)
+	}
+
+	setPruneAfterArchive(t, nil)
+	removed, err := store.Prune(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if removed != 5 { // the old call and its two parts, the orphan's two parts
+		t.Errorf("Prune removed %d rows, want 5", removed)
+	}
+	if got := keys(t, store.DB(), partsQuery); got != "toolu_new:0,toolu_new:1" {
+		t.Errorf("store command_parts after the prune = %s, want the recent call's two parts", got)
+	}
+	if got := keys(t, archive, partsQuery); got != "toolu_old:0,toolu_old:1,toolu_orphan:0,toolu_orphan:1" {
+		t.Errorf("archive command_parts after the prune = %s, want each part once", got)
+	}
+}
+
+// TestFaultsWithIdenticalColumnsAreTwoRowsAndTwoArchiveRows: a fault has its own
+// fault_id, so two faults with the same columns are two rows in the store and,
+// after a prune, two in the archive.
+func TestFaultsWithIdenticalColumnsAreTwoRowsAndTwoArchiveRows(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	fault := Fault{TS: cutoff.Add(-time.Hour).UnixMilli(), SessionID: "sess-1", ToolUseID: "toolu_1", Stage: StageParse, Error: "boom"}
+	for range 2 {
+		if err := store.AddFault(ctx, fault); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := keys(t, store.DB(), "SELECT fault_id FROM faults ORDER BY fault_id"); got != "1,2" {
+		t.Errorf("fault_id of the two stored faults = %s, want 1,2", got)
+	}
+	removed, err := store.Prune(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if removed != 2 {
+		t.Errorf("Prune removed %d rows, want both faults", removed)
+	}
+	if got := keys(t, openArchive(t, store), "SELECT fault_id FROM faults ORDER BY fault_id"); got != "1,2" {
+		t.Errorf("archived fault_id = %s, want 1,2", got)
+	}
+}
+
+// TestPruneNeverDeletesAFaultWhoseIDTheArchiveHoldsForAnother: a store
+// recreated beside a kept archive numbers its faults from 1 again; an expired
+// fault whose fault_id the archive already holds for a different fault is
+// never deleted without its own archive copy.
+func TestPruneNeverDeletesAFaultWhoseIDTheArchiveHoldsForAnother(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	first, err := OpenDB(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if err := first.AddFault(ctx, Fault{TS: cutoff.Add(-time.Hour).UnixMilli(), SessionID: "sess-old", Stage: StageParse, Error: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Prune(ctx, cutoff); err != nil {
+		t.Fatalf("first Prune: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("remove %s: %v", file, err)
+		}
+	}
+	second := openStoreAt(t, path)
+	if err := second.AddFault(ctx, Fault{TS: cutoff.Add(-2 * time.Hour).UnixMilli(), SessionID: "sess-new", Stage: StageStore, Error: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(t, second.DB(), "SELECT fault_id FROM faults"); got != "1" {
+		t.Fatalf("fault_id of the recreated store's fault = %s, want 1, the archived fault's id", got)
+	}
+	if _, err := second.Prune(ctx, cutoff); err != nil {
+		t.Fatalf("second Prune: %v", err)
+	}
+	stored := countIn(t, second.DB(), "faults")
+	var archived int
+	if err := openArchive(t, second).QueryRow("SELECT COUNT(*) FROM faults WHERE session_id = 'sess-new'").Scan(&archived); err != nil {
+		t.Fatalf("count the archived new fault: %v", err)
+	}
+	if stored == 0 && archived == 0 {
+		t.Errorf("the new fault left the store with no archive copy of its own")
+	}
+}
+
+// openStoreAt opens the store at path, closed at the test's end.
+func openStoreAt(t *testing.T, path string) *Store {
+	t.Helper()
+	store, err := OpenDB(context.Background(), path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return store
+}
+
+// TestStageTerminatedIsAFaultStage: the terminated stage is the string "terminated"
+// and a fault written with it is stored under that stage.
+func TestStageTerminatedIsAFaultStage(t *testing.T) {
+	if StageTerminated != "terminated" {
+		t.Errorf("StageTerminated = %q, want terminated", StageTerminated)
+	}
+	store := openTestStore(t)
+	if err := store.AddFault(context.Background(), Fault{TS: 1, Stage: StageTerminated, Error: "Stop: terminated by SIGTERM"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := row(t, store, "faults", "stage = ?", "terminated"); got == nil {
+		t.Error("no faults row of stage terminated after AddFault with StageTerminated")
 	}
 }
 

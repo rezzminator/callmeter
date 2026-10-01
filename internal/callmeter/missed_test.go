@@ -61,6 +61,31 @@ func TestIngestMissedTurnsEachLineIntoABinaryFault(t *testing.T) {
 	}
 }
 
+// TestIngestMissedTerminatedLinesAreTerminatedFaults: a line the binary wrote
+// itself (reason `terminated by …`) becomes a terminated fault and every other
+// line stays a binary fault; both keep the `{event}: {reason}` text.
+func TestIngestMissedTerminatedLinesAreTerminatedFaults(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	writeMissed(t, path,
+		"1790000001\tSubagentStop\tterminated by SIGTERM\n"+
+			"1790000002\tStop\tdownload failed\n"+
+			"1790000003\tunknown\tterminated by SIGHUP\n"+
+			"1790000004\tStop\tbinary exited terminated by signal\n")
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 4 {
+		t.Fatalf("IngestMissed = %d, %v; want 4, nil", n, err)
+	}
+	got := keys(t, store.DB(), "SELECT stage || '|' || ts || '|' || error FROM faults ORDER BY ts")
+	want := "terminated|1790000001000|SubagentStop: terminated by SIGTERM," +
+		"binary|1790000002000|Stop: download failed," +
+		"terminated|1790000003000|unknown: terminated by SIGHUP," +
+		"binary|1790000004000|Stop: binary exited terminated by signal"
+	if got != want {
+		t.Errorf("faults = %s\nwant %s", got, want)
+	}
+}
+
 func ingestLeftovers(t *testing.T, path string) []string {
 	t.Helper()
 	left, err := filepath.Glob(path + ".ingest-*")

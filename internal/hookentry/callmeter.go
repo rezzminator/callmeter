@@ -11,8 +11,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
@@ -101,6 +106,7 @@ type callmeterRun struct {
 	stderr  io.Writer
 	logPath string // callmeter.log; "" = stderr only
 	getenv  paths.Getenv
+	state   *terminationState // shared with the signal handler; nil = none installed
 	store   *callmeter.Store
 	now     int64
 	raw     []byte // the payload as it arrived: detail's source
@@ -121,7 +127,10 @@ type callmeterRun struct {
 // store under $CALLMETER_HOME. It exits 0 on every path and writes nothing to
 // stdout — it changes nothing the model sees — and a failure to record is said
 // on stderr, in callmeter.log with the session and tool_use_id, and as a faults
-// row whenever the store itself is reachable.
+// row whenever the store itself is reachable. A SIGTERM, SIGINT or SIGHUP (a
+// headless `claude -p` terminates its running async hooks at exit) that lands
+// before the run's event is accounted for leaves one missed.log line instead
+// (terminateOnSignal); one of them ignored on entry stays ignored.
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	home, err := paths.Home(getenv)
 	if err != nil {
@@ -130,14 +139,180 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		return 0
 	}
 	logPath := paths.Log(home)
+	state := &terminationState{}
+	signals := make(chan os.Signal, 1)
+	// A signal ignored on entry (`nohup`, a background job of a non-interactive
+	// shell) stays ignored: Notify would install a handler in its place and
+	// turn a signal that ended nothing into a terminated run.
+	var handled []os.Signal
+	for _, sig := range []os.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP} {
+		if !signal.Ignored(sig) {
+			handled = append(handled, sig)
+		}
+	}
+	if len(handled) > 0 { // Notify with no signal would relay every signal
+		signal.Notify(signals, handled...)
+	}
+	done := make(chan struct{})
+	defer func() {
+		signal.Stop(signals)
+		close(done)
+	}()
+	go terminateOnSignal(signals, done, state, paths.Missed(home), logPath, stderr, os.Exit)
 	seat, err := resolveCallmeterSeat(getenv)
 	if err != nil {
 		// The rows still land, without their seat; the gap is said, not hidden.
 		applog.Failure(stderr, logPath, "seat", "", "", err)
 	}
-	return runCallmeter(context.Background(), input, stderr, callmeterFiles{
+	return runCallmeter(withTerminationState(context.Background(), state), input, stderr, callmeterFiles{
 		store: paths.Store(home), log: logPath, missed: paths.Missed(home),
 	}, clock.Real, seat, getenv)
+}
+
+// terminationState is what a `callmeter hook` run shares with the goroutine
+// that handles its termination signal: the event name once the payload
+// decoded, and whether the run's event is accounted for, meaning its first
+// write batch committed or its first fault row was written. mu is held, from
+// the start of a write that can account for the run until that write's
+// outcome is known, so a signal landing mid-commit waits for the outcome.
+type terminationState struct {
+	mu        sync.Mutex
+	event     string
+	accounted bool
+}
+
+// terminationKey carries the terminationState in the ctx runCallmeter gets;
+// without it (tests, the fuzz target) a run behaves as if no handler existed.
+type terminationKey struct{}
+
+func withTerminationState(ctx context.Context, state *terminationState) context.Context {
+	return context.WithValue(ctx, terminationKey{}, state)
+}
+
+func terminationStateOf(ctx context.Context) *terminationState {
+	state, _ := ctx.Value(terminationKey{}).(*terminationState)
+	return state
+}
+
+// setEvent records the decoded hook_event_name for the handler's missed line.
+func (state *terminationState) setEvent(name string) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.event = name
+}
+
+// termHold is a write's hold on the terminationState: locked is false when
+// there is no state, or the run was already accounted for and needs none.
+type termHold struct {
+	state  *terminationState
+	locked bool
+}
+
+// hold takes the state's lock for one write unless the run is already
+// accounted for; the caller releases it once the write's outcome is known.
+func (state *terminationState) hold() termHold {
+	if state == nil {
+		return termHold{}
+	}
+	state.mu.Lock()
+	if state.accounted {
+		state.mu.Unlock()
+		return termHold{}
+	}
+	return termHold{state: state, locked: true}
+}
+
+// account marks the run's event accounted for: its batch committed or its
+// fault row was written.
+func (hold termHold) account() {
+	if hold.locked {
+		hold.state.accounted = true
+	}
+}
+
+func (hold termHold) release() {
+	if hold.locked {
+		hold.state.mu.Unlock()
+	}
+}
+
+// terminateOnSignal waits for the first signal on signals and applies the
+// rule: a run whose event is not accounted for appends one missed.log line
+// (event `unknown` until the payload decoded), a run whose event is accounted
+// for appends none, and either way the process exits 0 through exit. It takes
+// the state's lock first, so a write in flight finishes and is judged by its
+// outcome; the lock is not released before exit, so the run writes nothing
+// after the decision. A failure to append the line is said on stderr and in
+// the log, never a non-zero exit. done ends the wait without a signal.
+func terminateOnSignal(
+	signals <-chan os.Signal,
+	done <-chan struct{},
+	state *terminationState,
+	missed, logPath string,
+	stderr io.Writer,
+	exit func(int),
+) {
+	var sig os.Signal
+	select {
+	case sig = <-signals:
+	case <-done:
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.accounted {
+		if err := appendTerminated(missed, state.event, sig, clock.Real.Now()); err != nil {
+			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
+		}
+	}
+	exit(0)
+}
+
+// appendTerminated appends `{unix seconds}\t{event}\tterminated by {SIGNAL}` to
+// the missed.log at path, creating it and its directory when absent: one
+// write, so concurrent appenders never interleave a line.
+func appendTerminated(path, event string, sig os.Signal, now time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create the directory of %s: %w", path, err)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	line := fmt.Sprintf("%d\t%s\t%s%s\n", now.Unix(), missedEvent(event), callmeter.TerminatedReason, signalName(sig))
+	if _, err := file.WriteString(line); err != nil {
+		return errors.Join(fmt.Errorf("append to %s: %w", path, err), file.Close())
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+	return nil
+}
+
+// missedEvent is the event field of a missed.log line: the payload's
+// hook_event_name, or `unknown` when none decoded or it holds a character that
+// would break the tab-separated line.
+func missedEvent(name string) string {
+	if name == "" || strings.IndexFunc(name, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return "unknown"
+	}
+	return name
+}
+
+// signalName is the conventional name of a signal callmeter handles.
+func signalName(sig os.Signal) string {
+	switch sig {
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	}
+	return sig.String()
 }
 
 // callmeterFiles are the files of one run under $CALLMETER_HOME.
@@ -158,6 +333,7 @@ func runCallmeter(
 ) int {
 	run := &callmeterRun{
 		ctx: ctx, stderr: stderr, logPath: files.log, getenv: getenv, now: timing.Now().UnixMilli(), seat: seat,
+		state: terminationStateOf(ctx),
 	}
 	raw, readErr := io.ReadAll(input)
 	run.raw = raw
@@ -168,6 +344,8 @@ func runCallmeter(
 		payloadErr = fmt.Errorf("read hook payload: %w", readErr)
 	} else if err := json.Unmarshal(raw, &run.payload); err != nil {
 		payloadErr = fmt.Errorf("decode hook payload (%d bytes): %w", len(raw), err)
+	} else {
+		run.state.setEvent(run.payload.HookEventName)
 	}
 	store, err := callmeter.OpenDB(ctx, files.store)
 	if err != nil {
@@ -803,8 +981,12 @@ func (run *callmeterRun) resolvePending(agentID, transcript string) {
 
 // write runs one event's writes in one transaction, the run's own rows with
 // them (runRows); a failure is a store fault. fn nil writes the run's rows only.
+// While the run's event is not accounted for, the signal handler is held off
+// until the batch committed or, failed, until its fault row was written.
 func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	run.batches++
+	hold := run.state.hold()
+	defer hold.release()
 	err := run.store.Batch(run.ctx, func(tx *callmeter.Tx) error {
 		if fn != nil {
 			if err := fn(tx); err != nil {
@@ -814,13 +996,23 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 		return run.runRows(tx)
 	})
 	if err != nil {
-		run.fault(callmeter.StageStore, toolUseID, err)
+		run.faultHeld(hold, callmeter.StageStore, toolUseID, err)
+		return
 	}
+	hold.account()
 }
 
 // fault says a failure to record: stderr and callmeter.log always, and a
 // faults row when the store is open. A fault the store refuses is logged only.
 func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
+	hold := run.state.hold()
+	defer hold.release()
+	run.faultHeld(hold, stage, toolUseID, cause)
+}
+
+// faultHeld is fault for a caller that already holds the signal handler off
+// (write, after its batch failed): hold is that caller's, released by it.
+func (run *callmeterRun) faultHeld(hold termHold, stage, toolUseID string, cause error) {
 	session := run.payload.SessionID
 	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
 	if run.store == nil {
@@ -831,7 +1023,9 @@ func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
 	})
 	if err != nil {
 		applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		return
 	}
+	hold.account()
 }
 
 func presentString(value string) *string {

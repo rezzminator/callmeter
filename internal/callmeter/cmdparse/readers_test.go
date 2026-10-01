@@ -2,9 +2,13 @@ package cmdparse
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/rezzminator/callmeter/internal/runner"
 )
@@ -256,5 +260,74 @@ func TestTildeAndPlaceholders(t *testing.T) {
 			}
 			assertFiles(t, got["c1"], tc.want)
 		})
+	}
+}
+
+// parseWithin runs ParseBatch on one call in its own goroutine and fails the
+// test once it runs past bound, so a parse that never returns still fails.
+func parseWithin(t *testing.T, cwd, command string, bound time.Duration) []Part {
+	t.Helper()
+	type result struct {
+		parts map[string][]Part
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		parts, err := ParseBatch(context.Background(), []Call{{ID: "c1", Command: command, Cwd: cwd, Home: cwd}}, failingPython{})
+		done <- result{parts, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("ParseBatch(%q): %v", command, r.err)
+		}
+		return r.parts["c1"]
+	case <-time.After(bound):
+		t.Fatalf("ParseBatch(%q) still running after %v", command, bound)
+		return nil
+	}
+}
+
+// TestGlobOverFilesystemRootReturnsInBound is the input class FuzzParse
+// stalled on: `/*/*/*/*/a` (four levels, 0.2 s alone, over 1 s under ten
+// fuzz workers) made the glob read every directory under the filesystem
+// root; six levels (seed d32551b2ba7a921b) take seconds alone.
+func TestGlobOverFilesystemRootReturnsInBound(t *testing.T) {
+	t.Parallel()
+	parts := parseWithin(t, fixture(t), "/*/*/*/*/*/*/a", time.Second)
+	if len(parts) == 0 {
+		t.Fatal("no parts")
+	}
+	for _, part := range parts {
+		if part.Status == "" {
+			t.Errorf("part %d (%s) carries no status", part.Seq, part.Program)
+		}
+	}
+}
+
+// The globs of one call share maxGlobLookups directory reads and stats: a
+// glob whose expansion needs more stays as written, like a pattern that
+// matched nothing, and its part names the gap in Error; a glob earlier in the
+// call, within the bound, expands as before.
+func TestGlobOverLookupBoundStaysAsWritten(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t, "top.txt")
+	for i := 0; i <= maxGlobLookups/2; i++ {
+		dir := filepath.Join(cwd, fmt.Sprintf("d%04d", i))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "f"), []byte("line\n"), 0o600); err != nil {
+			t.Fatalf("write %s/f: %v", dir, err)
+		}
+	}
+	parts := parseWithin(t, cwd, "cat *.txt; cat */f", time.Second)
+	if len(parts) != 2 {
+		t.Fatalf("parts = %+v, want two cat parts", parts)
+	}
+	assertFiles(t, parts[:1], []FileRef{ref(cwd, "top.txt", ActionReadWhole, "")})
+	if got := parts[1]; got.Status != StatusOK || len(got.Files) != 0 || !reflect.DeepEqual(got.Args, []string{"*/f"}) ||
+		!strings.Contains(got.Error, "glob */f over") {
+		t.Errorf("part 1 = %+v, want cat with */f as written, no file, the bound named in Error", got)
 	}
 }

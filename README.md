@@ -127,7 +127,7 @@ No. The wrapper is POSIX sh, and binaries are released for macOS and Linux on am
 <details>
 <summary>What happens when a hook cannot run?</summary>
 
-The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `{CALLMETER_HOME}/missed.log`; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
+The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `{CALLMETER_HOME}/missed.log`; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
 
 </details>
 

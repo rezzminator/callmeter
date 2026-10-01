@@ -392,9 +392,10 @@ func readRows(rows rowSource, what string, scan func(rowSource) error) error {
 }
 
 // recordingNotes names what the hook never recorded: calls (payload, store or
-// transcript faults) and events (a binary the wrapper could not run). A call
-// counts once however many faults name it, and not at all when its row was
-// written anyway; a fault naming no call counts as one.
+// transcript faults) and events (a binary the wrapper could not run, a hook a
+// signal ended before it recorded). A call counts once however many faults
+// name it, and not at all when its row was written anyway; a fault naming no
+// call counts as one.
 func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, error) {
 	var notes []string
 	faultWhere, faultArgs := faultFilter(f, "faults")
@@ -416,15 +417,20 @@ func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]st
 			),
 		)
 	}
-	var missed int64
-	if err := store.DB().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM faults WHERE stage = ? AND "+faultWhere,
-		append([]any{callmeter.StageBinary}, faultArgs...)...,
-	).Scan(&missed); err != nil {
-		return nil, fmt.Errorf("callmeter report: count unrecorded events: %w", err)
-	}
-	if missed > 0 {
-		notes = append(notes, fmt.Sprintf("%d events unrecorded: binary unavailable", missed))
+	for _, lost := range []struct{ stage, why string }{
+		{callmeter.StageBinary, "binary unavailable"},
+		{callmeter.StageTerminated, "hook terminated before recording"},
+	} {
+		var missed int64
+		if err := store.DB().QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM faults WHERE stage = ? AND "+faultWhere,
+			append([]any{lost.stage}, faultArgs...)...,
+		).Scan(&missed); err != nil {
+			return nil, fmt.Errorf("callmeter report: count unrecorded %s events: %w", lost.stage, err)
+		}
+		if missed > 0 {
+			notes = append(notes, fmt.Sprintf("%d events unrecorded: %s", missed, lost.why))
+		}
 	}
 	return notes, nil
 }

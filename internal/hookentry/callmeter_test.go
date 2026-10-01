@@ -1127,17 +1127,19 @@ func requestEntry(msg, toolUseID, model, stopReason, usage string) string {
 		`","stop_reason":"` + stopReason + `","content":[{"type":"tool_use","id":"` + toolUseID + `"}],"usage":` + usage + `}}` + "\n"
 }
 
-// toolPayload is a hook payload for one tool call: the event's own keys (a
-// tool_response, an error) in extra.
+// toolPayload is a hook payload for one tool call in session A: the first
+// main-chat capture of event with tool_name tool (else the event's first
+// main-chat capture; see capturedLine), tool_use_id, tool_input and extra
+// applied over it, the event's own keys (a tool_response, an error) in extra,
+// an extra valued dropKey removing its key.
 func toolPayload(t *testing.T, event, toolUseID, tool string, input any, extra map[string]any) string {
 	t.Helper()
-	payload := map[string]any{
-		"session_id": cmSessionA, "hook_event_name": event, "cwd": cmDemoProj, "tool_name": tool, "tool_use_id": toolUseID,
-		"transcript_path": cmDemoHome + "/.claude/projects/-tmp-demo-proj/" + cmSessionA + ".jsonl", "tool_input": input,
-	}
-	for key, value := range extra {
-		payload[key] = value
-	}
+	payload := capturedLine(t, event, tool)
+	setSession(payload)
+	payload["tool_name"] = tool
+	payload["tool_use_id"] = toolUseID
+	payload["tool_input"] = input
+	applyFields(payload, extra)
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("encode payload: %v", err)
@@ -1145,19 +1147,124 @@ func toolPayload(t *testing.T, event, toolUseID, tool string, input any, extra m
 	return string(encoded)
 }
 
+// batchPayload is a PostToolBatch payload in session A: the first main-chat
+// capture of the event, transcript_path set to transcript, and tool_calls one
+// entry per id, each cloned from the captured first entry with tool_use_id set
+// and tool_response "ok".
 func batchPayload(t *testing.T, transcript string, ids ...string) string {
 	t.Helper()
+	payload := capturedLine(t, "PostToolBatch", "")
+	captured, _ := payload["tool_calls"].([]any)
+	if len(captured) == 0 {
+		t.Fatalf("the captured PostToolBatch payload holds no tool_calls entry to clone")
+	}
+	first, ok := captured[0].(map[string]any)
+	if !ok {
+		t.Fatalf("the captured PostToolBatch first tool_calls entry is %T, want an object", captured[0])
+	}
 	calls := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
-		calls = append(calls, map[string]any{"tool_use_id": id, "tool_response": "ok"})
+		call := make(map[string]any, len(first))
+		for key, value := range first {
+			call[key] = value
+		}
+		call["tool_use_id"] = id
+		call["tool_response"] = "ok"
+		calls = append(calls, call)
 	}
-	encoded, err := json.Marshal(map[string]any{
-		"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": transcript, "tool_calls": calls,
-	})
+	payload["session_id"] = cmSessionA
+	payload["transcript_path"] = transcript
+	payload["tool_calls"] = calls
+	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("encode batch: %v", err)
 	}
 	return string(encoded)
+}
+
+// TestToolPayloadStartsFromACapture: toolPayload starts from the first
+// main-chat capture of its event and tool, falling back to the event's first
+// main-chat capture when the pair was never captured.
+func TestToolPayloadStartsFromACapture(t *testing.T) {
+	t.Run("the captured pair keeps its keys", func(t *testing.T) {
+		// Only the gym S1 capture holds an Edit, and it carries an effort.
+		got := decoded(t, toolPayload(t, "PostToolUse", "toolu_x", "Edit", map[string]any{"file_path": "f"}, nil))
+		for _, key := range []string{"effort", "duration_ms", "permission_mode", "prompt_id", "tool_response"} {
+			if _, ok := got[key]; !ok {
+				t.Errorf("PostToolUse Edit payload lacks the captured key %q: %v", key, got)
+			}
+		}
+	})
+	t.Run("the call's own keys are overridden", func(t *testing.T) {
+		got := decoded(t, toolPayload(t, "PostToolUse", "toolu_x", "Bash", map[string]any{"command": "echo hi"},
+			map[string]any{"tool_response": "mine", "duration_ms": 5.0}))
+		if got["tool_use_id"] != "toolu_x" || got["tool_name"] != "Bash" || got["tool_response"] != "mine" || got["duration_ms"] != 5.0 {
+			t.Errorf("tool_use_id, tool_name, tool_response, duration_ms = %v, %v, %v, %v", got["tool_use_id"], got["tool_name"], got["tool_response"], got["duration_ms"])
+		}
+		if input, _ := got["tool_input"].(map[string]any); input["command"] != "echo hi" || len(input) != 1 {
+			t.Errorf("tool_input = %v, want only the command", got["tool_input"])
+		}
+		if got["session_id"] != cmSessionA || got["cwd"] != cmDemoProj {
+			t.Errorf("session_id, cwd = %v, %v; want session A, %s", got["session_id"], got["cwd"], cmDemoProj)
+		}
+	})
+	t.Run("an extra valued dropKey leaves its key out", func(t *testing.T) {
+		got := decoded(t, toolPayload(t, "PostToolUse", "toolu_x", "Edit", map[string]any{}, map[string]any{"effort": dropKey}))
+		if _, ok := got["effort"]; ok {
+			t.Errorf("effort is present after dropKey: %v", got)
+		}
+	})
+	t.Run("a failure event keeps its error keys", func(t *testing.T) {
+		got := decoded(t, toolPayload(t, "PostToolUseFailure", "toolu_x", "Bash", map[string]any{}, nil))
+		if got["error"] == nil || got["is_interrupt"] == nil {
+			t.Errorf("PostToolUseFailure payload lacks the captured error or is_interrupt: %v", got)
+		}
+	})
+	t.Run("a pair no capture holds falls back to the event's first main-chat capture", func(t *testing.T) {
+		got := decoded(t, toolPayload(t, "PostToolUse", "toolu_x", "NoSuchTool", map[string]any{}, nil))
+		if got["tool_name"] != "NoSuchTool" {
+			t.Errorf("tool_name = %v, want NoSuchTool", got["tool_name"])
+		}
+		for _, key := range []string{"duration_ms", "permission_mode", "prompt_id", "tool_response"} {
+			if _, ok := got[key]; !ok {
+				t.Errorf("the fallback payload lacks the captured PostToolUse key %q: %v", key, got)
+			}
+		}
+		if _, ok := got["agent_id"]; ok {
+			t.Errorf("the fallback payload is a sub-agent's: %v", got)
+		}
+	})
+}
+
+// TestBatchPayloadStartsFromACapture: batchPayload starts from the first
+// main-chat PostToolBatch capture, one tool_calls entry per id cloned from the
+// captured first entry.
+func TestBatchPayloadStartsFromACapture(t *testing.T) {
+	got := decoded(t, batchPayload(t, "/tmp/demo-home/t.jsonl", "toolu_a", "toolu_b", "toolu_c"))
+	if got["session_id"] != cmSessionA || got["transcript_path"] != "/tmp/demo-home/t.jsonl" || got["hook_event_name"] != "PostToolBatch" {
+		t.Errorf("session_id, transcript_path, hook_event_name = %v, %v, %v", got["session_id"], got["transcript_path"], got["hook_event_name"])
+	}
+	for _, key := range []string{"permission_mode", "prompt_id", "cwd"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("batch payload lacks the captured key %q: %v", key, got)
+		}
+	}
+	if _, ok := got["agent_id"]; ok {
+		t.Errorf("batch payload is a sub-agent's: %v", got)
+	}
+	calls, _ := got["tool_calls"].([]any)
+	if len(calls) != 3 {
+		t.Fatalf("tool_calls holds %d entries, want 3: %v", len(calls), got["tool_calls"])
+	}
+	for i, id := range []string{"toolu_a", "toolu_b", "toolu_c"} {
+		call, _ := calls[i].(map[string]any)
+		if call["tool_use_id"] != id || call["tool_response"] != "ok" {
+			t.Errorf("entry %d tool_use_id, tool_response = %v, %v; want %s, ok", i, call["tool_use_id"], call["tool_response"], id)
+		}
+		if call["tool_name"] == nil || call["tool_input"] == nil {
+			t.Errorf("entry %d lacks the captured first entry's tool_name or tool_input: %v", i, call)
+		}
+	}
 }
 
 // TestCallmeterRecordsTheTokenSplitAndAnEditsLines replays an Edit and two

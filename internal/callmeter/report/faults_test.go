@@ -144,7 +144,7 @@ func TestFaultsBinaryStageListedNotUnknown(t *testing.T) {
 		}
 		stageRows = append(stageRows, row[1]+"="+row[2])
 	}
-	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=2"}
+	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=2", "terminated=0"}
 	if strings.Join(stageRows, ",") != strings.Join(want, ",") {
 		t.Errorf("stage rows = %v, want %v", stageRows, want)
 	}
@@ -164,7 +164,33 @@ func TestFaultsStageListWithNoFaults(t *testing.T) {
 			stageRows = append(stageRows, row[1]+"="+row[2])
 		}
 	}
-	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=0"}
+	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=0", "terminated=0"}
+	if strings.Join(stageRows, ",") != strings.Join(want, ",") {
+		t.Errorf("stage rows = %v, want %v", stageRows, want)
+	}
+}
+
+// TestFaultsTerminatedStageListedNotUnknown: a terminated fault is counted on
+// its own stage row, in the contract's order, never as an unknown stage.
+func TestFaultsTerminatedStageListedNotUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	if err := store.AddFault(ctx, callmeter.Fault{
+		TS: ms(time.Hour), Stage: callmeter.StageTerminated, Error: "SubagentStop: terminated by SIGTERM",
+	}); err != nil {
+		t.Fatalf("AddFault: %v", err)
+	}
+	table, err := Faults(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Faults: %v", err)
+	}
+	var stageRows []string
+	for _, row := range table.Rows {
+		if row[0] == "stage" {
+			stageRows = append(stageRows, row[1]+"="+row[2])
+		}
+	}
+	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=0", "terminated=1"}
 	if strings.Join(stageRows, ",") != strings.Join(want, ",") {
 		t.Errorf("stage rows = %v, want %v", stageRows, want)
 	}

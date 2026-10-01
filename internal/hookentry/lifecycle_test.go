@@ -2,33 +2,345 @@ package hookentry
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 )
 
-// hookPayload is a payload of event in session A, built from the verify
-// capture's key list for it: the common keys plus fields.
-func hookPayload(t *testing.T, event string, fields map[string]any) string {
+// dropKey as a field value removes that key from the payload a helper builds:
+// the captured line carries keys (an effort, a prompt_id, a permission_mode) a
+// test's input must not have.
+type dropKeyMarker struct{}
+
+var dropKey = dropKeyMarker{}
+
+// captureKey names a captured line by its event and, for a tool event, its tool.
+type captureKey struct{ event, tool string }
+
+// captureIndex is the first line of each kind among the committed captures,
+// kept as raw JSON so every use decodes its own copy.
+type captureIndex struct {
+	mainTool  map[captureKey]string // (event, tool) -> first main-chat line
+	mainEvent map[string]string     // event -> first main-chat line, any tool
+	anyEvent  map[string]string     // event -> first line of any agent, for the events only a sub-agent sends
+	searched  []string              // the files read, in search order
+}
+
+// derivedEvents are the events no capture holds: each starts from the captured
+// line of another event, drops that event's own keys and takes the event name.
+var derivedEvents = map[string]struct {
+	from string
+	drop []string
+}{
+	"Notification":     {from: "Stop", drop: []string{"background_tasks", "last_assistant_message", "session_crons", "stop_hook_active"}},
+	"PermissionDenied": {from: "PermissionRequest", drop: []string{"permission_suggestions"}},
+}
+
+var captures struct {
+	sync.Mutex
+	index *captureIndex // nil until a load succeeds, so a failed load is retried and fails again
+}
+
+func newCaptureIndex() *captureIndex {
+	return &captureIndex{mainTool: map[captureKey]string{}, mainEvent: map[string]string{}, anyEvent: map[string]string{}}
+}
+
+// add reads the lines of one capture file, in order: the first line of each
+// kind wins, and a sub-agent's line (one with an agent_id) never counts as a
+// main-chat one.
+func (index *captureIndex) add(t *testing.T, source string, lines []string) {
 	t.Helper()
-	payload := map[string]any{
-		"session_id": cmSessionA, "hook_event_name": event, "cwd": cmDemoProj,
-		"transcript_path": cmDemoHome + "/.claude/projects/-tmp-demo-proj/" + cmSessionA + ".jsonl",
+	index.searched = append(index.searched, source)
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal([]byte(line), &fields); err != nil {
+			t.Fatalf("decode a capture line of %s: %v", source, err)
+		}
+		event, _ := fields["hook_event_name"].(string)
+		tool, _ := fields["tool_name"].(string)
+		if _, ok := index.anyEvent[event]; !ok {
+			index.anyEvent[event] = line
+		}
+		if _, subagent := fields["agent_id"]; subagent {
+			continue
+		}
+		if _, ok := index.mainEvent[event]; !ok {
+			index.mainEvent[event] = line
+		}
+		if _, ok := index.mainTool[captureKey{event, tool}]; !ok {
+			index.mainTool[captureKey{event, tool}] = line
+		}
 	}
+}
+
+// capturedIndex is the capture index, loaded once per test binary from, in
+// order, testdata/verify, testdata/gym/{S1,S1b,S2,S3,S4} and
+// testdata/callmeter/*.jsonl; the first line of a kind wins.
+func capturedIndex(t *testing.T) *captureIndex {
+	t.Helper()
+	captures.Lock()
+	defer captures.Unlock()
+	if captures.index != nil {
+		return captures.index
+	}
+	index := newCaptureIndex()
+	add := func(source string, lines []string) { index.add(t, source, lines) }
+	add(filepath.Join("testdata", "verify", "payloads.jsonl"), fixturePayloads(t, "verify"))
+	for _, session := range gymSessions {
+		add(filepath.Join("testdata", "gym", session, "payloads.jsonl"), fixturePayloads(t, "gym/"+session))
+	}
+	files, err := filepath.Glob(filepath.Join("testdata", "callmeter", "*.jsonl"))
+	if err != nil {
+		t.Fatalf("list the callmeter captures: %v", err)
+	}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read capture %s: %v", file, err)
+		}
+		add(file, strings.Split(string(data), "\n"))
+	}
+	captures.index = index
+	return index
+}
+
+// capturedLine is a fresh decoded copy of the capture a helper starts from,
+// by lookupCapture's rule; no capture at all fails the test.
+func capturedLine(t *testing.T, event, tool string) map[string]any {
+	t.Helper()
+	line, err := lookupCapture(capturedIndex(t), event, tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return line
+}
+
+// lookupCapture is the first main-chat line of event with tool_name tool (tool
+// "" or no such pair: the event's first main-chat line), else the event's
+// first line of any agent, else, for a derivedEvents event, the line of the
+// event it derives from. No capture at all is an error naming the event and
+// the files searched.
+func lookupCapture(index *captureIndex, event, tool string) (map[string]any, error) {
+	raw, ok := "", false
+	if tool != "" {
+		raw, ok = index.mainTool[captureKey{event, tool}]
+	}
+	if !ok {
+		raw, ok = index.mainEvent[event]
+	}
+	if !ok {
+		raw, ok = index.anyEvent[event]
+	}
+	if !ok {
+		derived, isDerived := derivedEvents[event]
+		if !isDerived {
+			return nil, fmt.Errorf("no captured %s payload to start from (tool %q); searched %s", event, tool, strings.Join(index.searched, ", "))
+		}
+		line, err := lookupCapture(index, derived.from, "")
+		if err != nil {
+			return nil, fmt.Errorf("%s derives from %s: %w", event, derived.from, err)
+		}
+		line["hook_event_name"] = event
+		for _, key := range derived.drop {
+			delete(line, key)
+		}
+		return line, nil
+	}
+	var line map[string]any
+	if err := json.Unmarshal([]byte(raw), &line); err != nil {
+		return nil, fmt.Errorf("decode the captured %s payload: %w", event, err)
+	}
+	return line, nil
+}
+
+// setSession points a payload at session A under the neutral roots.
+func setSession(payload map[string]any) {
+	payload["session_id"] = cmSessionA
+	payload["cwd"] = cmDemoProj
+	payload["transcript_path"] = cmDemoHome + "/.claude/projects/-tmp-demo-proj/" + cmSessionA + ".jsonl"
+}
+
+// applyFields overrides payload's keys with fields; a field valued dropKey
+// removes its key.
+func applyFields(payload, fields map[string]any) {
 	for key, value := range fields {
+		if _, remove := value.(dropKeyMarker); remove {
+			delete(payload, key)
+			continue
+		}
 		payload[key] = value
 	}
+}
+
+// hookPayload is a payload of event in session A: the first main-chat line of
+// event among the captures (see capturedIndex; Notification and
+// PermissionDenied derive from Stop and PermissionRequest), every captured key
+// kept, session A's session_id, cwd and transcript_path set, then fields
+// applied, a field valued dropKey removing its key.
+func hookPayload(t *testing.T, event string, fields map[string]any) string {
+	t.Helper()
+	payload := capturedLine(t, event, "")
+	setSession(payload)
+	applyFields(payload, fields)
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("encode %s payload: %v", event, err)
 	}
 	return string(encoded)
+}
+
+// TestHookPayloadStartsFromACapture: hookPayload starts from the first
+// main-chat capture of its event, keeping every captured key; fields override
+// and dropKey removes.
+func TestHookPayloadStartsFromACapture(t *testing.T) {
+	t.Run("every captured key is kept", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "StopFailure", nil))
+		for _, key := range []string{"effort", "error", "last_assistant_message", "prompt_id"} {
+			if _, ok := got[key]; !ok {
+				t.Errorf("StopFailure payload lacks the captured key %q: %v", key, got)
+			}
+		}
+		if got["session_id"] != cmSessionA || got["cwd"] != cmDemoProj || got["hook_event_name"] != "StopFailure" {
+			t.Errorf("session keys = %v, %v, %v; want session A, %s, StopFailure", got["session_id"], got["cwd"], got["hook_event_name"], cmDemoProj)
+		}
+		if want := cmDemoHome + "/.claude/projects/-tmp-demo-proj/" + cmSessionA + ".jsonl"; got["transcript_path"] != want {
+			t.Errorf("transcript_path = %v, want %s", got["transcript_path"], want)
+		}
+	})
+	t.Run("fields are applied over the capture", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "StopFailure", map[string]any{"error": "mine", "added": 1.0, "cwd": "/elsewhere"}))
+		if got["error"] != "mine" || got["added"] != 1.0 || got["cwd"] != "/elsewhere" {
+			t.Errorf("error, added, cwd = %v, %v, %v; want mine, 1, /elsewhere", got["error"], got["added"], got["cwd"])
+		}
+	})
+	t.Run("a field valued dropKey leaves its key out", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "StopFailure", map[string]any{"effort": dropKey, "error": "mine"}))
+		if _, ok := got["effort"]; ok {
+			t.Errorf("effort is present after dropKey: %v", got)
+		}
+		if got["error"] != "mine" || got["prompt_id"] == nil {
+			t.Errorf("the other keys changed: %v", got)
+		}
+	})
+	t.Run("a main-chat capture carries no agent_id", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "PostToolUse", nil))
+		for _, key := range []string{"agent_id", "agent_type"} {
+			if _, ok := got[key]; ok {
+				t.Errorf("a PostToolUse payload carries %q: %v", key, got)
+			}
+		}
+	})
+	t.Run("an event only a sub-agent sends starts from its capture", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "SubagentStop", nil))
+		if got["agent_id"] == nil || got["agent_transcript_path"] == nil {
+			t.Errorf("SubagentStop payload lacks the captured agent_id or agent_transcript_path: %v", got)
+		}
+	})
+	t.Run("Notification starts from the Stop capture without Stop's own keys", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "Notification", map[string]any{"message": "m"}))
+		if got["hook_event_name"] != "Notification" || got["message"] != "m" {
+			t.Errorf("hook_event_name, message = %v, %v; want Notification, m", got["hook_event_name"], got["message"])
+		}
+		for _, key := range []string{"background_tasks", "last_assistant_message", "session_crons", "stop_hook_active"} {
+			if _, ok := got[key]; ok {
+				t.Errorf("a Notification payload carries Stop's key %q: %v", key, got)
+			}
+		}
+		if got["permission_mode"] == nil || got["prompt_id"] == nil {
+			t.Errorf("a Notification payload lacks the captured permission_mode or prompt_id: %v", got)
+		}
+	})
+	t.Run("PermissionDenied starts from the PermissionRequest capture without its suggestions", func(t *testing.T) {
+		got := decoded(t, hookPayload(t, "PermissionDenied", map[string]any{"tool_use_id": "toolu_denied"}))
+		if got["hook_event_name"] != "PermissionDenied" || got["tool_use_id"] != "toolu_denied" {
+			t.Errorf("hook_event_name, tool_use_id = %v, %v; want PermissionDenied, toolu_denied", got["hook_event_name"], got["tool_use_id"])
+		}
+		if _, ok := got["permission_suggestions"]; ok {
+			t.Errorf("a PermissionDenied payload carries permission_suggestions: %v", got)
+		}
+		if got["tool_name"] == nil || got["tool_input"] == nil || got["prompt_id"] == nil {
+			t.Errorf("a PermissionDenied payload lacks the captured tool_name, tool_input or prompt_id: %v", got)
+		}
+	})
+}
+
+// TestLookupCapturePrefersTheMainChat: a sub-agent's line ahead of the main
+// chat's in the search order never becomes the starting capture; an event only
+// a sub-agent sends does. The lines are the real capture's PostToolUse Read
+// and SubagentStop with and without an agent_id.
+func TestLookupCapturePrefersTheMainChat(t *testing.T) {
+	main := capturedLine(t, "PostToolUse", "Read")
+	subagent := capturedLine(t, "PostToolUse", "Read")
+	subagent["agent_id"], subagent["agent_type"] = "asub01", "Explore"
+	stop := capturedLine(t, "SubagentStop", "")
+	encode := func(line map[string]any) string {
+		encoded, err := json.Marshal(line)
+		if err != nil {
+			t.Fatalf("encode a capture line: %v", err)
+		}
+		return string(encoded)
+	}
+	index := newCaptureIndex()
+	index.add(t, "synthetic", []string{encode(subagent), encode(main), encode(stop)})
+	for _, tool := range []string{"Read", ""} {
+		got, err := lookupCapture(index, "PostToolUse", tool)
+		if err != nil {
+			t.Fatalf("lookupCapture PostToolUse %q: %v", tool, err)
+		}
+		if _, ok := got["agent_id"]; ok {
+			t.Errorf("lookupCapture PostToolUse %q returned the sub-agent's line: %v", tool, got)
+		}
+	}
+	got, err := lookupCapture(index, "SubagentStop", "")
+	if err != nil {
+		t.Fatalf("lookupCapture SubagentStop: %v", err)
+	}
+	if got["agent_id"] == nil {
+		t.Errorf("lookupCapture SubagentStop lost its agent_id: %v", got)
+	}
+}
+
+// TestLookupCaptureWithoutACapture: an event no capture holds and no
+// derivation covers is an error naming the event and every file searched, and
+// the search order is verify, the gym sessions, then the callmeter captures.
+func TestLookupCaptureWithoutACapture(t *testing.T) {
+	index := capturedIndex(t)
+	_, err := lookupCapture(index, "NoSuchEvent", "")
+	if err == nil {
+		t.Fatal("lookupCapture of an uncaptured event returned no error")
+	}
+	if !strings.Contains(err.Error(), "NoSuchEvent") {
+		t.Errorf("the error does not name the event: %v", err)
+	}
+	for _, file := range index.searched {
+		if !strings.Contains(err.Error(), file) {
+			t.Errorf("the error does not name the searched file %s: %v", file, err)
+		}
+	}
+	want := []string{filepath.Join("testdata", "verify", "payloads.jsonl")}
+	for _, session := range gymSessions {
+		want = append(want, filepath.Join("testdata", "gym", session, "payloads.jsonl"))
+	}
+	if len(index.searched) <= len(want) || !slices.Equal(index.searched[:len(want)], want) {
+		t.Errorf("searched = %v, want %v then the callmeter captures", index.searched, want)
+	}
+	for _, file := range index.searched[len(want):] {
+		if filepath.Dir(file) != filepath.Join("testdata", "callmeter") {
+			t.Errorf("searched %s after the gym sessions, want a testdata/callmeter capture", file)
+		}
+	}
 }
 
 // lifecyclePayloads is one payload per recorded non-tool event, each
