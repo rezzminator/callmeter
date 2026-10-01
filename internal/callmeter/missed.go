@@ -22,9 +22,11 @@ const ingestInfix = ".ingest-"
 // unparsedLimit is how many bytes of a malformed missed.log line its fault keeps.
 const unparsedLimit = 200
 
-// IngestMissed turns the wrapper's missed.log into `binary` faults and
-// returns how many it wrote. Each line is `{unix seconds}\t{event}\t{reason}`
-// and becomes a fault stamped seconds × 1000 whose error is `{event}: {reason}`;
+// IngestMissed turns the wrapper's missed.log into `binary` faults, and the
+// lines the binary wrote itself (a reason opening TerminatedReason) into
+// `terminated` faults, and returns how many it wrote. Each line is
+// `{unix seconds}\t{event}\t{reason}` and becomes a fault stamped seconds × 1000
+// whose error is `{event}: {reason}`;
 // a line that does not parse becomes a fault `unparsed missed.log line: …` of
 // its first 200 bytes, never a dropped line.
 //
@@ -201,6 +203,12 @@ func parseMissed(data []byte, now int64) []Fault {
 	return faults
 }
 
+// TerminatedReason opens the reason of a missed.log line the binary wrote itself
+// when a signal ended its run before it recorded: `terminated by SIGTERM`.
+// parseMissedLine turns such a line into a StageTerminated fault; every other
+// line stays StageBinary.
+const TerminatedReason = "terminated by "
+
 // parseMissedLine reads `{unix seconds}\t{event}\t{reason}`; false when the
 // line has not that shape.
 func parseMissedLine(line string) (Fault, bool) {
@@ -212,5 +220,9 @@ func parseMissedLine(line string) (Fault, bool) {
 	if err != nil {
 		return Fault{}, false
 	}
-	return Fault{TS: seconds * 1000, Stage: StageBinary, Error: fields[1] + ": " + fields[2]}, true
+	stage := StageBinary
+	if strings.HasPrefix(fields[2], TerminatedReason) {
+		stage = StageTerminated // the binary's own line: a signal cut its run short
+	}
+	return Fault{TS: seconds * 1000, Stage: stage, Error: fields[1] + ": " + fields[2]}, true
 }

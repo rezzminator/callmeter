@@ -48,7 +48,19 @@ const (
 // Version names this parser's behaviour. A stored call parsed by an older
 // version is parsed again, so a fix reaches every call still in the window;
 // raise it with every change to the parts or files a command parses to.
-const Version = 2
+const Version = 3
+
+// The bounds of one call's parse, so no command can hold a report run. A
+// command over maxCommandBytes is one unparsed part, never handed to the
+// shell parser; a literal -c string nested deeper than maxShellDepth is one
+// unparsed part in place of its parse; the globs of one call share
+// maxGlobLookups directory reads and stats, past which a glob stays as
+// written.
+const (
+	maxCommandBytes = 65536
+	maxShellDepth   = 8
+	maxGlobLookups  = 4096
+)
 
 // Call is one Bash tool call: its tool_use_id, its command string, the
 // absolute directory it ran in, and the home directory a leading unquoted
@@ -182,6 +194,11 @@ type callParser struct {
 	// existingOnly makes a known reader attribute existing files only, as
 	// an unknown program does (its operands come through xargs).
 	existingOnly bool
+	// shellDepth counts the literal -c strings the walk is inside, up to
+	// maxShellDepth; globLookups the directory reads and stats the call's
+	// globs have spent, up to maxGlobLookups.
+	shellDepth  int
+	globLookups int
 }
 
 // pyPart is a Python part awaiting its scan: where it sits among the parts
@@ -200,6 +217,10 @@ func parseCall(call Call) *callParser {
 		pyParts:   map[string]pyPart{},
 		dir:       call.Cwd,
 		printer:   syntax.NewPrinter(),
+	}
+	if len(call.Command) > maxCommandBytes {
+		p.parts = []Part{{Seq: 0, Lang: LangSh, Status: StatusUnparsed, Error: fmt.Sprintf("command over %d bytes", maxCommandBytes)}}
+		return p
 	}
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(call.Command), "")
 	if err != nil {

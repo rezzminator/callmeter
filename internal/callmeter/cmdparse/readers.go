@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -341,6 +342,8 @@ func (p *callParser) redirFiles(redirs []*syntax.Redirect) []FileRef {
 // glob expands an unquoted glob against the current directory; no match (or a
 // malformed pattern, or an unknown directory) leaves the word as written, as
 // the shell does, and reports it unmatched: a pattern is never a missing file.
+// A glob past the call's maxGlobLookups is left the same way, with a note
+// naming the gap.
 func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched bool) {
 	if !isGlob || !strings.ContainsAny(val, "*?[") {
 		return []string{val}, false
@@ -352,7 +355,11 @@ func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched boo
 		}
 		pattern = filepath.Join(p.dir, pattern)
 	}
-	matches, err := filepath.Glob(pattern)
+	matches, err := p.globBounded(pattern)
+	if errors.Is(err, errGlobBound) {
+		p.notes = append(p.notes, fmt.Sprintf("glob %s over %d directory lookups, left unexpanded", val, maxGlobLookups))
+		return []string{val}, true
+	}
 	if err != nil || len(matches) == 0 {
 		return []string{val}, true
 	}
@@ -369,6 +376,101 @@ func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched boo
 		out = append(out, rel)
 	}
 	return out, false
+}
+
+// errGlobBound stops a glob once the call's globs have spent maxGlobLookups.
+var errGlobBound = errors.New("glob over the lookup bound")
+
+// globBounded is filepath.Glob with every directory stat and read counted
+// against the call's maxGlobLookups: `/*/*/*/*/*/a` would otherwise read
+// every directory five levels under the filesystem root. Past the bound it
+// returns errGlobBound; an unreadable directory matches nothing, as in
+// filepath.Glob.
+func (p *callParser) globBounded(pattern string) ([]string, error) {
+	if _, err := filepath.Match(pattern, ""); err != nil {
+		return nil, err
+	}
+	return p.globPattern(pattern)
+}
+
+func (p *callParser) globPattern(pattern string) ([]string, error) {
+	if !strings.ContainsAny(pattern, `*?[\`) {
+		if err := p.spendGlobLookup(); err != nil {
+			return nil, err
+		}
+		if _, err := os.Lstat(pattern); err != nil {
+			return nil, nil
+		}
+		return []string{pattern}, nil
+	}
+	dir, file := filepath.Split(pattern)
+	switch dir {
+	case "":
+		dir = "."
+	case string(filepath.Separator):
+	default:
+		dir = dir[:len(dir)-1]
+	}
+	if !strings.ContainsAny(dir, `*?[\`) {
+		return p.globDir(dir, file, nil)
+	}
+	if dir == pattern {
+		return nil, filepath.ErrBadPattern
+	}
+	dirs, err := p.globPattern(dir)
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
+	for _, d := range dirs {
+		if matches, err = p.globDir(d, file, matches); err != nil {
+			return nil, err
+		}
+	}
+	return matches, nil
+}
+
+// globDir appends the names in dir matching pattern, in sorted order.
+func (p *callParser) globDir(dir, pattern string, matches []string) ([]string, error) {
+	if err := p.spendGlobLookup(); err != nil {
+		return nil, err
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return matches, nil
+	}
+	if err := p.spendGlobLookup(); err != nil {
+		return nil, err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return matches, nil
+	}
+	names, readErr := d.Readdirnames(-1)
+	if err := d.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", dir, err)
+	}
+	if readErr != nil && len(names) == 0 {
+		return matches, nil
+	}
+	slices.Sort(names)
+	for _, n := range names {
+		ok, err := filepath.Match(pattern, n)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			matches = append(matches, filepath.Join(dir, n))
+		}
+	}
+	return matches, nil
+}
+
+func (p *callParser) spendGlobLookup() error {
+	if p.globLookups >= maxGlobLookups {
+		return errGlobBound
+	}
+	p.globLookups++
+	return nil
 }
 
 // file reports whether a resolved argument is an existing regular file.

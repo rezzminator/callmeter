@@ -1,17 +1,35 @@
 package hookentry
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
 )
+
+// buildCallmeter builds ./cmd/callmeter to binary.
+func buildCallmeter(ctx context.Context, t *testing.T, binary string) {
+	t.Helper()
+	built, err := runner.Real{}.Run(ctx, []string{"go", "build", "-o", binary, "./cmd/callmeter"},
+		runner.RunOptions{Dir: filepath.Join("..", "..")})
+	if err != nil || built.ExitCode != 0 {
+		t.Fatalf("build callmeter: %v (exit %d): %s", err, built.ExitCode, built.Stderr)
+	}
+}
 
 // hookProcesses is how many `callmeter hook` processes write the one store at
 // once: more than any real session runs in parallel.
@@ -27,11 +45,7 @@ func TestProcessConcurrentHooks(t *testing.T) {
 	defer cancel()
 	lab := newCallmeterLab(t)
 	binary := filepath.Join(lab.root, "bin", "callmeter")
-	built, err := runner.Real{}.Run(ctx, []string{"go", "build", "-o", binary, "./cmd/callmeter"},
-		runner.RunOptions{Dir: filepath.Join("..", "..")})
-	if err != nil || built.ExitCode != 0 {
-		t.Fatalf("build callmeter: %v (exit %d): %s", err, built.ExitCode, built.Stderr)
-	}
+	buildCallmeter(ctx, t, binary)
 	if err := os.RemoveAll(lab.home); err != nil {
 		t.Fatalf("clear the lab home: %v", err)
 	}
@@ -99,5 +113,541 @@ func TestProcessConcurrentHooks(t *testing.T) {
 	}
 	if n := lab.count("SELECT COUNT(*) FROM turns"); n != wantTurns {
 		t.Errorf("turns holds %d rows, want the in-order replay's %d", n, wantTurns)
+	}
+}
+
+// signalDelay is how long a signal test lets a hook process run before it
+// signals it: well past the process's start, well inside the 3 s settle wait
+// of a SubagentStop whose transcript lacks its final message.
+const signalDelay = 700 * time.Millisecond
+
+// missedLine is one line the binary appends to missed.log under a signal.
+var missedLine = regexp.MustCompile(`^(\d+)\t(\S+)\tterminated by (SIG[A-Z]+)\n$`)
+
+// signalScene is one hermetic run of the built binary: its own CALLMETER_HOME,
+// seat and the gym/S2 session's transcripts.
+type signalScene struct {
+	lab    *callmeterLab
+	binary string
+	home   string // CALLMETER_HOME
+	env    []string
+}
+
+func newSignalScene(t *testing.T, binary string) *signalScene {
+	t.Helper()
+	lab := newCallmeterLab(t)
+	if err := os.RemoveAll(lab.home); err != nil {
+		t.Fatalf("clear the lab home: %v", err)
+	}
+	if err := os.CopyFS(lab.home, os.DirFS(filepath.Join("testdata", "gym", "S2", "home"))); err != nil {
+		t.Fatalf("copy the S2 home: %v", err)
+	}
+	home := filepath.Join(lab.root, "callmeter-home")
+	lab.storePath = paths.Store(home)
+	lab.missed = paths.Missed(home)
+	lab.logPath = paths.Log(home)
+	return &signalScene{
+		lab: lab, binary: binary, home: home,
+		env: append(os.Environ(),
+			"CALLMETER_HOME="+home, "HOME="+lab.home, "CLAUDE_CONFIG_DIR="+filepath.Join(lab.home, ".claude")),
+	}
+}
+
+// payload is the first captured payload of event in gym/S2, rewritten by the lab.
+func (scene *signalScene) payload(t *testing.T, event string) string {
+	t.Helper()
+	for _, line := range fixturePayloads(t, "gym/S2") {
+		if eventName(t, line) == event {
+			return scene.lab.rewrite(line)
+		}
+	}
+	t.Fatalf("gym/S2 holds no %s payload", event)
+	return ""
+}
+
+// unfinishedStop is a typed SubagentStop whose sub-agent transcript lacks its
+// final message: its run waits out the settle wait before it records.
+func (scene *signalScene) unfinishedStop(t *testing.T) string {
+	t.Helper()
+	payload := scene.payload(t, "SubagentStop")
+	transcript, _ := payloadField(t, payload, "agent_transcript_path").(string)
+	full, err := os.ReadFile(transcript)
+	if err != nil {
+		t.Fatalf("read the sub-agent transcript: %v", err)
+	}
+	lines := strings.SplitAfter(string(full), "\n")
+	for len(lines) > 0 && (lines[len(lines)-1] == "" || strings.Contains(lines[len(lines)-1], `"stop_reason":"end_turn"`)) {
+		lines = lines[:len(lines)-1]
+	}
+	scene.lab.write(transcript, []byte(strings.Join(lines, "")))
+	return payload
+}
+
+// hookProcess is a started `callmeter hook` the test signals mid-run.
+type hookProcess struct {
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	stdout, stderr *bytes.Buffer
+	started        time.Time
+}
+
+// start spawns `callmeter hook`; a payload is written to its stdin and the
+// pipe closed, "" leaves stdin open and unread.
+func (scene *signalScene) start(t *testing.T, payload string) *hookProcess {
+	t.Helper()
+	return scene.startCmd(t, payload, exec.Command(scene.binary, "hook"))
+}
+
+// startIgnoring spawns `callmeter hook` with the signals named by traps (the
+// sh names, `HUP INT`) ignored on entry, as `nohup` or a non-interactive
+// shell's background job leaves them: sh sets the disposition and execs the
+// binary in its own pid.
+func (scene *signalScene) startIgnoring(t *testing.T, payload, traps string) *hookProcess {
+	t.Helper()
+	return scene.startCmd(t, payload,
+		exec.Command("/bin/sh", "-c", `trap '' `+traps+`; exec "$0" hook`, scene.binary))
+}
+
+func (scene *signalScene) startCmd(t *testing.T, payload string, cmd *exec.Cmd) *hookProcess {
+	t.Helper()
+	proc := &hookProcess{stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
+	proc.cmd = cmd
+	proc.cmd.Env = scene.env
+	proc.cmd.Stdout, proc.cmd.Stderr = proc.stdout, proc.stderr
+	stdin, err := proc.cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("pipe stdin: %v", err)
+	}
+	proc.stdin = stdin
+	proc.started = time.Now()
+	if err := proc.cmd.Start(); err != nil {
+		t.Fatalf("start callmeter hook: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := proc.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill callmeter hook: %v", err)
+		}
+	})
+	if payload != "" {
+		if _, err := io.WriteString(stdin, payload); err != nil {
+			t.Fatalf("write the payload: %v", err)
+		}
+		if err := stdin.Close(); err != nil {
+			t.Fatalf("close stdin: %v", err)
+		}
+	}
+	return proc
+}
+
+func (proc *hookProcess) signal(t *testing.T, sig syscall.Signal) {
+	t.Helper()
+	if err := proc.cmd.Process.Signal(sig); err != nil {
+		t.Fatalf("send %v: %v", sig, err)
+	}
+}
+
+// exit waits for the process and returns its exit code, -1 when a signal killed it.
+func (proc *hookProcess) exit(t *testing.T) int {
+	t.Helper()
+	waited := make(chan error, 1)
+	go func() { waited <- proc.cmd.Wait() }()
+	select {
+	case err := <-waited:
+		var exitErr *exec.ExitError
+		if err != nil && !errors.As(err, &exitErr) {
+			t.Fatalf("wait for callmeter hook: %v", err)
+		}
+		return proc.cmd.ProcessState.ExitCode()
+	case <-time.After(30 * time.Second):
+		t.Fatalf("callmeter hook still running 30 s on; stderr %q", proc.stderr)
+		return 0
+	}
+}
+
+// missedLines is the content of the scene's missed.log, "" when there is none.
+func (scene *signalScene) missedLines(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(paths.Missed(scene.home))
+	if errors.Is(err, os.ErrNotExist) {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read missed.log: %v", err)
+	}
+	return string(data)
+}
+
+// wantTerminatedLine checks that missed.log holds exactly one line of event
+// and signal, stamped within the run's own seconds.
+func (scene *signalScene) wantTerminatedLine(t *testing.T, proc *hookProcess, event, signal string) {
+	t.Helper()
+	got := scene.missedLines(t)
+	match := missedLine.FindStringSubmatch(got)
+	if match == nil || strings.Count(got, "\n") != 1 {
+		t.Fatalf("missed.log = %q, want one line `{secs}\\t%s\\tterminated by %s`", got, event, signal)
+	}
+	secs, err := strconv.ParseInt(match[1], 10, 64)
+	if err != nil || secs < proc.started.Unix() || secs > time.Now().Unix() {
+		t.Errorf("missed.log stamp = %q, want Unix seconds of this run (%d..%d)", match[1], proc.started.Unix(), time.Now().Unix())
+	}
+	if match[2] != event || match[3] != signal {
+		t.Errorf("missed.log line = %q, want event %s signal %s", got, event, signal)
+	}
+}
+
+// wantQuietExit checks the exit contract of every signalled run: exit 0 and
+// nothing on stdout.
+func wantQuietExit(t *testing.T, proc *hookProcess) {
+	t.Helper()
+	if code := proc.exit(t); code != 0 || proc.stdout.Len() != 0 {
+		t.Errorf("exit %d, stdout %q, stderr %q; want exit 0 and an empty stdout", code, proc.stdout, proc.stderr)
+	}
+}
+
+// holdStore takes the store's write lock through a second connection, so a
+// hook's first write batch waits on the busy timeout until release.
+func (scene *signalScene) holdStore(t *testing.T) (release func()) {
+	t.Helper()
+	store := scene.lab.db() // creates the schema
+	conn, err := store.DB().Conn(scene.lab.ctx)
+	if err != nil {
+		t.Fatalf("take a connection: %v", err)
+	}
+	if _, err := conn.ExecContext(scene.lab.ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("take the store's write lock: %v", err)
+	}
+	return func() {
+		if _, err := conn.ExecContext(scene.lab.ctx, "ROLLBACK"); err != nil {
+			t.Errorf("release the store's write lock: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Errorf("close the lock connection: %v", err)
+		}
+	}
+}
+
+// TestProcessSignalledHook drives the built binary under SIGTERM, SIGINT and
+// SIGHUP: a hook a signal ends before its event is accounted for leaves one
+// missed.log line, one it ends after leaves none, and every one exits 0
+// silently.
+func TestProcessSignalledHook(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "callmeter")
+	buildCallmeter(ctx, t, binary)
+
+	for sig, name := range map[syscall.Signal]string{
+		syscall.SIGTERM: "SIGTERM", syscall.SIGINT: "SIGINT", syscall.SIGHUP: "SIGHUP",
+	} {
+		t.Run("killed before recording by "+name, func(t *testing.T) {
+			scene := newSignalScene(t, binary)
+			proc := scene.start(t, scene.unfinishedStop(t))
+			time.Sleep(signalDelay)
+			proc.signal(t, sig)
+			wantQuietExit(t, proc)
+			scene.wantTerminatedLine(t, proc, "SubagentStop", name)
+			if n := scene.lab.count("SELECT COUNT(*) FROM events"); n != 0 {
+				t.Errorf("events holds %d rows, want none for the killed run", n)
+			}
+		})
+	}
+
+	for sig, name := range map[syscall.Signal]string{syscall.SIGINT: "SIGINT", syscall.SIGHUP: "SIGHUP"} {
+		t.Run(name+" ignored on entry stays ignored", func(t *testing.T) {
+			scene := newSignalScene(t, binary)
+			proc := scene.startIgnoring(t, scene.unfinishedStop(t), "HUP INT")
+			time.Sleep(signalDelay)
+			proc.signal(t, sig)
+			wantQuietExit(t, proc)
+			if got := scene.missedLines(t); got != "" {
+				t.Errorf("missed.log = %q, want no line: an ignored signal ends nothing", got)
+			}
+			if n := scene.lab.count("SELECT COUNT(*) FROM events"); n != 1 {
+				t.Errorf("events holds %d rows, want the run's one: it finished despite the ignored %s", n, name)
+			}
+		})
+	}
+
+	t.Run("killed before decode", func(t *testing.T) {
+		scene := newSignalScene(t, binary)
+		proc := scene.start(t, "") // stdin open, nothing to read
+		time.Sleep(signalDelay)
+		proc.signal(t, syscall.SIGTERM)
+		wantQuietExit(t, proc)
+		scene.wantTerminatedLine(t, proc, "unknown", "SIGTERM")
+	})
+
+	t.Run("killed during the commit, which commits", func(t *testing.T) {
+		scene := newSignalScene(t, binary)
+		payload := scene.payload(t, "PreToolUse")
+		release := scene.holdStore(t)
+		proc := scene.start(t, payload)
+		time.Sleep(signalDelay)
+		proc.signal(t, syscall.SIGTERM)
+		time.Sleep(signalDelay)
+		release()
+		wantQuietExit(t, proc)
+		if got := scene.missedLines(t); got != "" {
+			t.Errorf("missed.log = %q, want no line for an event that committed", got)
+		}
+		id, _ := payloadField(t, payload, "tool_use_id").(string)
+		if n := scene.lab.count("SELECT COUNT(*) FROM calls WHERE tool_use_id = ?", id); n != 1 {
+			t.Errorf("calls holds %d rows for %s, want the committed one", n, id)
+		}
+	})
+
+	t.Run("killed during the commit, which fails", func(t *testing.T) {
+		scene := newSignalScene(t, binary)
+		payload := scene.payload(t, "PreToolUse")
+		if _, err := scene.lab.db().DB().ExecContext(ctx,
+			"CREATE TRIGGER refuse_calls BEFORE INSERT ON calls BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+			t.Fatalf("create the refusing trigger: %v", err)
+		}
+		release := scene.holdStore(t)
+		proc := scene.start(t, payload)
+		time.Sleep(signalDelay)
+		proc.signal(t, syscall.SIGTERM)
+		time.Sleep(signalDelay)
+		release()
+		wantQuietExit(t, proc)
+		if got := scene.missedLines(t); got != "" {
+			t.Errorf("missed.log = %q, want no line: the failed batch's store fault accounts for the event", got)
+		}
+		if n := scene.lab.count(
+			"SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE '%refused by the test%'", callmeter.StageStore); n != 1 {
+			t.Errorf("store faults naming the refusal = %d, want 1", n)
+		}
+	})
+
+	t.Run("missed.log cannot be written", func(t *testing.T) {
+		scene := newSignalScene(t, binary)
+		if err := os.MkdirAll(paths.Missed(scene.home), 0o755); err != nil { // a directory where the file goes
+			t.Fatalf("make missed.log a directory: %v", err)
+		}
+		proc := scene.start(t, "")
+		time.Sleep(signalDelay)
+		proc.signal(t, syscall.SIGTERM)
+		wantQuietExit(t, proc)
+		logged, err := os.ReadFile(paths.Log(scene.home))
+		if err != nil {
+			t.Fatalf("read callmeter.log: %v", err)
+		}
+		for name, text := range map[string]string{"stderr": proc.stderr.String(), "callmeter.log": string(logged)} {
+			if !strings.Contains(text, "missed.log") || !strings.Contains(text, callmeter.StageTerminated) {
+				t.Errorf("%s = %q, want the failed append to missed.log said", name, text)
+			}
+		}
+	})
+
+	t.Run("home cannot be written", func(t *testing.T) {
+		scene := newSignalScene(t, binary)
+		parent := filepath.Join(scene.lab.root, "not-a-directory")
+		if err := os.WriteFile(parent, nil, 0o644); err != nil {
+			t.Fatalf("write %s: %v", parent, err)
+		}
+		scene.home = filepath.Join(parent, "home") // creating it fails whoever runs the test
+		scene.env = append(scene.env, "CALLMETER_HOME="+scene.home)
+		proc := scene.start(t, "")
+		time.Sleep(signalDelay)
+		proc.signal(t, syscall.SIGTERM)
+		wantQuietExit(t, proc)
+		if !strings.Contains(proc.stderr.String(), "missed.log") {
+			t.Errorf("stderr = %q, want the failed append to missed.log said", proc.stderr)
+		}
+	})
+}
+
+// terminate starts the signal handler for sig as the binary does, in its own
+// goroutine, and returns the channel its exit code arrives on.
+func (lab *callmeterLab) terminate(state *terminationState, sig os.Signal, stderr io.Writer) <-chan int {
+	signals := make(chan os.Signal, 1)
+	signals <- sig
+	codes := make(chan int, 1)
+	go terminateOnSignal(signals, nil, state, lab.missed, lab.logPath, stderr, func(code int) { codes <- code })
+	return codes
+}
+
+// await returns the handler's exit code, failing when it does not exit.
+func await(t *testing.T, codes <-chan int) int {
+	t.Helper()
+	select {
+	case code := <-codes:
+		return code
+	case <-time.After(10 * time.Second):
+		t.Fatal("the signal handler did not exit")
+		return 0
+	}
+}
+
+// feedWithState runs one payload as the binary does: a terminationState in the ctx.
+func (lab *callmeterLab) feedWithState(state *terminationState, payload string) int {
+	shared := filepath.Join(lab.home, ".claude")
+	var stderr bytes.Buffer
+	return runCallmeter(withTerminationState(context.Background(), state), strings.NewReader(payload), &stderr,
+		lab.files(), lab.clock, callmeterSeat{dir: lab.seatDir, configDir: &shared}, mapEnv(lab.env))
+}
+
+// TestTerminationAfterRecordingWritesNoLine: a signal after the run's first
+// batch committed, or its first fault row was written, ends the run with no
+// missed line and the rows in place.
+func TestTerminationAfterRecordingWritesNoLine(t *testing.T) {
+	scene := newSignalScene(t, "")
+	lab := scene.lab
+	for name, run := range map[string]struct {
+		payload string
+		rows    string
+		want    int
+	}{
+		"batch committed": {
+			scene.payload(t, "PreToolUse"),
+			"SELECT COUNT(*) FROM calls", 1,
+		},
+		"fault row written": {
+			"not a hook payload",
+			"SELECT COUNT(*) FROM faults WHERE stage = 'payload'", 1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := &terminationState{}
+			if code := lab.feedWithState(state, run.payload); code != 0 {
+				t.Fatalf("run exit code = %d, want 0", code)
+			}
+			var stderr bytes.Buffer
+			if code := await(t, lab.terminate(state, syscall.SIGTERM, &stderr)); code != 0 {
+				t.Errorf("handler exit code = %d, want 0", code)
+			}
+			if got := scene.missedLines(t); got != "" {
+				t.Errorf("missed.log = %q, want no line for an event already accounted for", got)
+			}
+			if n := lab.count(run.rows); n != run.want {
+				t.Errorf("%q = %d, want %d", run.rows, n, run.want)
+			}
+		})
+	}
+}
+
+// TestTerminationBeforeRecordingWritesTheLine: a run with nothing accounted
+// for leaves one line naming its event, `unknown` when the payload never
+// decoded or its name would break the line; the home is created when absent.
+func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
+	for name, run := range map[string]struct{ event, want string }{
+		"decoded":                 {"Stop", "Stop"},
+		"not decoded":             {"", "unknown"},
+		"a name with a tab":       {"Pre\tToolUse", "unknown"},
+		"a name with a line feed": {"Pre\nToolUse", "unknown"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			scene := newSignalScene(t, "")
+			state := &terminationState{}
+			state.setEvent(run.event)
+			var stderr bytes.Buffer
+			if code := await(t, scene.lab.terminate(state, syscall.SIGINT, &stderr)); code != 0 {
+				t.Errorf("handler exit code = %d, want 0", code)
+			}
+			if got := scene.missedLines(t); !missedLine.MatchString(got) || !strings.Contains(got, "\t"+run.want+"\tterminated by SIGINT\n") {
+				t.Errorf("missed.log = %q, want one line of event %s", got, run.want)
+			}
+			info, err := os.Stat(scene.home)
+			if err != nil || info.Mode().Perm() != 0o755 {
+				t.Errorf("home = %v, %v; want it created 0755", info, err)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("handler stderr = %q, want nothing said for a line that was written", stderr.String())
+			}
+		})
+	}
+
+	t.Run("store unreachable", func(t *testing.T) {
+		scene := newSignalScene(t, "")
+		lab := scene.lab
+		parent := filepath.Join(lab.root, "not-a-directory")
+		if err := os.WriteFile(parent, nil, 0o644); err != nil {
+			t.Fatalf("write %s: %v", parent, err)
+		}
+		lab.storePath = filepath.Join(parent, "callmeter.db")
+		state := &terminationState{}
+		if code := lab.feedWithState(state, scene.payload(t, "PreToolUse")); code != 0 {
+			t.Fatalf("run exit code = %d, want 0", code)
+		}
+		var stderr bytes.Buffer
+		if code := await(t, lab.terminate(state, syscall.SIGHUP, &stderr)); code != 0 {
+			t.Errorf("handler exit code = %d, want 0", code)
+		}
+		if got := scene.missedLines(t); !strings.Contains(got, "\tPreToolUse\tterminated by SIGHUP\n") {
+			t.Errorf("missed.log = %q, want the line: a store nobody could write accounts for nothing", got)
+		}
+	})
+}
+
+// waitHeld waits until the run sits inside a write holding the state's lock,
+// past any momentary take of it.
+func waitHeld(t *testing.T, state *terminationState) {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for stable := 0; stable < 3; {
+		if time.Now().After(deadline) {
+			t.Fatal("the run never held the signal state's lock inside its write")
+		}
+		time.Sleep(20 * time.Millisecond)
+		if state.mu.TryLock() {
+			state.mu.Unlock()
+			stable = 0
+		} else {
+			stable++
+		}
+	}
+}
+
+// TestTerminationWaitsOutAnInFlightCommit: a signal landing while the run's
+// first batch is committing waits for its outcome — committed, no line and the
+// rows; failed, its store fault and no line.
+func TestTerminationWaitsOutAnInFlightCommit(t *testing.T) {
+	for _, failing := range []bool{false, true} {
+		name := "the batch commits"
+		if failing {
+			name = "the batch fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			scene := newSignalScene(t, "")
+			lab := scene.lab
+			payload := scene.payload(t, "PreToolUse")
+			if failing {
+				if _, err := lab.db().DB().ExecContext(lab.ctx,
+					"CREATE TRIGGER refuse_calls BEFORE INSERT ON calls BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+					t.Fatalf("create the refusing trigger: %v", err)
+				}
+			}
+			release := scene.holdStore(t)
+			state := &terminationState{}
+			ran := make(chan int, 1)
+			go func() { ran <- lab.feedWithState(state, payload) }()
+			waitHeld(t, state)
+
+			var stderr bytes.Buffer
+			codes := lab.terminate(state, syscall.SIGTERM, &stderr)
+			select {
+			case code := <-codes:
+				t.Fatalf("the handler exited %d while the commit was in flight", code)
+			case <-time.After(300 * time.Millisecond):
+			}
+			release()
+			if code := <-ran; code != 0 {
+				t.Errorf("run exit code = %d, want 0", code)
+			}
+			if code := await(t, codes); code != 0 {
+				t.Errorf("handler exit code = %d, want 0", code)
+			}
+			if got := scene.missedLines(t); got != "" {
+				t.Errorf("missed.log = %q, want no line: the commit's outcome accounts for the event", got)
+			}
+			calls := lab.count("SELECT COUNT(*) FROM calls")
+			faults := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE '%refused by the test%'", callmeter.StageStore)
+			switch {
+			case failing && (calls != 0 || faults != 1):
+				t.Errorf("after a failed batch: %d calls, %d store faults; want 0 and 1", calls, faults)
+			case !failing && (calls != 1 || faults != 0):
+				t.Errorf("after a committed batch: %d calls, %d store faults; want 1 and 0", calls, faults)
+			}
+		})
 	}
 }

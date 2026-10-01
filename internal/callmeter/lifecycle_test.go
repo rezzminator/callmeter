@@ -415,3 +415,119 @@ func TestTouchSessionColumnsComeFromTheEarliestRun(t *testing.T) {
 		}
 	}
 }
+
+// runValue is the value n of a session column as the sessions row holds it: a
+// larger n is a larger value, so a test can tell the earliest run from the
+// smallest value.
+func runValue(column string, n int) any {
+	if column == "tz_offset_minutes" {
+		return int64(n)
+	}
+	return fmt.Sprintf("v%02d", n)
+}
+
+// sessionRunColumns are the seven columns a hook run carries into its session,
+// each with how a run of the test sets its value n.
+var sessionRunColumns = []struct {
+	name string
+	set  func(s *Session, n int)
+}{
+	{"cwd", func(s *Session, n int) { s.Cwd = Ptr(runValue("cwd", n).(string)) }},
+	{"transcript_path", func(s *Session, n int) { s.TranscriptPath = Ptr(runValue("transcript_path", n).(string)) }},
+	{"seat_dir", func(s *Session, n int) { s.SeatDir = Ptr(runValue("seat_dir", n).(string)) }},
+	{"config_dir", func(s *Session, n int) { s.ConfigDir = Ptr(runValue("config_dir", n).(string)) }},
+	{"host", func(s *Session, n int) { s.Host = Ptr(runValue("host", n).(string)) }},
+	{"tz_name", func(s *Session, n int) { s.TZName = Ptr(runValue("tz_name", n).(string)) }},
+	{"tz_offset_minutes", func(s *Session, n int) { s.TZOffsetMinutes = Ptr(runValue("tz_offset_minutes", n).(int64)) }},
+}
+
+// touchSessionRuns folds the runs into one session, in the order given, each in
+// its own batch as the async hooks write it.
+func touchSessionRuns(t *testing.T, store *Store, runs []Session) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.DB().Exec("DELETE FROM sessions"); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range runs {
+		if err := store.Batch(ctx, func(tx *Tx) error { return tx.TouchSession(ctx, s) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestTouchSessionColumnIsTheEarliestRunsInEveryArrivalOrder: of three runs per
+// column, the first without the column, the second carrying a value that sorts
+// above the third's, the column and its ts are the second's whatever order the
+// runs land in; the earliest run carrying it wins, never the smallest value.
+func TestTouchSessionColumnIsTheEarliestRunsInEveryArrivalOrder(t *testing.T) {
+	store := openTestStore(t)
+	for _, column := range sessionRunColumns {
+		blank := Session{SessionID: "sess-1", TS: 10}
+		b, c := Session{SessionID: "sess-1", TS: 20}, Session{SessionID: "sess-1", TS: 30}
+		column.set(&b, 90)
+		column.set(&c, 10)
+		for _, order := range permutations([]Session{blank, b, c}) {
+			touchSessionRuns(t, store, order)
+			got := row(t, store, "sessions", "session_id = ?", "sess-1")
+			if got[column.name] != runValue(column.name, 90) || got[column.name+"_ts"] != int64(20) {
+				t.Errorf("runs at ts %d, %d, %d: sessions.%s = %v with ts %v, want %v with ts 20",
+					order[0].TS, order[1].TS, order[2].TS, column.name, got[column.name], got[column.name+"_ts"],
+					runValue(column.name, 90))
+			}
+			if got["first_ts"] != int64(10) || got["last_ts"] != int64(30) {
+				t.Errorf("runs at ts %d, %d, %d: first_ts %v last_ts %v, want 10 and 30",
+					order[0].TS, order[1].TS, order[2].TS, got["first_ts"], got["last_ts"])
+			}
+			for _, other := range sessionRunColumns {
+				if other.name != column.name && (got[other.name] != nil || got[other.name+"_ts"] != nil) {
+					t.Errorf("sessions.%s = %v with ts %v, want NULL: no run carried it", other.name, got[other.name], got[other.name+"_ts"])
+				}
+			}
+		}
+	}
+}
+
+// TestTouchSessionColumnTakesTheSmallerValueAtOneTs: runs at one ts carrying
+// different values leave the smaller, whatever order they land in, and a later
+// run does not displace it.
+func TestTouchSessionColumnTakesTheSmallerValueAtOneTs(t *testing.T) {
+	store := openTestStore(t)
+	for _, column := range sessionRunColumns {
+		runs := map[string]Session{
+			"high": {SessionID: "sess-1", TS: 20}, "low": {SessionID: "sess-1", TS: 20}, "later": {SessionID: "sess-1", TS: 30},
+		}
+		for name, n := range map[string]int{"high": 90, "low": 10, "later": 5} {
+			run := runs[name]
+			column.set(&run, n)
+			runs[name] = run
+		}
+		for _, order := range permutations([]string{"high", "low", "later"}) {
+			touchSessionRuns(t, store, []Session{runs[order[0]], runs[order[1]], runs[order[2]]})
+			got := row(t, store, "sessions", "session_id = ?", "sess-1")
+			if got[column.name] != runValue(column.name, 10) || got[column.name+"_ts"] != int64(20) {
+				t.Errorf("runs landing %v: sessions.%s = %v with ts %v, want %v with ts 20",
+					order, column.name, got[column.name], got[column.name+"_ts"], runValue(column.name, 10))
+			}
+		}
+	}
+}
+
+// TestTouchSessionColumnNoRunCarriesStaysNull: a session whose runs carry none
+// of the columns holds NULL in each column and in its ts.
+func TestTouchSessionColumnNoRunCarriesStaysNull(t *testing.T) {
+	store := openTestStore(t)
+	runs := []Session{{SessionID: "sess-1", TS: 10}, {SessionID: "sess-1", TS: 20}, {SessionID: "sess-1", TS: 30}}
+	for _, order := range permutations(runs) {
+		touchSessionRuns(t, store, order)
+		got := row(t, store, "sessions", "session_id = ?", "sess-1")
+		for _, column := range sessionRunColumns {
+			if got[column.name] != nil || got[column.name+"_ts"] != nil {
+				t.Errorf("sessions.%s = %v with ts %v, want NULL and NULL: no run carried it", column.name, got[column.name], got[column.name+"_ts"])
+			}
+		}
+		if got["first_ts"] != int64(10) || got["last_ts"] != int64(30) {
+			t.Errorf("first_ts %v last_ts %v, want 10 and 30", got["first_ts"], got["last_ts"])
+		}
+	}
+}

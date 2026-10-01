@@ -5,7 +5,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 ## Tiers
 
 - Unit: a package test beside its package, in-process. The store is a real SQLite file, the filesystem real, under the package's jail.
-- Process: a test that builds `./cmd/callmeter` into `t.TempDir()`, or runs the sh wrapper, and spawns it as a separate process: `internal/wrappertest` (resolution, download, lock, checksum, `missed.log`) and the concurrency gymnastics (many hooks writing one store at once). Still hermetic: no network beyond a local `httptest` server, no Claude Code.
+- Process: a test that builds `./cmd/callmeter` into `t.TempDir()`, or runs the sh wrapper, and spawns it as a separate process: `internal/wrappertest` (resolution, download, lock, checksum, `missed.log`), a signalled hook binary (SIGTERM, SIGINT or SIGHUP before and after its event is recorded) and the concurrency gymnastics (many hooks writing one store at once). Still hermetic: no network beyond a local `httptest` server, no Claude Code.
 - e2e: `CALLMETER_E2E=1 go test ./e2e/...` runs a real `claude -p --model haiku --setting-sources project,local` with the plugin loaded through `--plugin-dir`, then reads the store it wrote. It costs tokens, needs the host's Claude Code login, and is run once by the lander, never by an executor.
 
 ## Where a test lives
@@ -53,6 +53,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 - A test calling `t.Setenv` or `t.Chdir` stays serial; any other test may use `t.Parallel`.
 - Isolation is one temp root per test, never a shared store.
 - The `SubagentStop` settle wait runs on the real clock (up to 3 s); a test fakes only `now`, never the wait.
+  - One exception: a fuzz target zeroes the settle wait through the `agentSettle` seam, because a fuzz target tests input handling, not timing, and a real 3 s settle per `SubagentStop` input starves the engine and would mask a real hang. Every other test keeps the rule.
 
 ## Gates and floors
 
@@ -72,6 +73,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 - A probe that launches `claude` closes stdin (`</dev/null`) or it hangs.
 - A headless `claude -p` cancels running async hooks at exit, so an e2e run's last calls can keep only their `PreToolUse` row; an e2e assertion on a call's result columns names the call it checks, never "every call".
 - `ls` may be aliased on a developer host; scripts call `command ls` or `/bin/ls`.
+- `FuzzHookPayload` switches the engine's coverage minimization off (it sets `test.fuzzminimizetime` to 0 before `f.Fuzz`; a `-fuzzminimizetime` named on the command line wins). The engine hands each input that found new coverage to one worker to shrink for up to 60 s, every attempt a full hook run over a payload of up to tens of KB, and those attempts are not counted as execs: a few at once leave every worker minimizing and the run printing `0/sec` samples, which reads as a stall but is not a hang. The cost: such an input, and a crasher, is kept unminimized, and the Go fuzz cache grows with every run (`go clean -fuzzcache` empties it).
 
 ## What not to test
 

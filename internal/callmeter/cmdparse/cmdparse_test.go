@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/rezzminator/callmeter/internal/runner"
@@ -281,5 +282,23 @@ func TestWordsExpandingToNothing(t *testing.T) {
 				t.Errorf("%q: parts = %+v, want one redirect-only part writing out", command, parts)
 			}
 		}
+	}
+}
+
+// A command over maxCommandBytes is one unparsed part: no shell parse is
+// attempted. One of exactly maxCommandBytes parses as any other.
+func TestOversizeCommandIsOneUnparsedPart(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t, "x")
+	pad := func(n int) string {
+		cmd := "cat x;"
+		return cmd + strings.Repeat(" ", n-len(cmd))
+	}
+	at := parseOne(t, cwd, pad(maxCommandBytes), nil)
+	assertFiles(t, at, []FileRef{ref(cwd, "x", ActionReadWhole, "")})
+	over := parseOne(t, cwd, pad(maxCommandBytes+1), nil)
+	want := []Part{{Seq: 0, Lang: LangSh, Status: StatusUnparsed, Error: "command over 65536 bytes"}}
+	if !reflect.DeepEqual(over, want) {
+		t.Fatalf("parts = %+v\nwant    %+v", over, want)
 	}
 }

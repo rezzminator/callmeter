@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // subFixture makes a cwd holding the named files, with sub/ holding the
@@ -202,4 +204,42 @@ func TestDoubleQuotedEscapes(t *testing.T) {
 	cwd := fixture(t, "x y", "z")
 	parts := parseOne(t, cwd, `bash -c "cat \"x y\""; python3 -c "open(\"z\")"`, nil)
 	assertFiles(t, parts, []FileRef{ref(cwd, "x y", ActionReadWhole, ""), ref(cwd, "z", ActionReadWhole, "")})
+}
+
+// nestShell wraps command in levels of `bash -c '…'`.
+func nestShell(t *testing.T, command string, levels int) string {
+	t.Helper()
+	for range levels {
+		quoted, err := syntax.Quote(command, syntax.LangBash)
+		if err != nil {
+			t.Fatalf("quote %q: %v", command, err)
+		}
+		command = "bash -c " + quoted
+	}
+	return command
+}
+
+// A literal -c string nested more than maxShellDepth levels is one unparsed
+// part; the levels around it parse as before.
+func TestInnerShellNestingBound(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t, "x")
+	at := parseOne(t, cwd, nestShell(t, "cat x", maxShellDepth), nil)
+	if len(at) != maxShellDepth+1 || at[maxShellDepth].Program != "cat" {
+		t.Fatalf("parts = %+v, want %d bash parts then cat", at, maxShellDepth)
+	}
+	assertFiles(t, at, []FileRef{ref(cwd, "x", ActionReadWhole, "")})
+	over := parseOne(t, cwd, nestShell(t, "cat x", maxShellDepth+1), nil)
+	if len(over) != maxShellDepth+2 {
+		t.Fatalf("parts = %+v, want %d bash parts then one unparsed part", over, maxShellDepth+1)
+	}
+	for i, part := range over[:maxShellDepth+1] {
+		if part.Program != "bash" || part.Status != StatusOK {
+			t.Errorf("part %d = %+v, want an ok bash part", i, part)
+		}
+	}
+	want := Part{Seq: maxShellDepth + 1, Lang: LangSh, Status: StatusUnparsed, Error: "shell -c nested over 8 levels"}
+	if got := over[maxShellDepth+1]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("level %d part = %+v\nwant %+v", maxShellDepth+1, got, want)
+	}
 }

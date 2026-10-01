@@ -278,10 +278,13 @@ func nullID(id string) sql.NullString { return sql.NullString{String: id, Valid:
 
 // TouchSession folds one hook run into its sessions row: first_ts keeps the
 // minimum and last_ts the maximum of every run's clock reading, and engine is
-// claude. The run's own columns come from the earliest run: a run whose ts is
-// below the stored first_ts overwrites those it carries, any other run fills
-// them when empty, and a column the run does not carry is left to the others.
-// The derived columns are RefreshSession's.
+// claude. Each of the run's own columns holds the value of the earliest run
+// that carried it, with that run's ts in {column}_ts: a run's value replaces
+// the stored one when the stored one is NULL, when the run's ts is below the
+// stored {column}_ts, or when the ts are equal and the run's value is smaller.
+// The result is the same whatever order the runs land in, and a column the run
+// does not carry is left to the others. The derived columns are
+// RefreshSession's.
 func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 	if s.SessionID == "" {
 		return fmt.Errorf("callmeter store %s: upsert into sessions without a session_id", t.path)
@@ -303,13 +306,16 @@ func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 		mergeSet("sessions", "engine", Overwrite, nil),
 	}
 	for _, c := range own {
-		names = append(names, c.name)
-		values = append(values, c.value)
-		// Every SET expression reads the row as it was before this update, so
-		// sessions.first_ts here is the stored one, not this run's minimum.
-		sets = append(sets, fmt.Sprintf(
-			"%[1]s = CASE WHEN excluded.first_ts < sessions.first_ts THEN excluded.%[1]s ELSE COALESCE(sessions.%[1]s, excluded.%[1]s) END",
-			c.name))
+		names = append(names, c.name, c.name+"_ts")
+		values = append(values, c.value, s.TS)
+		// The run's value wins on an empty column, an earlier ts, or the smaller
+		// value at an equal ts. Every SET expression reads the row as it was
+		// before this update, so the column and its ts both judge the stored pair.
+		wins := fmt.Sprintf("sessions.%[1]s IS NULL OR excluded.%[1]s_ts < sessions.%[1]s_ts OR "+
+			"(excluded.%[1]s_ts = sessions.%[1]s_ts AND excluded.%[1]s < sessions.%[1]s)", c.name)
+		sets = append(sets,
+			fmt.Sprintf("%[1]s = CASE WHEN %[2]s THEN excluded.%[1]s ELSE sessions.%[1]s END", c.name, wins),
+			fmt.Sprintf("%[1]s_ts = CASE WHEN %[2]s THEN excluded.%[1]s_ts ELSE sessions.%[1]s_ts END", c.name, wins))
 	}
 	marks := strings.TrimSuffix(strings.Repeat("?, ", len(names)), ", ")
 	statement := fmt.Sprintf("INSERT INTO sessions (%s) VALUES (%s) ON CONFLICT(session_id) DO UPDATE SET %s",

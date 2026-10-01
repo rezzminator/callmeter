@@ -50,7 +50,8 @@ func shellScript(base string, rest []arg) (arg, bool) {
 // same conditional depth, starting in the current directory. The inner shell
 // is a child process: its `cd` and its variables end with it, and it sees no
 // unexported variable of the outer one. A STRING the parse cannot know
-// stays an ordinary part; one that does not parse is one error part.
+// stays an ordinary part; one that does not parse is one error part, and one
+// nested deeper than maxShellDepth is one unparsed part.
 func (p *callParser) innerShell(program string, rest []arg, script arg, lead []FileRef, redirs []*syntax.Redirect) {
 	if !script.resolved {
 		files := append(append(lead, p.attribute(filepath.Base(program), rest)...), p.redirFiles(redirs)...)
@@ -58,6 +59,10 @@ func (p *callParser) innerShell(program string, rest []arg, script arg, lead []F
 		return
 	}
 	p.emit(Part{Lang: LangSh, Program: program, Args: argTexts(rest), Files: append(lead, p.redirFiles(redirs)...)})
+	if p.shellDepth >= maxShellDepth {
+		p.emit(Part{Lang: LangSh, Status: StatusUnparsed, Error: fmt.Sprintf("shell -c nested over %d levels", maxShellDepth)})
+		return
+	}
 	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(script.text), "")
 	if err != nil {
 		p.emit(Part{Lang: LangSh, Status: StatusError, Error: fmt.Sprintf("%s -c: %v", filepath.Base(program), err)})
@@ -65,7 +70,11 @@ func (p *callParser) innerShell(program string, rest []arg, script arg, lead []F
 	}
 	dir, vars, unmatched, arrays := p.dir, p.vars, p.unmatched, p.arrays
 	p.vars, p.unmatched, p.arrays = map[string][]string{}, map[string][]bool{}, map[string][]string{}
-	defer func() { p.dir, p.vars, p.unmatched, p.arrays = dir, vars, unmatched, arrays }()
+	p.shellDepth++
+	defer func() {
+		p.dir, p.vars, p.unmatched, p.arrays = dir, vars, unmatched, arrays
+		p.shellDepth--
+	}()
 	syntax.Walk(file, p.visit)
 }
 

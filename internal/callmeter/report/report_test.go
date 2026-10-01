@@ -330,6 +330,38 @@ func TestBinaryFaultsBecomeTheMissedEventsNoteOnEveryTopic(t *testing.T) {
 	}
 }
 
+// TestTerminatedFaultsBecomeTheUnrecordedEventsNoteOnEveryTopic: hook runs a
+// signal cut short before they recorded are a note counting them, in the
+// window, after the binary note; a binary fault is never counted in it.
+func TestTerminatedFaultsBecomeTheUnrecordedEventsNoteOnEveryTopic(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	faults := []callmeter.Fault{
+		{TS: ms(time.Hour), Stage: callmeter.StageTerminated, Error: "SubagentStop: terminated by SIGTERM"},
+		{TS: ms(2 * time.Hour), Stage: callmeter.StageTerminated, Error: "unknown: terminated by SIGINT"},
+		{TS: ms(3 * 24 * time.Hour), Stage: callmeter.StageTerminated, Error: "Stop: terminated by SIGHUP"},
+		{TS: ms(time.Hour), Stage: callmeter.StageBinary, Error: "Stop: download failed"},
+	}
+	for _, fault := range faults {
+		if err := store.AddFault(ctx, fault); err != nil {
+			t.Fatalf("AddFault: %v", err)
+		}
+	}
+	for name, topic := range map[string]func(context.Context, *callmeter.Store, Filter, NameOf) (*Table, error){
+		"files": Files, "faults": Faults, "sessions": Sessions, "events": Events, "coverage": Coverage,
+	} {
+		table, err := topic(ctx, store, Filter{Since: testNow.Add(-24 * time.Hour), OwnSeat: t.TempDir()}, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		binary := slices.Index(table.Notes, "1 events unrecorded: binary unavailable")
+		terminated := slices.Index(table.Notes, "2 events unrecorded: hook terminated before recording")
+		if binary < 0 || terminated != binary+1 {
+			t.Errorf("%s notes = %q, want the binary note then the 2 terminated faults of the last day", name, table.Notes)
+		}
+	}
+}
+
 func TestInapplicableNotesNameEachFlagATopicCannotApply(t *testing.T) {
 	both := Filter{Project: "/w/p", AgentType: "Explore", Session: "s", Limit: 3}
 	for topic, want := range map[string]string{

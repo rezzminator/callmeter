@@ -247,7 +247,44 @@ func newLiveRun(t *testing.T, name string) *liveRun {
 	}
 	refuseRealState(t, r.home)
 	t.Logf("%s: scratch %s (kept after the run)", name, root)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("%s: the hook logs of %s, for the diagnosis of the failure above\n%s", name, r.home, r.logTails())
+		}
+	})
 	return r
+}
+
+// logTailLines is how much of each hook log a failed test prints.
+const logTailLines = 40
+
+// lastLines is the last n lines of data.
+func lastLines(data []byte, n int) string {
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// logTail renders the last n lines of the file at path under its path; an
+// absent file is a line saying so and an unreadable one is named with its error.
+func logTail(path string, n int) string {
+	data, err := os.ReadFile(path)
+	switch {
+	case os.IsNotExist(err):
+		return fmt.Sprintf("%s: absent", path)
+	case err != nil:
+		return fmt.Sprintf("%s: unreadable: %v", path, err)
+	case len(data) == 0:
+		return fmt.Sprintf("--- %s: empty ---", path)
+	}
+	return fmt.Sprintf("--- last %d lines of %s ---\n%s", n, path, lastLines(data, n))
+}
+
+// logTails is the tail of callmeter.log and of missed.log of the run's home.
+func (r *liveRun) logTails() string {
+	return logTail(paths.Log(r.home), logTailLines) + "\n" + logTail(paths.Missed(r.home), logTailLines)
 }
 
 // gitEnv makes git deterministic and independent of the host's configuration.
@@ -399,6 +436,128 @@ func count(t *testing.T, db *sql.DB, query string, args ...any) int {
 	return n
 }
 
+// describeWhere is a condition with the arguments its placeholders stand for.
+func describeWhere(where string, args []any) string {
+	if len(args) == 0 {
+		return where
+	}
+	return fmt.Sprintf("%s with %v", where, args)
+}
+
+// wantCount fails, naming the table, the condition, got and want, unless
+// exactly want rows of table match where.
+func wantCount(t *testing.T, db *sql.DB, table, where string, want int, args ...any) bool {
+	t.Helper()
+	n := count(t, db, "SELECT COUNT(*) FROM "+table+" WHERE "+where, args...)
+	if n != want {
+		t.Errorf("%s: %d rows where %s, want %d", table, n, describeWhere(where, args), want)
+		return false
+	}
+	return true
+}
+
+// wantSome fails, naming the table, the condition, got and want, unless at
+// least one row of table matches where.
+func wantSome(t *testing.T, db *sql.DB, table, where string, args ...any) bool {
+	t.Helper()
+	n := count(t, db, "SELECT COUNT(*) FROM "+table+" WHERE "+where, args...)
+	if n == 0 {
+		t.Errorf("%s: %d rows where %s, want at least 1", table, n, describeWhere(where, args))
+		return false
+	}
+	return true
+}
+
+const (
+	cellNull  = "<NULL>"
+	cellNoRow = "<no row>"
+)
+
+// cell is the value of column col in the row of table whose idCol is id, as
+// text; a NULL is cellNull and a missing row is cellNoRow.
+func cell(t *testing.T, db *sql.DB, table, col, idCol, id string) string {
+	t.Helper()
+	var v sql.NullString
+	err := db.QueryRowContext(context.Background(), fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", col, table, idCol), id).Scan(&v)
+	switch {
+	case err == sql.ErrNoRows:
+		return cellNoRow
+	case err != nil:
+		t.Fatalf("read %s.%s for %s %s: %v", table, col, idCol, id, err)
+	case !v.Valid:
+		return cellNull
+	}
+	return v.String
+}
+
+// isSet is true for a cell holding a non-empty value.
+func isSet(got string) bool { return got != "" && got != cellNull && got != cellNoRow }
+
+// wantCell fails, naming table, column, the row's id, got and want, unless ok
+// accepts the cell.
+func wantCell(t *testing.T, db *sql.DB, table, col, idCol, id, want string, ok func(got string) bool) bool {
+	t.Helper()
+	got := cell(t, db, table, col, idCol, id)
+	if ok(got) {
+		return true
+	}
+	t.Errorf("%s.%s: row of %s %s: got %q, want %s", table, col, idCol, id, got, want)
+	return false
+}
+
+// rowsText renders up to 50 rows of a query, one per line, columns joined by
+// " | ", a NULL as NULL; a failed query renders as the failure, never as no rows.
+func rowsText(t *testing.T, db *sql.DB, query string, args ...any) string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), query, args...)
+	if err != nil {
+		return fmt.Sprintf("(query %q failed: %v)", query, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Logf("close rows of %q: %v", query, err)
+		}
+	}()
+	cols, err := rows.Columns()
+	if err != nil {
+		return fmt.Sprintf("(columns of %q failed: %v)", query, err)
+	}
+	var lines []string
+	more := 0
+	for rows.Next() {
+		vals := make([]sql.NullString, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return fmt.Sprintf("(scan of %q failed: %v)", query, err)
+		}
+		if len(lines) == 50 {
+			more++
+			continue
+		}
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = "NULL"
+			if v.Valid {
+				parts[i] = v.String
+			}
+		}
+		lines = append(lines, strings.Join(parts, " | "))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Sprintf("(read of %q failed after %d rows: %v)", query, len(lines), err)
+	}
+	if more > 0 {
+		lines = append(lines, fmt.Sprintf("... and %d more rows", more))
+	}
+	if len(lines) == 0 {
+		return fmt.Sprintf("(no rows from %q)", query)
+	}
+	return "  " + strings.Join(cols, " | ") + "\n  " + strings.Join(lines, "\n  ")
+}
+
 // column returns the first column of every row, a NULL as "".
 func column(t *testing.T, db *sql.DB, query string, args ...any) []string {
 	t.Helper()
@@ -469,8 +628,9 @@ func settle(t *testing.T, home string) {
 }
 
 // eventually runs check until it returns no problems or settleLimit passes,
-// then reports every problem of the last attempt.
-func eventually(t *testing.T, what string, check func() []string) {
+// then reports every problem of the last attempt and, from each seen, the
+// rows the store held at that moment.
+func eventually(t *testing.T, what string, check func() []string, seen ...func() string) {
 	t.Helper()
 	deadline := clock.Real.Now().Add(settleLimit)
 	for {
@@ -480,7 +640,10 @@ func eventually(t *testing.T, what string, check func() []string) {
 		}
 		if clock.Real.Now().After(deadline) {
 			for _, p := range problems {
-				t.Errorf("%s: %s", what, p)
+				t.Errorf("waited for %s: not met after %s: %s", what, settleLimit, p)
+			}
+			for _, rows := range seen {
+				t.Logf("waited for %s: the last rows seen\n%s", what, rows())
 			}
 			return
 		}
@@ -668,11 +831,11 @@ func completenessProblems(t *testing.T, db *sql.DB, main transcript, subs map[st
 	for _, use := range allUses(main, subs) {
 		call, ok := calls[use.ID]
 		if !ok {
-			problems = append(problems, fmt.Sprintf("tool_use %s (%s) has no calls row", use.ID, use.Name))
+			problems = append(problems, fmt.Sprintf("calls.tool_use_id: no row for %s (%s)", use.ID, use.Name))
 			continue
 		}
 		if call.requestID != use.MessageID {
-			problems = append(problems, fmt.Sprintf("tool_use %s (%s): calls.request_id %q, the transcript's message is %q", use.ID, use.Name, call.requestID, use.MessageID))
+			problems = append(problems, fmt.Sprintf("calls.request_id: for %s (%s): got %q, want %q (the transcript's message)", use.ID, use.Name, call.requestID, use.MessageID))
 		}
 		if seenMessage[use.MessageID] {
 			continue
@@ -680,11 +843,11 @@ func completenessProblems(t *testing.T, db *sql.DB, main transcript, subs map[st
 		seenMessage[use.MessageID] = true
 		req, ok := requests[use.MessageID]
 		if !ok {
-			problems = append(problems, fmt.Sprintf("message %s (carrying tool_use %s) has no requests row", use.MessageID, use.ID))
+			problems = append(problems, fmt.Sprintf("requests.request_id: no row for %s (carrying tool_use %s)", use.MessageID, use.ID))
 			continue
 		}
 		if !req.pending.Valid || req.pending.Int64 != 0 {
-			problems = append(problems, fmt.Sprintf("request %s: pending = %v, want 0", use.MessageID, req.pending))
+			problems = append(problems, fmt.Sprintf("requests.pending: for %s: got %v, want 0", use.MessageID, req.pending))
 		}
 		split := map[string]sql.NullInt64{
 			"input_tokens": req.input, "cache_read_tokens": req.cacheRead, "cache_creation_tokens": req.cacheCreation,
@@ -693,16 +856,16 @@ func completenessProblems(t *testing.T, db *sql.DB, main transcript, subs map[st
 		}
 		for name, v := range split {
 			if !v.Valid {
-				problems = append(problems, fmt.Sprintf("request %s: %s is NULL", use.MessageID, name))
+				problems = append(problems, fmt.Sprintf("requests.%s: for %s: got NULL, want a count", name, use.MessageID))
 			}
 		}
 		if req.input.Valid && req.cacheRead.Valid && req.cacheCreation.Valid && req.context.Valid &&
 			req.context.Int64 != req.input.Int64+req.cacheRead.Int64+req.cacheCreation.Int64 {
-			problems = append(problems, fmt.Sprintf("request %s: context_tokens %d is not input + cache read + cache creation", use.MessageID, req.context.Int64))
+			problems = append(problems, fmt.Sprintf("requests.context_tokens: for %s: got %d, want %d (input + cache read + cache creation)", use.MessageID, req.context.Int64, req.input.Int64+req.cacheRead.Int64+req.cacheCreation.Int64))
 		}
 		if req.cacheCreation.Valid && req.cache5m.Valid && req.cache1h.Valid &&
 			req.cache5m.Int64+req.cache1h.Int64 != req.cacheCreation.Int64 {
-			problems = append(problems, fmt.Sprintf("request %s: the 5m and 1h cache creation do not add up to cache_creation_tokens", use.MessageID))
+			problems = append(problems, fmt.Sprintf("requests.cache_creation_tokens: for %s: got %d, want %d (5m + 1h cache creation)", use.MessageID, req.cacheCreation.Int64, req.cache5m.Int64+req.cache1h.Int64))
 		}
 	}
 	return problems
@@ -718,15 +881,15 @@ func agentProblems(t *testing.T, db *sql.DB, main transcript, subs map[string]tr
 			continue
 		}
 		if count(t, db, "SELECT COUNT(*) FROM agents WHERE parent_tool_use_id = ?", use.ID) == 0 {
-			problems = append(problems, fmt.Sprintf("Agent tool_use %s has no agents row", use.ID))
+			problems = append(problems, fmt.Sprintf("agents.parent_tool_use_id: 0 rows for Agent tool_use %s, want at least 1", use.ID))
 		}
 	}
 	for id := range subs {
 		if count(t, db, "SELECT COUNT(*) FROM agents WHERE agent_id = ?", id) == 0 {
-			problems = append(problems, fmt.Sprintf("sub-agent %s has a transcript and no agents row", id))
+			problems = append(problems, fmt.Sprintf("agents.agent_id: 0 rows for sub-agent %s (it has a transcript), want at least 1", id))
 		}
 		if count(t, db, "SELECT COUNT(*) FROM agent_turns WHERE agent_id = ?", id) == 0 {
-			problems = append(problems, fmt.Sprintf("sub-agent %s has no agent_turns row", id))
+			problems = append(problems, fmt.Sprintf("agent_turns.agent_id: 0 rows for sub-agent %s, want at least 1", id))
 		}
 	}
 	return problems
@@ -741,9 +904,25 @@ func assertNoFaults(t *testing.T, db *sql.DB) {
 	for _, row := range rows {
 		t.Logf("fault row: %s", row)
 	}
-	if n := count(t, db, "SELECT COUNT(*) FROM faults WHERE stage IN ('payload', 'store', 'binary')"); n != 0 {
-		t.Errorf("%d fault rows of stage payload, store or binary (all fault rows are logged above)", n)
+	// A terminated row is the truthful record of a hook cut short by a
+	// headless exit: logged above, never a failure.
+	wantCount(t, db, "faults", "stage IN ('payload', 'store', 'binary')", 0)
+}
+
+// unexpectedMissed is every line of a missed.log whose reason, the third tab
+// field, does not start with "terminated by ".
+func unexpectedMissed(data []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "\t", 3)
+		if len(fields) < 3 || !strings.HasPrefix(fields[2], "terminated by ") {
+			out = append(out, line)
+		}
 	}
+	return out
 }
 
 // assertSilentStream checks the stream-json output of a session: callmeter's
@@ -862,37 +1041,42 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 	t.Run("lifecycle", func(t *testing.T) {
 		db := openStore(t, r.home)
 		for _, want := range []string{"SessionStart", "UserPromptSubmit", "InstructionsLoaded", "SessionEnd"} {
-			if count(t, db, "SELECT COUNT(*) FROM events WHERE event = ? AND session_id = ?", want, first.id) == 0 {
-				t.Errorf("no %s event for session %s", want, first.id)
-			}
+			wantSome(t, db, "events", "event = ? AND session_id = ?", want, first.id)
 		}
-		if n := count(t, db, "SELECT COUNT(*) FROM events WHERE event = 'SessionStart' AND source = 'startup' AND session_id = ?", first.id); n == 0 {
-			t.Errorf("no SessionStart event with source startup")
+		wantSome(t, db, "events", "event = 'SessionStart' AND source = 'startup' AND session_id = ?", first.id)
+		wantSome(t, db, "events", "event = 'UserPromptSubmit' AND prompt_bytes > 0 AND session_id = ?", first.id)
+		if !wantCount(t, db, "sessions", "1 = 1", 1) {
+			t.FailNow()
 		}
-		if n := count(t, db, "SELECT COUNT(*) FROM events WHERE event = 'UserPromptSubmit' AND prompt_bytes > 0 AND session_id = ?", first.id); n == 0 {
-			t.Errorf("no UserPromptSubmit event with prompt_bytes > 0")
-		}
-		if n := count(t, db, "SELECT COUNT(*) FROM sessions"); n != 1 {
-			t.Fatalf("%d sessions rows, want 1", n)
-		}
-		for want, query := range map[string]string{
-			"engine = claude":        "SELECT COUNT(*) FROM sessions WHERE session_id = ? AND engine = 'claude'",
-			"host set":               "SELECT COUNT(*) FROM sessions WHERE session_id = ? AND COALESCE(host, '') <> ''",
-			"start_source = startup": "SELECT COUNT(*) FROM sessions WHERE session_id = ? AND start_source = 'startup'",
-			"end_reason set":         "SELECT COUNT(*) FROM sessions WHERE session_id = ? AND COALESCE(end_reason, '') <> ''",
-			"model set":              "SELECT COUNT(*) FROM sessions WHERE session_id = ? AND COALESCE(model, '') <> ''",
+		equals := func(v string) func(string) bool { return func(got string) bool { return got == v } }
+		for _, check := range []struct {
+			column, want string
+			ok           func(string) bool
+		}{
+			{"engine", `"claude"`, equals("claude")},
+			{"host", "a non-empty value", isSet},
+			{"start_source", `"startup"`, equals("startup")},
+			{"end_reason", "a non-empty value", isSet},
+			{"model", "a non-empty value", isSet},
 		} {
-			if count(t, db, query, first.id) != 1 {
-				t.Errorf("sessions row of %s: want %s", first.id, want)
-			}
+			wantCell(t, db, "sessions", check.column, "session_id", first.id, check.want, check.ok)
 		}
 	})
 
 	t.Run("completeness", func(t *testing.T) {
 		db := openStore(t, r.home)
-		eventually(t, "calls and requests", func() []string { return completenessProblems(t, db, main, subs) })
+		eventually(t, "calls and requests", func() []string { return completenessProblems(t, db, main, subs) },
+			func() string { return rowsText(t, db, "SELECT tool_use_id, request_id, tool FROM calls") },
+			func() string {
+				return rowsText(t, db, `SELECT request_id, pending, input_tokens, cache_read_tokens, cache_creation_tokens,
+					cache_creation_5m_tokens, cache_creation_1h_tokens, context_tokens, output_tokens FROM requests`)
+			})
 		if agentRan {
-			eventually(t, "agents", func() []string { return agentProblems(t, db, main, subs) })
+			eventually(t, "agents", func() []string { return agentProblems(t, db, main, subs) },
+				func() string {
+					return rowsText(t, db, "SELECT agent_id, parent_tool_use_id, session_id, stopped FROM agents")
+				},
+				func() string { return rowsText(t, db, "SELECT agent_id, COUNT(*) FROM agent_turns GROUP BY agent_id") })
 		} else {
 			t.Logf("the model skipped the Agent step: agents and agent_turns rows are not asserted")
 		}
@@ -900,25 +1084,19 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 
 	t.Run("turns", func(t *testing.T) {
 		db := openStore(t, r.home)
-		if n := count(t, db, "SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND session_id = ?", first.id); n == 0 {
-			t.Errorf("no Stop turns row")
-		}
+		wantSome(t, db, "turns", "event = 'Stop' AND session_id = ?", first.id)
 		if agentRan {
 			// Every sub-agent that stopped fired one SubagentStop.
 			stopped := count(t, db, "SELECT COUNT(*) FROM agents WHERE stopped IS NOT NULL AND session_id = ?", first.id)
 			if n := count(t, db, "SELECT COUNT(*) FROM turns WHERE event = 'SubagentStop' AND session_id = ?", first.id); n < stopped || n == 0 {
-				t.Errorf("%d SubagentStop turns rows for %d stopped agents", n, stopped)
+				t.Errorf("turns: %d rows where event = 'SubagentStop' and session_id = %s, want at least %d (the stopped agents rows) and at least 1", n, first.id, stopped)
 			}
 		}
-		if n := count(t, db, "SELECT COUNT(*) FROM turns WHERE event IN ('Stop', 'SubagentStop') AND last_assistant_message_bytes IS NULL"); n != 0 {
-			t.Errorf("%d turns rows without last_assistant_message_bytes", n)
-		}
-		if n := count(t, db, "SELECT COUNT(*) FROM turns WHERE event IN ('Stop', 'SubagentStop') AND typeof(last_assistant_message_bytes) <> 'integer'"); n != 0 {
-			t.Errorf("%d turns rows whose last_assistant_message_bytes is not a byte count", n)
-		}
+		wantCount(t, db, "turns", "event IN ('Stop', 'SubagentStop') AND last_assistant_message_bytes IS NULL", 0)
+		wantCount(t, db, "turns", "event IN ('Stop', 'SubagentStop') AND typeof(last_assistant_message_bytes) <> 'integer'", 0)
 		for _, name := range column(t, db, "SELECT name FROM pragma_table_info('turns')") {
 			if strings.Contains(name, "message") && name != "last_assistant_message_bytes" {
-				t.Errorf("turns has a column %q that could hold message text", name)
+				t.Errorf("turns.%s: a column that could hold message text, want only last_assistant_message_bytes", name)
 			}
 		}
 	})
@@ -933,19 +1111,26 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 			eventually(t, use.Name+" "+use.ID, func() []string {
 				switch {
 				case use.Name == "Write" || use.Name == "Edit":
-					if count(t, db, "SELECT COUNT(*) FROM calls WHERE tool_use_id = ? AND lines_added IS NOT NULL", use.ID) == 0 {
-						return []string{"lines_added is NULL"}
+					if got := cell(t, db, "calls", "lines_added", "tool_use_id", use.ID); got == cellNull || got == cellNoRow {
+						return []string{fmt.Sprintf("calls.lines_added: row of tool_use_id %s: got %s, want a count", use.ID, got)}
 					}
 				case use.Name == "Bash" && strings.Contains(use.Command, "go test"):
-					if count(t, db, "SELECT COUNT(*) FROM calls WHERE tool_use_id = ? AND test_runner = 'go'", use.ID) == 0 {
-						return []string{"test_runner is not go"}
+					if got := cell(t, db, "calls", "test_runner", "tool_use_id", use.ID); got != "go" {
+						return []string{fmt.Sprintf("calls.test_runner: row of tool_use_id %s: got %q, want \"go\"", use.ID, got)}
 					}
 				case use.Name == "Bash" && strings.Contains(use.Command, "git commit"):
-					if count(t, db, "SELECT COUNT(*) FROM calls WHERE tool_use_id = ? AND COALESCE(commit_sha, '') <> '' AND commit_branch = 'main'", use.ID) == 0 {
-						return []string{"commit_sha or commit_branch is missing"}
+					var problems []string
+					if got := cell(t, db, "calls", "commit_sha", "tool_use_id", use.ID); !isSet(got) {
+						problems = append(problems, fmt.Sprintf("calls.commit_sha: row of tool_use_id %s: got %q, want a non-empty value", use.ID, got))
 					}
+					if got := cell(t, db, "calls", "commit_branch", "tool_use_id", use.ID); got != "main" {
+						problems = append(problems, fmt.Sprintf("calls.commit_branch: row of tool_use_id %s: got %q, want \"main\"", use.ID, got))
+					}
+					return problems
 				}
 				return nil
+			}, func() string {
+				return rowsText(t, db, "SELECT tool_use_id, tool, lines_added, test_runner, commit_sha, commit_branch FROM calls WHERE tool_use_id = ?", use.ID)
 			})
 		}
 		for _, step := range []struct{ label, tool, contains string }{
@@ -985,26 +1170,20 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 		assertSilentStream(t, "run1-compact", compact.stream)
 		db = openStore(t, r.home)
 		for _, event := range []string{"PreCompact", "PostCompact"} {
-			if count(t, db, `SELECT COUNT(*) FROM events WHERE event = ? AND "trigger" = 'manual'`, event) == 0 {
-				t.Errorf("no %s event with trigger manual", event)
-			}
+			wantSome(t, db, "events", `event = ? AND "trigger" = 'manual'`, event)
 		}
 		for _, source := range []string{"resume", "compact"} {
-			if count(t, db, "SELECT COUNT(*) FROM events WHERE event = 'SessionStart' AND source = ?", source) == 0 {
-				t.Errorf("no SessionStart event with source %s", source)
-			}
+			wantSome(t, db, "events", "event = 'SessionStart' AND source = ?", source)
 		}
 		if n := count(t, db, "SELECT COUNT(*) FROM agents"); n != agentsBefore {
-			t.Errorf("%d agents rows after the compaction, %d before: the compaction agent got a row", n, agentsBefore)
+			t.Errorf("agents: %d rows after the compaction, want %d (the count before: the compaction agent got a row)", n, agentsBefore)
 		}
 		_, subsAfter := transcripts(t, first.id)
 		for id := range subsAfter {
 			if _, known := subsBefore[id]; known {
 				continue
 			}
-			if count(t, db, "SELECT COUNT(*) FROM agents WHERE agent_id = ?", id) != 0 {
-				t.Errorf("the compaction's agent %s has an agents row", id)
-			}
+			wantCount(t, db, "agents", "agent_id = ?", 0, id)
 		}
 	})
 
@@ -1188,18 +1367,109 @@ func TestLiveDownloadPath(t *testing.T) {
 	if served.Load() == 0 {
 		t.Errorf("the local release server never served %s", asset)
 	}
+	// A hook a headless exit cut short leaves a "terminated by" line; any
+	// other line is a binary that did not run.
 	if _, err := os.Stat(paths.Missed(r.home)); err == nil {
-		t.Errorf("missed.log exists: %s", readAll(t, paths.Missed(r.home)))
+		for _, line := range unexpectedMissed(readAll(t, paths.Missed(r.home))) {
+			t.Errorf("missed.log line whose reason does not start with %q: %q", "terminated by ", line)
+		}
 	} else if !os.IsNotExist(err) {
 		t.Errorf("stat missed.log: %v", err)
 	}
 	db := openStore(t, r.home)
 	eventually(t, "the Bash call", func() []string {
-		if count(t, db, "SELECT COUNT(*) FROM calls WHERE tool = 'Bash' AND session_id = ?", second.id) == 0 {
-			return []string{"no Bash calls row for session " + second.id}
+		if n := count(t, db, "SELECT COUNT(*) FROM calls WHERE tool = 'Bash' AND session_id = ?", second.id); n == 0 {
+			return []string{"calls: 0 rows where tool = 'Bash' and session_id = " + second.id + ", want at least 1"}
 		}
 		return nil
+	}, func() string {
+		return rowsText(t, db, "SELECT tool_use_id, tool, session_id FROM calls")
 	})
 	assertNoFaults(t, db)
 	assertSilentStream(t, "run2", second.stream)
+}
+
+func TestLogTailRendersTheLastLinesAbsenceAndErrors(t *testing.T) {
+	dir := t.TempDir()
+	var lines []string
+	for i := 1; i <= 100; i++ {
+		lines = append(lines, fmt.Sprintf("line %d", i))
+	}
+	long := filepath.Join(dir, "callmeter.log")
+	writeFile(t, long, strings.Join(lines, "\n")+"\n")
+	got := logTail(long, logTailLines)
+	if !strings.HasPrefix(got, "--- last 40 lines of "+long+" ---\n") || !strings.HasSuffix(got, "\nline 100") || !strings.Contains(got, "\nline 61\n") || strings.Contains(got, "line 60\n") {
+		t.Errorf("tail of a 100-line log: %q", got)
+	}
+	if got := logTail(filepath.Join(dir, "missed.log"), logTailLines); got != filepath.Join(dir, "missed.log")+": absent" {
+		t.Errorf("tail of an absent file: %q", got)
+	}
+	empty := filepath.Join(dir, "empty.log")
+	writeFile(t, empty, "")
+	if got := logTail(empty, logTailLines); !strings.Contains(got, "empty") {
+		t.Errorf("tail of an empty file: %q", got)
+	}
+	// A directory is readable as a path and unreadable as a file.
+	if got := logTail(dir, logTailLines); !strings.HasPrefix(got, dir+": unreadable: ") {
+		t.Errorf("tail of an unreadable path: %q", got)
+	}
+}
+
+func TestLiveRunLogTailsNameBothLogs(t *testing.T) {
+	r := &liveRun{home: t.TempDir()}
+	writeFile(t, paths.Log(r.home), "hook said hello\n")
+	got := r.logTails()
+	if !strings.Contains(got, paths.Log(r.home)+" ---\nhook said hello") || !strings.Contains(got, paths.Missed(r.home)+": absent") {
+		t.Errorf("log tails of a run with callmeter.log and no missed.log: %q", got)
+	}
+}
+
+func TestUnexpectedMissedAcceptsOnlyTerminatedLines(t *testing.T) {
+	data := "1700000000\tPreToolUse\tterminated by SIGTERM\n" +
+		"1700000001\tunknown\tterminated by SIGHUP\n" +
+		"\n" +
+		"1700000002\tStop\tbinary exited 2\n" +
+		"1700000003\tStop\n"
+	got := unexpectedMissed([]byte(data))
+	want := []string{"1700000002\tStop\tbinary exited 2", "1700000003\tStop"}
+	if !slices.Equal(got, want) {
+		t.Errorf("unexpected missed lines %q, want %q", got, want)
+	}
+	if got := unexpectedMissed(nil); len(got) != 0 {
+		t.Errorf("unexpected lines of an empty log: %q", got)
+	}
+}
+
+func TestCellAndRowsTextNameWhatTheyFound(t *testing.T) {
+	db, err := sqlitedb.OpenReadWrite(filepath.Join(t.TempDir(), "probe.db"), time.Second)
+	if err != nil {
+		t.Fatalf("open probe database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close probe database: %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE sessions (session_id TEXT, engine TEXT, host TEXT);
+		INSERT INTO sessions VALUES ('s1', 'claude', NULL)`); err != nil {
+		t.Fatalf("seed probe database: %v", err)
+	}
+	if got := cell(t, db, "sessions", "engine", "session_id", "s1"); got != "claude" {
+		t.Errorf("engine of s1: %q", got)
+	}
+	if got := cell(t, db, "sessions", "host", "session_id", "s1"); got != cellNull || isSet(got) {
+		t.Errorf("host of s1: %q", got)
+	}
+	if got := cell(t, db, "sessions", "engine", "session_id", "s2"); got != cellNoRow || isSet(got) {
+		t.Errorf("engine of s2: %q", got)
+	}
+	if got := rowsText(t, db, "SELECT session_id, host FROM sessions"); got != "  session_id | host\n  s1 | NULL" {
+		t.Errorf("rows text: %q", got)
+	}
+	if got := rowsText(t, db, "SELECT session_id FROM sessions WHERE session_id = 'none'"); !strings.Contains(got, "no rows") {
+		t.Errorf("rows text of an empty result: %q", got)
+	}
+	if got := rowsText(t, db, "SELECT nope FROM sessions"); !strings.Contains(got, "failed") {
+		t.Errorf("rows text of a broken query: %q", got)
+	}
 }
