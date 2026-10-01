@@ -1,0 +1,269 @@
+#!/bin/sh
+# callmeter: the plugin's one entry point. Every hook and the report skill run
+# this POSIX sh script; it finds the callmeter binary for this plugin version,
+# downloads and checksum-verifies it on first use, and runs it with its own
+# arguments and untouched stdin.
+#
+# Resolution order:
+#   1. $CALLMETER_BIN, when it names an executable file;
+#   2. {CALLMETER_HOME}/bin/{version}/callmeter, when executable;
+#   3. a download of $CALLMETER_RELEASE_BASE/callmeter--v{version}/callmeter_{version}_{os}_{arch},
+#      under a lock, verified against libexec/SHA256SUMS, installed at 2 by an
+#      atomic rename, every other cached version removed.
+#
+# Under `hook` this script never fails a call and never writes to stdout: any
+# failure exits 0 and appends one `{unix seconds}<TAB>{hook_event_name or unknown}<TAB>{reason}`
+# line to {CALLMETER_HOME}/missed.log, which the binary counts on its next run.
+# Under any other subcommand a failure is `callmeter: binary unavailable: {reason}`
+# on stderr and exit 1. There is no `set -e`: every failure goes through fail().
+
+mode=run
+if [ "${1-}" = hook ]; then
+  mode=hook
+fi
+
+# Cleanup state: the lock directory this run holds and its temp download.
+held=
+lock=
+tmp=
+# Set once a child binary may have consumed stdin.
+stdin_spent=
+
+cleanup() {
+  if [ -n "$tmp" ]; then
+    rm -f "$tmp"
+    tmp=
+  fi
+  if [ -n "$held" ]; then
+    rmdir "$lock" 2>/dev/null
+    held=
+  fi
+}
+
+# on_signal: a hook killed before its binary ran (past its timeout, waiting on
+# a lock or a download) is a missed event. Once the binary has started, the
+# signal is the harness ending the hook (a headless exit cancels every running
+# async hook), and the exit stays silent.
+on_signal() {
+  if [ "$mode" = hook ]; then
+    if [ -z "$stdin_spent" ]; then
+      log_missed "killed by signal"
+    fi
+    exit 0
+  fi
+  exit 1
+}
+
+trap cleanup EXIT
+trap on_signal HUP INT TERM
+
+# first_json_string KEY: reads JSON on stdin and prints the first string value
+# of "KEY": "...", or nothing. All of stdin is consumed (the writer never gets
+# a broken pipe); values holding an escape are not matched.
+first_json_string() {
+  LC_ALL=C grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null \
+    | { IFS= read -r first; cat >/dev/null; printf '%s' "$first"; } \
+    | sed "s/^\"$1\"[[:space:]]*:[[:space:]]*\"//; s/\"\$//"
+}
+
+# hook_event prints the hook_event_name of the payload on stdin, or `unknown`
+# when stdin is a terminal, was already read, or carries none.
+hook_event() {
+  event=
+  if [ -z "$stdin_spent" ] && [ ! -t 0 ]; then
+    event=$(first_json_string hook_event_name)
+  fi
+  case $event in
+    '' | *[!A-Za-z0-9_]*) event=unknown ;;
+  esac
+  printf '%s' "$event"
+}
+
+log_missed() {
+  if [ -z "$home" ]; then
+    return 0
+  fi
+  event=$(hook_event)
+  mkdir -p "$home" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log" 2>/dev/null
+  return 0
+}
+
+fail() {
+  if [ "$mode" = hook ]; then
+    log_missed "$1"
+    exit 0
+  fi
+  printf 'callmeter: binary unavailable: %s\n' "$1" >&2
+  exit 1
+}
+
+# run_bin BINARY ARGS...: runs the binary and does not return. Outside `hook`
+# it execs. Under `hook` it runs the binary as a child, so a binary that cannot
+# start (noexec mount, wrong architecture) or crashes still ends in exit 0 and
+# a missed.log line instead of the shell's 126, 127 or a signal status.
+run_bin() {
+  bin=$1
+  shift
+  if [ "$mode" != hook ]; then
+    exec "$bin" "$@"
+  fi
+  stdin_spent=1
+  "$bin" "$@"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "binary exited $rc"
+  fi
+  exit 0
+}
+
+# home: CALLMETER_HOME, else XDG_STATE_HOME (counted only when absolute) or
+# $HOME/.local/state, plus /callmeter. Empty when no home can be resolved.
+home=${CALLMETER_HOME-}
+if [ -z "$home" ]; then
+  xdg=${XDG_STATE_HOME-}
+  case $xdg in
+    /*) ;;
+    *) xdg=${HOME:+$HOME/.local/state} ;;
+  esac
+  if [ -n "$xdg" ]; then
+    home=$xdg/callmeter
+  fi
+fi
+
+# 1. the override
+if [ -n "${CALLMETER_BIN-}" ] && [ -f "$CALLMETER_BIN" ] && [ -x "$CALLMETER_BIN" ]; then
+  run_bin "$CALLMETER_BIN" "$@"
+fi
+
+# The plugin root is the directory above this script's own.
+case $0 in
+  */*) script=$0 ;;
+  *) script=$(command -v "$0" 2>/dev/null) ;;
+esac
+root=$(cd "$(dirname -- "$script")/.." 2>/dev/null && pwd)
+if [ -z "$root" ]; then
+  fail "plugin root not found"
+fi
+
+version=$(first_json_string version <"$root/.claude-plugin/plugin.json" 2>/dev/null)
+case $version in
+  '' | *[!0-9A-Za-z._+-]*) fail "no plugin version" ;;
+esac
+
+if [ -z "$home" ]; then
+  fail "cannot resolve CALLMETER_HOME"
+fi
+bin_dir=$home/bin
+target=$bin_dir/$version/callmeter
+
+# 2. the cache
+if [ -f "$target" ] && [ -x "$target" ]; then
+  run_bin "$target" "$@"
+fi
+
+# lock_is_stale: the lock directory is older than 120 seconds. An mtime that
+# cannot be read counts as not stale: the waiter times out instead of removing
+# a live holder's lock.
+lock_is_stale() {
+  m=$(stat -c %Y "$lock" 2>/dev/null) || m=$(stat -f %m "$lock" 2>/dev/null) || return 1
+  case $m in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ $(($(date +%s) - m)) -gt 120 ]
+}
+
+# sha256_of FILE prints the file's SHA-256, with shasum else sha256sum.
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+# 3. the download
+asset_os=
+case $(uname -s 2>/dev/null) in
+  Darwin) asset_os=darwin ;;
+  Linux) asset_os=linux ;;
+  *) fail "unsupported platform" ;;
+esac
+asset_arch=
+case $(uname -m 2>/dev/null) in
+  x86_64 | amd64) asset_arch=amd64 ;;
+  arm64 | aarch64) asset_arch=arm64 ;;
+  *) fail "unsupported platform" ;;
+esac
+asset=callmeter_${version}_${asset_os}_${asset_arch}
+
+command -v curl >/dev/null 2>&1 || fail "curl not found"
+if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+  fail "no sha256 tool"
+fi
+sums=$root/libexec/SHA256SUMS
+if [ ! -r "$sums" ]; then
+  fail "checksums file unreadable"
+fi
+expected=$(awk -v a="$asset" '{ name = $2; sub(/^\*/, "", name) } name == a { print $1; exit }' "$sums")
+if [ -z "$expected" ]; then
+  fail "no checksum for $asset"
+fi
+release_base=${CALLMETER_RELEASE_BASE:-https://github.com/rezzminator/callmeter/releases/download}
+url=${release_base%/}/callmeter--v${version}/${asset}
+
+mkdir -p "$bin_dir" 2>/dev/null || fail "cannot create $bin_dir"
+lock=$bin_dir/.lock-$version
+
+waited=0
+stale_removed=
+while :; do
+  if mkdir "$lock" 2>/dev/null; then
+    held=1
+    break
+  fi
+  # Another run holds the lock: its install is the one we wait for.
+  if [ -f "$target" ] && [ -x "$target" ]; then
+    run_bin "$target" "$@"
+  fi
+  if [ -z "$stale_removed" ] && lock_is_stale; then
+    stale_removed=1
+    rmdir "$lock" 2>/dev/null
+    continue
+  fi
+  if [ "$waited" -ge 50 ]; then
+    fail "lock wait timed out"
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+
+# The holder may have lost a race: another run installed between our cache
+# check and our lock.
+if [ -f "$target" ] && [ -x "$target" ]; then
+  cleanup
+  run_bin "$target" "$@"
+fi
+
+# Only a lock holder writes a temp download, so a killed run's leftover goes.
+rm -f "$bin_dir"/.tmp-* 2>/dev/null
+tmp=$bin_dir/.tmp-$$
+curl -fsSL --connect-timeout 5 --max-time 40 -o "$tmp" "$url" </dev/null >/dev/null 2>&1 || fail "download failed"
+actual=$(sha256_of "$tmp")
+if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
+  fail "checksum mismatch"
+fi
+chmod 0755 "$tmp" || fail "cannot make the download executable"
+mkdir -p "$bin_dir/$version" 2>/dev/null || fail "cannot create $bin_dir/$version"
+mv -f "$tmp" "$target" || fail "cannot install $target"
+tmp=
+
+# Every other cached version goes; dot entries (locks, temp files) are not versions.
+for d in "$bin_dir"/*; do
+  if [ -d "$d" ] && [ "${d##*/}" != "$version" ]; then
+    rm -rf "$d"
+  fi
+done
+
+cleanup
+run_bin "$target" "$@"
