@@ -19,15 +19,14 @@ import (
 // driverName is the pure-Go SQLite driver the whole binary uses.
 const driverName = "sqlite"
 
-// StoreBusyTimeout is how long a statement on a callmeter store waits for a
-// concurrent writer before it fails.
-const StoreBusyTimeout = 10 * time.Second
-
 // OpenStore opens one of callmeter's own databases, creating it and its
-// directory (0700): one connection, StoreBusyTimeout, WAL — verified, since a
-// store that silently stayed in rollback mode would make concurrent hooks
-// erase one another's writes — synchronous=NORMAL and foreign keys on.
-func OpenStore(ctx context.Context, path string) (*sql.DB, error) {
+// directory (0700): one connection, a busy timeout of busy (how long a
+// statement waits on a concurrent writer before it fails; the driver does not
+// stop that wait on a ctx deadline, so busy is the caller's whole bound), WAL
+// — verified, since a store that silently stayed in rollback mode would make
+// concurrent hooks erase one another's writes — synchronous=NORMAL and foreign
+// keys on.
+func OpenStore(ctx context.Context, path string, busy time.Duration) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory for %s: %w", path, err)
 	}
@@ -37,16 +36,16 @@ func OpenStore(ctx context.Context, path string) (*sql.DB, error) {
 	}
 	database.SetMaxOpenConns(1)
 	database.SetMaxIdleConns(1)
-	if err := storePragmas(ctx, database); err != nil {
+	if err := storePragmas(ctx, database, busy); err != nil {
 		return nil, errors.Join(fmt.Errorf("configure sqlite database %s: %w", path, err), database.Close())
 	}
 	return database, nil
 }
 
-func storePragmas(ctx context.Context, database *sql.DB) error {
+func storePragmas(ctx context.Context, database *sql.DB, busy time.Duration) error {
 	if _, err := database.ExecContext(
 		ctx,
-		fmt.Sprintf("PRAGMA busy_timeout=%d", StoreBusyTimeout.Milliseconds()),
+		fmt.Sprintf("PRAGMA busy_timeout=%d", busy.Milliseconds()),
 	); err != nil {
 		return fmt.Errorf("set busy_timeout: %w", err)
 	}

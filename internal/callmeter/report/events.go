@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 )
@@ -43,6 +44,20 @@ func Events(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 	}
 	if t.Notes, err = topicNotes(ctx, store, f, n, false); err != nil {
 		return nil, err
+	}
+	// A SessionEnd of a session that never started is counted under its reason
+	// above like any other; the note says how many of them end such a session.
+	var beforeStart int64
+	if err := store.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM events e WHERE e.event = ? AND `+endedBeforeStart("e.session_id")+` AND `+where,
+		append([]any{callmeter.EventSessionEnd}, args...)...,
+	).Scan(&beforeStart); err != nil {
+		return nil, fmt.Errorf("callmeter report: count the SessionEnd events of sessions that never started: %w", err)
+	}
+	if beforeStart > 0 {
+		t.Notes = append(t.Notes, fmt.Sprintf(
+			"%d SessionEnd events end a session that never started (no SessionStart, nothing ran; see the sessions topic)",
+			beforeStart))
 	}
 	return t, nil
 }

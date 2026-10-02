@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -92,8 +93,28 @@ func TestEnsureParsedRecordsParseFault(t *testing.T) {
 		"SELECT stage, error FROM faults WHERE tool_use_id = 'b1'").Scan(&stage, &message); err != nil {
 		t.Fatalf("read parse fault: %v", err)
 	}
-	if stage != "parse" || !strings.Contains(message, "invalid syntax") {
-		t.Errorf("fault = %s %q, want a parse fault carrying the message", stage, message)
+	if stage != "parse" || strings.Contains(message, "invalid syntax") ||
+		!strings.Contains(message, callmeter.ErrorNotStored+" (") {
+		t.Errorf("fault = %s %q, want a parse fault with the parser's message only sized: it quotes the command", stage, message)
+	}
+}
+
+// A part that failed to parse before any program was read names
+// "no program parsed" in its fault, never an empty pair of parentheses.
+func TestEnsureParsedMarksAPartWithNoProgram(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	seed(t, store, bash("b1", "s", "", ms(time.Hour), workDir(t), `echo private-word (`, 10))
+	if _, err := EnsureParsed(ctx, store, "", rejectingPython{}); err != nil {
+		t.Fatalf("EnsureParsed: %v", err)
+	}
+	var message string
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT error FROM faults WHERE tool_use_id = 'b1' AND stage = 'parse'").Scan(&message); err != nil {
+		t.Fatalf("read parse fault: %v", err)
+	}
+	if !regexp.MustCompile(`^part 0 \(no program parsed\): error text not stored \([0-9]+ bytes\)$`).MatchString(message) {
+		t.Errorf("fault = %q, want part 0 (no program parsed) with the message sized", message)
 	}
 }
 

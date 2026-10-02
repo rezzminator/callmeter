@@ -643,7 +643,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/pfm/scripts/arch-check.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]
@@ -737,7 +737,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/scripts/description-check.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]
@@ -1414,7 +1414,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/pfm/scripts/arch-check.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]
@@ -1469,7 +1469,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/pfm/scripts/arch-check.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]
@@ -1888,7 +1888,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/.worktrees/tokens-fix/.claude/scripts/dev.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]
@@ -2842,7 +2842,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/scripts/leak-check.sh",
-      "action": "unknown",
+      "action": "exec",
       "exists": true
      }
     ]

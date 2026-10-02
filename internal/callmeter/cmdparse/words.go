@@ -117,6 +117,12 @@ func (p *callParser) param(x *syntax.ParamExp) ([]string, []bool, bool) {
 		x.Repl != nil || x.Exp != nil || x.Names != 0 {
 		return nil, nil, false
 	}
+	// A zsh flag, prefix or modifier (${(f)a}, ${=a}, ${~a}, ${^a}, ${+a},
+	// ${a:h}) changes the value in ways this parser does not model: unknown.
+	if x.Flags != nil || x.IsSet || x.Split != syntax.OptUnset || x.GlobSubst != syntax.OptUnset ||
+		x.RcExpand != syntax.OptUnset || x.NestedParam != nil || len(x.Modifiers) > 0 {
+		return nil, nil, false
+	}
 	marks := p.unmatched[x.Param.Value]
 	if elems, isArray := p.arrays[x.Param.Value]; isArray {
 		vals, ok := arrayElems(elems, x.Index)
@@ -135,11 +141,14 @@ func (p *callParser) param(x *syntax.ParamExp) ([]string, []bool, bool) {
 
 // text renders a word as the program receives it where that is known, and
 // as its source where it is not: a -c argument or a heredoc body keeps its
-// unexpanded `$X` rather than being dropped.
-func (p *callParser) text(w *syntax.Word) string {
+// unexpanded `$X` rather than being dropped. known is false when any
+// expansion was left as its source (a variable with no single literal value,
+// a command or arithmetic substitution): the program received something else.
+func (p *callParser) text(w *syntax.Word) (string, bool) {
 	if w == nil {
-		return ""
+		return "", true
 	}
+	known := true
 	var b strings.Builder
 	var render func(parts []syntax.WordPart, quoted bool)
 	render = func(parts []syntax.WordPart, quoted bool) {
@@ -160,14 +169,16 @@ func (p *callParser) text(w *syntax.Word) string {
 					b.WriteString(vals[0])
 					continue
 				}
+				known = false
 				b.WriteString(p.source(x))
 			default:
+				known = false
 				b.WriteString(p.source(x))
 			}
 		}
 	}
 	render(w.Parts, false)
-	return b.String()
+	return b.String(), known
 }
 
 func (p *callParser) source(node syntax.Node) string {

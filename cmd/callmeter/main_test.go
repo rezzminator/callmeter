@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,7 +203,7 @@ func TestUsageErrorsExitTwoWithUsageOnStderr(t *testing.T) {
 func TestHelpPrintsUsageOnStdout(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
 		code, stdout, stderr := newCLI(t).run("", arg)
-		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|version|help}") ||
+		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|redact|version|help}") ||
 			!strings.Contains(stdout, "usage: callmeter report") {
 			t.Errorf("callmeter %s = %d, stdout %q, stderr %q; want 0 and the usage on stdout", arg, code, stdout, stderr)
 		}
@@ -215,5 +219,93 @@ func TestVersionPrintsTheLinkedVersion(t *testing.T) {
 	t.Cleanup(func() { version = previous })
 	if code, stdout, _ := newCLI(t).run("", "version"); code != 0 || stdout != "callmeter 9.9.9\n" {
 		t.Fatalf("callmeter version = %d, %q; want 0 and the linked version", code, stdout)
+	}
+}
+
+// bashFailure is the captured failed Bash call of the scripted chat with its
+// command and error replaced by invented ones.
+func bashFailure(t *testing.T, c cli, command, errorText string) string {
+	t.Helper()
+	payload := scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[4]
+	if !strings.Contains(payload, `"hook_event_name":"PostToolUseFailure"`) {
+		t.Fatalf("payload 5 is not the captured Bash failure: %s", payload)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal([]byte(payload), &fields); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	fields["tool_input"].(map[string]any)["command"] = command
+	fields["error"] = errorText
+	out, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	return string(out)
+}
+
+func TestHookStoresNoHeredocBody(t *testing.T) {
+	c := newCLI(t)
+	body := "first-private-line\n\tsecond-private-line\n"
+	payload := bashFailure(t, c, "cat > /tmp/demo-proj/notes.txt <<'EOF'\n"+body+"EOF\nwc -l /tmp/demo-proj/notes.txt", "Exit code 1")
+	if code, stdout, stderr := c.run(payload, "hook"); code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("hook = %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if n := c.count(`SELECT count(*) FROM calls WHERE instr(json_extract(input, '$.command'), 'private-line') > 0 OR instr(input, 'private-line') > 0`); n != 0 {
+		t.Fatalf("calls holding the heredoc body = %d, want 0", n)
+	}
+	want := `'cat > /tmp/demo-proj/notes.txt <<''EOF''' || char(10) || 'EOF' || char(10) || 'wc -l /tmp/demo-proj/notes.txt'`
+	query := fmt.Sprintf(`SELECT count(*) FROM calls WHERE json_extract(input, '$.command') = %s AND json_extract(input, '$.heredoc_bytes') = %d`, want, len(body))
+	if n := c.count(query); n != 1 {
+		t.Fatalf("calls with the redirect, the delimiter and heredoc_bytes %d = %d, want 1", len(body), n)
+	}
+}
+
+// Turns green once the store writes calls.error through
+// callmeter.SanitizeError.
+func TestHookStoresNoToolOutputAsError(t *testing.T) {
+	c := newCLI(t)
+	payload := bashFailure(t, c, "cat /tmp/demo-proj/missing.txt", "Exit code 1\ncat: private-output-line")
+	if code, stdout, stderr := c.run(payload, "hook"); code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("hook = %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if n := c.count(`SELECT count(*) FROM calls WHERE error = 'Exit code 1'`); n != 1 {
+		t.Fatalf("calls whose error is the exit code line alone = %d, want 1", n)
+	}
+}
+
+func TestRedactRewritesTheStoreAndPrintsCounts(t *testing.T) {
+	c := newCLI(t)
+	c.seed()
+	store, err := callmeter.OpenDB(context.Background(), c.store())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	_, err = store.DB().Exec(`INSERT INTO calls (tool_use_id, tool, ts, cwd, input) VALUES ('toolu_old', 'Bash', 1, '/tmp/demo-proj', ?)`,
+		`{"command":"cat <<EOF > /tmp/demo-proj/a\nprivate-line\nEOF\n"}`)
+	if err := errors.Join(err, store.Close()); err != nil {
+		t.Fatalf("seed an old row: %v", err)
+	}
+	code, stdout, stderr := c.run("", "redact")
+	if code != 0 || stderr != "" {
+		t.Fatalf("redact = %d, stderr %q", code, stderr)
+	}
+	for _, line := range []string{"calls.input     1 rows rewritten", "calls.error     0 rows rewritten", "events.detail   0 rows rewritten", "command_parts   0 rows deleted"} {
+		if !strings.Contains(stdout, line) {
+			t.Errorf("redact stdout lacks %q:\n%s", line, stdout)
+		}
+	}
+	if n := c.count(`SELECT count(*) FROM calls WHERE instr(input, 'private-line') > 0`); n != 0 {
+		t.Fatalf("calls holding the body after redact = %d, want 0", n)
+	}
+}
+
+func TestRedactWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
+	c := newCLI(t)
+	code, stdout, stderr := c.run("", "redact")
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "no store at") {
+		t.Fatalf("redact = %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	if _, err := os.Stat(c.store()); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("redact created the store: %v", err)
 	}
 }

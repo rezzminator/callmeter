@@ -51,7 +51,7 @@ type Call struct {
 	AgentType       *string
 	RequestID       *string
 	PromptID        *string
-	TS              *int64 // Unix ms UTC
+	TS              *int64 // Unix ms UTC; always KeepMin, whatever the upsert's mode
 	Tool            *string
 	Input           *string // SanitizeInput's output
 	Cwd             *string
@@ -167,7 +167,12 @@ func (c Call) columns() []column {
 	cs = add(cs, "agent_type", c.AgentType)
 	cs = add(cs, "request_id", c.RequestID)
 	cs = add(cs, "prompt_id", c.PromptID)
-	cs = add(cs, "ts", c.TS)
+	// A call's ts is the earliest hook that saw it: async hooks land in any
+	// order, and a PostToolUse or batch landing after the PreToolUse, or an
+	// earlier one landing last, never moves it later.
+	if c.TS != nil {
+		cs = append(cs, column{name: "ts", value: *c.TS}.withMode(KeepMin))
+	}
 	cs = add(cs, "tool", c.Tool)
 	cs = add(cs, "input", c.Input)
 	cs = add(cs, "cwd", c.Cwd)
@@ -415,6 +420,115 @@ func (t *Tx) ResolveRequest(ctx context.Context, provisionalID string, r Request
 	return t.RecountRequest(ctx, r.RequestID)
 }
 
+// resolvedBy is the usage that resolves the pending request: the first of its
+// calls the transcript read found, the way a hook's resolvePending looks.
+func resolvedBy(request PendingRequest, found map[string]RequestUsage) (RequestUsage, bool) {
+	for _, id := range request.CallIDs {
+		if usage, ok := found[id]; ok {
+			return usage, true
+		}
+	}
+	return RequestUsage{}, false
+}
+
+// ResolvePendingFrom resolves each of the pending requests whose calls found
+// (FindRequests over their transcript) names, to the message that issued its
+// first call found: the request's own row is rewritten to the message id
+// (ResolveRequest) at that message's usage, written by source. A pending
+// request none of whose calls is in found stays pending.
+func (t *Tx) ResolvePendingFrom(ctx context.Context, pending []PendingRequest, found map[string]RequestUsage, source string) error {
+	for _, request := range pending {
+		usage, ok := resolvedBy(request, found)
+		if !ok {
+			continue
+		}
+		resolved := Request{RequestID: usage.MessageID, Source: Ptr(source)}
+		ApplyUsage(&resolved, usage)
+		if err := t.ResolveRequest(ctx, request.RequestID, resolved); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SettleRequest writes r, a request read whole from its transcript at its
+// final usage, over its row: the model, stop reason and token columns the
+// transcript holds win; ts and the owner, prompt, source and seat columns only
+// fill, so a batch's values stand in whichever order the two land. Each call of toolUseIDs that names no request yet (its
+// batch never ran, as when its agent was interrupted) is pointed at it, and its
+// calls are recounted (RecountRequest), so a reply with no tool call holds 0.
+// A request older than since (the session's first recorded run) is written
+// only over a row a batch already stored: the transcript lines before callmeter
+// first saw the session (enabled mid-session, or a resumed history) are not
+// back-filled.
+func (t *Tx) SettleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
+	return t.settleRequest(ctx, r, toolUseIDs, since, Overwrite)
+}
+
+// RecoverRequest is SettleRequest for a request read from the transcript of a
+// session gone quiet (RecoverQuiet): every column only fills, so a value a
+// hook stored is never overwritten, and the calls pointing, the since rule and
+// the recount are SettleRequest's.
+func (t *Tx) RecoverRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
+	return t.settleRequest(ctx, r, toolUseIDs, since, FillEmpty)
+}
+
+// settleRequest is SettleRequest and RecoverRequest: mode is how the usage
+// columns (the ones SettleRequest overwrites) merge; the owner, prompt, ts,
+// source and seat columns only fill in both.
+func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64, mode Mode) error {
+	columns := r.columns()
+	for i := range columns {
+		switch columns[i].name {
+		case "ts", "session_id", "agent_id", "prompt_id", "source", "config_dir", "seat_dir":
+			columns[i] = columns[i].withMode(FillEmpty)
+		}
+	}
+	if r.TS != nil && *r.TS >= since {
+		if err := t.upsert(ctx, "requests", "request_id", r.RequestID, columns, mode); err != nil {
+			return err
+		}
+	} else {
+		// An UPDATE, never a read before the write: a transaction that reads
+		// first fails busy at its first write, with no busy wait, whenever
+		// another hook wrote in between.
+		sets := make([]string, 0, len(columns))
+		values := make([]any, 0, len(columns)+1)
+		for _, c := range columns {
+			merge := mode
+			if c.mode != nil {
+				merge = *c.mode
+			}
+			if merge == FillEmpty {
+				sets = append(sets, fmt.Sprintf("%[1]s = COALESCE(%[1]s, ?)", c.name))
+			} else {
+				sets = append(sets, c.name+" = ?")
+			}
+			values = append(values, c.value)
+		}
+		result, err := t.tx.ExecContext(ctx,
+			"UPDATE requests SET "+strings.Join(sets, ", ")+" WHERE request_id = ?", append(values, r.RequestID)...)
+		if err != nil {
+			return fmt.Errorf("callmeter store %s: settle stored request %q: %w", t.path, r.RequestID, err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("callmeter store %s: settle stored request %q: %w", t.path, r.RequestID, err)
+		}
+		if updated == 0 {
+			return nil
+		}
+	}
+	for _, id := range toolUseIDs {
+		if _, err := t.tx.ExecContext(ctx,
+			"UPDATE calls SET request_id = ? WHERE tool_use_id = ? AND request_id IS NULL", r.RequestID, id,
+		); err != nil {
+			return fmt.Errorf("callmeter store %s: point call %q at request %q: %w", t.path, id, r.RequestID, err)
+		}
+	}
+	return t.RecountRequest(ctx, r.RequestID)
+}
+
 // RecountRequest sets requestID's calls to the number of calls rows carrying
 // it, so the count is the same in any landing order and under a duplicate
 // delivery. A request with no row is left absent.
@@ -484,6 +598,46 @@ func jsonList(values []string) (string, error) {
 	return string(encoded), err
 }
 
+// UnfinishedCall is a call with neither an outcome nor a delivered size: its
+// PreToolUse alone landed.
+type UnfinishedCall struct {
+	ToolUseID string
+	AgentID   *string
+	AgentType *string
+	NoTS      bool // ts IS NULL: stored before every hook set one
+	// Delivered: bytes_delivered is set, so the batch already stored the call's
+	// size; RecoverQuiet settles only a call whose size is still unknown.
+	Delivered bool
+}
+
+// UnfinishedCalls lists the session's calls with no real size: running, ended
+// with no PostToolUse or PostToolUseFailure (the user interrupted a sub-agent),
+// or refused by Claude Code before any PostToolUse, its batch alone landed.
+func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]UnfinishedCall, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL FROM calls
+		WHERE session_id = ? AND bytes_real IS NULL
+		ORDER BY ts, tool_use_id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("callmeter store %s: list unfinished calls of session %q: %w", s.path, sessionID, err)
+	}
+	var calls []UnfinishedCall
+	for rows.Next() {
+		var c UnfinishedCall
+		if err := rows.Scan(&c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("callmeter store %s: scan unfinished call: %w", s.path, err),
+				rows.Close(),
+			)
+		}
+		calls = append(calls, c)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("callmeter store %s: read unfinished calls: %w", s.path, err)
+	}
+	return calls, nil
+}
+
 // PendingRequests lists the provisional requests of one session and agent
 // (agentID "" is the main chat, agent_id IS NULL), each with its call ids.
 func (s *Store) PendingRequests(ctx context.Context, sessionID, agentID string) ([]PendingRequest, error) {
@@ -522,6 +676,95 @@ func (s *Store) PendingRequests(ctx context.Context, sessionID, agentID string) 
 		pending[i].CallIDs = ids
 	}
 	return pending, nil
+}
+
+// PendingAgents lists, once each, the sub-agents of one session holding a
+// pending request.
+func (s *Store) PendingAgents(ctx context.Context, sessionID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT agent_id FROM requests
+		WHERE pending = 1 AND session_id = ? AND agent_id IS NOT NULL
+		ORDER BY agent_id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("callmeter store %s: list agents with pending requests of session %q: %w",
+			s.path, sessionID, err)
+	}
+	var agents []string
+	for rows.Next() {
+		var agentID string
+		if err := rows.Scan(&agentID); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("callmeter store %s: scan agent with pending requests: %w", s.path, err),
+				rows.Close(),
+			)
+		}
+		agents = append(agents, agentID)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("callmeter store %s: read agents with pending requests: %w", s.path, err)
+	}
+	return agents, nil
+}
+
+// SessionFirstTS is the first recorded run of a session (sessions.first_ts);
+// ok is false while the session has none.
+func (s *Store) SessionFirstTS(ctx context.Context, sessionID string) (ts int64, ok bool, err error) {
+	var first sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT MIN(first_ts) FROM sessions WHERE session_id = ?", sessionID).Scan(&first); err != nil {
+		return 0, false, fmt.Errorf("callmeter store %s: read the first run of session %q: %w", s.path, sessionID, err)
+	}
+	return first.Int64, first.Valid, nil
+}
+
+// UnstoppedAgents lists the sub-agents of one session with no stop recorded:
+// killed, interrupted or still running, so no SubagentStop read their
+// transcript's requests.
+func (s *Store) UnstoppedAgents(ctx context.Context, sessionID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT agent_id FROM agents WHERE session_id = ? AND stopped IS NULL ORDER BY agent_id`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("callmeter store %s: list unstopped agents of session %q: %w", s.path, sessionID, err)
+	}
+	var agents []string
+	for rows.Next() {
+		var agentID string
+		if err := rows.Scan(&agentID); err != nil {
+			return nil, errors.Join(fmt.Errorf("callmeter store %s: scan unstopped agent: %w", s.path, err), rows.Close())
+		}
+		agents = append(agents, agentID)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("callmeter store %s: read unstopped agents: %w", s.path, err)
+	}
+	return agents, nil
+}
+
+// SettledAgents lists the session's agents whose last SubagentStop is no
+// earlier than their last SubagentStart: that stop swept the agent's
+// transcript (sweepRequests), so SessionEnd need not read it again.
+func (s *Store) SettledAgents(ctx context.Context, sessionID string) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT a.agent_id FROM agents a
+		LEFT JOIN (SELECT agent_id, max(ts) AS ts FROM events WHERE session_id = ?1 AND event = ?2 GROUP BY agent_id) e
+		ON e.agent_id = a.agent_id
+		WHERE a.session_id = ?1 AND a.stopped IS NOT NULL AND a.stopped >= COALESCE(e.ts, 0)`,
+		sessionID, EventSubagentStart)
+	if err != nil {
+		return nil, fmt.Errorf("callmeter store %s: list settled agents of session %q: %w", s.path, sessionID, err)
+	}
+	settled := map[string]bool{}
+	for rows.Next() {
+		var agentID string
+		if err := rows.Scan(&agentID); err != nil {
+			return nil, errors.Join(fmt.Errorf("callmeter store %s: scan settled agent: %w", s.path, err), rows.Close())
+		}
+		settled[agentID] = true
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, fmt.Errorf("callmeter store %s: read settled agents: %w", s.path, err)
+	}
+	return settled, nil
 }
 
 // callIDs lists the calls carrying requestID; a provisional key's own first

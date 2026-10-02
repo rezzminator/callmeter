@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
@@ -9,12 +10,12 @@ import (
 )
 
 // readActions are the attributed actions that deliver a file's content (or
-// part of it) to the model; write and exec do not.
+// part of it) to the model. Write and exec do not; unknown (a wrapper or a
+// program the parser does not know) may or may not, so it counts nowhere.
 var readActions = map[string]bool{
 	cmdparse.ActionReadWhole: true,
 	cmdparse.ActionReadRange: true,
 	cmdparse.ActionSearch:    true,
-	cmdparse.ActionUnknown:   true,
 }
 
 // writeTools are the tools whose result gives a file's size before and after.
@@ -23,7 +24,7 @@ var writeTools = []any{"Write", "Edit", "MultiEdit", "NotebookEdit"}
 type fileStat struct {
 	path      string
 	readBytes int64 // via the Read tool
-	bashBytes int64 // each attributing Bash call's bytes ÷ the files that call credits
+	bashBytes int64 // the bytes of Bash calls reading this one file and running none
 	reads     int64
 	certain   int64            // reads a part outside every branch made
 	cond      int64            // reads made only by parts inside a branch
@@ -33,15 +34,25 @@ type fileStat struct {
 	sizeTS    int64            // ts of the latest look: a Read's size or a Bash reference's existence
 	whole     int64
 	ranged    int64
+	execs     int64 // Bash calls running the file
+	// Calls behind each byte column with and without a delivered size: one
+	// with none is left out of the sum, never added as 0. bashShared counts
+	// reads whose call's bytes went to no file, since the call read several
+	// files or also ran one.
+	readKnown, readUnknown, bashKnown, bashUnknown, bashShared int64
 }
 
 func agentKey(session, agent string) string { return session + "/" + agent }
 
 // Files ranks files by bytes delivered: Read bytes and Bash-attributed bytes
-// are two columns, never summed; rows rank by the larger of the two. A Bash
-// call's bytes are shared evenly across the distinct files it credits, the
-// remainder one byte each to the first files in part order, so the shares
-// sum to the call's bytes exactly (bashShares). READS splits into CERTAIN
+// are two columns, never summed; rows rank by the larger of the two. Only a
+// read mode (read-whole, read-range, search) is a Bash read. A Bash call's
+// bytes go to a file only when the call reads that one file and runs no file
+// (exec) and names none through a wrapper (unknown): its output cannot be
+// split per file otherwise, so such a call's reads count, its bytes go to no
+// file, and a note names the calls. A Bash call running a file counts in
+// EXECS alone; an unknown attribution counts nowhere and a note names how
+// many there were. READS splits into CERTAIN
 // and CONDITIONAL: a Read call, or a Bash call with a part outside every
 // branch naming the file, is certain; a Bash call naming it only in parts
 // inside a branch, a case arm or right of && / || is conditional. A file the
@@ -58,20 +69,28 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 		}
 		return s
 	}
+	var readUnknown, bashUnknown int64 // calls with no delivered size
+	var bashShared, unknownRefs int64  // calls whose bytes go to no file; unknown attributions
 	where, args := f.where()
 	err := query(ctx, store, "Read calls",
 		`SELECT c.file_path, COALESCE(c.session_id, ''), COALESCE(c.agent_id, ''), COALESCE(c.ts, 0),
-		COALESCE(c.bytes_delivered, 0), c.file_bytes, c.read_start, c.read_lines, c.read_total_lines
+		c.bytes_delivered, c.file_bytes, c.read_start, c.read_lines, c.read_total_lines
 		FROM calls c WHERE c.tool = 'Read' AND c.file_path IS NOT NULL AND `+where+` ORDER BY c.ts`, args,
 		func(r rowSource) error {
 			var path, session, agent string
-			var ts, delivered int64
-			var size, start, lines, total *int64
+			var ts int64
+			var delivered, size, start, lines, total *int64
 			if err := r.Scan(&path, &session, &agent, &ts, &delivered, &size, &start, &lines, &total); err != nil {
 				return err
 			}
 			s := stat(path)
-			s.readBytes += delivered
+			if delivered == nil {
+				s.readUnknown++
+				readUnknown++
+			} else {
+				s.readBytes += *delivered
+				s.readKnown++
+			}
 			s.reads++
 			s.certain++
 			s.agents[agentKey(session, agent)]++
@@ -94,20 +113,35 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	}
 	err = query(ctx, store, "Bash calls",
 		`SELECT c.tool_use_id, COALESCE(c.session_id, ''), COALESCE(c.agent_id, ''), COALESCE(c.ts, 0),
-		COALESCE(c.bytes_delivered, 0)
+		c.bytes_delivered
 		FROM calls c WHERE c.tool = 'Bash' AND `+where+` ORDER BY c.ts`, args,
 		func(r rowSource) error {
 			var id, session, agent string
-			var ts, delivered int64
+			var ts int64
+			var delivered *int64
 			if err := r.Scan(&id, &session, &agent, &ts, &delivered); err != nil {
 				return err
 			}
 			seen := map[string]bool{}
 			var credited []string        // distinct read paths, in part order
 			certain := map[string]bool{} // a certain part read it: the call's read is certain
+			execs := map[string]bool{}   // paths the call runs
+			opaque := false              // the call runs a file or names one through a wrapper
 			for _, part := range parts[id] {
 				for _, ref := range part.files {
-					if !readActions[ref.Action] {
+					switch {
+					case ref.Action == cmdparse.ActionExec:
+						opaque = true
+						if !execs[ref.Path] {
+							execs[ref.Path] = true
+							stat(ref.Path).execs++
+						}
+						continue
+					case ref.Action == cmdparse.ActionUnknown:
+						opaque = true
+						unknownRefs++
+						continue
+					case !readActions[ref.Action]:
 						continue
 					}
 					if !part.conditional {
@@ -119,7 +153,14 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 					}
 				}
 			}
-			shares := bashShares(delivered, len(credited))
+			single := len(credited) == 1 && !opaque
+			switch {
+			case len(credited) == 0:
+			case delivered == nil:
+				bashUnknown++
+			case !single:
+				bashShared++
+			}
 			seen = map[string]bool{}
 			for _, part := range parts[id] {
 				for _, ref := range part.files {
@@ -132,7 +173,15 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 						// One call's references share one parse-time stat.
 						s.gone, s.sizeTS = !ref.Exists, ts
 					}
-					s.bashBytes += shares[len(seen)-1]
+					switch {
+					case delivered == nil:
+						s.bashUnknown++
+					case single:
+						s.bashBytes += *delivered
+						s.bashKnown++
+					default:
+						s.bashShared++
+					}
 					s.reads++
 					if certain[ref.Path] {
 						s.certain++
@@ -181,6 +230,7 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 			"WHOLE",
 			"RANGED",
 			"RE-READS",
+			"EXECS",
 		},
 	}
 	for _, s := range list[:min(len(list), f.limit())] {
@@ -197,8 +247,8 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 		}
 		t.Rows = append(t.Rows, []string{
 			s.path,
-			itoa(s.readBytes),
-			itoa(s.bashBytes),
+			sizeCell(s.readBytes, s.readKnown, s.readUnknown),
+			sizeCell(s.bashBytes, s.bashKnown, s.bashUnknown+s.bashShared),
 			itoa(s.reads),
 			itoa(s.certain),
 			itoa(s.cond),
@@ -207,6 +257,7 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 			itoa(s.whole),
 			itoa(s.ranged),
 			itoa(rereads),
+			itoa(s.execs),
 		})
 	}
 	notes, err := gapNotes(ctx, store, f)
@@ -214,26 +265,20 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 		return nil, err
 	}
 	t.Notes = notes
+	if readUnknown > 0 {
+		t.Notes = append(t.Notes, unknownSizeNote(readUnknown, "Read calls", "READ BYTES"))
+	}
+	if bashUnknown > 0 {
+		t.Notes = append(t.Notes, unknownSizeNote(bashUnknown, "Bash calls", "BASH BYTES"))
+	}
+	if bashShared > 0 {
+		t.Notes = append(t.Notes, sharedBytesNote(bashShared))
+	}
+	if unknownRefs > 0 {
+		t.Notes = append(t.Notes, fmt.Sprintf("%d file attributions with mode unknown (a wrapper or unrecognised program): not counted", unknownRefs))
+	}
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
-}
-
-// bashShares splits a call's bytes across n credited files: each gets
-// bytes ÷ n, and the first bytes mod n files one byte more, so the shares sum
-// to bytes exactly.
-func bashShares(bytes int64, n int) []int64 {
-	if n == 0 {
-		return nil
-	}
-	shares := make([]int64, n)
-	base, rest := bytes/int64(n), bytes%int64(n)
-	for i := range shares {
-		shares[i] = base
-		if int64(i) < rest {
-			shares[i]++
-		}
-	}
-	return shares
 }
 
 type writeStat struct {
@@ -327,4 +372,10 @@ func Writes(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 	t.Notes = notes
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
+}
+
+// sharedBytesNote names the Bash calls whose bytes BASH BYTES credits to no
+// file: calls reading several files, or also running one.
+func sharedBytesNote(n int64) string {
+	return fmt.Sprintf("%d Bash calls read several files or also ran one: their bytes are credited to no file in BASH BYTES", n)
 }

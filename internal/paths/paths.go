@@ -53,9 +53,6 @@ func Log(home string) string { return filepath.Join(home, "callmeter.log") }
 // Missed is the log the wrapper appends to when it could not run the binary.
 func Missed(home string) string { return filepath.Join(home, "missed.log") }
 
-// Archive is the archive database under home.
-func Archive(home string) string { return filepath.Join(home, "archive.db") }
-
 // BinCache is the cached binary of one version under home.
 func BinCache(home, version string) string {
 	return filepath.Join(home, "bin", version, "callmeter")

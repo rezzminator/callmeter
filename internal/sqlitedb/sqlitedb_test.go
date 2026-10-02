@@ -19,12 +19,15 @@ func pragma(t *testing.T, database *sql.DB, name string) string {
 	return value
 }
 
+// storeTestBusy is the busy timeout the tests open a store with.
+const storeTestBusy = time.Second
+
 // TestOpenStoreAppliesTheStorePragmaSet pins the one pragma set every
 // callmeter store runs on: WAL, synchronous=NORMAL (1), foreign keys on, and
-// the store busy timeout.
+// the busy timeout the caller passed.
 func TestOpenStoreAppliesTheStorePragmaSet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "store.db")
-	database, err := OpenStore(context.Background(), path)
+	database, err := OpenStore(context.Background(), path, storeTestBusy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +37,7 @@ func TestOpenStoreAppliesTheStorePragmaSet(t *testing.T) {
 		}
 	}()
 	for name, want := range map[string]string{
-		"journal_mode": "wal", "synchronous": "1", "foreign_keys": "1", "busy_timeout": "10000",
+		"journal_mode": "wal", "synchronous": "1", "foreign_keys": "1", "busy_timeout": "1000",
 	} {
 		if got := pragma(t, database, name); got != want {
 			t.Errorf("PRAGMA %s = %q, want %q", name, got, want)
@@ -46,7 +49,7 @@ func TestOpenStoreAppliesTheStorePragmaSet(t *testing.T) {
 // missing parent chain is created 0700, never wider.
 func TestOpenStoreCreatesItsDirectoryPrivate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state", "callmeter")
-	database, err := OpenStore(context.Background(), filepath.Join(dir, "callmeter.db"))
+	database, err := OpenStore(context.Background(), filepath.Join(dir, "callmeter.db"), storeTestBusy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +79,7 @@ func TestStorePragmasRefuseAJournalThatIsNotWAL(t *testing.T) {
 			t.Errorf("close database: %v", err)
 		}
 	}()
-	err = storePragmas(context.Background(), database)
+	err = storePragmas(context.Background(), database, storeTestBusy)
 	if err == nil {
 		t.Fatal("storePragmas accepted a connection that cannot run WAL")
 	}
@@ -126,7 +129,7 @@ func TestOpenReadWriteKeepsTheOwnersSettings(t *testing.T) {
 // as an empty database.
 func TestOpenersReachAPathWithURICharacters(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "odd?dir#%41", "store.db")
-	store, err := OpenStore(context.Background(), path)
+	store, err := OpenStore(context.Background(), path, storeTestBusy)
 	if err != nil {
 		t.Fatal(err)
 	}

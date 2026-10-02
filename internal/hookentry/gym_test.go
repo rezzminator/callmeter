@@ -255,9 +255,7 @@ func TestReplayOversizedRead(t *testing.T) {
 		if call.tool != "Read" || !strings.HasSuffix(text(object(call.post, "tool_input"), "file_path"), "/wide.txt") {
 			continue
 		}
-		message := []rune(text(call.post, "error"))
-		want := string(message[:min(len(message), callmeter.ErrorLimit)])
-		expect(t, "wide.txt Read", r.lab.call(id), map[string]any{"failed": 1, "error": want})
+		expect(t, "wide.txt Read", r.lab.call(id), map[string]any{"failed": 1, "error": callmeter.ErrorNotStored})
 		return
 	}
 	t.Fatal("S1b has no Read of wide.txt")
@@ -300,14 +298,14 @@ func TestReplayAgents(t *testing.T) {
 		t.Errorf("background agent: %d agent_turns rows, want 2", n)
 	}
 	// Woken twice in one prompt, the agent's two SubagentStart payloads are the
-	// same bytes, so one event at the earlier ts: turn 2 has no start of its own.
+	// same bytes seconds apart: two occurrences, so each turn has its own start.
 	first := r.lab.row("SELECT started, stopped FROM agent_turns WHERE agent_id = ? AND seq = 1", background)
 	if first["started"] == "<nil>" || first["stopped"] == "<nil>" {
 		t.Errorf("background agent turn 1: started %s, stopped %s; want both set", first["started"], first["stopped"])
 	}
 	second := r.lab.row("SELECT started, stopped FROM agent_turns WHERE agent_id = ? AND seq = 2", background)
-	if second["started"] != "<nil>" || second["stopped"] == "<nil>" {
-		t.Errorf("background agent turn 2: started %s, stopped %s; want started NULL, stopped set", second["started"], second["stopped"])
+	if second["started"] == "<nil>" || second["stopped"] == "<nil>" {
+		t.Errorf("background agent turn 2: started %s, stopped %s; want both set", second["started"], second["stopped"])
 	}
 	if n := r.lab.count("SELECT COUNT(*) FROM agent_turns WHERE agent_id = ?", nested); n != 1 {
 		t.Errorf("nested agent: %d agent_turns rows, want 1", n)

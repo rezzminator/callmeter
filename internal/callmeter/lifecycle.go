@@ -2,9 +2,12 @@ package callmeter
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -14,6 +17,8 @@ const (
 	EventSubagentStop  = "SubagentStop"
 	EventSessionStart  = "SessionStart"
 	EventSessionEnd    = "SessionEnd"
+	EventStop          = "Stop"
+	EventStopFailure   = "StopFailure"
 )
 
 // engineClaude is the sessions.engine every row of this binary carries.
@@ -34,9 +39,9 @@ type Event struct {
 	PermissionMode *string
 	Source         *string
 	Model          *string
-	Reason         *string
+	Reason         *string // a SessionEnd label, or LabelNotStored and its size
 	Trigger        *string
-	ErrorType      *string
+	ErrorType      *string // a StopFailure label, or LabelNotStored and its size
 	LoadReason     *string
 	MemoryType     *string
 	FilePath       *string
@@ -46,6 +51,39 @@ type Event struct {
 	PromptBytes    *int64
 	Detail         *string // sanitized JSON
 	SeatDir        *string
+}
+
+// LabelNotStored is what events.error_type or events.reason holds, followed by
+// ` (N bytes)`, for a value off its event's label list (detailLabels): such a
+// value may be free text, so only its UTF-8 byte count is stored.
+const LabelNotStored = "label not stored"
+
+// EndReasonNever is what sessions.end_reason holds for a session whose latest
+// run went quiet with no SessionEnd recorded and no trace of one lost: Claude
+// Code did not run its SessionEnd hooks. Quiet-session recovery writes it
+// (RecoverQuiet); it is no SessionEnd label (detailLabels), so it never
+// collides with a reason a hook stored. Any later hook of the session, one
+// dated after its last hook, clears it (TouchSession), since the session runs
+// again; a refreshing hook recomputes it as well (RefreshSession).
+const EndReasonNever = "never"
+
+// EndReasonLost is what sessions.end_reason holds for a session whose latest
+// run's SessionEnd hook ran and was lost before it recorded: a binary or
+// terminated fault of a SessionEnd names the session (a missed.log line of the
+// wrapper or of a hook binary killed by a signal). Quiet-session recovery
+// writes it (RecoverQuiet) only while end_reason is NULL; it is no SessionEnd
+// label (detailLabels), and a later hook of the session clears it
+// (RefreshSession), as it does EndReasonNever.
+const EndReasonLost = "lost"
+
+// labelColumn is the stored form of the string a payload of event carries
+// under key: a label of detailLabels as it is, nil as nil, and any other value
+// as LabelNotStored and its size.
+func labelColumn(event, key string, value *string) *string {
+	if value == nil || detailLabels[event][key][*value] {
+		return value
+	}
+	return Ptr(fmt.Sprintf("%s (%d bytes)", LabelNotStored, len(*value)))
 }
 
 func (e Event) columns() []column {
@@ -58,9 +96,9 @@ func (e Event) columns() []column {
 	cs = add(cs, "permission_mode", e.PermissionMode)
 	cs = add(cs, "source", e.Source)
 	cs = add(cs, "model", e.Model)
-	cs = add(cs, "reason", e.Reason)
+	cs = add(cs, "reason", labelColumn(e.Event, "reason", e.Reason))
 	cs = add(cs, "trigger", e.Trigger)
-	cs = add(cs, "error_type", e.ErrorType)
+	cs = add(cs, "error_type", labelColumn(e.Event, "error", e.ErrorType))
 	cs = add(cs, "load_reason", e.LoadReason)
 	cs = add(cs, "memory_type", e.MemoryType)
 	cs = add(cs, "file_path", e.FilePath)
@@ -129,6 +167,115 @@ func (t *Tx) InsertEvent(ctx context.Context, e Event) (bool, error) {
 	return t.insertEarliest(ctx, "events", "event_id", e.EventID, e.TS, e.columns())
 }
 
+// RecoveredDetail is the detail of a main-chat turn end, a Stop or a
+// StopFailure, rebuilt from the transcript because its hook was lost (Claude
+// Code cancels it as a headless process exits): a hook's own row never carries
+// it. A rebuilt Stop's turns row shares its events row's id.
+const RecoveredDetail = `{"from_transcript":true}`
+
+// latestPromptTS is the SQL ts of session's latest main-chat prompt, 0 when it
+// has none; session is an SQL expression.
+func latestPromptTS(session string) string {
+	return `(SELECT COALESCE(MAX(ts), 0) FROM events WHERE session_id = ` + session +
+		` AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '')`
+}
+
+// turnEnded is the SQL condition that session's main chat has a turn end, a
+// Stop turn or a StopFailure event, at or after since; both are SQL
+// expressions.
+func turnEnded(session, since string) string {
+	return `(EXISTS (SELECT 1 FROM events f WHERE f.session_id = ` + session + ` AND f.event = 'StopFailure'
+			AND COALESCE(f.agent_id, '') = '' AND f.ts >= ` + since + `)
+		OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = ` + session + ` AND t.event = 'Stop'
+			AND COALESCE(t.agent_id, '') = '' AND t.ts >= ` + since + `))`
+}
+
+// turnEndMissing is the SQL condition that session's latest main-chat prompt
+// has no turn end; session is an SQL expression.
+func turnEndMissing(session string) string {
+	return `(EXISTS (SELECT 1 FROM events WHERE session_id = ` + session + ` AND event = 'UserPromptSubmit'
+			AND COALESCE(agent_id, '') = '')
+		AND NOT ` + turnEnded(session, latestPromptTS(session)) + `)`
+}
+
+// RecoverTurnEnd inserts e, whose Event is EventStop or EventStopFailure, as
+// the main chat's turn end for the session's latest prompt, rebuilt from the
+// transcript (RecoveredDetail), and reports whether a row went in. A Stop is
+// an events row and a turns row under one id; the turns columns only a hook
+// carries stay NULL. It writes nothing when the session already has, since
+// that prompt, a main-chat StopFailure or Stop (the hook's or an earlier
+// recovery), or for a Stop whose transcript entry predates the prompt: that
+// answer is an earlier turn's, and the latest turn's is not on disk. The row's
+// id follows from the event, the session and the prompt's ts, so a repeated
+// recovery is a no-op by event_id too; its ts is e.TS, never before the
+// prompt's. Call it after the transaction's first write, which holds the lock.
+func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
+	if e.Event != EventStop && e.Event != EventStopFailure {
+		return false, fmt.Errorf("callmeter store %s: recover a turn end of event %q, want Stop or StopFailure", t.path, e.Event)
+	}
+	if e.SessionID == nil || *e.SessionID == "" {
+		return false, fmt.Errorf("callmeter store %s: recover a %s without a session_id", t.path, e.Event)
+	}
+	session := *e.SessionID
+	var promptID sql.NullString
+	var asked int64
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT prompt_id, ts FROM events WHERE session_id = ? AND event = 'UserPromptSubmit'
+		AND COALESCE(agent_id, '') = '' ORDER BY ts DESC LIMIT 1`, session).Scan(&promptID, &asked)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("callmeter store %s: read the latest prompt of session %q: %w", t.path, session, err)
+	}
+	if e.Event == EventStop && e.TS != 0 && e.TS < asked {
+		return false, nil
+	}
+	var answered int
+	if err := t.tx.QueryRowContext(ctx, `SELECT `+turnEnded("?1", "?2"), session, asked).Scan(&answered); err != nil {
+		return false, fmt.Errorf("callmeter store %s: read the turn end of session %q: %w", t.path, session, err)
+	}
+	if answered != 0 {
+		return false, nil
+	}
+	sum := sha256.Sum256([]byte("callmeter recovered " + e.Event + "\x00" + session + "\x00" + strconv.FormatInt(asked, 10)))
+	e.EventID = hex.EncodeToString(sum[:])
+	e.PromptID = nil
+	if promptID.Valid {
+		e.PromptID = &promptID.String
+	}
+	e.TS = max(e.TS, asked)
+	e.Detail = Ptr(RecoveredDetail)
+	inserted, err := t.InsertEvent(ctx, e)
+	if err != nil {
+		return false, fmt.Errorf("recover the %s of session %q: %w", e.Event, session, err)
+	}
+	if e.Event == EventStop {
+		turn := Turn{EventID: e.EventID, Event: EventStop, SessionID: e.SessionID, PromptID: e.PromptID, TS: e.TS, SeatDir: e.SeatDir}
+		if _, err := t.InsertTurn(ctx, turn); err != nil {
+			return false, fmt.Errorf("recover the Stop turn of session %q: %w", session, err)
+		}
+	}
+	return inserted, nil
+}
+
+// DropRecoveredTurnEnd deletes the session's rebuilt turn ends (RecoverTurnEnd)
+// of the prompt a Stop or StopFailure hook delivered at hookTS answers, a
+// rebuilt Stop's turns row with its events row: the hook's own row replaces
+// them. Only a rebuilt main-chat row (RecoveredDetail) at or after that prompt
+// goes.
+func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS int64) error {
+	rebuilt := `SELECT event_id FROM events WHERE event IN ('Stop', 'StopFailure') AND session_id = ?1
+		AND COALESCE(agent_id, '') = '' AND detail = ?2 AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events
+			WHERE session_id = ?1 AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' AND ts <= ?3)`
+	for _, statement := range []string{
+		`DELETE FROM turns WHERE event_id IN (` + rebuilt + `)`,
+		`DELETE FROM events WHERE event_id IN (` + rebuilt + `)`,
+	} {
+		if _, err := t.tx.ExecContext(ctx, statement, sessionID, RecoveredDetail, hookTS); err != nil {
+			return fmt.Errorf("callmeter store %s: drop the rebuilt turn end of session %q: %w", t.path, sessionID, err)
+		}
+	}
+	return nil
+}
+
 // InsertTurn writes turn under the clash rule of insertEarliest and reports
 // whether a row went in or was replaced.
 func (t *Tx) InsertTurn(ctx context.Context, turn Turn) (bool, error) {
@@ -136,6 +283,113 @@ func (t *Tx) InsertTurn(ctx context.Context, turn Turn) (bool, error) {
 		return false, fmt.Errorf("callmeter store %s: insert turn %q without a hook_event_name", t.path, turn.EventID)
 	}
 	return t.insertEarliest(ctx, "turns", "event_id", turn.EventID, turn.TS, turn.columns())
+}
+
+// RedeliveryWindow: the same payload bytes delivered within it of a stored
+// occurrence are that occurrence redelivered; further apart they are a new
+// occurrence (an agent woken twice in one prompt sends identical
+// SubagentStart bytes seconds apart).
+const RedeliveryWindow int64 = 1000 // ms
+
+// occurrence is one stored events row of a payload's bytes: its event_id (the
+// plain hash or hash:ts) and its ts, the earliest delivery's.
+type occurrence struct {
+	id string
+	ts int64
+}
+
+// ClaimOccurrence is the event_id a delivery of the payload hashed hash, at
+// ts, is stored under, with the stored rows of those bytes moved to their
+// final ids first. The delivery is a redelivery of the stored occurrence
+// whose ts is nearest, the earlier on a tie, when that lies within
+// RedeliveryWindow, else a new occurrence. The earliest occurrence of the
+// bytes holds the plain hash and every other one hash:{its earliest ts}, so
+// the ids follow from the deliveries' ts, never from their arrival order: a
+// delivery that makes an occurrence the earliest takes the plain hash from the
+// one holding it, and an earlier redelivery moves its occurrence to its own
+// ts. A move renames the occurrence's events and turns rows and the
+// agent_turns edges naming them; the insert that follows replaces the moved
+// row whole when this delivery is the earlier. A row an earlier build stored
+// under the plain hash is an occurrence like any other. A payload carries no
+// timestamp, so the hash alone cannot tell a redelivery from the same bytes
+// sent again later. Every turns row shares its run's events row id, so the
+// events rows list the occurrences. Call it after the transaction's first
+// write, which holds the lock.
+func (t *Tx) ClaimOccurrence(ctx context.Context, hash string, ts int64) (string, error) {
+	if hash == "" {
+		return "", fmt.Errorf("callmeter store %s: resolve an occurrence without a payload hash", t.path)
+	}
+	// A range on the primary key: ':' is 0x3A and ';' 0x3B, so it holds the plain
+	// hash and every hash:ts id, and nothing else.
+	rows, err := t.tx.QueryContext(ctx, "SELECT event_id, ts FROM events WHERE event_id >= ?1 AND event_id < ?1 || ';'", hash)
+	if err != nil {
+		return "", fmt.Errorf("callmeter store %s: list the occurrences of payload %q: %w", t.path, hash, err)
+	}
+	var stored []occurrence
+	for rows.Next() {
+		var o occurrence
+		if err := rows.Scan(&o.id, &o.ts); err != nil {
+			return "", errors.Join(fmt.Errorf("callmeter store %s: scan an occurrence of payload %q: %w", t.path, hash, err), rows.Close())
+		}
+		stored = append(stored, o)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return "", fmt.Errorf("callmeter store %s: read the occurrences of payload %q: %w", t.path, hash, err)
+	}
+
+	own, ownDistance := -1, int64(0)
+	for i, o := range stored {
+		distance := max(o.ts-ts, ts-o.ts)
+		if distance > RedeliveryWindow {
+			continue
+		}
+		if own < 0 || distance < ownDistance || (distance == ownDistance && o.ts < stored[own].ts) {
+			own, ownDistance = i, distance
+		}
+	}
+	ownTS := ts
+	if own >= 0 {
+		ownTS = min(ownTS, stored[own].ts)
+	}
+	earliest := true
+	for i, o := range stored {
+		if i != own && o.ts < ownTS {
+			earliest = false
+		}
+	}
+	id := hash + ":" + strconv.FormatInt(ownTS, 10)
+	if earliest {
+		id = hash
+		for i, o := range stored {
+			if i != own && o.id == hash {
+				if err := t.moveOccurrence(ctx, hash, hash+":"+strconv.FormatInt(o.ts, 10)); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	if own >= 0 && stored[own].id != id {
+		if err := t.moveOccurrence(ctx, stored[own].id, id); err != nil {
+			return "", err
+		}
+	}
+	return id, nil
+}
+
+// moveOccurrence renames the occurrence stored under from to to: its events
+// and turns rows, and the agent_turns edges that name it.
+func (t *Tx) moveOccurrence(ctx context.Context, from, to string) error {
+	for _, statement := range []string{
+		"UPDATE events SET event_id = ?2 WHERE event_id = ?1",
+		"UPDATE turns SET event_id = ?2 WHERE event_id = ?1",
+		"UPDATE agent_turns SET start_event_id = ?2 WHERE start_event_id = ?1",
+		"UPDATE agent_turns SET stop_event_id = ?2 WHERE stop_event_id = ?1",
+	} {
+		if _, err := t.tx.ExecContext(ctx, statement, from, to); err != nil {
+			return fmt.Errorf("callmeter store %s: move occurrence %q to %q (%s): %w", t.path, from, to, statement, err)
+		}
+	}
+	return nil
 }
 
 // insertEarliest writes one row keyed by its payload's hash, so the same bytes
@@ -283,7 +537,9 @@ func nullID(id string) sql.NullString { return sql.NullString{String: id, Valid:
 // the stored one when the stored one is NULL, when the run's ts is below the
 // stored {column}_ts, or when the ts are equal and the run's value is smaller.
 // The result is the same whatever order the runs land in, and a column the run
-// does not carry is left to the others. The derived columns are
+// does not carry is left to the others. A run dated after the stored last_ts
+// clears an EndReasonNever mark, since the quiet session runs again; a late
+// run, dated at or before it, leaves the mark. The derived columns are
 // RefreshSession's.
 func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 	if s.SessionID == "" {
@@ -304,6 +560,8 @@ func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 		mergeSet("sessions", "first_ts", KeepMin, nil),
 		mergeSet("sessions", "last_ts", KeepMax, nil),
 		mergeSet("sessions", "engine", Overwrite, nil),
+		fmt.Sprintf("end_reason = CASE WHEN sessions.end_reason = '%s' AND excluded.last_ts > sessions.last_ts "+
+			"THEN NULL ELSE sessions.end_reason END", EndReasonNever),
 	}
 	for _, c := range own {
 		names = append(names, c.name, c.name+"_ts")

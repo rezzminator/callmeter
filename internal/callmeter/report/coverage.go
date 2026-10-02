@@ -1,8 +1,14 @@
 package report
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,10 +28,27 @@ var walkLimit = 200_000
 
 // transcript is one main transcript file a seat holds.
 type transcript struct {
-	seat, project, session string
+	seat, project, session string // seat: every seat reaching the file, ", "-joined
+	path                   string
 	modified               time.Time
 	bytes                  int64
 }
+
+// The classes of an unrecorded transcript, read from the transcript itself, in
+// the order their notes print.
+const (
+	whyBeforeStore = "before-store" // its first entry predates the store's earliest record
+	whyNoTurn      = "no-turn"      // no timestamped entry: no turn ran
+	whyNoHook      = "no-hook"      // no stop-hook summary names callmeter's hook
+	whyHookRan     = "hook-ran"     // callmeter's hook ran, yet the store holds nothing
+	whyUnreadable  = "unreadable"   // the transcript could not be read; a note names it
+)
+
+var whyOrder = []string{whyBeforeStore, whyNoTurn, whyNoHook, whyHookRan, whyUnreadable}
+
+// hookBinary ends the command plugins/callmeter/hooks/hooks.json registers for
+// every hook event, Stop included, as a stop-hook summary names it.
+const hookBinary = "/libexec/callmeter"
 
 // Coverage lists the transcripts modified in the window that the store never
 // recorded, latest first: one row per transcript under
@@ -34,13 +57,16 @@ type transcript struct {
 // not a chat of its own and is never listed. A session is recorded when the
 // sessions or calls table holds its id. The first note counts the transcripts
 // modified, recorded and unrecorded; a projects directory that cannot be read
-// is a note naming it, never a smaller count. Only --since, --session and
-// --limit narrow it: --project and --agent-type name no column of a transcript.
+// is a note naming it, never a smaller count. Each row names when the transcript
+// started (its first timestamped entry) and why the store holds nothing of it
+// (WHY, see classify), and one note per class counts them. Only --since,
+// --session and --limit narrow it: --project and --agent-type name no column of
+// a transcript.
 func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
 		Title:  f.title("coverage", n),
-		Header: []string{"SEAT", "PROJECT", "SESSION", "MODIFIED", "BYTES"},
+		Header: []string{"SEAT", "PROJECT", "SESSION", "STARTED", "MODIFIED", "BYTES", "WHY"},
 	}
 	since := f.Since
 	if since.IsZero() {
@@ -54,9 +80,17 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 	if err != nil {
 		return nil, err
 	}
+	earliest, err := earliestRecord(ctx, store)
+	if err != nil {
+		return nil, err
+	}
 	walk := &walker{since: since, session: f.Session, remaining: walkLimit}
-	for _, seat := range seats {
-		if err := walk.seat(ctx, seat); err != nil {
+	dirs, err := projectsDirs(seats)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range dirs {
+		if err := walk.seat(ctx, dir); err != nil {
 			return nil, err
 		}
 	}
@@ -65,6 +99,21 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		if !recorded[found.session] {
 			missing = append(missing, found)
 		}
+	}
+	started := make(map[string]time.Time, len(missing))
+	why := make(map[string]string, len(missing))
+	counts := map[string]int{}
+	var readNotes []string
+	for _, found := range missing {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("callmeter report: classify transcripts: %w", err)
+		}
+		at, class, err := classify(found.path, earliest)
+		if err != nil {
+			readNotes = append(readNotes, fmt.Sprintf("cannot read %s: %v", found.path, err))
+		}
+		started[found.path], why[found.path] = at, class
+		counts[class]++
 	}
 	sort.Slice(missing, func(i, j int) bool {
 		a, b := missing[i], missing[j]
@@ -84,14 +133,24 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 	if f.OwnSeat == "" {
 		notes = append(notes, "the report's own Claude Code config dir could not be resolved (no CLAUDE_CONFIG_DIR or HOME)")
 	}
+	for _, class := range whyOrder {
+		if counts[class] > 0 {
+			notes = append(notes, fmt.Sprintf("%d %s: %s", counts[class], class, whyMeaning(class, earliest)))
+		}
+	}
 	notes = append(notes, walk.notes...)
+	notes = append(notes, readNotes...)
 	if len(missing) > f.limit() {
 		missing = missing[:f.limit()]
 	}
 	for _, found := range missing {
+		start := "-"
+		if at := started[found.path]; !at.IsZero() {
+			start = at.UTC().Format("2006-01-02 15:04")
+		}
 		t.Rows = append(t.Rows, []string{
-			found.seat, found.project, found.session,
-			found.modified.UTC().Format("2006-01-02 15:04"), itoa(found.bytes),
+			found.seat, found.project, found.session, start,
+			found.modified.UTC().Format("2006-01-02 15:04"), itoa(found.bytes), why[found.path],
 		})
 	}
 	rest, err := topicNotes(ctx, store, f, n, false)
@@ -130,6 +189,39 @@ func coverageSeats(ctx context.Context, store *callmeter.Store, own string) ([]s
 	return seats, nil
 }
 
+// projectsDir is one real projects directory and every seat that reaches it.
+type projectsDir struct {
+	path  string // the directory to read, symlinks resolved
+	shown string // the first seat's {seat}/projects, what a note names
+	seats []string
+}
+
+// projectsDirs resolves each seat's projects directory through symlinks and
+// groups the seats that share one, so a transcript is walked once and names every
+// seat. A directory that does not exist stays a group of its own under its
+// unresolved path (the walk notes it); any other resolve error is returned.
+func projectsDirs(seats []string) ([]projectsDir, error) {
+	var dirs []projectsDir
+	index := map[string]int{}
+	for _, seat := range seats {
+		projects := filepath.Join(seat, "projects")
+		real, err := filepath.EvalSymlinks(projects)
+		if errors.Is(err, fs.ErrNotExist) {
+			real = projects
+		} else if err != nil {
+			return nil, fmt.Errorf("callmeter report: resolve %s: %w", projects, err)
+		}
+		i, ok := index[real]
+		if !ok {
+			i = len(dirs)
+			index[real] = i
+			dirs = append(dirs, projectsDir{path: real, shown: projects})
+		}
+		dirs[i].seats = append(dirs[i].seats, seat)
+	}
+	return dirs, nil
+}
+
 // recordedSessions is every session id the sessions or calls table holds.
 func recordedSessions(ctx context.Context, store *callmeter.Store) (map[string]bool, error) {
 	recorded := map[string]bool{}
@@ -150,6 +242,113 @@ func recordedSessions(ctx context.Context, store *callmeter.Store) (map[string]b
 	return recorded, nil
 }
 
+// earliestRecord is the first moment the store holds: the earliest session start
+// or call, zero for an empty store.
+func earliestRecord(ctx context.Context, store *callmeter.Store) (time.Time, error) {
+	var earliest time.Time
+	err := query(ctx, store, "earliest record",
+		`SELECT MIN(t) FROM (SELECT MIN(first_ts) AS t FROM sessions UNION ALL SELECT MIN(ts) FROM calls)`, nil,
+		func(r rowSource) error {
+			var ms sql.NullInt64
+			if err := r.Scan(&ms); err != nil {
+				return err
+			}
+			if ms.Valid {
+				earliest = time.UnixMilli(ms.Int64)
+			}
+			return nil
+		})
+	if err != nil {
+		return time.Time{}, err
+	}
+	return earliest, nil
+}
+
+// whyMeaning is the note text of one class.
+func whyMeaning(class string, earliest time.Time) string {
+	switch class {
+	case whyBeforeStore:
+		return "started before the store's earliest record, " + earliest.UTC().Format("2006-01-02 15:04") + " UTC"
+	case whyNoTurn:
+		return "no timestamped entry, so no turn ran"
+	case whyNoHook:
+		return "no stop-hook summary names callmeter's hook: the plugin was not loaded for that launch, or no turn ended"
+	case whyHookRan:
+		return "callmeter's hook ran, yet this store holds no record: another CALLMETER_HOME, or a capture gap"
+	default:
+		return "the transcript could not be read"
+	}
+}
+
+// classify reads a transcript line by line for when it started (its first
+// top-level timestamp) and why the store holds none of it: before-store when
+// it started before earliest (a non-zero store's first record), no-turn when no
+// entry carries a timestamp, hook-ran once a stop_hook_summary names callmeter's
+// hook, no-hook otherwise. Only the timestamp and the hook commands are decoded;
+// nothing of the transcript leaves this function but the time and the class. A
+// read failure is the unreadable class and the error.
+func classify(path string, earliest time.Time) (time.Time, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return time.Time{}, whyUnreadable, err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 64<<10)
+	var started time.Time
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if started.IsZero() {
+				var head struct {
+					Timestamp string `json:"timestamp"`
+				}
+				if json.Unmarshal(line, &head) == nil && head.Timestamp != "" {
+					if at, err := time.Parse(time.RFC3339Nano, head.Timestamp); err == nil {
+						started = at
+						if !earliest.IsZero() && at.Before(earliest) {
+							return started, whyBeforeStore, nil
+						}
+					}
+				}
+			}
+			if bytes.Contains(line, []byte(`"stop_hook_summary"`)) && namesCallmeterHook(line) {
+				return started, whyHookRan, nil
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return started, whyUnreadable, readErr
+		}
+	}
+	if started.IsZero() {
+		return started, whyNoTurn, nil
+	}
+	return started, whyNoHook, nil
+}
+
+// namesCallmeterHook reports whether a stop_hook_summary line lists a command
+// whose program is callmeter's hook binary.
+func namesCallmeterHook(line []byte) bool {
+	var summary struct {
+		Subtype   string `json:"subtype"`
+		HookInfos []struct {
+			Command string `json:"command"`
+		} `json:"hookInfos"`
+	}
+	if json.Unmarshal(line, &summary) != nil || summary.Subtype != "stop_hook_summary" {
+		return false
+	}
+	for _, info := range summary.HookInfos {
+		fields := strings.Fields(info.Command)
+		if len(fields) > 0 && strings.HasSuffix(strings.Trim(fields[0], `"'`), hookBinary) {
+			return true
+		}
+	}
+	return false
+}
+
 // walker walks the main transcripts of seats under one entry budget.
 type walker struct {
 	since     time.Time
@@ -160,11 +359,13 @@ type walker struct {
 	stopped   bool
 }
 
-// seat reads {seat}/projects/*/*.jsonl. A directory that cannot be read is a
+// seat reads {projects}/*/*.jsonl of one real projects directory, naming d.shown
+// in its notes. A directory that cannot be read is a
 // note; running out of the entry budget stops every later read with one note.
-func (s *walker) seat(ctx context.Context, seat string) error {
-	projects := filepath.Join(seat, "projects")
-	entries, ok := s.read(projects)
+func (s *walker) seat(ctx context.Context, d projectsDir) error {
+	projects := d.path
+	seat := strings.Join(d.seats, ", ")
+	entries, ok := s.readNamed(projects, d.shown)
 	if !ok {
 		return nil
 	}
@@ -172,7 +373,7 @@ func (s *walker) seat(ctx context.Context, seat string) error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("callmeter report: scan transcripts under %s: %w", projects, err)
 		}
-		if !s.spend(projects) {
+		if !s.spend(d.shown) {
 			return nil
 		}
 		dir := filepath.Join(projects, entry.Name())
@@ -193,7 +394,7 @@ func (s *walker) seat(ctx context.Context, seat string) error {
 			continue
 		}
 		for _, file := range files {
-			if !s.spend(projects) {
+			if !s.spend(d.shown) {
 				return nil
 			}
 			if !strings.HasSuffix(file.Name(), ".jsonl") {
@@ -216,7 +417,7 @@ func (s *walker) seat(ctx context.Context, seat string) error {
 				continue
 			}
 			s.found = append(s.found, transcript{
-				seat: seat, project: entry.Name(), session: session, modified: info.ModTime(), bytes: info.Size(),
+				seat: seat, project: entry.Name(), session: session, path: path, modified: info.ModTime(), bytes: info.Size(),
 			})
 		}
 	}
@@ -224,13 +425,16 @@ func (s *walker) seat(ctx context.Context, seat string) error {
 }
 
 // read lists dir, spending one budget unit per entry; a failure is a note.
-func (s *walker) read(dir string) ([]fs.DirEntry, bool) {
+func (s *walker) read(dir string) ([]fs.DirEntry, bool) { return s.readNamed(dir, dir) }
+
+// readNamed is read with the note naming shown, not the resolved dir.
+func (s *walker) readNamed(dir, shown string) ([]fs.DirEntry, bool) {
 	if s.stopped {
 		return nil, false
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		s.notes = append(s.notes, fmt.Sprintf("cannot read %s: %v", dir, err))
+		s.notes = append(s.notes, fmt.Sprintf("cannot read %s: %s", shown, strings.ReplaceAll(err.Error(), dir, shown)))
 		return nil, false
 	}
 	return entries, true

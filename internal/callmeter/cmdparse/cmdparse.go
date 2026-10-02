@@ -30,6 +30,11 @@ const (
 	StatusError             = "error"
 	StatusUnparsed          = "unparsed"
 	StatusPythonUnavailable = "python-unavailable"
+	// StatusScriptBody is a part whose program reads its script from a
+	// heredoc in another language (python3 - <<EOF): the shell parsed it, and
+	// the script itself is left unparsed (its body is not stored, or holds an
+	// unresolved expansion), never a parse fault.
+	StatusScriptBody = "script-body"
 )
 
 // File actions.
@@ -48,7 +53,16 @@ const (
 // Version names this parser's behaviour. A stored call parsed by an older
 // version is parsed again, so a fix reaches every call still in the window;
 // raise it with every change to the parts or files a command parses to.
-const Version = 3
+const Version = 7
+
+// errHeredocNotStored is the cause on a Python part whose heredoc has no body:
+// the store cuts every heredoc body out of a command.
+const errHeredocNotStored = "heredoc body not stored"
+
+// errCodeUnresolved is the cause on a Python part whose -c script or
+// here-string holds an expansion the parse cannot know (`$(…)`, a variable
+// set from one): the snippet the interpreter ran is unknown.
+const errCodeUnresolved = "code holds an unresolved expansion"
 
 // The bounds of one call's parse, so no command can hold a report run. A
 // command over maxCommandBytes is one unparsed part, never handed to the
@@ -222,13 +236,28 @@ func parseCall(call Call) *callParser {
 		p.parts = []Part{{Seq: 0, Lang: LangSh, Status: StatusUnparsed, Error: fmt.Sprintf("command over %d bytes", maxCommandBytes)}}
 		return p
 	}
-	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(call.Command), "")
+	file, err := parseShell(call.Command, true)
 	if err != nil {
 		p.parts = []Part{{Seq: 0, Lang: LangSh, Status: StatusError, Error: err.Error()}}
 		return p
 	}
 	syntax.Walk(file, p.visit)
 	return p
+}
+
+// parseShell parses src as bash and, only when that fails and zsh may have run
+// it, as zsh: the Bash tool runs the user's $SHELL (zsh on macOS), so a command
+// valid only in zsh ran as written. When neither parses, bash's error stands.
+// Nothing records which dialect parsed: a part has no column for it.
+func parseShell(src string, zsh bool) (*syntax.File, error) {
+	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(src), "")
+	if err == nil || !zsh {
+		return file, err
+	}
+	if zfile, zerr := syntax.NewParser(syntax.Variant(syntax.LangZsh)).Parse(strings.NewReader(src), ""); zerr == nil {
+		return zfile, nil
+	}
+	return nil, err
 }
 
 func (p *callParser) visit(node syntax.Node) bool {
@@ -441,6 +470,14 @@ func (p *callParser) callStmt(cmd *syntax.CallExpr, redirs []*syntax.Redirect) {
 		p.innerShell(program, rest, script, lead, redirs)
 		return
 	}
+	if i, ok := shellFile(base, rest); ok {
+		// `bash run.sh` runs run.sh as `./run.sh` does: an exec, the words
+		// after it its arguments.
+		files := slices.Concat(lead, p.plain(rest[:i], ActionUnknown), p.plain(rest[i:i+1], ActionExec),
+			p.plain(rest[i+1:], ActionUnknown), p.redirFiles(redirs))
+		p.emit(Part{Lang: LangSh, Program: program, Args: texts, Files: files})
+		return
+	}
 	switch {
 	case base == "cd":
 		p.emit(Part{Lang: LangSh, Program: program, Args: texts, Files: append(lead, p.redirFiles(redirs)...)})
@@ -500,12 +537,13 @@ var pythonName = regexp.MustCompile(`^python(3(\.\d+)?)?$`)
 func (p *callParser) python(program string, rest []arg, lead []FileRef, redirs []*syntax.Redirect) {
 	texts := argTexts(rest)
 	files := slices.Concat(lead, p.redirFiles(redirs))
-	code, haveCode, stdinCode := "", false, true
+	code, haveCode, known, stdinCode, heredoc := "", false, true, true, false
 	for i := 0; i < len(rest); i++ {
 		a := rest[i].text
 		switch {
 		case a == "-c" && i+1 < len(rest):
-			code, haveCode = p.text(rest[i+1].word), true
+			code, known = p.text(rest[i+1].word)
+			haveCode = true
 		case a == "-m":
 			stdinCode = false
 		case a == "-W" || a == "-X":
@@ -526,14 +564,32 @@ func (p *callParser) python(program string, rest []arg, lead []FileRef, redirs [
 		for _, r := range redirs {
 			switch r.Op {
 			case syntax.Hdoc, syntax.DashHdoc:
-				code, haveCode = p.text(r.Hdoc), r.Hdoc != nil
+				if r.Hdoc == nil {
+					// The store keeps no heredoc body (RedactHeredocs): the
+					// snippet is unknown, never an empty one.
+					p.emit(Part{Lang: LangPython, Program: program, Args: texts, Files: files, Status: StatusScriptBody, Error: errHeredocNotStored})
+					return
+				}
+				code, known = p.text(r.Hdoc)
+				haveCode, heredoc = true, true
 			case syntax.WordHdoc:
-				code, haveCode = p.text(r.Word), true
+				code, known = p.text(r.Word)
+				haveCode, heredoc = true, false
 			}
 		}
 	}
 	if !haveCode {
 		p.emit(Part{Lang: LangSh, Program: program, Args: texts, Files: files})
+		return
+	}
+	if !known {
+		// A stored unquoted body keeps only its command substitutions
+		// (RedactHeredocs), so its script is unknown too.
+		status := StatusUnparsed
+		if heredoc {
+			status = StatusScriptBody
+		}
+		p.emit(Part{Lang: LangPython, Program: program, Args: texts, Files: files, Status: status, Error: errCodeUnresolved})
 		return
 	}
 	id := fmt.Sprintf("%s#%d", p.call.ID, len(p.parts))

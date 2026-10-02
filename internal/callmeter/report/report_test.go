@@ -465,3 +465,152 @@ func TestUnrecordedCallsNoteCountsOnlyCallsMissingFromTheStore(t *testing.T) {
 		t.Errorf("report does not count one lost call:\n%s", out)
 	}
 }
+
+// TestAbsentSizesAreClassifiedNeverCountedAsZero: a call with no delivered
+// size is unknown, not 0 bytes. The note says why each has none, by what the
+// store holds: a start alone (interrupted, killed or still running), a result
+// whose batch never landed, an internal agent's call; a denied or rejected
+// call is named as that whether or not its size is known.
+func TestAbsentSizesAreClassifiedNeverCountedAsZero(t *testing.T) {
+	store := openStore(t)
+	call := func(id, agent, agentType string, failed *bool, outcome string, delivered *int64) callmeter.Call {
+		c := callmeter.Call{
+			ToolUseID: id, SessionID: callmeter.Ptr("s1"), TS: callmeter.Ptr(ms(time.Hour)),
+			Tool: callmeter.Ptr("Bash"), Failed: failed, BytesDelivered: delivered,
+		}
+		if agent != "" {
+			c.AgentID = callmeter.Ptr(agent)
+		}
+		if agentType != "" {
+			c.AgentType = callmeter.Ptr(agentType)
+		}
+		if outcome != "" {
+			c.Error = callmeter.Ptr(outcome)
+		}
+		return c
+	}
+	seed(t, store, call("t_started", "a1", "gitter", nil, "", nil))
+	seed(t, store, call("t_unbatched", "", "", callmeter.Ptr(false), "", nil))
+	seed(t, store, call("t_internal", "a2", "", nil, "", nil))
+	seed(t, store, call("t_hookdeny", "", "", callmeter.Ptr(true), callmeter.OutcomeDeniedByHook, callmeter.Ptr(int64(38))))
+	seed(t, store, call("t_rejected", "a1", "gitter", callmeter.Ptr(true), callmeter.OutcomeRejectedByUser,
+		callmeter.Ptr(int64(80))))
+	seed(t, store, call("t_refused", "", "", callmeter.Ptr(true), callmeter.OutcomeRefused, nil))
+	table, err := Files(context.Background(), store, Filter{}, func(string) (string, error) { return "chat", nil })
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	out := render(t, table)
+	for _, want := range []string{
+		"1 calls have no delivered size (only PreToolUse recorded: interrupted, killed or still running): size unknown, not counted",
+		"1 calls have no delivered size (ran, no PostToolBatch recorded: its turn was abandoned or is still running): size unknown, not counted",
+		"1 calls have no delivered size (a Claude Code internal agent's, no transcript): size unknown, not counted",
+		"1 calls " + callmeter.OutcomeDeniedByHook,
+		"1 calls " + callmeter.OutcomeRejectedByUser,
+		"1 calls " + callmeter.OutcomeRefused + ": size unknown, not counted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "counted as 0 bytes") {
+		t.Errorf("report counts an absent size as 0 bytes:\n%s", out)
+	}
+}
+
+// TestBatchOnlyCallsAreNamedByTool: a tool a function-hooks plugin answers in
+// its own tool.call hook fires no PostToolUse, so its row holds only the
+// PostToolBatch size: it is named by its tool, never left a silent row with
+// its real size, duration and outcome missing.
+func TestBatchOnlyCallsAreNamedByTool(t *testing.T) {
+	store := openStore(t)
+	seed(t, store, callmeter.Call{
+		ToolUseID: "t_served", SessionID: callmeter.Ptr("s1"), TS: callmeter.Ptr(ms(time.Hour)),
+		Tool: callmeter.Ptr("mcp__demo-plugin__probe"), BytesDelivered: callmeter.Ptr(int64(95)),
+	})
+	seed(t, store, callmeter.Call{
+		ToolUseID: "t_ran", SessionID: callmeter.Ptr("s1"), TS: callmeter.Ptr(ms(time.Hour)), Tool: callmeter.Ptr("Bash"),
+		Failed: callmeter.Ptr(false), BytesReal: callmeter.Ptr(int64(5)), BytesDelivered: callmeter.Ptr(int64(5)),
+	})
+	// A row from before the batch set a ts: named with its class in any
+	// window, never as a call stored before every hook set a ts.
+	seed(t, store, callmeter.Call{
+		ToolUseID: "t_served_legacy", SessionID: callmeter.Ptr("s1"),
+		Tool: callmeter.Ptr("mcp__demo-plugin__probe"), BytesDelivered: callmeter.Ptr(int64(95)),
+	})
+	for _, f := range []Filter{{}, {Since: time.UnixMilli(ms(2 * time.Hour))}} {
+		table, err := Files(context.Background(), store, f, func(string) (string, error) { return "chat", nil })
+		if err != nil {
+			t.Fatalf("Files: %v", err)
+		}
+		out := render(t, table)
+		want := "note: 2 calls of mcp__demo-plugin__probe have only their PostToolBatch size"
+		if !strings.Contains(out, want) || strings.Contains(out, "calls of Bash") || strings.Contains(out, "have no ts") {
+			t.Errorf("since %v: report does not name the batch-only calls by their tool alone (want %q):\n%s", f.Since, want, out)
+		}
+	}
+}
+
+// TestPendingNotesNameTheirReason: a request still pending was one count with
+// no reason, so a request stuck forever read the same as one a live chat is
+// about to resolve. Each is now named by why its size is unread: its
+// transcript faulted, its session ended first, or its session has not ended.
+func TestPendingNotesNameTheirReason(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	pending := func(id, session string) {
+		seedRequest(t, store, callmeter.Request{
+			RequestID: callmeter.ProvisionalKey(id), SessionID: callmeter.Ptr(session), TS: callmeter.Ptr(ms(2 * time.Hour)),
+			Pending: callmeter.Ptr(true),
+		})
+		seed(t, store, callmeter.Call{
+			ToolUseID: id, SessionID: callmeter.Ptr(session), TS: callmeter.Ptr(ms(2 * time.Hour)),
+			Tool: callmeter.Ptr("Bash"), RequestID: callmeter.Ptr(callmeter.ProvisionalKey(id)),
+		})
+	}
+	pending("t_live", "s_live")
+	pending("t_ended", "s_ended")
+	pending("t_ended2", "s_ended")
+	pending("t_unread", "s_unread")
+	seedEvent(t, store, callmeter.Event{EventID: "e1", Event: callmeter.EventSessionEnd, TS: ms(time.Hour), SessionID: callmeter.Ptr("s_ended")})
+	if err := store.AddFault(ctx, callmeter.Fault{
+		TS: ms(2 * time.Hour), SessionID: "s_unread", ToolUseID: "t_unread", Stage: callmeter.StageTranscript,
+		Error: "read transcript: no such file",
+	}); err != nil {
+		t.Fatalf("AddFault: %v", err)
+	}
+	table, err := Files(ctx, store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	out := render(t, table)
+	for _, want := range []string{
+		"1 requests still pending (its transcript could not be read): context size unknown, not counted",
+		"2 requests still pending (its session ended before the transcript held it): context size unknown, not counted",
+		"1 requests still pending (its session has not ended: still live, or killed before its Stop): context size unknown, not counted",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestCallsWithoutTSAreNamedInANote: a call row with no ts (written before
+// every hook set one) falls outside any --since window, so a note names how
+// many there are, windowed or not, never a silent drop.
+func TestCallsWithoutTSAreNamedInANote(t *testing.T) {
+	store := openStore(t)
+	seed(t, store, callmeter.Call{ToolUseID: "t_nots", SessionID: callmeter.Ptr("s1"), Tool: callmeter.Ptr("Bash")})
+	seed(t, store, callmeter.Call{
+		ToolUseID: "t_ts", SessionID: callmeter.Ptr("s1"), TS: callmeter.Ptr(ms(time.Hour)), Tool: callmeter.Ptr("Bash"),
+	})
+	for _, f := range []Filter{{}, {Since: time.UnixMilli(ms(2 * time.Hour))}} {
+		table, err := Faults(context.Background(), store, f, func(string) (string, error) { return "chat", nil })
+		if err != nil {
+			t.Fatalf("Faults: %v", err)
+		}
+		if out := render(t, table); !strings.Contains(out, "note: 1 calls have no ts") {
+			t.Errorf("since %v: report does not name the call without a ts:\n%s", f.Since, out)
+		}
+	}
+}

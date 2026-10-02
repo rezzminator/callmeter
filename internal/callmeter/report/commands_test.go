@@ -3,6 +3,7 @@ package report
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,5 +124,40 @@ func TestCommandsShapesParsedEchoAndPrintf(t *testing.T) {
 	want := []string{"sed ; grep x", "echo $X ; git status", "cat a ; printf %s ; git log"}
 	if !reflect.DeepEqual(shapes, want) {
 		t.Errorf("shapes = %q\nwant     %q", shapes, want)
+	}
+}
+
+// A Bash call with no delivered size is counted as a call but left out of
+// BYTES, P50 and P95, never folded in as 0 bytes, and a note names it.
+func TestCommandsLeavesUnknownSizesOutOfStatistics(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	dir := workDir(t)
+	for i, size := range []int64{3000, 5000, 7000} {
+		seed(t, store, bash("k"+string(rune('1'+i)), "s", "A", ms(time.Duration(5-i)*time.Hour), dir, "go test ./...", size))
+	}
+	unknown := bash("u1", "s", "A", ms(time.Hour), dir, "go test ./x/...", 0)
+	unknown.BytesDelivered = nil
+	seed(t, store, unknown)
+	alone := bash("u2", "s", "A", ms(time.Hour/2), dir, "go vet ./...", 0)
+	alone.BytesDelivered = nil
+	seed(t, store, alone)
+	if _, err := EnsureParsed(ctx, store, "", nil); err != nil {
+		t.Fatalf("EnsureParsed: %v", err)
+	}
+	table, err := Commands(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Commands: %v", err)
+	}
+	want := [][]string{
+		{"go test", "4", "15000", "5000", "7000", "0", "0", "0"},
+		{"go vet", "1", UnknownSize, UnknownSize, UnknownSize, "0", "0", "0"},
+	}
+	if !reflect.DeepEqual(table.Rows, want) {
+		t.Errorf("rows = %v\nwant   %v (header %v)", table.Rows, want, table.Header)
+	}
+	note := "note: 2 Bash calls have no delivered size: size unknown, not counted in BYTES, P50 or P95"
+	if out := render(t, table); !strings.Contains(out, note) {
+		t.Errorf("report lacks %q:\n%s", note, out)
 	}
 }

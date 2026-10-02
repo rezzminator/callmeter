@@ -108,3 +108,37 @@ func TestPythonWriteOfAMissingFile(t *testing.T) {
 		missing(cwd, "X/f", ActionWrite, ""),
 	})
 }
+
+// A -c script or here-string holding an expansion the parse cannot know (a
+// variable set from a command substitution) is an unknown snippet: one
+// unparsed Python part keeping its program, never a Python syntax error on
+// the unexpanded `$X`. A variable with a literal value is substituted and
+// the snippet parses as before.
+func TestPythonCodeWithAnUnresolvedExpansionIsUnparsed(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t)
+	for _, command := range []string{
+		`N=$(date +%s) && V=$(python3 -c "print($N/1000)") && echo "$V"`,
+		`a=$(date +%s); b=$(date +%s); python3 -c "print(int(($b-$a)*1000))"`,
+		`python3 -c "print($(date +%s)+1)"`,
+		`python3 <<< "print($UNSET_VAR)"`,
+	} {
+		parts := parseOne(t, cwd, command, nil)
+		var py []Part
+		for _, part := range parts {
+			if part.Status == StatusError {
+				t.Errorf("%s: error part %+v", command, part)
+			}
+			if part.Lang == LangPython {
+				py = append(py, part)
+			}
+		}
+		if len(py) != 1 || py[0].Program != "python3" || py[0].Status != StatusUnparsed || py[0].Error != errCodeUnresolved {
+			t.Errorf("%s: python parts = %+v, want one unparsed python3 part (%s)", command, py, errCodeUnresolved)
+		}
+	}
+	parts := parseOne(t, cwd, `N=5 && python3 -c "print($N/1000)"`, nil)
+	if len(parts) != 1 || parts[0].Lang != LangPython || parts[0].Status != StatusOK {
+		t.Fatalf("parts = %+v, want one ok python part for a literal variable", parts)
+	}
+}

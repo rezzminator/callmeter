@@ -106,3 +106,40 @@ func TestSequencesEmptyWindow(t *testing.T) {
 		t.Errorf("empty report = %q, want heading plus %q", lines, EmptyLine)
 	}
 }
+
+// A run occurrence holding a call with no delivered size is left out of BYTES
+// and MEAN BYTES, never summed as 0 bytes; a run with no known occurrence
+// shows its bytes as unknown, and a note names the calls.
+func TestSequencesLeavesUnknownSizesOutOfBytes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	for _, agent := range []string{"A", "B", "C"} {
+		seed(t, store, stepCall(agent+"1", agent, "Grep", "", 30, 100))
+	}
+	seed(t, store, stepCall("A2", "A", "Read", "/A/x.go", 29, 1000))
+	seed(t, store, stepCall("B2", "B", "Read", "/B/x.go", 29, 1000))
+	unknown := stepCall("C2", "C", "Read", "/C/x.go", 29, 0)
+	unknown.BytesDelivered = nil
+	seed(t, store, unknown)
+	for _, agent := range []string{"D", "E"} {
+		glob := stepCall(agent+"1", agent, "Glob", "", 30, 0)
+		glob.BytesDelivered = nil
+		seed(t, store, glob)
+		seed(t, store, stepCall(agent+"2", agent, "Write", "/"+agent+"/y.go", 29, 50))
+	}
+	table, err := Sequences(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Sequences: %v", err)
+	}
+	want := [][]string{
+		{"Grep → Read new", "3", "3", "2200", "1100"},
+		{"Glob → Write new", "2", "2", UnknownSize, UnknownSize},
+	}
+	if !reflect.DeepEqual(table.Rows, want) {
+		t.Errorf("rows = %v\nwant   %v (header %v)", table.Rows, want, table.Header)
+	}
+	note := "note: 3 calls have no delivered size: size unknown, not counted in BYTES or MEAN BYTES; a run occurrence holding one is left out whole"
+	if out := render(t, table); !strings.Contains(out, note) {
+		t.Errorf("report lacks %q:\n%s", note, out)
+	}
+}

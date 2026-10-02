@@ -509,6 +509,190 @@ func TestLifecycleSessionStart(t *testing.T) {
 	})
 }
 
+// TestLifecycleSessionEndRecoversALostStopFailure: live, Claude Code SIGTERMed
+// the sync StopFailure hook 20-30 ms after spawning it as a headless process
+// tore down, sometimes before its first instruction, leaving no row and no
+// fault; when SessionEnd runs, its transcript ends on the API-error entry.
+// SessionEnd writes the failed turn's StopFailure from that entry, once
+// however often it runs; the hook's own row, landing before or after, is the
+// one row left.
+func TestLifecycleSessionEndRecoversALostStopFailure(t *testing.T) {
+	const refusal = "invented-refusal-words"
+	base := time.Date(2026, 9, 23, 1, 30, 0, 0, time.UTC).UnixMilli()
+	setup := func(t *testing.T) (lab *callmeterLab, prompt, end func(at int64), failure func(at int64)) {
+		lab = newCallmeterLab(t)
+		main := lab.transcript(cmSessionA)
+		lab.write(main, []byte(`{"type":"user","timestamp":"2026-09-23T01:30:00.000Z","message":{"role":"user","content":"invented prompt"}}`+"\n"+
+			`{"type":"assistant","timestamp":"2026-09-23T01:30:02.500Z","isApiErrorMessage":true,"error":"model_not_found",`+
+			`"message":{"id":"msg-demo-err","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence",`+
+			`"content":[{"type":"text","text":"`+refusal+`"}]}}`+"\n"))
+		prompt = func(at int64) {
+			lab.feedAt(at, hookPayload(t, "UserPromptSubmit", map[string]any{"prompt": "invented prompt", "prompt_id": "p-lost"}))
+		}
+		end = func(at int64) {
+			lab.feedAt(at, hookPayload(t, "SessionEnd", map[string]any{"reason": "other", "transcript_path": main}))
+		}
+		failure = func(at int64) {
+			lab.feedAt(at, hookPayload(t, "StopFailure", map[string]any{"error": "model_not_found", "prompt_id": "p-lost"}))
+		}
+		lab.feedAt(base-1000, hookPayload(t, "SessionStart", map[string]any{"source": "startup"}))
+		return lab, prompt, end, failure
+	}
+	failures := func(lab *callmeterLab) int {
+		return lab.count("SELECT count(*) FROM events WHERE event = 'StopFailure'")
+	}
+	t.Run("hook lost", func(t *testing.T) {
+		lab, prompt, end, _ := setup(t)
+		prompt(base)
+		end(base + 3000)
+		if n := failures(lab); n != 1 {
+			t.Fatalf("StopFailure rows = %d, want 1 recovered from the transcript", n)
+		}
+		row := lab.event("StopFailure")
+		expect(t, "StopFailure", row, map[string]any{
+			"error_type": "model_not_found", "detail": callmeter.RecoveredDetail, "prompt_id": "p-lost", "ts": base + 2500,
+		})
+		end(base + 5000)
+		if n := failures(lab); n != 1 {
+			t.Errorf("StopFailure rows = %d after a second SessionEnd, want still 1", n)
+		}
+		if strings.Contains(lab.storeText(), refusal) {
+			t.Errorf("the store holds the API error's message text")
+		}
+		if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+			t.Errorf("faults = %d, want 0", n)
+		}
+		if n := lab.count("SELECT count(*) FROM events WHERE event = 'Stop'") + lab.count("SELECT count(*) FROM turns WHERE event = 'Stop'"); n != 0 {
+			t.Errorf("Stop rows = %d, want none: the turn ended on an API error", n)
+		}
+	})
+	t.Run("hook lands after the recovery", func(t *testing.T) {
+		lab, prompt, end, failure := setup(t)
+		prompt(base)
+		end(base + 3000)
+		failure(base + 2600)
+		if n := failures(lab); n != 1 {
+			t.Fatalf("StopFailure rows = %d, want the hook's alone", n)
+		}
+		row := lab.event("StopFailure")
+		if row["detail"] == callmeter.RecoveredDetail {
+			t.Errorf("detail = %s, want the hook's own row, not the recovered one", row["detail"])
+		}
+		expect(t, "StopFailure", row, map[string]any{"error_type": "model_not_found", "ts": base + 2600})
+	})
+	t.Run("hook lands before SessionEnd", func(t *testing.T) {
+		lab, prompt, end, failure := setup(t)
+		prompt(base)
+		failure(base + 2600)
+		end(base + 3000)
+		if n := failures(lab); n != 1 {
+			t.Fatalf("StopFailure rows = %d, want the hook's alone", n)
+		}
+		if row := lab.event("StopFailure"); row["detail"] == callmeter.RecoveredDetail {
+			t.Errorf("detail = %s, want the hook's own row, not the recovered one", row["detail"])
+		}
+	})
+}
+
+// TestLifecycleSessionEndRecoversALostStop: live, a headless `claude -p`
+// exit cancelled the async Stop hook (a `Stop: terminated by SIGTERM` fault)
+// after the turn's answer was on disk; when SessionEnd runs, it
+// rebuilds the Stop, its events row and its turns row, under RecoveredDetail,
+// once however often it runs; the hook's own Stop, landing before or after, is
+// the one left; a turn whose answer is not on disk gets none.
+func TestLifecycleSessionEndRecoversALostStop(t *testing.T) {
+	const answer = "invented-answer-words"
+	base := time.Date(2026, 10, 2, 0, 27, 13, 0, time.UTC).UnixMilli()
+	const (
+		promptLine = `{"type":"user","timestamp":"2026-10-02T00:27:13.000Z","message":{"role":"user","content":"invented prompt"}}`
+		toolLine   = `{"type":"assistant","timestamp":"2026-10-02T00:27:15.000Z","message":{"id":"msg-demo-tool","model":"claude-demo",` +
+			`"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_demo","name":"Bash","input":{}}]}}`
+		answerLine = `{"type":"assistant","timestamp":"2026-10-02T00:27:20.600Z","message":{"id":"msg-demo-ok","model":"claude-demo",` +
+			`"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"` + answer + `"}]}}`
+	)
+	setup := func(t *testing.T, lines ...string) (lab *callmeterLab, end, stop func(at int64)) {
+		lab = newCallmeterLab(t)
+		main := lab.transcript(cmSessionA)
+		lab.write(main, []byte(strings.Join(lines, "\n")+"\n"))
+		lab.feedAt(base-1000, hookPayload(t, "SessionStart", map[string]any{"source": "startup"}))
+		lab.feedAt(base, hookPayload(t, "UserPromptSubmit", map[string]any{"prompt": "invented prompt", "prompt_id": "p-lost"}))
+		end = func(at int64) {
+			lab.feedAt(at, hookPayload(t, "SessionEnd", map[string]any{"reason": "other", "transcript_path": main}))
+		}
+		stop = func(at int64) {
+			lab.feedAt(at, hookPayload(t, "Stop", map[string]any{
+				"prompt_id": "p-lost", "last_assistant_message": answer, "transcript_path": main,
+			}))
+		}
+		return lab, end, stop
+	}
+	// stops is the main chat's Stop events and turns rows, and how many turns
+	// rows share no events row's id.
+	stops := func(lab *callmeterLab) (events, turns, orphans int) {
+		return lab.count("SELECT count(*) FROM events WHERE event = 'Stop'"),
+			lab.count("SELECT count(*) FROM turns WHERE event = 'Stop'"),
+			lab.count("SELECT count(*) FROM turns t WHERE t.event = 'Stop' AND NOT EXISTS (SELECT 1 FROM events e WHERE e.event_id = t.event_id)")
+	}
+	t.Run("hook lost", func(t *testing.T) {
+		lab, end, _ := setup(t, promptLine, toolLine, answerLine)
+		end(base + 7700)
+		if e, tu, o := stops(lab); e != 1 || tu != 1 || o != 0 {
+			t.Fatalf("Stop rows = %d events, %d turns, %d orphan turns; want 1, 1, 0 rebuilt from the transcript", e, tu, o)
+		}
+		expect(t, "Stop event", lab.event("Stop"), map[string]any{
+			"detail": callmeter.RecoveredDetail, "prompt_id": "p-lost", "ts": base + 7600, "agent_id": nil,
+		})
+		expect(t, "Stop turn", lab.row("SELECT * FROM turns WHERE event = 'Stop'"), map[string]any{
+			"prompt_id": "p-lost", "ts": base + 7600, "agent_id": nil, "last_assistant_message_bytes": nil,
+		})
+		end(base + 9000)
+		if e, tu, _ := stops(lab); e != 1 || tu != 1 {
+			t.Errorf("Stop rows = %d events, %d turns after a second SessionEnd, want still 1 and 1", e, tu)
+		}
+		if n := lab.count("SELECT count(*) FROM events WHERE event = 'StopFailure'"); n != 0 {
+			t.Errorf("StopFailure rows = %d, want 0: the turn ended on an answer", n)
+		}
+		if strings.Contains(lab.storeText(), answer) {
+			t.Errorf("the store holds the answer's text")
+		}
+		if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+			t.Errorf("faults = %d, want 0", n)
+		}
+	})
+	t.Run("hook lands after the recovery", func(t *testing.T) {
+		lab, end, stop := setup(t, promptLine, toolLine, answerLine)
+		end(base + 7700)
+		stop(base + 7650)
+		if e, tu, o := stops(lab); e != 1 || tu != 1 || o != 0 {
+			t.Fatalf("Stop rows = %d events, %d turns, %d orphan turns; want the hook's alone", e, tu, o)
+		}
+		if row := lab.event("Stop"); row["detail"] == callmeter.RecoveredDetail {
+			t.Errorf("detail = %s, want the hook's own row, not the rebuilt one", row["detail"])
+		}
+		expect(t, "Stop turn", lab.row("SELECT * FROM turns WHERE event = 'Stop'"), map[string]any{
+			"ts": base + 7650, "last_assistant_message_bytes": len(answer),
+		})
+	})
+	t.Run("hook lands before SessionEnd", func(t *testing.T) {
+		lab, end, stop := setup(t, promptLine, toolLine, answerLine)
+		stop(base + 7650)
+		end(base + 7700)
+		if e, tu, _ := stops(lab); e != 1 || tu != 1 {
+			t.Fatalf("Stop rows = %d events, %d turns, want the hook's alone", e, tu)
+		}
+		if row := lab.event("Stop"); row["detail"] == callmeter.RecoveredDetail {
+			t.Errorf("detail = %s, want the hook's own row, not the rebuilt one", row["detail"])
+		}
+	})
+	t.Run("turn still running", func(t *testing.T) {
+		lab, end, _ := setup(t, promptLine, toolLine)
+		end(base + 7700)
+		if e, tu, _ := stops(lab); e != 0 || tu != 0 {
+			t.Errorf("Stop rows = %d events, %d turns, want none: the answer is not on disk", e, tu)
+		}
+	})
+}
+
 func TestLifecycleSessionEnd(t *testing.T) {
 	lab := newCallmeterLab(t)
 	unreadable := filepath.Join(lab.root, "not-a-transcript")
@@ -523,7 +707,7 @@ func TestLifecycleSessionEnd(t *testing.T) {
 	expect(t, "event", lab.event("SessionEnd"), map[string]any{"reason": "other"})
 	expect(t, "session", lab.row("SELECT * FROM sessions"), map[string]any{"end_reason": "other"})
 	if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
-		t.Errorf("faults = %d, want 0: SessionEnd reads no transcript", n)
+		t.Errorf("faults = %d, want 0: a SessionEnd whose transcript path is not a regular file reads nothing and writes no fault", n)
 	}
 }
 
@@ -606,9 +790,11 @@ func TestLifecycleDuplicateDelivery(t *testing.T) {
 	stop := lifecyclePayloads(t, "x")["Stop"]
 	lab.feed(post, stop)
 	before := lab.call("toolu_dup")
-	lab.clock.Advance(time.Minute)
+	// Redeliveries within the window: the same bytes seconds apart are another
+	// occurrence (TestLifecycleRewokenAgentIsTwoOccurrences).
+	lab.clock.Advance(500 * time.Millisecond)
 	lab.feed(stop, stop)
-	lab.clock.Advance(-time.Minute)
+	lab.clock.Advance(-500 * time.Millisecond)
 	lab.feed(post)
 	if n := lab.count("SELECT count(*) FROM events"); n != 1 {
 		t.Errorf("events = %d, want 1", n)
@@ -620,6 +806,41 @@ func TestLifecycleDuplicateDelivery(t *testing.T) {
 	for column, value := range before {
 		if after[column] != value {
 			t.Errorf("calls.%s = %q after the duplicate, want %q", column, after[column], value)
+		}
+	}
+}
+
+// TestLifecycleRewokenAgentIsTwoOccurrences: an agent woken twice in one prompt
+// sends identical SubagentStart bytes seconds apart, and each wake is its own
+// events row and agent turn with its start; the same bytes redelivered within
+// a second are the first wake's row.
+func TestLifecycleRewokenAgentIsTwoOccurrences(t *testing.T) {
+	lab := newCallmeterLab(t)
+	const agent = "arewake01"
+	transcript := filepath.Join(lab.root, "agent-"+agent+".jsonl")
+	lab.write(transcript, []byte(requestEntry("msg_rewake", "toolu_rewake", "claude-haiku-4-5", "end_turn", flatUsage)))
+	fields := map[string]any{
+		"agent_id": agent, "agent_type": "Explore", "prompt_id": "p-rewake", "agent_transcript_path": transcript,
+	}
+	start := lab.rewrite(hookPayload(t, "SubagentStart", fields))
+	stop := lab.rewrite(hookPayload(t, "SubagentStop", fields))
+	base := time.Date(2026, 9, 23, 1, 30, 0, 0, time.UTC).UnixMilli()
+	lab.feedAt(base, start)
+	lab.feedAt(base+300, start) // a redelivery of the first wake
+	lab.feedAt(base+5000, stop)
+	lab.feedAt(base+10000, start) // the same bytes, woken again
+	lab.feedAt(base+15000, stop)
+	for query, want := range map[string]int{
+		"SELECT count(*) FROM events WHERE event = 'SubagentStart' AND agent_id = '" + agent + "'":                              2,
+		"SELECT count(*) FROM events WHERE event = 'SubagentStop' AND agent_id = '" + agent + "'":                               2,
+		"SELECT count(*) FROM turns WHERE event = 'SubagentStop' AND agent_id = '" + agent + "'":                                2,
+		"SELECT count(*) FROM agent_turns WHERE agent_id = '" + agent + "'":                                                     2,
+		"SELECT count(*) FROM agent_turns WHERE agent_id = '" + agent + "' AND seq = 1 AND started = " + fmt.Sprint(base):       1,
+		"SELECT count(*) FROM agent_turns WHERE agent_id = '" + agent + "' AND seq = 2 AND started = " + fmt.Sprint(base+10000): 1,
+		"SELECT count(*) FROM agent_turns WHERE agent_id = '" + agent + "' AND (started IS NULL OR stopped IS NULL)":            0,
+	} {
+		if n := lab.count(query); n != want {
+			t.Errorf("%s = %d, want %d", query, n, want)
 		}
 	}
 }
@@ -812,7 +1033,7 @@ func TestLifecycleUnregisteredEvent(t *testing.T) {
 	lab := newCallmeterLab(t)
 	lab.feed(hookPayload(t, "MessageDisplay", map[string]any{"message": "x"}))
 	expect(t, "fault", lab.row("SELECT * FROM faults"), map[string]any{
-		"stage": callmeter.StagePayload, "error": `event "MessageDisplay" is not one callmeter records`,
+		"stage": callmeter.StagePayload, "error": `event (name not stored, 14 bytes) is not one callmeter records`,
 	})
 	for _, table := range []string{"events", "turns", "sessions", "calls", "agents"} {
 		if n := lab.count("SELECT count(*) FROM " + table); n != 0 {
@@ -847,5 +1068,90 @@ func TestLifecycleExitAndStdout(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Errorf("stdout = %q, want empty", out)
+	}
+}
+
+// The plugin's hooks.json runs a hook synchronously only where Claude Code
+// would otherwise lose it: SessionStart may download the binary, and a
+// headless run's exit cancels an async SessionEnd or StopFailure still running
+// (a refused turn's StopFailure lands milliseconds before the SessionEnd).
+// Every other event stays async, so no call or turn waits on a hook.
+func TestHooksJSONSyncOnlyWhereAnExitWouldCancel(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugins", "callmeter", "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read hooks.json: %v", err)
+	}
+	var file struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Async   *bool `json:"async"`
+				Timeout *int  `json:"timeout"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatalf("decode hooks.json: %v", err)
+	}
+	syncTimeout := map[string]int{
+		callmeter.EventSessionStart: 60,
+		callmeter.EventSessionEnd:   2,
+		"StopFailure":               2,
+	}
+	for event, groups := range file.Hooks {
+		for _, group := range groups {
+			for _, hook := range group.Hooks {
+				want, sync := syncTimeout[event]
+				switch {
+				case sync && (hook.Async != nil || hook.Timeout == nil || *hook.Timeout != want):
+					t.Errorf("%s: async %v timeout %v, want sync with timeout %d", event, hook.Async, hook.Timeout, want)
+				case !sync && (hook.Async == nil || !*hook.Async || hook.Timeout != nil):
+					t.Errorf("%s: async %v timeout %v, want async with no timeout", event, hook.Async, hook.Timeout)
+				}
+			}
+		}
+	}
+	for event := range syncTimeout {
+		if len(file.Hooks[event]) == 0 {
+			t.Errorf("%s is not registered", event)
+		}
+	}
+}
+
+// TestLifecycleOffListLabelIsSized: a StopFailure error or a SessionEnd reason
+// off its event's label list may be free text: the events row and the
+// session's end_reason hold only its size.
+func TestLifecycleOffListLabelIsSized(t *testing.T) {
+	lab := newCallmeterLab(t)
+	lab.feed(
+		hookPayload(t, "StopFailure", map[string]any{"error": privacySentinel, "prompt_id": "p-1"}),
+		hookPayload(t, "SessionEnd", map[string]any{"reason": privacySentinel}),
+	)
+	sized := fmt.Sprintf("label not stored (%d bytes)", len(privacySentinel))
+	expect(t, "StopFailure", lab.event("StopFailure"), map[string]any{"error_type": sized})
+	expect(t, "SessionEnd", lab.event("SessionEnd"), map[string]any{"reason": sized})
+	expect(t, "session", lab.row("SELECT * FROM sessions"), map[string]any{"end_reason": sized})
+	if strings.Contains(lab.storeText(), privacySentinel) {
+		t.Errorf("a column of the store holds the free text %q", privacySentinel)
+	}
+}
+
+// TestLifecycleEventNameWithoutSessionIsSized: a payload with no session_id is
+// a fault quoting its hook_event_name only when callmeter records that event;
+// any other value may be any text, and the fault states only its size.
+func TestLifecycleEventNameWithoutSessionIsSized(t *testing.T) {
+	for _, tc := range []struct{ event, want string }{
+		{"PostToolUse", `"PostToolUse" payload carries no session_id`},
+		{privacySentinel, fmt.Sprintf("(name not stored, %d bytes) payload carries no session_id", len(privacySentinel))},
+	} {
+		lab := newCallmeterLab(t)
+		payload, err := json.Marshal(map[string]any{"hook_event_name": tc.event})
+		if err != nil {
+			t.Fatalf("encode payload: %v", err)
+		}
+		lab.feed(string(payload))
+		expect(t, "fault", lab.row("SELECT * FROM faults"), map[string]any{"stage": callmeter.StagePayload, "error": tc.want})
+		if tc.event == privacySentinel && strings.Contains(lab.storeText(), privacySentinel) {
+			t.Errorf("a column of the store holds the free text %q", privacySentinel)
+		}
 	}
 }

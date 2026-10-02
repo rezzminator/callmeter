@@ -1,0 +1,150 @@
+package callmeter
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+// RedactCount is how many rows of one column a Redact pass changed.
+type RedactCount struct {
+	Column string
+	Rows   int64
+}
+
+// Redact rewrites the rows already stored the way they are written now, in one
+// transaction that takes the write lock at BEGIN IMMEDIATE: every calls.input
+// through SanitizeInput (a Bash command's heredoc bodies cut out, free text
+// sized), every calls.error through SanitizeError, every events.detail through
+// SanitizeDetail for its event, every faults.error through sanitizeFault. A call whose input changed loses its command_parts rows,
+// which the next report parses again from the redacted input. A row that
+// cannot be rewritten fails the whole pass and changes nothing. Redact is an
+// explicit command, never a migration; a second pass changes nothing. It
+// returns the rows changed per column: calls.input, calls.error,
+// events.detail, faults.error, then the command_parts rows deleted.
+func (s *Store) Redact(ctx context.Context) (counts []RedactCount, err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("callmeter store %s: take a connection to redact: %w", s.path, err)
+	}
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: release the redact connection: %w", s.path, closeErr))
+		}
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return nil, fmt.Errorf("callmeter store %s: begin redact: %w", s.path, err)
+	}
+	counts, err = redactRows(ctx, conn)
+	if err == nil {
+		if _, err = conn.ExecContext(ctx, "COMMIT"); err == nil {
+			return counts, nil
+		}
+		err = fmt.Errorf("commit: %w", err)
+	}
+	err = fmt.Errorf("callmeter store %s: redact: %w", s.path, err)
+	if _, rollbackErr := conn.ExecContext(ctx, "ROLLBACK"); rollbackErr != nil {
+		err = errors.Join(err, fmt.Errorf("callmeter store %s: roll back redact: %w", s.path, rollbackErr))
+	}
+	return nil, err
+}
+
+// redactRows is Redact's work inside its transaction.
+func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
+	inputs, err := rewriteColumn(ctx, conn, "calls.input",
+		`SELECT tool_use_id, COALESCE(tool, ''), input FROM calls WHERE input IS NOT NULL`,
+		`UPDATE calls SET input = ? WHERE tool_use_id = ?`,
+		func(tool, input string) (string, error) { return SanitizeInput(tool, json.RawMessage(input)) })
+	if err != nil {
+		return nil, err
+	}
+	var parts int64
+	for _, id := range inputs {
+		result, err := conn.ExecContext(ctx, `DELETE FROM command_parts WHERE tool_use_id = ?`, id)
+		if err != nil {
+			return nil, fmt.Errorf("delete the command_parts of call %v: %w", id, err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("count the command_parts deleted for call %v: %w", id, err)
+		}
+		parts += n
+	}
+	errorRows, err := rewriteColumn(ctx, conn, "calls.error",
+		`SELECT tool_use_id, '', error FROM calls WHERE error IS NOT NULL`,
+		`UPDATE calls SET error = ? WHERE tool_use_id = ?`,
+		func(_, text string) (string, error) { return SanitizeError(text), nil })
+	if err != nil {
+		return nil, err
+	}
+	details, err := rewriteColumn(ctx, conn, "events.detail",
+		`SELECT event_id, COALESCE(event, ''), detail FROM events WHERE detail IS NOT NULL`,
+		`UPDATE events SET detail = ? WHERE event_id = ?`,
+		func(event, detail string) (string, error) {
+			return sanitizeEventDetail(event, json.RawMessage(detail), nil)
+		})
+	if err != nil {
+		return nil, err
+	}
+	faults, err := rewriteColumn(ctx, conn, "faults.error",
+		`SELECT fault_id, COALESCE(stage, ''), error FROM faults WHERE error IS NOT NULL`,
+		`UPDATE faults SET error = ? WHERE fault_id = ?`,
+		func(stage, text string) (string, error) { return sanitizeFault(stage, text), nil })
+	if err != nil {
+		return nil, err
+	}
+	return []RedactCount{
+		{Column: "calls.input", Rows: int64(len(inputs))},
+		{Column: "calls.error", Rows: int64(len(errorRows))},
+		{Column: "events.detail", Rows: int64(len(details))},
+		{Column: "faults.error", Rows: int64(len(faults))},
+		{Column: "command_parts", Rows: parts},
+	}, nil
+}
+
+// rewriteColumn reads every (key, aux, value) row selectRows yields, then
+// writes each value rewrite changes back through update (value, key). It
+// returns the keys of the rows it changed.
+func rewriteColumn(
+	ctx context.Context,
+	conn *sql.Conn,
+	column, selectRows, update string,
+	rewrite func(aux, value string) (string, error),
+) ([]any, error) {
+	type row struct {
+		key        any
+		aux, value string
+	}
+	var rows []row
+	result, err := conn.QueryContext(ctx, selectRows)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", column, err)
+	}
+	for result.Next() {
+		var r row
+		if err := result.Scan(&r.key, &r.aux, &r.value); err != nil {
+			return nil, errors.Join(fmt.Errorf("scan %s: %w", column, err), result.Close())
+		}
+		rows = append(rows, r)
+	}
+	if err := errors.Join(result.Err(), result.Close()); err != nil {
+		return nil, fmt.Errorf("read %s: %w", column, err)
+	}
+	var changed []any
+	for _, r := range rows {
+		value, err := rewrite(r.aux, r.value)
+		if err != nil {
+			return nil, fmt.Errorf("%s of row %v: %w", column, r.key, err)
+		}
+		if value == r.value {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, update, value, r.key); err != nil {
+			return nil, fmt.Errorf("write %s of row %v: %w", column, r.key, err)
+		}
+		changed = append(changed, r.key)
+	}
+	return changed, nil
+}

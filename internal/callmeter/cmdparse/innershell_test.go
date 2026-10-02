@@ -243,3 +243,54 @@ func TestInnerShellNestingBound(t *testing.T) {
 		t.Fatalf("level %d part = %+v\nwant %+v", maxShellDepth+1, got, want)
 	}
 }
+
+// A shell given a script file runs it: the script is an exec, the words after
+// it are its arguments, as with `./run.sh`. -c and -s keep their meaning.
+func TestShellScriptFile(t *testing.T) {
+	t.Parallel()
+	type shape struct {
+		program string
+		files   []FileRef
+	}
+	cases := []struct {
+		name    string
+		command string
+		want    func(cwd string) []shape
+	}{
+		{"bash runs a script", `bash run.sh`, func(cwd string) []shape {
+			return []shape{{"bash", []FileRef{ref(cwd, "run.sh", ActionExec, "")}}}
+		}},
+		{"sh runs a script", `sh x.sh`, func(cwd string) []shape {
+			return []shape{{"sh", []FileRef{ref(cwd, "x.sh", ActionExec, "")}}}
+		}},
+		{"zsh runs a script", `zsh x.sh`, func(cwd string) []shape {
+			return []shape{{"zsh", []FileRef{ref(cwd, "x.sh", ActionExec, "")}}}
+		}},
+		{"flags before the script, arguments after it", `bash -o pipefail -x run.sh x`, func(cwd string) []shape {
+			return []shape{{"bash", []FileRef{ref(cwd, "run.sh", ActionExec, ""), ref(cwd, "x", ActionUnknown, "")}}}
+		}},
+		{"bash -c is parsed as shell, never an exec", `bash -c 'cat x'`, func(cwd string) []shape {
+			return []shape{{"bash", nil}, {"cat", []FileRef{ref(cwd, "x", ActionReadWhole, "")}}}
+		}},
+		{"bash -s reads its script from stdin", `bash -s x`, func(cwd string) []shape {
+			return []shape{{"bash", []FileRef{ref(cwd, "x", ActionUnknown, "")}}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cwd := fixture(t, "run.sh", "x.sh", "x")
+			parts := parseOne(t, cwd, tc.command, nil)
+			var got []shape
+			for _, p := range parts {
+				if p.Status != StatusOK {
+					t.Fatalf("part %+v is not ok; parts = %+v", p, parts)
+				}
+				got = append(got, shape{p.Program, p.Files})
+			}
+			if want := tc.want(cwd); !reflect.DeepEqual(got, want) {
+				t.Errorf("parts = %+v, want %+v", got, want)
+			}
+		})
+	}
+}

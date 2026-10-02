@@ -435,21 +435,38 @@ func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]st
 	return notes, nil
 }
 
-// pendingNotes names the requests whose context size is not yet read.
+// pendingNotes names the requests whose context size is not yet read, each
+// by why: its transcript faulted, its session ended before the transcript held
+// it, or its session has not ended (still live, or killed before its Stop).
 func pendingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, error) {
 	var notes []string
 	reqWhere, reqArgs := requestFilter(f)
-	var pending int64
-	if err := store.DB().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM requests r WHERE r.pending = 1 AND "+reqWhere, reqArgs...,
-	).Scan(&pending); err != nil {
-		return nil, fmt.Errorf("callmeter report: count pending requests: %w", err)
-	}
-	if pending > 0 {
-		notes = append(
-			notes,
-			fmt.Sprintf("%d requests still pending (context size not yet read from the transcript)", pending),
-		)
+	args := append([]any{callmeter.StageTranscript, callmeter.PendingPrefix, callmeter.EventSessionEnd}, reqArgs...)
+	err := query(ctx, store, "pending requests",
+		`SELECT CASE
+			WHEN EXISTS (SELECT 1 FROM faults ft WHERE ft.stage = ? AND (
+				ft.tool_use_id IN (SELECT c.tool_use_id FROM calls c WHERE c.request_id = r.request_id)
+				OR ? || ft.tool_use_id = r.request_id))
+				THEN 'its transcript could not be read'
+			WHEN EXISTS (SELECT 1 FROM events e WHERE e.session_id = r.session_id AND e.event = ? AND e.ts >= r.ts)
+				THEN 'its session ended before the transcript held it'
+			ELSE 'its session has not ended: still live, or killed before its Stop'
+		END reason, COUNT(*)
+		FROM requests r WHERE r.pending = 1 AND `+reqWhere+`
+		GROUP BY reason ORDER BY reason`,
+		args,
+		func(row rowSource) error {
+			var reason string
+			var n int64
+			if err := row.Scan(&reason, &n); err != nil {
+				return err
+			}
+			notes = append(notes,
+				fmt.Sprintf("%d requests still pending (%s): context size unknown, not counted", n, reason))
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
 	return notes, nil
 }
@@ -472,9 +489,14 @@ func topicNotes(ctx context.Context, store *callmeter.Store, f Filter, n *names,
 	return append(notes, n.notes()...), nil
 }
 
+// batchOnlyCall is a call only PostToolBatch wrote: a delivered size and none of
+// the outcome a PostToolUse, PostToolUseFailure or a refusal label sets.
+const batchOnlyCall = "(c.bytes_delivered IS NOT NULL AND c.failed IS NULL AND c.error IS NULL)"
+
 // gapNotes names every gap the window holds: calls not recorded, events the
 // binary never delivered, requests still pending, calls with no delivered size,
-// snippets unparsed per status and Bash calls never parsed.
+// calls PostToolBatch alone recorded, snippets unparsed per status and Bash
+// calls never parsed.
 func gapNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, error) {
 	notes, err := recordingNotes(ctx, store, f)
 	if err != nil {
@@ -485,18 +507,85 @@ func gapNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, 
 		return nil, err
 	}
 	notes = append(notes, pending...)
-	where, args := f.where()
-	var undelivered int64
+	// A call stored before every hook set a ts has none, so --since never
+	// reaches it: it is named whether or not the report is windowed. A row
+	// only PostToolBatch wrote is named by its own note below instead.
+	unwindowed := f
+	unwindowed.Since = time.Time{}
+	noTSWhere, noTSArgs := unwindowed.where()
+	var noTS int64
 	if err := store.DB().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM calls c WHERE c.bytes_delivered IS NULL AND "+where, args...,
-	).Scan(&undelivered); err != nil {
-		return nil, fmt.Errorf("callmeter report: count calls without delivered bytes: %w", err)
+		"SELECT COUNT(*) FROM calls c WHERE c.ts IS NULL AND NOT "+batchOnlyCall+" AND "+noTSWhere, noTSArgs...,
+	).Scan(&noTS); err != nil {
+		return nil, fmt.Errorf("callmeter report: count calls without a ts: %w", err)
 	}
-	if undelivered > 0 {
-		notes = append(
-			notes,
-			fmt.Sprintf("%d calls have no delivered size (no PostToolBatch recorded): counted as 0 bytes", undelivered),
-		)
+	if noTS > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d calls have no ts (stored before every hook set one): outside any --since window", noTS))
+	}
+	where, args := f.where()
+	// A call with no delivered size is unknown, never 0 bytes: each is named by
+	// why it has none, and a denied, rejected or refused call by its outcome
+	// label. The IN lists are sized from outcomes, so a label added here needs
+	// no SQL edit.
+	outcomes := []any{callmeter.OutcomeDeniedByHook, callmeter.OutcomeDeniedByPermission,
+		callmeter.OutcomeRejectedByUser, callmeter.OutcomeRefused}
+	in := "(" + strings.TrimSuffix(strings.Repeat("?, ", len(outcomes)), ", ") + ")"
+	err = query(ctx, store, "calls without a delivered size",
+		`SELECT CASE
+			WHEN c.error IN `+in+` THEN c.error
+			WHEN c.failed = 1 THEN 'failed, no PostToolBatch recorded'
+			WHEN c.failed = 0 THEN 'ran, no PostToolBatch recorded: its turn was abandoned or is still running'
+			WHEN c.agent_id IS NOT NULL AND c.agent_type IS NULL THEN 'a Claude Code internal agent''s, no transcript'
+			ELSE 'only PreToolUse recorded: interrupted, killed or still running'
+		END, COALESCE(c.error IN `+in+`, 0), c.bytes_delivered IS NULL, COUNT(*)
+		FROM calls c WHERE (c.bytes_delivered IS NULL OR c.error IN `+in+`) AND `+where+`
+		GROUP BY 1, 2, 3 ORDER BY 2 DESC, 1, 3`,
+		append(append(append(append([]any{}, outcomes...), outcomes...), outcomes...), args...),
+		func(r rowSource) error {
+			var class string
+			var outcome, unknown bool
+			var n int64
+			if err := r.Scan(&class, &outcome, &unknown, &n); err != nil {
+				return err
+			}
+			switch {
+			case outcome && unknown:
+				notes = append(notes, fmt.Sprintf("%d calls %s: size unknown, not counted", n, class))
+			case outcome:
+				notes = append(notes, fmt.Sprintf("%d calls %s", n, class))
+			default:
+				notes = append(notes,
+					fmt.Sprintf("%d calls have no delivered size (%s): size unknown, not counted", n, class))
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	// A call only PostToolBatch wrote has its delivered size and nothing the
+	// PostToolUse would have set: named by its tool, since a tool a
+	// function-hooks plugin answers in its own tool.call hook fires no
+	// PostToolUse on any call (mcp__sub-agent-compact__compact). A row from
+	// before the batch set a ts is named in any window, as the no-ts note's are.
+	err = query(ctx, store, "calls recorded by PostToolBatch alone",
+		`SELECT COALESCE(c.tool, '(none)'), COUNT(*) FROM calls c
+		WHERE `+batchOnlyCall+` AND ((c.ts IS NULL AND `+noTSWhere+`) OR (c.ts IS NOT NULL AND `+where+`))
+		GROUP BY 1 ORDER BY 1`,
+		append(append([]any{}, noTSArgs...), args...),
+		func(r rowSource) error {
+			var tool string
+			var n int64
+			if err := r.Scan(&tool, &n); err != nil {
+				return err
+			}
+			notes = append(notes, fmt.Sprintf("%d calls of %s have only their PostToolBatch size (no PostToolUse "+
+				"or PostToolUseFailure landed: a tool a function-hooks plugin answers itself fires neither, "+
+				"else the hook was cancelled or failed): real size, duration and outcome unknown, not counted", n, tool))
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
 	err = query(ctx, store, "unparsed snippets",
 		`SELECT p.parse_status, COUNT(*) FROM command_parts p JOIN calls c ON c.tool_use_id = p.tool_use_id

@@ -3,7 +3,9 @@ package hookentry
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -162,6 +164,55 @@ func (run *callmeterRun) turnOf() *callmeter.Turn {
 	return turn
 }
 
+// recoverTurnEnd is SessionEnd's recovery of a lost turn-end hook: Claude
+// Code cancels the hooks still running as a headless process exits, the sync
+// StopFailure hook within milliseconds, sometimes before its first
+// instruction, and the async Stop hook mid-run (a `Stop: terminated by
+// SIGTERM` fault), so the turn's row never lands. When SessionEnd runs, the
+// main transcript shows by then how the turn ended: the `<synthetic>` API-error
+// entry a failed turn left, or the answer that ended it. Claude Code may end a
+// session without running SessionEnd at all; report-time recovery rebuilds the
+// turn end of that session once it is quiet (callmeter.RecoverQuiet). When the
+// transcript shows a turn end and the session has no main-chat StopFailure or
+// Stop since its latest prompt,
+// that turn end is written from the entry (RecoverTurnEnd), its detail saying
+// so. The hook's own run drops it when it lands later (DropRecoveredTurnEnd). A
+// transcript that is not there, or not a regular file, is not a fault, as at
+// sweepRequests.
+func (run *callmeterRun) recoverTurnEnd() {
+	p := run.payload
+	if p.TranscriptPath == "" || run.overBudget() {
+		return
+	}
+	if info, err := os.Stat(p.TranscriptPath); errors.Is(err, fs.ErrNotExist) || (err == nil && !info.Mode().IsRegular()) {
+		return // as sweepRequests: no file to read is no fault
+	}
+	end, err := callmeter.TranscriptTurnEnd(p.TranscriptPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		run.fault(callmeter.StageTranscript, "", err)
+		return
+	}
+	if end.Event == "" {
+		return
+	}
+	if end.TS == 0 {
+		end.TS = run.now
+	}
+	e := callmeter.Event{Event: end.Event, SessionID: callmeter.Ptr(p.SessionID), TS: end.TS,
+		ErrorType: presentString(end.ErrorType), SeatDir: run.seat.dir}
+	run.write("", func(tx *callmeter.Tx) error {
+		// The session touch is the transaction's first statement (runRows).
+		if err := tx.TouchSession(run.ctx, run.sessionOf()); err != nil {
+			return err
+		}
+		_, err := tx.RecoverTurnEnd(run.ctx, e)
+		return err
+	})
+}
+
 // sanitizedList is a payload list as stored; absent or null is NULL, and one
 // that does not sanitize is a payload fault and NULL.
 func (run *callmeterRun) sanitizedList(name string, raw json.RawMessage) *string {
@@ -207,11 +258,41 @@ func effortOf(raw json.RawMessage, getenv paths.Getenv) *string {
 	return presentString(getenv("CLAUDE_EFFORT"))
 }
 
-// runRows writes the rows this run owns beside its event's own: the events
-// and turns rows, the agent's turns rebuilt from its events, and the session.
-// Every write is idempotent, so each of the run's transactions carries them
-// and the first to commit lands them.
+// runRows writes the rows this run owns beside its event's own: the session
+// touched first, the events and turns rows under one occurrence id, the
+// agent's turns rebuilt from its events, and the session refreshed. The
+// session touch is the transaction's first statement: store transactions are
+// deferred, so a read before the first write fails SQLITE_BUSY under
+// concurrent hooks, and the occurrence is claimed after it. The run's event
+// and turn share the id ClaimOccurrence resolves for their payload's hash at
+// the run's clock, so the same bytes a second apart are one occurrence and
+// seconds apart two, each under an id its deliveries' ts fix whatever order
+// they land in. Every write is idempotent, so each of the run's transactions
+// carries them and the first to commit lands them.
 func (run *callmeterRun) runRows(tx *callmeter.Tx) error {
+	if err := tx.TouchSession(run.ctx, run.sessionOf()); err != nil {
+		return err
+	}
+	if run.endsTurn {
+		// This hook's own turn end, written in the same transaction, replaces
+		// the one SessionEnd or a quiet-session recovery rebuilt from the
+		// transcript when this hook was thought lost (recoverTurnEnd).
+		if err := tx.DropRecoveredTurnEnd(run.ctx, run.payload.SessionID, run.now); err != nil {
+			return err
+		}
+	}
+	if run.event != nil || run.turn != nil {
+		id, err := tx.ClaimOccurrence(run.ctx, run.eventID, run.now)
+		if err != nil {
+			return err
+		}
+		if run.event != nil {
+			run.event.EventID = id
+		}
+		if run.turn != nil {
+			run.turn.EventID = id
+		}
+	}
 	if run.event != nil {
 		if _, err := tx.InsertEvent(run.ctx, *run.event); err != nil {
 			return err
@@ -226,9 +307,6 @@ func (run *callmeterRun) runRows(tx *callmeter.Tx) error {
 		if err := tx.RebuildAgentTurns(run.ctx, run.payload.AgentID); err != nil {
 			return err
 		}
-	}
-	if err := tx.TouchSession(run.ctx, run.sessionOf()); err != nil {
-		return err
 	}
 	if run.refresh {
 		return tx.RefreshSession(run.ctx, run.payload.SessionID)

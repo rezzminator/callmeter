@@ -2,6 +2,8 @@ package report
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +75,34 @@ func TestEventsFiltersNarrowAndLimitCaps(t *testing.T) {
 		}
 		if len(table.Rows) != c.want {
 			t.Errorf("%s rows = %v, want %d", name, rowsOf(table), c.want)
+		}
+	}
+}
+
+// A SessionEnd of a session that never started is counted under its reason
+// like any other, and a note says how many of them end such a session.
+func TestEventsNotesSessionEndsOfSessionsThatNeverStarted(t *testing.T) {
+	store := openStore(t)
+	seedEvents(t, store)
+	seedEvent(t, store, callmeter.Event{
+		EventID: "e9", Event: callmeter.EventSessionEnd, TS: ms(10 * time.Minute), SessionID: callmeter.Ptr("s9"),
+		Reason: callmeter.Ptr("prompt_input_exit"),
+	})
+	ctx := context.Background()
+	table, err := Events(ctx, store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	want := "1 SessionEnd events end a session that never started (no SessionStart, nothing ran; see the sessions topic)"
+	if !slices.Contains(table.Notes, want) {
+		t.Errorf("notes = %q, want %q", table.Notes, want)
+	}
+	if table, err = Events(ctx, store, Filter{Session: "s1"}, chatOf); err != nil {
+		t.Fatalf("Events s1: %v", err)
+	}
+	for _, note := range table.Notes {
+		if strings.Contains(note, "never started") {
+			t.Errorf("s1 notes = %q, want no never-started note outside the filter", table.Notes)
 		}
 	}
 }

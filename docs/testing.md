@@ -35,7 +35,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 - Every package with tests except `e2e/` has a `TestMain` calling `testjail.Run(m)`: `HOME`, `TMPDIR` and `CALLMETER_HOME` point into temp dirs, `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_SESSION_ID` are cleared. Resolving `CALLMETER_HOME` unset under `go test` is an error, never the real home.
 - `e2e/` keeps the real `HOME` and seat (Claude Code needs its login) and sets `CALLMETER_HOME` to a fresh scratch dir under `/tmp/callmeter/e2e/` per run.
 - Tests never touch `~/.local/state/callmeter`.
-- The plugin is never enabled on the host: e2e loads it per session with `--plugin-dir`, nothing else installs it.
+- e2e loads the plugin per session with `--plugin-dir` and `--setting-sources project,local`, so a dev install enabled in a seat's user settings never reaches it; the dev install is the only host install (`CLAUDE.md` § Runtime).
 - One temp root per test; a test leaves nothing outside it.
 
 ## Run commands
@@ -47,31 +47,34 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 - Plugin manifests: `claude plugin validate --strict .` (the marketplace) and `claude plugin validate --strict plugins/callmeter` (the plugin).
 - Release consistency: `scripts/release-check.sh` (the version places agree, the committed `SHA256SUMS` matches a fresh build).
 - e2e: `CALLMETER_E2E=1 go test ./e2e/... -count=1`, the lander only.
+- Reconcile, dev-only and never shipped: `go run ./scripts/reconcile --db {snapshot}/callmeter.db [--since T] [--until T]` compares every session of a store snapshot against its transcripts, parsed on their own, and prints each mismatch by class; an allowlisted or expected one (`parse-script-body`, `parse-python-code-unresolved`, `parse-python-unparsed-pre6` among them) carries its reason. A session whose latest run has no `SessionEnd` event is `session-no-end-hook`: expected only when its `end_reason` is `never` and its main transcript holds no `SessionEnd` hook attachment, unexplained when the transcript holds one or when it has gone an hour quiet unmarked, and PENDING `session-no-end-hook-live` within the hour; one whose `end_reason` is `lost` (its own `SessionEnd` hook ran and was killed or not served, the store's fault naming the session) is the expected `session-end-killed`, with or without that attachment. A `transcript` fault recovery wrote for a turn it could never fill (`agent {agent_id} turn stopped {stopped}: …`, `prompt {prompt_id} Stop {event_id}: …`) is the expected `fault-transcript-unfillable` only when reconcile's own parse finds no request of that agent in the turn's span, or no non-`tool_use` reply of that prompt, at or after the session's `first_ts`; otherwise it is unexplained. A disk session the snapshot never recorded is the expected `session-unrecorded` when a scratch store under `--scratch` (default `/tmp/callmeter`; every `callmeter.db` read read-only, an unreadable one listed on the summary) records it. A call `TaskStop` cut (its error result written within 5 s of a `TaskStop` naming its sub-agent, no assistant line of the agent after it) is the expected `call-no-request`, `call-no-size` and `request-missing`, the request kept out of both token sums, and `agent-tool-uses` when those calls are the whole gap and the agent's last turn is open. An agent whose count trails its transcript while its last turn runs (no `SubagentStop`, no `SessionEnd` since its start, a line within the hour) is PENDING `agent-tool-uses-open`: the count lands at its `SubagentStop`. A message a sub-agent sent the chat (`isMeta`, `origin.kind` `peer`) is a prompt; a turn whose final message keeps a null `stop_reason` counts as a turn; a session with a transcript file written within the hour is `session-no-end-hook-live`, as recovery reads it. `--since` limits which sessions are judged, not which evidence is read: a `binary` fault `unknown: killed by signal` is vouched for by the sessions with an events, calls or requests row in its second widened by 1 s each side, and a neighbour outside the window is compared over its whole history, its mismatches never printed. Exit 0 every mismatch explained, 1 an unexplained one or no session compared, 2 the check could not run.
 
 ## Concurrency
 
 - A test calling `t.Setenv` or `t.Chdir` stays serial; any other test may use `t.Parallel`.
 - Isolation is one temp root per test, never a shared store.
-- The `SubagentStop` settle wait runs on the real clock (up to 3 s); a test fakes only `now`, never the wait.
-  - One exception: a fuzz target zeroes the settle wait through the `agentSettle` seam, because a fuzz target tests input handling, not timing, and a real 3 s settle per `SubagentStop` input starves the engine and would mask a real hang. Every other test keeps the rule.
+- The `SubagentStop` and `Stop` settle waits run on the real clock (up to 3 s, until the transcript holds the answer to the payload's `prompt_id`); a test fakes only `now`, never the wait.
+  - One exception: a fuzz target zeroes the settle wait through the `agentSettle` seam, because a fuzz target tests input handling, not timing, and a real 3 s settle per `SubagentStop` or `Stop` input starves the engine and would mask a real hang. Every other test keeps the rule.
 
 ## Gates and floors
 
-- CI (`.github/workflows/ci.yml`): gofmt, vet, tests, both plugin validates and the leak check.
+- CI (`.github/workflows/ci.yml`): gofmt, vet, tests, both plugin validates and the leak gate.
 - No coverage floor in 0.1.0.
 - Allowed skips, each named: the e2e gate without `CALLMETER_E2E=1`, and corpus cases carrying `known_defect`. Any other skip fails review.
 
 ## Bug classes
 
-- Order dependence: async hooks land in any order and sometimes twice; a store behaviour is tested with its payloads in more than one order and with a duplicate delivery.
-- Absence read as zero: a gap (an unrecorded call, an unparsed snippet, a missed binary run, an unreadable transcript) must show as a note or a fault, never as a smaller number.
-- Privacy: a test that feeds a prompt, message or file content asserts its text appears nowhere in the store, only its `_bytes` count.
+- Order dependence: async hooks land in any order and sometimes twice; a store behaviour is tested with its payloads in more than one order and with a duplicate delivery, within 1 s (one occurrence) and further apart (two).
+- Absence read as zero: a gap (an unrecorded call, a call with only its `PostToolBatch` size, an unknown delivered size, an unparsed snippet, a missed binary run, an unreadable transcript) must show as a note, a fault or `unknown`, never as a smaller number.
+- Privacy: a test that feeds a prompt, message, file content, heredoc body, error text, free tool-input text (a description, a query) or free event string asserts its text appears nowhere in the store, only its `_bytes` count, its size or a label.
 
 ## Tricks and traps
 
 - On macOS `/tmp` is a symlink to `/private/tmp`, and Claude Code reports `cwd` as `/private/tmp/…`; a test comparing paths resolves both sides or uses the jail's own paths.
 - A probe that launches `claude` closes stdin (`</dev/null`) or it hangs.
+- A headless `claude -p` may exit without running `SessionEnd`: e2e `lifecycle` reads the run's debug log (`--debug-file`, a `SessionEnd:{reason} [… callmeter hook]` line) and requires either the `SessionEnd` row and `end_reason`, or a `callmeter report` run with `CALLMETER_QUIET_AFTER=1ms` that settles the session with `end_reason` `never`, its turn end and its calls; it logs which branch it took.
 - A headless `claude -p` cancels running async hooks at exit, so an e2e run's last calls can keep only their `PreToolUse` row; an e2e assertion on a call's result columns names the call it checks, never "every call".
+- `TestProcessConcurrentHooks` stamps every hook with the real clock while the gym transcripts keep their capture time: a SessionEnd committing before its session's prompt rebuilds a Stop dated before that prompt, which the Stop hook's drop rightly keeps as an earlier turn's. Its counts leave rebuilt turn ends out (`hookRows`) and fail on any rebuilt row that artifact does not explain (`strayRebuiltEnds`).
 - `ls` may be aliased on a developer host; scripts call `command ls` or `/bin/ls`.
 - `FuzzHookPayload` switches the engine's coverage minimization off (it sets `test.fuzzminimizetime` to 0 before `f.Fuzz`; a `-fuzzminimizetime` named on the command line wins). The engine hands each input that found new coverage to one worker to shrink for up to 60 s, every attempt a full hook run over a payload of up to tens of KB, and those attempts are not counted as execs: a few at once leave every worker minimizing and the run printing `0/sec` samples, which reads as a stall but is not a hang. The cost: such an input, and a crasher, is kept unminimized, and the Go fuzz cache grows with every run (`go clean -fuzzcache` empties it).
 

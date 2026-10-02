@@ -1,6 +1,9 @@
 package callmeter
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -204,5 +207,254 @@ func TestFindRequestsWidensPastALargeTail(t *testing.T) {
 	}
 	if _, ok := got["toolu_large_absent"]; ok {
 		t.Error("an id the transcript never holds is in the map")
+	}
+}
+
+// TranscriptAPIError reads the error kind of the `<synthetic>` message an API
+// error leaves where a model answer would be, only when it is the
+// transcript's last message; a non-kind error string reads as "unknown", so no
+// message text ever leaves the transcript.
+func TestTranscriptAPIError(t *testing.T) {
+	const (
+		prompt = `{"type":"user","timestamp":"2026-09-23T09:00:00.000Z","message":{"role":"user","content":"invented prompt"}}`
+		answer = `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","message":{"id":"msg-demo-ok","model":"claude-demo","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"invented answer"}]}}`
+		tail   = `{"type":"last-prompt","sessionId":"s-demo"}` + "\n" + `{"type":"cost-state","sessionId":"s-demo"}`
+	)
+	refusal := func(kind string) string {
+		return `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","isApiErrorMessage":true,"error":"` + kind +
+			`","message":{"id":"msg-demo-err","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"invented refusal text"}]}}`
+	}
+	cases := []struct {
+		name, body, want string
+	}{
+		{"refused then bookkeeping", prompt + "\n" + refusal("oauth_org_not_allowed") + "\n" + tail + "\n", "oauth_org_not_allowed"},
+		{"refused, no trailing newline", prompt + "\n" + refusal("rate_limit"), "rate_limit"},
+		{"error not a kind", prompt + "\n" + refusal("Weekly Limit: invented refusal text") + "\n", "unknown"},
+		{"no error field", prompt + "\n" + strings.Replace(refusal("x"), `"error":"x",`, "", 1) + "\n", "unknown"},
+		{"answered", prompt + "\n" + answer + "\n" + tail + "\n", ""},
+		{"refused, then answered", prompt + "\n" + refusal("rate_limit") + "\n" + prompt + "\n" + answer + "\n", ""},
+		{"refused, then a new prompt", prompt + "\n" + refusal("rate_limit") + "\n" + prompt + "\n", ""},
+		{"partial last line", prompt + "\n" + refusal("rate_limit") + "\n" + `{"type":"assist`, "rate_limit"},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "t.jsonl")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write transcript: %v", err)
+			}
+			got, err := TranscriptAPIError(path)
+			if err != nil {
+				t.Fatalf("TranscriptAPIError: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("TranscriptAPIError = %q, want %q", got, c.want)
+			}
+		})
+	}
+	t.Run("refusal before a large tail", func(t *testing.T) {
+		big := `{"type":"attachment","pad":"` + strings.Repeat("x", 2*requestTailWindow) + `"}`
+		path := filepath.Join(t.TempDir(), "t.jsonl")
+		if err := os.WriteFile(path, []byte(prompt+"\n"+refusal("rate_limit")+"\n"+big+"\n"), 0o600); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
+		if got, err := TranscriptAPIError(path); err != nil || got != "rate_limit" {
+			t.Errorf("TranscriptAPIError = %q, %v, want rate_limit", got, err)
+		}
+	})
+	t.Run("malformed line", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "t.jsonl")
+		if err := os.WriteFile(path, []byte(prompt+"\n{bad\n"), 0o600); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
+		if _, err := TranscriptAPIError(path); err == nil || !strings.Contains(err.Error(), path) {
+			t.Errorf("TranscriptAPIError err = %v, want one naming %s", err, path)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		if _, err := TranscriptAPIError(filepath.Join(t.TempDir(), "absent.jsonl")); err == nil {
+			t.Error("TranscriptAPIError on an absent file returned no error")
+		}
+	})
+}
+
+// multiBlockMessage is one model message as Claude Code writes it: one entry
+// per content block, all sharing the id, the usage repeated as it stood when
+// the block was written; only the last entry carries the final output_tokens
+// and stop_reason.
+func multiBlockMessage(id string, toolUseIDs ...string) string {
+	usage := func(output int) string {
+		return fmt.Sprintf(`{"input_tokens":3,"cache_read_input_tokens":40,"cache_creation_input_tokens":5,"output_tokens":%d}`, output)
+	}
+	text := `{"type":"assistant","timestamp":"2026-09-23T01:00:00.000Z","message":{"id":"` + id +
+		`","model":"claude-opus-4-1","stop_reason":null,"content":[{"type":"thinking","thinking":"invented"}],"usage":` + usage(8) + `}}` + "\n"
+	for i, toolUseID := range toolUseIDs {
+		stop, output := `null`, 8
+		if i == len(toolUseIDs)-1 {
+			stop, output = `"tool_use"`, 643
+		}
+		text += fmt.Sprintf(`{"type":"assistant","timestamp":"2026-09-23T01:00:0%d.000Z","message":{"id":"%s","model":"claude-opus-4-1",`+
+			`"stop_reason":%s,"content":[{"type":"tool_use","id":"%s","name":"Bash","input":{}}],"usage":%s}}`+"\n",
+			i+1, id, stop, toolUseID, usage(output))
+		text += `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"` + toolUseID + `","content":"ok"}]}}` + "\n"
+	}
+	return text
+}
+
+// TestFindRequestsTakesTheMessagesFinalEntry: a message of several tool_use
+// blocks is several entries; the request of every one of its calls is the
+// message's final usage and stop reason, never the partial usage of the entry
+// naming the call (the store kept output 8 against 643 and no stop reason).
+func TestFindRequestsTakesTheMessagesFinalEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocks.jsonl")
+	if err := os.WriteFile(path, []byte(multiBlockMessage("msg_blocks", "toolu_first", "toolu_second", "toolu_last")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := FindRequests(path, []string{"toolu_first", "toolu_second"})
+	if err != nil {
+		t.Fatalf("FindRequests: %v", err)
+	}
+	for _, id := range []string{"toolu_first", "toolu_second"} {
+		r := got[id]
+		if r.MessageID != "msg_blocks" || r.OutputTokens != 643 || r.StopReason != "tool_use" || r.ContextTokens != 48 {
+			t.Errorf("request of %s = %+v, want msg_blocks with output 643, stop tool_use, context 48", id, r)
+		}
+	}
+}
+
+// TestReadRequestsReadsEveryRequestAtItsFinalUsage: ReadRequests returns each
+// message once, in order, at its last entry's usage and stop reason, a reply
+// with no tool call included, with the prompt it answered; the synthetic
+// message and a message with no usage are not requests; final follows the last
+// assistant entry.
+func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "main.jsonl")
+	reply := func(stop string, output int) string {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":"2026-09-23T01:00:09.000Z","message":{"id":"msg_reply","model":"claude-opus-4-1",`+
+			`"stop_reason":%s,"content":[{"type":"text","text":"invented reply"}],"usage":{"input_tokens":1,"cache_read_input_tokens":90,`+
+			`"cache_creation_input_tokens":2,"output_tokens":%d}}}`+"\n", stop, output)
+	}
+	transcript := `{"type":"user","promptId":"prompt-invented-1","message":{"role":"user","content":"invented"}}` + "\n" +
+		multiBlockMessage("msg_blocks", "toolu_first", "toolu_last") +
+		`{"type":"assistant","timestamp":"2026-09-23T01:00:08.000Z","message":{"id":"msg_nousage","model":"claude-opus-4-1","content":[]}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-09-23T01:00:08.500Z","message":{"id":"msg_synthetic","model":"<synthetic>",` +
+		`"stop_reason":"stop_sequence","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}` + "\n" +
+		reply(`null`, 4)
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requests, final, err := ReadRequests(path)
+	if err != nil {
+		t.Fatalf("ReadRequests: %v", err)
+	}
+	if final {
+		t.Errorf("final = true before the reply's last entry")
+	}
+	if err := os.WriteFile(path, []byte(transcript+reply(`"end_turn"`, 212)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requests, final, err = ReadRequests(path)
+	if err != nil {
+		t.Fatalf("ReadRequests: %v", err)
+	}
+	if !final {
+		t.Errorf("final = false after an end_turn entry")
+	}
+	want := []TranscriptRequest{
+		{
+			RequestUsage: RequestUsage{
+				MessageID: "msg_blocks", TS: 1790125200000, Model: "claude-opus-4-1", StopReason: "tool_use",
+				InputTokens: 3, CacheReadTokens: 40, CacheCreationTokens: 5, ContextTokens: 48, OutputTokens: 643,
+			},
+			PromptID: "prompt-invented-1", ToolUseIDs: []string{"toolu_first", "toolu_last"},
+		},
+		{
+			RequestUsage: RequestUsage{
+				MessageID: "msg_reply", TS: 1790125209000, Model: "claude-opus-4-1", StopReason: "end_turn",
+				InputTokens: 1, CacheReadTokens: 90, CacheCreationTokens: 2, ContextTokens: 93, OutputTokens: 212,
+			},
+			PromptID: "prompt-invented-1",
+		},
+	}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("ReadRequests = %+v\nwant %+v", requests, want)
+	}
+}
+
+// TestTranscriptTimestampErrorStatesOnlyItsSize: an assistant entry whose
+// timestamp does not parse is an error naming the message id and the
+// timestamp's size, never the value, which may be any text.
+func TestTranscriptTimestampErrorStatesOnlyItsSize(t *testing.T) {
+	const private = "SENTINEL private words"
+	path := filepath.Join(t.TempDir(), "main.jsonl")
+	entry := `{"type":"assistant","timestamp":"` + private + `","message":{"id":"msg_badtime","model":"claude-opus-4-1",` +
+		`"content":[{"type":"tool_use","id":"toolu_badtime","name":"Bash","input":{}}],"usage":{"input_tokens":1,"output_tokens":1}}}` + "\n"
+	if err := os.WriteFile(path, []byte(entry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, findErr := FindRequests(path, []string{"toolu_badtime"})
+	_, _, readErr := ReadRequests(path)
+	want := fmt.Sprintf(`assistant message "msg_badtime": timestamp of %d bytes is not RFC 3339`, len(private))
+	for name, err := range map[string]error{"FindRequests": findErr, "ReadRequests": readErr} {
+		if err == nil {
+			t.Errorf("%s on an unparsable timestamp succeeded", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), private) {
+			t.Errorf("%s error = %q, want it to hold %q and never the timestamp", name, err, want)
+		}
+	}
+}
+
+// TranscriptTurnEnd is how the transcript ends its latest turn and the
+// entry's own timestamp in Unix ms, which a rebuilt turn end is stamped with: a
+// StopFailure for an API-error entry, a Stop for an answer ending the turn,
+// none for a turn still awaiting its answer or interrupted; 0 when there is no
+// turn end or the entry's timestamp is no RFC 3339.
+func TestTranscriptTurnEnd(t *testing.T) {
+	const (
+		prompt  = `{"type":"user","timestamp":"2026-09-23T09:00:00.000Z","message":{"role":"user","content":"invented prompt"}}`
+		answer  = `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","message":{"id":"msg-demo-ok","model":"claude-demo","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"invented answer"}]}}`
+		tool    = `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","message":{"id":"msg-demo-tool","model":"claude-demo","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_demo","name":"Bash","input":{}}]}}`
+		result  = `{"type":"user","timestamp":"2026-09-23T09:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_demo","content":"invented output"}]}}`
+		halted  = `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","message":{"id":"msg-demo-int","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"invented interruption"}]}}`
+		summary = `{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-09-23T09:00:03.000Z"}`
+	)
+	refusal := func(stamp string) string {
+		return `{"type":"assistant",` + stamp + `"isApiErrorMessage":true,"error":"model_not_found",` +
+			`"message":{"id":"msg-demo-err","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"invented refusal text"}]}}`
+	}
+	cases := []struct {
+		name, body, event, kind string
+		ts                      int64
+	}{
+		{"timestamped", prompt + "\n" + refusal(`"timestamp":"2026-09-23T09:00:01.250Z",`) + "\n", EventStopFailure, "model_not_found", 1790154001250},
+		{"no timestamp", prompt + "\n" + refusal("") + "\n", EventStopFailure, "model_not_found", 0},
+		{"unparsable timestamp", prompt + "\n" + refusal(`"timestamp":"yesterday",`) + "\n", EventStopFailure, "model_not_found", 0},
+		{"answered", prompt + "\n" + answer + "\n", EventStop, "", 1790154001000},
+		{"answered, then bookkeeping", prompt + "\n" + answer + "\n" + summary + "\n", EventStop, "", 1790154001000},
+		{"tool call awaiting its result", prompt + "\n" + tool + "\n", "", "", 0},
+		{"tool result awaiting the answer", prompt + "\n" + tool + "\n" + result + "\n", "", "", 0},
+		{"interrupted", prompt + "\n" + halted + "\n", "", "", 0},
+		{"prompt awaiting the answer", answer + "\n" + prompt + "\n", "", "", 0},
+		{"empty", "", "", "", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "t.jsonl")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write transcript: %v", err)
+			}
+			end, err := TranscriptTurnEnd(path)
+			if err != nil {
+				t.Fatalf("TranscriptTurnEnd: %v", err)
+			}
+			if want := (TurnEnd{Event: c.event, ErrorType: c.kind, TS: c.ts}); end != want {
+				t.Errorf("TranscriptTurnEnd = %+v, want %+v", end, want)
+			}
+		})
+	}
+	if _, err := TranscriptTurnEnd(filepath.Join(t.TempDir(), "absent.jsonl")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("TranscriptTurnEnd on a missing transcript = %v, want an error wrapping fs.ErrNotExist", err)
 	}
 }
