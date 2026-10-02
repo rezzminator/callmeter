@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -342,13 +344,6 @@ func TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows(t *testing.T) {
 
 func TestCallmeterCLIReportJSONWithoutStoreIsAbsentAndCreatesNothing(t *testing.T) {
 	fixture := newLab(t)
-	missed := paths.Missed(filepath.Dir(fixture.storePath))
-	if err := os.MkdirAll(filepath.Dir(missed), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(missed, []byte("1\tStop\tno binary\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	for _, topic := range allTopics {
 		code, stdout, stderr := fixture.run("report", topic, "--json")
 		if code != 0 || stderr != "" {
@@ -363,18 +358,97 @@ func TestCallmeterCLIReportJSONWithoutStoreIsAbsentAndCreatesNothing(t *testing.
 	if _, err := os.Stat(fixture.storePath); !os.IsNotExist(err) {
 		t.Fatalf("report created the store %s (stat err %v)", fixture.storePath, err)
 	}
-	if _, err := os.Stat(missed); err != nil {
-		t.Errorf("a report with no store touched missed.log: %v", err)
+}
+
+// TestCallmeterCLIReportWithoutStoreCountsMissedLines: with no store, the lines
+// of missed.log and of every claim missed.log.ingest-* are lost events, named
+// in one failure note grouped as the store's own note groups them, never
+// "nothing recorded yet"; exit 0, no store created, no file moved or changed.
+// An ingested claim missed.log.done-* is not counted: its lines went into a
+// store. The lines are derived from the wrapper's and the binary's own shapes.
+func TestCallmeterCLIReportWithoutStoreCountsMissedLines(t *testing.T) {
+	const session = "0b5e1c2a-7d4f-4e8b-9a61-3f2c8d9e0a17"
+	for name, tc := range map[string]struct {
+		files map[string]string // file name under CALLMETER_HOME → content
+		note  string
+	}{
+		"missed.log only": {
+			files: map[string]string{
+				"missed.log": "1700000000\tStop\tdownload failed\n" +
+					"1700000001\tPreToolUse\tdownload failed\t" + session + "\n" +
+					"1700000002\tPostToolUse\tstore unavailable: open\t" + session + "\n" +
+					"not a missed line\n",
+			},
+			note: "4 events unrecorded: binary unavailable: 3, hook terminated before recording: 1",
+		},
+		"with a claim": {
+			files: map[string]string{
+				"missed.log": "1700000003\tStop\tlock wait timed out\n",
+				"missed.log.ingest-4242": "1700000000\tSessionStart\tdownload failed\n" +
+					"1700000001\tPostToolUse\tterminated by SIGTERM\t" + session + "\n" +
+					"1700000002\tStop\tpanic\t" + session + "\n",
+				"missed.log.done-40-4241": "1699999999\tStop\tdownload failed\n",
+			},
+			note: "4 events unrecorded: binary unavailable: 2, hook terminated before recording: 2",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newLab(t)
+			home := filepath.Dir(fixture.storePath)
+			if err := os.MkdirAll(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for file, content := range tc.files {
+				if err := os.WriteFile(filepath.Join(home, file), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			code, stdout, stderr := fixture.run("report", "files")
+			want := "callmeter: no store at " + fixture.storePath + "\nnote: " + tc.note + "\n"
+			if code != 0 || stderr != "" || stdout != want || strings.Contains(stdout, "nothing recorded yet") {
+				t.Errorf("report files without a store = %d, want 0\nstdout:\n%s\nwant:\n%s\nstderr:\n%s", code, stdout, want, stderr)
+			}
+			code, stdout, stderr = fixture.run("report", "files", "--json")
+			if code != 0 || stderr != "" || strings.Contains(stdout, "nothing recorded yet") {
+				t.Fatalf("report files --json without a store = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+			got := decodeReport(t, stdout)
+			if got.Store != "absent" || got.Path != fixture.storePath || len(got.Columns) != 0 || len(got.Rows) != 0 ||
+				!slices.Equal(got.Notes, []string{tc.note}) {
+				t.Errorf("report files --json without a store = %+v, want absent and the note %q", got, tc.note)
+			}
+			if _, err := os.Stat(fixture.storePath); !os.IsNotExist(err) {
+				t.Errorf("report created the store %s (stat err %v)", fixture.storePath, err)
+			}
+			entries, err := os.ReadDir(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != len(tc.files) {
+				t.Errorf("CALLMETER_HOME holds %d entries after the report, want the %d staged", len(entries), len(tc.files))
+			}
+			for file, content := range tc.files {
+				if data, err := os.ReadFile(filepath.Join(home, file)); err != nil || string(data) != content {
+					t.Errorf("report changed %s (err %v)", file, err)
+				}
+			}
+		})
 	}
 }
 
 func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	for _, topic := range []string{"prompts", "outcomes", "events", "agents", "tokens"} {
+	for topic, empty := range map[string]string{
+		"prompts":  "callmeter: no prompts in window",
+		"outcomes": report.EmptyLine,
+		"events":   "callmeter: no events in window",
+		"agents":   "callmeter: no sub-agents in window",
+		"tokens":   "callmeter: no requests in window",
+	} {
 		code, stdout, stderr := fixture.run("report", topic)
 		lines := strings.Split(strings.TrimSpace(stdout), "\n")
-		if code != 0 || len(lines) < 2 || lines[1] != report.EmptyLine {
+		if code != 0 || len(lines) < 2 || lines[1] != empty {
 			t.Errorf("report %s over an empty window = %d\nstdout:\n%s\nstderr:\n%s", topic, code, stdout, stderr)
 		}
 		code, stdout, stderr = fixture.run("report", topic, "--json")
@@ -632,6 +706,248 @@ func TestCallmeterCLIReportQuietAfterFromTheEnvironment(t *testing.T) {
 			}
 			if delivered, _ := fixture.callRow(t, "toolu_quiet"); delivered != nil {
 				t.Errorf("call bytes_delivered = %q, want NULL: a usage error reads nothing", *delivered)
+			}
+		})
+	}
+}
+
+// seedStoredCall writes one call row of tool holding input and errText as
+// stored, in the window, failed when errText is set.
+func (fixture lab) seedStoredCall(t *testing.T, id, tool, input, errText string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := callmeter.OpenDB(ctx, fixture.storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	call := callmeter.Call{
+		ToolUseID: id, SessionID: callmeter.Ptr("sess-old"), AgentID: callmeter.Ptr(""),
+		TS: callmeter.Ptr(time.Now().UnixMilli()), Tool: callmeter.Ptr(tool), Cwd: callmeter.Ptr("/work"),
+		Input: callmeter.Ptr(input), Failed: callmeter.Ptr(errText != ""), BytesDelivered: callmeter.Ptr(int64(10)),
+		Source: callmeter.Ptr(callmeter.SourceHook), SeatDir: callmeter.Ptr(fixture.seat),
+	}
+	if errText != "" {
+		call.Error = callmeter.Ptr(errText)
+	}
+	if err := store.UpsertCall(ctx, call, callmeter.Overwrite); err != nil {
+		t.Fatalf("seed call %s: %v", id, err)
+	}
+}
+
+// olderRulesNote is the note every topic prints for n calls Redact would rewrite.
+func olderRulesNote(n int) string {
+	return fmt.Sprintf("%d calls hold text stored under older privacy rules; run `callmeter redact` to scrub them", n)
+}
+
+// TestCallmeterCLIReportNotesCallsStoredUnderOlderPrivacyRules: calls stored
+// before a privacy rule (a text description, a multi-line error, a kept field
+// holding an object, a commit message, an MCP tool's labels, a url's query)
+// are counted by one note on every topic, text and --json, never quoted;
+// `callmeter redact` rewrites every one of them and the note goes.
+func TestCallmeterCLIReportNotesCallsStoredUnderOlderPrivacyRules(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedRead(t, "toolu_ok", "sess-1", "/work/one.md", fixture.seat)
+	secrets := []string{"LISTDESC", "STDERRLINE", "NESTEDSECRET", "COMMITMSG", "MAILTO", "TOKENQ", "FRAGQ"}
+	fixture.seedStoredCall(t, "toolu_desc", "Bash", `{"command":"ls","description":"LISTDESC files"}`, "Exit code 1\nSTDERRLINE")
+	fixture.seedStoredCall(t, "toolu_b4", "Read", `{"file_path":{"x":"NESTEDSECRET"}}`, "")
+	fixture.seedStoredCall(t, "toolu_b5", "Bash", `{"command":"git commit -m \"COMMITMSG\""}`, "")
+	fixture.seedStoredCall(t, "toolu_b7", "mcp__mail__send", `{"to":"MAILTO@example.com","type":"plain"}`, "")
+	fixture.seedStoredCall(t, "toolu_url", "WebFetch", `{"url":"https://x.example/cb?t=TOKENQ#FRAGQ"}`, "")
+	want := olderRulesNote(5)
+	for _, topic := range allTopics {
+		code, stdout, stderr := fixture.run("report", topic)
+		if code != 0 || !strings.Contains(stdout, "note: "+want+"\n") || strings.Count(stdout, "older privacy rules") != 1 {
+			t.Errorf("report %s = %d, want one note %q\nstdout:\n%s\nstderr:\n%s", topic, code, want, stdout, stderr)
+		}
+		code, stdout, _ = fixture.run("report", topic, "--json")
+		if got := decodeReport(t, stdout); code != 0 || !slices.Contains(got.Notes, want) {
+			t.Errorf("report %s --json notes = %q, want %q", topic, got.Notes, want)
+		}
+	}
+	var out, errs bytes.Buffer
+	code := Redact([]string{"redact"}, &out, &errs, fixture.getenv)
+	stdout, stderr := out.String(), errs.String()
+	if code != 0 || !strings.Contains(stdout, "calls.input     5 ") || !strings.Contains(stdout, "calls.error     1 ") {
+		t.Fatalf("redact = %d, want 5 inputs and 1 error rewritten\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, topic := range allTopics {
+		if _, stdout, _ := fixture.run("report", topic); strings.Contains(stdout, "older privacy rules") {
+			t.Errorf("report %s after redact still notes older rows:\n%s", topic, stdout)
+		}
+	}
+	ctx := context.Background()
+	store, err := callmeter.OpenDB(ctx, fixture.storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	inputs := map[string]string{}
+	rows, err := store.DB().QueryContext(ctx, `SELECT tool_use_id, COALESCE(input, '') || '|' || COALESCE(error, '') FROM calls`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id, stored string
+		if err := rows.Scan(&id, &stored); err != nil {
+			t.Fatal(err)
+		}
+		inputs[id] = stored
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatal(err)
+	}
+	wantStored := map[string]string{
+		"toolu_desc": `{"command":"ls","description_bytes":14}|Exit code 1`,
+		"toolu_b4":   `{"file_path_bytes":20}|`,
+		"toolu_b5":   `{"command":"git commit -m '[cut]'","operand_bytes":11}|`,
+		"toolu_b7":   `{"to_bytes":18,"type_bytes":5}|`,
+		"toolu_url":  `{"url":"https://x.example/cb"}|`,
+	}
+	for id, w := range wantStored {
+		if inputs[id] != w {
+			t.Errorf("call %s after redact = %q, want %q", id, inputs[id], w)
+		}
+	}
+	for id, stored := range inputs {
+		for _, secret := range secrets {
+			if strings.Contains(stored, secret) {
+				t.Errorf("call %s still holds %s after redact", id, secret)
+			}
+		}
+	}
+}
+
+// TestCallmeterCLIReportNoOlderRulesNoteOverConformingCalls: calls stored as
+// the sanitizers write them now (a sized description, a cut heredoc and commit
+// message, an MCP tool's sizes, a cut url, each error form) print no note.
+func TestCallmeterCLIReportNoOlderRulesNoteOverConformingCalls(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedRead(t, "toolu_ok", "sess-1", "/work/one.md", fixture.seat)
+	raw := []struct{ id, tool, input, errText string }{
+		{"toolu_a", "Bash", `{"command":"ls","description":"list files"}`, "Exit code 2\nstderr text"},
+		{"toolu_b", "Bash", "{\"command\":\"cat <<EOF > f\\nbody\\nEOF\\ngit commit -m msg\"}", "free error text"},
+		{"toolu_c", "mcp__mail__send", `{"to":"x@example.com","count":3}`, callmeter.OutcomeRefused},
+		{"toolu_d", "WebFetch", `{"url":"https://x.example/cb?t=q"}`, callmeter.OutcomeDeniedByPermission},
+		{"toolu_e", "Read", `{"file_path":["a","b"]}`, callmeter.ErrorNotStored},
+	}
+	for _, c := range raw {
+		input, err := callmeter.SanitizeInput(c.tool, json.RawMessage(c.input))
+		if err != nil {
+			t.Fatalf("SanitizeInput %s: %v", c.id, err)
+		}
+		fixture.seedStoredCall(t, c.id, c.tool, input, callmeter.SanitizeError(c.errText))
+	}
+	for _, topic := range allTopics {
+		code, stdout, stderr := fixture.run("report", topic)
+		if code != 0 || strings.Contains(stdout, "older privacy rules") {
+			t.Errorf("report %s over conforming calls = %d, want no older-rules note\nstdout:\n%s\nstderr:\n%s", topic, code, stdout, stderr)
+		}
+	}
+}
+
+func TestCallmeterCLIReportNotesAnUnreadableQuietTranscript(t *testing.T) {
+	for _, tc := range []struct {
+		name, label string
+		directory   bool
+	}{
+		{"permission", "permission denied", false},
+		{"other-error", "unreadable", true},
+	} {
+		for _, asJSON := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/json=%t", tc.name, asJSON), func(t *testing.T) {
+				fixture := newLab(t)
+				transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-unreadable.jsonl")
+				fixture.seedQuiet(t, "sess-unreadable", "toolu_unreadable", transcript)
+				// This quiet session has no call in flight: recovery reads its requests once.
+				store, err := callmeter.OpenDB(context.Background(), fixture.storePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, deleteErr := store.DB().Exec("DELETE FROM calls WHERE tool_use_id = ?", "toolu_unreadable")
+				if err := errors.Join(deleteErr, store.Close()); err != nil {
+					t.Fatal(err)
+				}
+				if tc.directory {
+					if err := os.Remove(transcript); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(transcript, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					quiet := time.Now().Add(-2 * time.Hour)
+					if err := os.Chtimes(transcript, quiet, quiet); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.Chmod(transcript, 0o000); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(transcript, 0o600) })
+				}
+				want := "1 transcripts could not be read by recovery (first: " + tc.label + ")"
+				args := []string{"report", "sessions"}
+				if asJSON {
+					args = append(args, "--json")
+				}
+				code, stdout, stderr := fixture.run(args...)
+				if code != 0 || !strings.Contains(stderr, "callmeter: recover quiet sessions: skipped: session sess-unreadable: "+transcript) {
+					t.Fatalf("report failed or lost the stderr skip line: code %d", code)
+				}
+				if asJSON {
+					if !slices.Contains(decodeReport(t, stdout).Notes, want) {
+						t.Errorf("JSON lacks recovery note %q", want)
+					}
+				} else if !strings.Contains(stdout, "\nnote: "+want+"\n") {
+					t.Errorf("text lacks recovery note %q", want)
+				}
+			})
+		}
+	}
+}
+
+// A quiet session with a call in flight has its one transcript read for its
+// requests and again for the call's result: both reads fail, and the note
+// still counts one transcript.
+func TestCallmeterCLIReportCountsAnUnreadableTranscriptOnce(t *testing.T) {
+	fixture := newLab(t)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-unreadable.jsonl")
+	fixture.seedQuiet(t, "sess-unreadable", "toolu_unreadable", transcript)
+	if err := os.Chmod(transcript, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(transcript, 0o600) })
+	code, stdout, stderr := fixture.run("report", "sessions")
+	if code != 0 || strings.Count(stderr, "callmeter: recover quiet sessions: skipped: session sess-unreadable: "+transcript) < 2 {
+		t.Fatalf("report = %d, want 0 and the transcript skipped by more than one read", code)
+	}
+	if want := "\nnote: 1 transcripts could not be read by recovery (first: permission denied)\n"; !strings.Contains(stdout, want) {
+		t.Errorf("stdout lacks %q", want)
+	}
+}
+
+func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		skipped []error
+		want    []string
+	}{
+		{"none", nil, nil},
+		{"permission", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrPermission)}, []string{"1 transcripts could not be read by recovery (first: permission denied)"}},
+		{"missing", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrNotExist)}, []string{"1 transcripts could not be read by recovery (first: not found)"}},
+		{"other-first", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrInvalid), fs.ErrPermission}, []string{"2 transcripts could not be read by recovery (first: unreadable)"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recoveryNotes(tc.skipped); !slices.Equal(got, tc.want) {
+				t.Errorf("notes = %q, want %q", got, tc.want)
 			}
 		})
 	}

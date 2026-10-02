@@ -42,10 +42,12 @@ type PyResult struct {
 	Error   string   `json:"error"`
 }
 
-// PythonRunner scans a batch of snippets with Python's own ast module. An
-// error means the batch was not scanned at all (no interpreter, a crash,
-// unreadable output); ParseBatch then marks every Python part of the batch
-// python-unavailable with that error as the cause.
+// ErrNoPython means the Python interpreter could not be found on PATH.
+var ErrNoPython = errors.New("cmdparse: no Python interpreter")
+
+// PythonRunner scans a batch of snippets with Python's own ast module.
+// An error wrapping ErrNoPython makes parts python-unavailable; every other
+// error or missing snippet result makes them python-error, with its cause.
 type PythonRunner interface {
 	Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error)
 }
@@ -57,11 +59,8 @@ type Python3 struct {
 	Program string
 }
 
-// Analyze implements PythonRunner.
-func (p Python3) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error) {
-	if len(snippets) == 0 {
-		return nil, nil
-	}
+// Resolve returns the interpreter path, or an error wrapping ErrNoPython.
+func (p Python3) Resolve() (string, error) {
 	cmdRunner := p.Runner
 	if cmdRunner == nil {
 		cmdRunner = runner.Real{}
@@ -72,7 +71,36 @@ func (p Python3) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, e
 	}
 	path, err := cmdRunner.LookPath(program)
 	if err != nil {
-		return nil, fmt.Errorf("cmdparse: %s not found on PATH: %w", program, err)
+		return "", fmt.Errorf("cmdparse: %s not found on PATH: %w: %w", program, ErrNoPython, err)
+	}
+	return path, nil
+}
+
+// PythonResolves reports whether the runner's interpreter resolves; a runner
+// without Resolve is called directly and needs no interpreter lookup here.
+func PythonResolves(py PythonRunner) bool {
+	if py == nil {
+		py = Python3{}
+	}
+	if resolver, ok := py.(interface{ Resolve() (string, error) }); ok {
+		_, err := resolver.Resolve()
+		return err == nil
+	}
+	return true
+}
+
+// Analyze implements PythonRunner.
+func (p Python3) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error) {
+	if len(snippets) == 0 {
+		return nil, nil
+	}
+	cmdRunner := p.Runner
+	if cmdRunner == nil {
+		cmdRunner = runner.Real{}
+	}
+	path, err := p.Resolve()
+	if err != nil {
+		return nil, err
 	}
 	input, err := json.Marshal(snippets)
 	if err != nil {

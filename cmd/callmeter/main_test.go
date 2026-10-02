@@ -10,10 +10,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
+	"github.com/rezzminator/callmeter/internal/hookentry"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/testjail"
 )
@@ -137,14 +139,87 @@ func TestHookGarbageStdinIsAPayloadFault(t *testing.T) {
 }
 
 // TestHookPanicStillExitsZero: a hook exits 0 on every path; a panic would
-// exit 2, which Claude Code reads as a blocking error.
+// exit 2, which Claude Code reads as a blocking error. The panic still leaves
+// its trace: a stack on stderr and, unless accounted for, one missed.log line
+// with reason `panic`, the event and session
+// the payload named (`unknown` and no session when it named none), one log
+// line, and the next report counts the line as an unrecorded event.
 func TestHookPanicStillExitsZero(t *testing.T) {
-	previous := hook
-	hook = func(io.Reader, io.Writer, paths.Getenv) int { panic("boom") }
-	t.Cleanup(func() { hook = previous })
-	code, stdout, stderr := newCLI(t).run("{}", "hook")
-	if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") {
-		t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
+	for _, tc := range []struct {
+		name       string
+		payload    func(c cli) string
+		line       string // the missed.log line after its seconds field
+		accounted  bool
+		unwritable bool
+	}{
+		{
+			name: "captured payload",
+			payload: func(c cli) string {
+				return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
+			},
+			line: "\tPostToolUse\tpanic\tb2c7b094-91c1-4b76-8621-258b240b695a\n",
+		},
+		{name: "no event", payload: func(cli) string { return "{}" }, line: "\tunknown\tpanic\n"},
+		{name: "accounted", payload: func(c cli) string {
+			return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
+		}, accounted: true},
+		{name: "unwritable missed log", payload: func(cli) string { return "{}" }, unwritable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCLI(t)
+			c.seed() // a store for the report to read, through the real hook
+			if tc.unwritable {
+				if err := os.Mkdir(paths.Missed(c.state), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stdin := tc.payload(c)
+			previous := hook
+			hook = func(input io.Reader, _ io.Writer, _ paths.Getenv) int {
+				if read, err := io.ReadAll(input); err != nil || string(read) != stdin {
+					t.Errorf("the hook read %d bytes (%v), want the %d of stdin", len(read), err, len(stdin))
+				}
+				if tc.accounted {
+					panic(hookentry.AccountedPanic{Value: "boom"})
+				}
+				panic("boom")
+			}
+			t.Cleanup(func() { hook = previous })
+			code, stdout, stderr := c.run(stdin, "hook")
+			hook = previous
+			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") || !strings.Contains(stderr, "goroutine ") {
+				t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
+			}
+			missed, err := os.ReadFile(paths.Missed(c.state))
+			if tc.unwritable {
+				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.state)) {
+					t.Errorf("unwritable missed.log: read error %v, append error said %v", err, strings.Contains(stderr, "open "+paths.Missed(c.state)))
+				}
+				return
+			}
+			if tc.accounted {
+				if !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
+					t.Fatalf("accounted panic left %d bytes in missed.log (%v), want no line", len(missed), err)
+				}
+				code, stdout, stderr = c.run("", "report", "files")
+				if code != 0 || strings.Contains(stdout, "events unrecorded: hook terminated before recording") {
+					t.Errorf("accounted panic report = %d, unrecorded event note %v; stderr %q", code,
+						strings.Contains(stdout, "events unrecorded: hook terminated before recording"), stderr)
+				}
+				return
+			}
+			if err != nil || !regexp.MustCompile(`^[0-9]+`+regexp.QuoteMeta(tc.line)+`$`).Match(missed) {
+				t.Fatalf("missed.log = %q (%v), want exactly one line {secs}%q", missed, err, tc.line)
+			}
+			logged, err := os.ReadFile(paths.Log(c.state))
+			if err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
+				t.Errorf("callmeter.log = %q (%v), want one line saying the panic", logged, err)
+			}
+			code, stdout, stderr = c.run("", "report", "files")
+			if code != 0 || !strings.Contains(stdout, "1 events unrecorded: hook terminated before recording") {
+				t.Errorf("report files = %d, want the panic counted as an unrecorded event\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+		})
 	}
 }
 

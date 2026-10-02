@@ -738,18 +738,14 @@ func TestPruneStopBetweenPhasesLeavesEveryRowInBothFilesAndTheNextPruneConverges
 }
 
 // TestPruneDeletesARowInBothFilesAndKeepsTheArchivedCopy: an expired row whose
-// key the archive already holds leaves the store and the archive keeps the
-// copy it has, never overwritten. A fault is never updated, so its archived
-// copy carries the store row's own columns, every one of them its key.
+// identical copy the archive already holds leaves the store and keeps that
+// copy in the archive, for aggregates as well as facts.
 func TestPruneDeletesARowInBothFilesAndKeepsTheArchivedCopy(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	stopPruneBetweenPhases(t, store, cutoff)
 	archive := openArchive(t, store)
-	if _, err := archive.Exec("UPDATE calls SET tool = 'archived copy'"); err != nil {
-		t.Fatalf("mark the archived call: %v", err)
-	}
 	if _, err := store.Prune(ctx, cutoff); err != nil {
 		t.Fatalf("Prune over rows in both files: %v", err)
 	}
@@ -761,8 +757,8 @@ func TestPruneDeletesARowInBothFilesAndKeepsTheArchivedCopy(t *testing.T) {
 			t.Errorf("archive %s holds %d rows, want its one copy", table, got)
 		}
 	}
-	if got := keys(t, archive, "SELECT tool FROM calls"); got != "archived copy" {
-		t.Errorf("the archived call's tool = %q, want the archive's own copy, not the store's", got)
+	if got := keys(t, archive, "SELECT tool FROM calls"); got != "Bash" {
+		t.Errorf("the archived call's tool = %q, want the identical stored copy", got)
 	}
 }
 
@@ -1033,6 +1029,310 @@ func TestPruneArchiveFailureDeletesNothing(t *testing.T) {
 			}
 			if n := count(t, store, "calls"); n != 0 {
 				t.Errorf("calls holds %d rows after the repaired prune, want 0", n)
+			}
+		})
+	}
+}
+
+func TestArchiveKeepsTheNewerSessionOnKeyReuse(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Now()
+	day := 24 * time.Hour
+	touch := func(ts time.Time, cwd string) {
+		t.Helper()
+		if err := store.Batch(ctx, func(tx *Tx) error {
+			return tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: ts.UnixMilli(), Cwd: Ptr(cwd)})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	touch(now.Add(-100*day), "/tmp/first-run")
+	if _, err := store.Prune(ctx, now.Add(-90*day)); err != nil {
+		t.Fatal(err)
+	}
+	touch(now.Add(-50*day), "/tmp/second-run")
+	if _, err := store.Prune(ctx, now.Add(-30*day)); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, store, "sessions"); n != 0 {
+		t.Errorf("store sessions = %d, want 0", n)
+	}
+	var newer int
+	if err := openArchive(t, store).QueryRow("SELECT COUNT(*) FROM sessions WHERE session_id = 'sess-1' AND cwd = '/tmp/second-run' AND last_ts = ?", now.Add(-50*day).UnixMilli()).Scan(&newer); err != nil {
+		t.Fatal(err)
+	}
+	if newer != 1 {
+		t.Error("archive lacks the resumed session row")
+	}
+}
+
+func TestPruneKeepsANewerAgentTurnTheArchiveLacks(t *testing.T) {
+	testPruneKeepsReusedFact(t, "agent_turns", "UPDATE agent_turns SET stopped = stopped + 10")
+}
+
+func TestPruneKeepsANewerEventTheArchiveLacks(t *testing.T) {
+	testPruneKeepsReusedFact(t, "events", "UPDATE events SET ts = ts + 10")
+}
+
+func testPruneKeepsReusedFact(t *testing.T, table, update string) {
+	t.Helper()
+	store := openTestStore(t)
+	cutoff := time.Now()
+	seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+	if _, err := store.Prune(context.Background(), cutoff); err != nil {
+		t.Fatal(err)
+	}
+	archive := openArchive(t, store)
+	// Recreate the facts under the same keys, then change an archived field.
+	seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+	if _, err := store.DB().Exec(update); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Prune(context.Background(), cutoff); err != nil {
+		t.Fatal(err)
+	}
+	want := seededRowsPerTable[table]
+	if got := count(t, store, table); got != want {
+		t.Errorf("store %s = %d rows, want %d newer facts kept", table, got, want)
+	}
+	if got := countIn(t, archive, table); got != want {
+		t.Errorf("archive %s = %d rows, want %d older facts", table, got, want)
+	}
+}
+
+func TestPruneRequiresEveryArchivedColumnToMatch(t *testing.T) {
+	for _, table := range pruneTables {
+		for _, column := range archiveTables[table.name].columns {
+			t.Run(table.name+"/"+column, func(t *testing.T) {
+				store := openTestStore(t)
+				cutoff := time.Now()
+				seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+				setPruneAfterArchive(t, func() error {
+					archive := openArchive(t, store)
+					_, err := archive.Exec(fmt.Sprintf("UPDATE %s SET %s = CASE WHEN typeof(%s) = 'integer' THEN %s + 1 ELSE COALESCE(%s, '') || '-changed' END", table.name, column, column, column, column))
+					return err
+				})
+				if _, err := store.Prune(context.Background(), cutoff); err != nil {
+					t.Fatal(err)
+				}
+				if got := count(t, store, table.name); got != seededRowsPerTable[table.name] {
+					t.Errorf("%s rows retained = %d, want %d when archived %s differs", table.name, got, seededRowsPerTable[table.name], column)
+				}
+			})
+		}
+	}
+}
+
+// seedPruneLoad writes 50k expired rows without storing any content.
+func seedPruneLoad(t *testing.T, store *Store, cutoff time.Time) {
+	t.Helper()
+	tx, err := store.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		"INSERT INTO calls (tool_use_id, ts, tool, session_id) SELECT 'call-' || n, ?1, 'Bash', 'session-' || n FROM rows",
+		"INSERT INTO requests (request_id, ts, session_id) SELECT 'request-' || n, ?1, 'session-' || n FROM rows",
+		"INSERT INTO events (event_id, ts, event, session_id) SELECT 'event-' || n, ?1, 'Notification', 'session-' || n FROM rows",
+		"INSERT INTO turns (event_id, ts, event, session_id) SELECT 'turn-' || n, ?1, 'Stop', 'session-' || n FROM rows",
+		"INSERT INTO sessions (session_id, first_ts, last_ts) SELECT 'session-' || n, ?1, ?1 FROM rows",
+	} {
+		if _, err := tx.Exec("WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n < 10000) "+statement, cutoff.Add(-time.Hour).UnixMilli()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPruneNeverHoldsTheWriteLockLong(t *testing.T) {
+	store := openTestStore(t)
+	cutoff := time.Now()
+	seedPruneLoad(t, store, cutoff)
+	probe, err := sqlitedb.OpenReadWrite(store.path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	ready, stop := make(chan struct{}), make(chan struct{})
+	type observation struct {
+		longest    time.Duration
+		busy, free int
+		err        error
+	}
+	done := make(chan observation, 1)
+	go func() {
+		var result observation
+		var busySince time.Time
+		sample := func() {
+			_, err := probe.Exec("BEGIN IMMEDIATE")
+			now := time.Now()
+			if IsBusy(err) {
+				result.busy++
+				if busySince.IsZero() {
+					busySince = now
+				}
+			} else {
+				if err == nil {
+					result.free++
+					_, err = probe.Exec("ROLLBACK")
+				}
+				if err != nil {
+					result.err = err
+				}
+				if !busySince.IsZero() {
+					if elapsed := now.Sub(busySince); elapsed > result.longest {
+						result.longest = elapsed
+					}
+					busySince = time.Time{}
+				}
+			}
+		}
+		sample()
+		close(ready)
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sample()
+			case <-stop:
+				sample()
+				done <- result
+				return
+			}
+		}
+	}()
+	<-ready
+	started := time.Now()
+	removed, err := store.Prune(context.Background(), cutoff)
+	took := time.Since(started)
+	close(stop)
+	result := <-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.err != nil {
+		t.Fatalf("non-busy probe error: %v", result.err)
+	}
+	t.Logf("prune elapsed %v; longest busy streak %v; busy probes %d, free probes %d", took, result.longest, result.busy, result.free)
+	if removed != 50000 {
+		t.Errorf("removed %d, want 50000", removed)
+	}
+	if result.busy == 0 {
+		t.Error("probe never observed the prune's write lock")
+	}
+	if result.longest >= 200*time.Millisecond {
+		t.Errorf("longest busy streak %v, want under 200ms", result.longest)
+	}
+}
+
+func TestPruneStopBetweenChunksKeepsCopiesAndConverges(t *testing.T) {
+	store := openTestStore(t)
+	cutoff := time.Now()
+	seedPruneLoad(t, store, cutoff)
+	// Abort the second delete chunk after the first 2000 rows committed.
+	if _, err := store.DB().Exec("CREATE TRIGGER stop_prune BEFORE DELETE ON calls WHEN (SELECT COUNT(*) FROM calls) <= 8000 BEGIN SELECT RAISE(ABORT, 'stop prune chunk'); END"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.Prune(context.Background(), cutoff)
+	if err == nil || !strings.Contains(err.Error(), "stop prune chunk") {
+		t.Fatalf("prune error = %v, want the second chunk's abort", err)
+	}
+	if removed != 2000 {
+		t.Errorf("removed = %d, want 2000 committed rows", removed)
+	}
+	if got := count(t, store, "calls"); got != 8000 {
+		t.Errorf("live calls = %d, want 8000 after one committed chunk", got)
+	}
+	archive := openArchive(t, store)
+	var copies int
+	if err := archive.QueryRow("SELECT COUNT(*) FROM calls WHERE ts = ? AND tool = 'Bash'", cutoff.Add(-time.Hour).UnixMilli()).Scan(&copies); err != nil {
+		t.Fatal(err)
+	}
+	if copies != 10000 {
+		t.Errorf("identical archived calls = %d, want 10000 including every deleted row", copies)
+	}
+	if _, err := store.DB().Exec("DROP TRIGGER stop_prune"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Prune(context.Background(), cutoff); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"calls", "requests", "events", "turns", "sessions"} {
+		if got := count(t, store, table); got != 0 {
+			t.Errorf("live %s = %d, want 0 after resumed prune", table, got)
+		}
+		if got := countIn(t, archive, table); got != 10000 {
+			t.Errorf("archive %s = %d, want 10000", table, got)
+		}
+	}
+}
+
+func TestPruneCancelledBetweenPhasesCanResume(t *testing.T) {
+	store := openTestStore(t)
+	cutoff := time.Now()
+	seedEveryTable(t, store, "old", cutoff.Add(-time.Hour).UnixMilli())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	setPruneAfterArchive(t, func() error { cancel(); return ctx.Err() })
+	if removed, err := store.Prune(ctx, cutoff); !errors.Is(err, context.Canceled) || removed != 0 {
+		t.Fatalf("cancelled prune = %d, %v; want 0, context.Canceled", removed, err)
+	}
+	for table, want := range seededRowsPerTable {
+		if got := count(t, store, table); got != want {
+			t.Errorf("cancelled prune retained %s = %d, want %d", table, got, want)
+		}
+	}
+	setPruneAfterArchive(t, nil)
+	if _, err := store.Prune(context.Background(), cutoff); err != nil {
+		t.Fatalf("resume after cancellation: %v", err)
+	}
+	for table := range seededRowsPerTable {
+		if got := count(t, store, table); got != 0 {
+			t.Errorf("resumed prune retained %s = %d, want 0", table, got)
+		}
+	}
+}
+
+func TestArchiveReplacesChangedAggregates(t *testing.T) {
+	for _, table := range []string{"calls", "requests", "agents"} {
+		t.Run(table, func(t *testing.T) {
+			store := openTestStore(t)
+			cutoff := time.Now()
+			old := cutoff.Add(-time.Hour).UnixMilli()
+			seedEveryTable(t, store, "old", old)
+			if _, err := store.Prune(context.Background(), cutoff); err != nil {
+				t.Fatal(err)
+			}
+			seedEveryTable(t, store, "old", old)
+			column := "tool"
+			err := store.Batch(context.Background(), func(tx *Tx) error {
+				switch table {
+				case "calls":
+					return tx.UpsertCall(context.Background(), Call{ToolUseID: "toolu_old", Tool: Ptr("Read")}, Overwrite)
+				case "requests":
+					column = "model"
+					return tx.UpsertRequest(context.Background(), Request{RequestID: "msg_old", Model: Ptr("Read")}, Overwrite)
+				default:
+					column = "model"
+					return tx.UpsertAgent(context.Background(), Agent{AgentID: "agent_old", Model: Ptr("Read")}, Overwrite)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Prune(context.Background(), cutoff); err != nil {
+				t.Fatal(err)
+			}
+			if got := count(t, store, table); got != 0 {
+				t.Errorf("live %s = %d, want 0", table, got)
+			}
+			if got := keys(t, openArchive(t, store), "SELECT "+column+" FROM "+table); got != "Read" {
+				t.Errorf("archive %s.%s = %q, want the updated aggregate", table, column, got)
 			}
 		})
 	}

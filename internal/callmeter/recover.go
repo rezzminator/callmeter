@@ -8,10 +8,39 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 )
+
+// Retention is the age window recovery keeps after old store rows are pruned.
+const Retention = 30 * 24 * time.Hour
+
+// ResolveTranscript keeps an existing stored path, otherwise finding the first
+// sorted session transcript under the stored projects root, then the seat's.
+// An unfound path is returned unchanged so callers retain their read errors.
+func ResolveTranscript(stored, seatDir, sessionID string) string {
+	if stored != "" {
+		if _, err := os.Stat(stored); err == nil {
+			return stored
+		}
+	}
+	var roots []string
+	if stored != "" {
+		roots = append(roots, filepath.Dir(filepath.Dir(stored)))
+	}
+	if seatDir != "" {
+		roots = append(roots, filepath.Join(seatDir, "projects"))
+	}
+	for _, root := range roots {
+		matches, _ := filepath.Glob(filepath.Join(root, "*", sessionID+".jsonl"))
+		if len(matches) != 0 {
+			return matches[0]
+		}
+	}
+	return stored
+}
 
 // QuietAfter is how long a session must have gone with no hook and no
 // transcript write before RecoverQuiet settles it from its transcripts. A live
@@ -44,10 +73,24 @@ type RecoverSummary struct {
 	// call or type from the sub-agent's meta file.
 	Rebuilt int
 	Parents int
-	// Skipped holds the per-session transcript errors, each naming the session
-	// and the path; the rest of the pass went on.
+	// Skipped holds the per-session transcript errors, each a *SkippedRead
+	// naming the session and the path; the rest of the pass went on. One
+	// transcript read more than once can be skipped more than once.
 	Skipped []error
 }
+
+// SkippedRead is one Skipped entry: a transcript of Session at Path that
+// recovery could not use, and why.
+type SkippedRead struct {
+	Session, Path string
+	Err           error
+}
+
+func (e *SkippedRead) Error() string {
+	return fmt.Sprintf("session %s: %s: %v", e.Session, e.Path, e.Err)
+}
+
+func (e *SkippedRead) Unwrap() error { return e.Err }
 
 // The tails of the transcript faults RecoverQuiet records for what it read in
 // full and could not fill (agentTurnMarker, stopReplyMarker, turnEndMarker,
@@ -165,13 +208,14 @@ func (t *Tx) MarkAgentStopsUnfillable(ctx context.Context, sessionID string, tur
 
 // callOpen is the SQL condition that the calls row aliased c holds something
 // recovery could settle: no size at all (neither bytes_real nor
-// bytes_delivered), no request, a provisional one, or a rebuilt call (source
+// bytes_delivered, unless a no-real-output outcome landed), no request,
+// a provisional one, or a rebuilt call (source
 // transcript, not failed) whose real size is still unknown, as an earlier
 // recovery left it before it measured the result's toolUseResult.
 func callOpen(c string) string {
-	return fmt.Sprintf(`((%[1]s.bytes_real IS NULL AND %[1]s.bytes_delivered IS NULL)
+	return fmt.Sprintf(`((%[4]s AND %[1]s.bytes_delivered IS NULL)
 		OR %[1]s.request_id IS NULL OR %[1]s.request_id LIKE %[2]s
-		OR (%[1]s.source = %[3]s AND %[1]s.bytes_real IS NULL AND COALESCE(%[1]s.failed, 0) = 0))`, c, sqlText(PendingPrefix+"%"), sqlText(SourceTranscript))
+		OR (%[1]s.source = %[3]s AND %[4]s AND COALESCE(%[1]s.failed, 0) = 0))`, c, sqlText(PendingPrefix+"%"), sqlText(SourceTranscript), realSizeOpen(c))
 }
 
 // callUnmarked is the SQL condition that recovery has not marked the calls row
@@ -366,6 +410,7 @@ type quietSession struct {
 // pendingRead is one chat's or sub-agent's pending requests with the requests
 // its transcript holds for their calls.
 type pendingRead struct {
+	agentID string
 	pending []PendingRequest
 	found   map[string]RequestUsage
 }
@@ -440,7 +485,7 @@ func (s *Store) RecoverQuiet(ctx context.Context, now time.Time, quiet time.Dura
 		if err := ctx.Err(); err != nil {
 			return summary, fmt.Errorf("callmeter store %s: recover quiet sessions: %w", s.path, err)
 		}
-		if err := s.recoverSession(ctx, session, cutoff, &summary); err != nil {
+		if err := s.recoverSession(ctx, session, now, cutoff, &summary); err != nil {
 			return summary, fmt.Errorf("recover session %s: %w", session.id, err)
 		}
 	}
@@ -502,9 +547,14 @@ func (s *Store) quietCandidates(ctx context.Context, beforeMS int64) ([]quietSes
 // recoverSession reads one candidate's transcripts and writes what they settle,
 // adding to summary. A transcript read that fails is a Skipped entry and the
 // other reads go on; a store error is returned.
-func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff time.Time, summary *RecoverSummary) error {
+func (s *Store) recoverSession(ctx context.Context, session quietSession, now, cutoff time.Time, summary *RecoverSummary) error {
+	seatDir := ""
+	if session.seatDir != nil {
+		seatDir = *session.seatDir
+	}
+	session.transcript = ResolveTranscript(session.transcript, seatDir, session.id)
 	skip := func(path string, err error) {
-		summary.Skipped = append(summary.Skipped, fmt.Errorf("session %s: %s: %w", session.id, path, err))
+		summary.Skipped = append(summary.Skipped, &SkippedRead{Session: session.id, Path: path, Err: err})
 	}
 	// Liveness, on disk: any transcript written since the cutoff means the
 	// session is still running (or its message still streaming).
@@ -553,7 +603,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 			skip(transcript, err)
 			return nil
 		}
-		pendingReads = append(pendingReads, pendingRead{pending: pending, found: found})
+		pendingReads = append(pendingReads, pendingRead{agentID: agentID, pending: pending, found: found})
 		return nil
 	}
 	if err := readPending("", session.transcript); err != nil {
@@ -613,11 +663,9 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 			}
 			sized := SettledCall(id, result)
 			if unfinishedOf[id].Delivered {
-				// Its delivered size is stored, so only its real size is
-				// open: a result with none leaves the call as it is (a rebuilt
-				// one for the call marker), and one with it fills the empty
-				// columns only.
-				if sized.BytesReal != nil {
+				// Keep its delivered size; fill a real size when available,
+				// or the outcome that settles a no-real-output tool.
+				if sized.BytesReal != nil || !HasRealOutput(unfinishedOf[id].Tool) {
 					settled = append(settled, sized)
 				}
 				continue
@@ -631,6 +679,8 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 	if err != nil {
 		return err
 	}
+	since = max(since, now.Add(-Retention).UnixMilli())
+	mainRequest := false
 	resolved := map[string]bool{} // message ids a pending request was resolved to
 	resolvedCount := 0
 	for _, read := range pendingReads {
@@ -638,12 +688,13 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 			if usage, ok := resolvedBy(request, read.found); ok {
 				resolved[usage.MessageID] = true
 				resolvedCount++
+				mainRequest = mainRequest || read.agentID == ""
 			}
 		}
 	}
 	var writes []requestWrite
 	built := map[string]requestWrite{} // every request read, by message id, so a rebuilt call's request is written
-	var uses []rebuildUse              // every tool_use at or after the session's first hook
+	var uses []rebuildUse              // every tool_use within the session and retention window
 	ends := map[string][]int64{}       // agent id -> the ts of the turn-end entry of each of its requests that ends a turn
 	metas := map[string]subagentMeta{} // agent id -> its meta file
 	// complete: every transcript of the session was read in full, so what no
@@ -738,10 +789,10 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 		}
 		var rebuiltOpen []openCall
 		for _, call := range rebuilt {
-			// A rebuilt call stays open while its real size is unknown: with no
-			// result at all it is looked up in every transcript, with a result
-			// that holds no toolUseResult it is only marked.
-			if call.BytesReal == nil && (call.Failed == nil || !*call.Failed) {
+			// A no-real-output call settles with its outcome. Other tools
+			// stay open while a successful result's real size is unknown.
+			hasRealOutput := call.Tool == nil || HasRealOutput(*call.Tool)
+			if call.BytesReal == nil && (call.Failed == nil || (!*call.Failed && hasRealOutput)) {
 				rebuiltOpen = append(rebuiltOpen, openCall{id: call.ToolUseID, sizeOpen: call.BytesDelivered == nil})
 			}
 			// The request that issued it is written, so it points the call
@@ -793,7 +844,6 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 				return err
 			}
 		}
-		mainRequest := false
 		for _, write := range writes {
 			if err := tx.RecoverRequest(ctx, write.request, write.ids, since); err != nil {
 				return err

@@ -349,6 +349,66 @@ func TestSessionTouchAndRefresh(t *testing.T) {
 	}
 }
 
+func TestSessionModel(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		events   []Event
+		requests []Request
+		want     string
+	}{
+		{name: "unknown"},
+		{name: "latest SessionStart", events: []Event{
+			{EventID: "start-old", Event: EventSessionStart, TS: 1, Model: Ptr("old")},
+			{EventID: "start-new", Event: EventSessionStart, TS: 2, Model: Ptr("new")},
+			{EventID: "start-null", Event: EventSessionStart, TS: 3},
+		}, want: "new"},
+		{name: "latest main request wins", events: []Event{
+			{EventID: "start", Event: EventSessionStart, TS: 5, Model: Ptr("start")},
+		}, requests: []Request{
+			{RequestID: "main-old", TS: Ptr[int64](1), Model: Ptr("old")},
+			{RequestID: "main-new", TS: Ptr[int64](2), Model: Ptr("main")},
+			{RequestID: "main-null", TS: Ptr[int64](3)},
+			{RequestID: "agent", TS: Ptr[int64](4), AgentID: Ptr("a1"), Model: Ptr("agent")},
+		}, want: "main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStore(t)
+			ctx := context.Background()
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				for _, event := range tc.events {
+					event.SessionID = Ptr("sess-1")
+					if _, err := tx.InsertEvent(ctx, event); err != nil {
+						return err
+					}
+				}
+				for _, request := range tc.requests {
+					request.SessionID = Ptr("sess-1")
+					if err := tx.UpsertRequest(ctx, request, Overwrite); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.SessionModel(ctx, "sess-1"); err != nil || got != tc.want {
+				t.Errorf("SessionModel = %q (%v), want %q", got, err, tc.want)
+			}
+			if got, err := store.SessionModel(ctx, "other"); err != nil || got != "" {
+				t.Errorf("other session model = %q (%v), want unknown", got, err)
+			}
+		})
+	}
+	t.Run("read error", func(t *testing.T) {
+		store := openTestStore(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if got, err := store.SessionModel(ctx, "sess-1"); got != "" || err == nil {
+			t.Errorf("cancelled read = %q (%v), want unknown and an error", got, err)
+		}
+	})
+}
+
 func TestSessionModelFallsBackToTheLatestSessionStart(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -482,7 +542,7 @@ func TestTouchSessionColumnsComeFromTheEarliestRun(t *testing.T) {
 		}
 		got := row(t, store, "sessions", "session_id = ?", "sess-1")
 		for column, want := range map[string]any{
-			"first_ts": int64(1000), "last_ts": int64(2000), "cwd": "/a", "transcript_path": "/t.jsonl", "seat_dir": "/seat",
+			"first_ts": int64(1000), "last_ts": int64(2000), "cwd": "/a", "transcript_path": "/t/sub.jsonl", "seat_dir": "/seat",
 			"config_dir": "/config", "host": "host/sub", "tz_name": "zone", "tz_offset_minutes": int64(1),
 		} {
 			if got[column] != want {
@@ -502,14 +562,13 @@ func runValue(column string, n int) any {
 	return fmt.Sprintf("v%02d", n)
 }
 
-// sessionRunColumns are the seven columns a hook run carries into its session,
+// sessionRunColumns are the six earliest-run columns a hook run carries into its session,
 // each with how a run of the test sets its value n.
 var sessionRunColumns = []struct {
 	name string
 	set  func(s *Session, n int)
 }{
 	{"cwd", func(s *Session, n int) { s.Cwd = Ptr(runValue("cwd", n).(string)) }},
-	{"transcript_path", func(s *Session, n int) { s.TranscriptPath = Ptr(runValue("transcript_path", n).(string)) }},
 	{"seat_dir", func(s *Session, n int) { s.SeatDir = Ptr(runValue("seat_dir", n).(string)) }},
 	{"config_dir", func(s *Session, n int) { s.ConfigDir = Ptr(runValue("config_dir", n).(string)) }},
 	{"host", func(s *Session, n int) { s.Host = Ptr(runValue("host", n).(string)) }},
@@ -608,9 +667,9 @@ func TestTouchSessionColumnNoRunCarriesStaysNull(t *testing.T) {
 	}
 }
 
-// TestInsertEventStoresOnlyALabel: a StopFailure error_type and a SessionEnd
-// reason are kept when they are a label of their event; any other value, which
-// may be free text, is stored as `label not stored (N bytes)`, and its session's
+// TestInsertEventStoresOnlyALabel: a StopFailure error_type in the shape of an
+// API error kind and a SessionEnd reason on its label list are kept; any other
+// value, which may be free text, is stored as `label not stored (N bytes)`, and its session's
 // end_reason follows.
 func TestInsertEventStoresOnlyALabel(t *testing.T) {
 	ctx := context.Background()
@@ -619,6 +678,9 @@ func TestInsertEventStoresOnlyALabel(t *testing.T) {
 	events := []Event{
 		{EventID: "f1", Event: "StopFailure", TS: 1, SessionID: Ptr("sess-1"), ErrorType: Ptr("rate_limit")},
 		{EventID: "f2", Event: "StopFailure", TS: 2, SessionID: Ptr("sess-1"), ErrorType: Ptr(private)},
+		{EventID: "f3", Event: "StopFailure", TS: 2, SessionID: Ptr("sess-1"), ErrorType: Ptr("overloaded")},
+		{EventID: "f4", Event: "StopFailure", TS: 2, SessionID: Ptr("sess-1"), ErrorType: Ptr("account_on_hold")},
+		{EventID: "f5", Event: "StopFailure", TS: 2, SessionID: Ptr("sess-1"), ErrorType: Ptr("cloud_credential_error")},
 		{EventID: "e1", Event: EventSessionEnd, TS: 3, SessionID: Ptr("sess-1"), Reason: Ptr("logout")},
 		{EventID: "e2", Event: EventSessionEnd, TS: 4, SessionID: Ptr("sess-1"), Reason: Ptr(private)},
 		{EventID: "e3", Event: EventSessionEnd, TS: 5, SessionID: Ptr("sess-2")},
@@ -636,7 +698,7 @@ func TestInsertEventStoresOnlyALabel(t *testing.T) {
 	sized := fmt.Sprintf("label not stored (%d bytes)", len(private))
 	got := keys(t, store.DB(), `SELECT group_concat(row, ' ') FROM (SELECT event_id || '|' || COALESCE(error_type, '-') || '|' ||
 		COALESCE(reason, '-') AS row FROM events ORDER BY event_id)`)
-	want := "e1|-|logout e2|-|" + sized + " e3|-|- f1|rate_limit|- f2|" + sized + "|-"
+	want := "e1|-|logout e2|-|" + sized + " e3|-|- f1|rate_limit|- f2|" + sized + "|- f3|overloaded|- f4|account_on_hold|- f5|cloud_credential_error|-"
 	if got != want {
 		t.Errorf("events = %q\nwant %q", got, want)
 	}
@@ -859,7 +921,7 @@ func TestDropRecoveredTurnEnd(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("insert the recovered twin: %v", err)
 	}
-	if err := store.Batch(ctx, func(tx *Tx) error { return tx.DropRecoveredTurnEnd(ctx, "s1", 320) }); err != nil {
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.DropRecoveredTurnEnd(ctx, "s1", 320, "") }); err != nil {
 		t.Fatalf("DropRecoveredTurnEnd: %v", err)
 	}
 	got := keys(t, store.DB(), `SELECT session_id || '/' || event_id FROM events WHERE event = 'StopFailure' ORDER BY session_id, ts`)
@@ -916,5 +978,139 @@ func TestTouchSessionAfterAQuietMarkClearsNever(t *testing.T) {
 	touch(time.Now(), nil)
 	if got := endReason(); got != "<NULL>" {
 		t.Errorf("end_reason after a later hook = %q, want NULL: the session runs again", got)
+	}
+}
+
+// A-S1: prompt u1's Stop hook, async, stamped by its own process clock after
+// prompt u2's UserPromptSubmit (a queued command or a task notification fires
+// u2 within tens of ms of u1's Stop), counts as u2's turn end: a lost u2 Stop
+// is never rebuilt, and u2 does not even read as a candidate.
+func TestTurnEndOfALaterPromptIgnoresAnEarlierPromptsLateStop(t *testing.T) {
+	store := openTestStore(t)
+	putRows(t, store,
+		[]Event{promptEvent("u1", "s1", 100), promptEvent("u2", "s1", 200),
+			{EventID: "stop-u1", Event: EventStop, TS: 210, SessionID: Ptr("s1"), PromptID: Ptr("p-u1"), Detail: Ptr(`{}`)}},
+		[]Turn{{EventID: "stop-u1", Event: EventStop, SessionID: Ptr("s1"), PromptID: Ptr("p-u1"), TS: 210}})
+
+	var missing int
+	if err := store.DB().QueryRow(`SELECT ` + turnEndMissing("'s1'")).Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if missing == 0 {
+		t.Errorf("turnEndMissing = false: u1's Stop (prompt p-u1, ts 210) counts as the turn end of u2 (prompt p-u2, ts 200)")
+	}
+	if !recoverEnd(t, store, Event{Event: EventStop, SessionID: Ptr("s1"), TS: 300}) {
+		t.Errorf("RecoverTurnEnd refused u2's Stop from its transcript: u1's Stop answers u2")
+	}
+}
+
+// A-S1, the drop half: u2's turn end was rebuilt (SessionEnd's recovery), then
+// u1's Stop hook lands, stamped after u2's prompt: it drops u2's rebuilt end.
+func TestLateStopNeverDropsTheNextPromptsRebuiltEnd(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	putRows(t, store, []Event{promptEvent("u1", "s1", 100), promptEvent("u2", "s1", 200)}, nil)
+	if !recoverEnd(t, store, Event{Event: EventStop, SessionID: Ptr("s1"), TS: 300}) {
+		t.Fatal("setup: no rebuilt Stop for u2")
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.DropRecoveredTurnEnd(ctx, "s1", 210, "p-u1") }); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWhere(t, store, `SELECT COUNT(*) FROM events WHERE event = 'Stop' AND prompt_id = 'p-u2'`); n != 1 {
+		t.Errorf("u2's rebuilt Stop rows = %d after u1's Stop hook (ts 210) dropped, want 1", n)
+	}
+	if n := countWhere(t, store, `SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND prompt_id = 'p-u2'`); n != 1 {
+		t.Errorf("u2's rebuilt Stop turns = %d after u1's Stop hook (ts 210) dropped, want 1", n)
+	}
+}
+
+func TestLateStopDropsARebuiltEndThatNamesNoPrompt(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if !recoverEnd(t, store, Event{Event: EventStop, SessionID: Ptr("s1"), TS: 300}) {
+		t.Fatal("setup: no rebuilt Stop before the prompt")
+	}
+	for _, table := range []string{"events", "turns"} {
+		if n := countWhere(t, store, "SELECT COUNT(*) FROM "+table+" WHERE event = 'Stop' AND prompt_id IS NULL"); n != 1 {
+			t.Fatalf("setup: %s holds %d NULL-prompt rebuilt Stops, want 1", table, n)
+		}
+	}
+	putRows(t, store, []Event{promptEvent("u1", "s1", 100)}, nil)
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.DropRecoveredTurnEnd(ctx, "s1", 310, "p-u1") }); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"events", "turns"} {
+		if n := countWhere(t, store, "SELECT COUNT(*) FROM "+table+" WHERE event = 'Stop'"); n != 0 {
+			t.Errorf("%s holds %d rebuilt Stops after u1's Stop hook dropped, want 0", table, n)
+		}
+	}
+}
+
+func countWhere(t *testing.T, store *Store, query string) int {
+	t.Helper()
+	var n int
+	if err := store.DB().QueryRow(query).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestTouchSessionTranscriptPathIsTheNewestRuns(t *testing.T) {
+	store := openTestStore(t)
+	for _, runs := range [][]Session{
+		{{SessionID: "sess-1", TS: 10, TranscriptPath: Ptr("/tmp/old.jsonl")},
+			{SessionID: "sess-1", TS: 20, TranscriptPath: Ptr("/tmp/new.jsonl")},
+			{SessionID: "sess-1", TS: 30, TranscriptPath: Ptr("")},
+			{SessionID: "sess-1", TS: 40}},
+		{{SessionID: "sess-1", TS: 20, TranscriptPath: Ptr("/tmp/a.jsonl")},
+			{SessionID: "sess-1", TS: 20, TranscriptPath: Ptr("/tmp/new.jsonl")},
+			{SessionID: "sess-1", TS: 10, TranscriptPath: Ptr("/tmp/z.jsonl")}},
+	} {
+		for _, order := range permutations(runs) {
+			touchSessionRuns(t, store, order)
+			got := row(t, store, "sessions", "session_id = 'sess-1'")
+			if got["transcript_path"] != "/tmp/new.jsonl" || got["transcript_path_ts"] != int64(20) {
+				t.Errorf("transcript_path = %v with ts %v, want /tmp/new.jsonl with ts 20", got["transcript_path"], got["transcript_path_ts"])
+			}
+		}
+	}
+}
+
+func TestTurnEndMatchesPromptAndTimestamp(t *testing.T) {
+	for _, event := range []string{EventStop, EventStopFailure} {
+		for _, tc := range []struct {
+			name         string
+			prompt, stop *string
+			ts           int64
+			ended        bool
+		}{
+			{"same prompt", Ptr("p-u2"), Ptr("p-u2"), 210, true},
+			{"earlier prompt", Ptr("p-u2"), Ptr("p-u1"), 210, false},
+			{"null stop prompt", Ptr("p-u2"), nil, 210, true},
+			{"null latest prompt", nil, Ptr("p-u1"), 210, true},
+			{"same prompt before timestamp", Ptr("p-u2"), Ptr("p-u2"), 199, false},
+			{"null stop before timestamp", Ptr("p-u2"), nil, 199, false},
+		} {
+			t.Run(event+"/"+tc.name, func(t *testing.T) {
+				store := openTestStore(t)
+				u := promptEvent("u2", "s1", 200)
+				u.PromptID = tc.prompt
+				e := Event{EventID: "end", Event: event, SessionID: Ptr("s1"), TS: tc.ts, PromptID: tc.stop}
+				var turns []Turn
+				if event == EventStop {
+					turns = []Turn{{EventID: e.EventID, Event: event, SessionID: e.SessionID, PromptID: e.PromptID, TS: e.TS}}
+				}
+				putRows(t, store, []Event{u}, nil)
+				// At an equal timestamp, the larger event id identifies the latest prompt.
+				putRows(t, store, []Event{promptEvent("u1", "s1", 200), e}, turns)
+				missing := countWhere(t, store, "SELECT "+turnEndMissing("'s1'"))
+				if (missing == 0) != tc.ended {
+					t.Errorf("turn ended = %v, want %v", missing == 0, tc.ended)
+				}
+				if inserted := recoverEnd(t, store, Event{Event: EventStop, SessionID: Ptr("s1"), TS: 300}); inserted == tc.ended {
+					t.Errorf("RecoverTurnEnd inserted = %v, want %v", inserted, !tc.ended)
+				}
+			})
+		}
 	}
 }

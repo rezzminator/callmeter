@@ -15,6 +15,7 @@ import (
 func Sessions(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty: "callmeter: no sessions in window",
 		Title: f.title("sessions", n),
 		Header: []string{
 			"CHAT", "SESSION", "STARTED", "LAST", "MODEL", "START", "END", "CALLS", "AGENTS", "CWD", "HOST", "TZ",
@@ -54,25 +55,32 @@ func Sessions(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 	if err != nil {
 		return nil, err
 	}
-	beforeStart, idle, noEnd, lostEnd := 0, 0, 0, 0
+	var beforeStart, idle, noEnd, lostEnd int64
+	for _, note := range []struct {
+		condition string
+		count     *int64
+	}{
+		{endedBeforeStart("s.session_id"), &beforeStart},
+		{ranNothing("s.session_id"), &idle},
+		{"s.end_reason = '" + callmeter.EndReasonNever + "'", &noEnd},
+		{"s.end_reason = '" + callmeter.EndReasonLost + "'", &lostEnd},
+	} {
+		if err := query(ctx, store, "session note count",
+			"SELECT COUNT(*) FROM sessions s WHERE "+where+" AND "+note.condition, args,
+			func(r rowSource) error { return r.Scan(note.count) }); err != nil {
+			return nil, err
+		}
+	}
 	for _, row := range found {
-		if row.end != nil && *row.end == callmeter.EndReasonNever {
-			noEnd++
-		}
-		if row.end != nil && *row.end == callmeter.EndReasonLost {
-			lostEnd++
-		}
 		start := textCell(row.start)
 		if row.beforeStart {
 			start = "never"
-			beforeStart++
 		}
 		model := textCell(row.model)
 		if row.idle {
 			if row.model != nil && *row.model != "" {
 				model += " (unused)"
 			}
-			idle++
 		}
 		t.Rows = append(t.Rows, []string{
 			n.of(row.session), row.session, stampCell(row.first), stampCell(row.last), model,

@@ -8,11 +8,13 @@ package cmdparse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -30,6 +32,8 @@ const (
 	StatusError             = "error"
 	StatusUnparsed          = "unparsed"
 	StatusPythonUnavailable = "python-unavailable"
+	// StatusPythonError means Python ran but its scan failed (exit, output, count, id or missing snippet).
+	StatusPythonError = "python-error"
 	// StatusScriptBody is a part whose program reads its script from a
 	// heredoc in another language (python3 - <<EOF): the shell parsed it, and
 	// the script itself is left unparsed (its body is not stored, or holds an
@@ -68,12 +72,20 @@ const errCodeUnresolved = "code holds an unresolved expansion"
 // command over maxCommandBytes is one unparsed part, never handed to the
 // shell parser; a literal -c string nested deeper than maxShellDepth is one
 // unparsed part in place of its parse; the globs of one call share
-// maxGlobLookups directory reads and stats, past which a glob stays as
-// written.
+// maxGlobLookups directory reads and stats, maxGlobEntries directory entries
+// read and maxGlobTime from their first lookup, past any of which a glob
+// stays as written.
 const (
 	maxCommandBytes = 65536
 	maxShellDepth   = 8
 	maxGlobLookups  = 4096
+)
+
+// maxGlobEntries and maxGlobTime are variables only so a test can shrink
+// them; nothing else writes them.
+var (
+	maxGlobEntries = 1 << 17
+	maxGlobTime    = 250 * time.Millisecond
 )
 
 // Call is one Bash tool call: its tool_use_id, its command string, the
@@ -103,7 +115,7 @@ type FileRef struct {
 // nothing nameable (`command -v X`) stays the Program with its own Args and
 // attributes no file. Program is empty for a part that only carries the
 // redirections of a compound command or a bare `> file`. Error holds the
-// parser's message for StatusError, the cause for StatusPythonUnavailable,
+// parser's message for StatusError, the cause for either Python failure status,
 // and any file-stat failure met while attributing (the part stays ok).
 // Conditional is true for a part inside an if/elif/else branch or a case
 // arm, or on the right-hand side of && or ||; an if's own condition is not.
@@ -121,9 +133,10 @@ type Part struct {
 // ParseBatch parses every call and returns its parts keyed by Call.ID. The
 // shell pass runs per call; every Python snippet of the batch goes to py in
 // one Analyze. A nil py is Python3{} (python3 on PATH). When py fails, every
-// Python part of the batch is StatusPythonUnavailable with the cause in
-// Error. The error return is for a malformed batch (duplicate id, relative
-// cwd) or a cancelled ctx, never for a command that did not parse.
+// Python part is StatusPythonUnavailable for ErrNoPython, otherwise
+// StatusPythonError, with the cause in Error. The error return is for a
+// malformed batch (duplicate id, relative cwd) or a cancelled ctx, never for
+// a command that did not parse.
 func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string][]Part, error) {
 	if py == nil {
 		py = Python3{}
@@ -159,13 +172,16 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 		for snipID, pp := range p.pyParts {
 			part := &p.parts[pp.idx]
 			if err != nil {
-				part.Status = StatusPythonUnavailable
+				part.Status = StatusPythonError
+				if errors.Is(err, ErrNoPython) {
+					part.Status = StatusPythonUnavailable
+				}
 				part.Error = err.Error()
 				continue
 			}
 			res, ok := byID[snipID]
 			if !ok {
-				part.Status = StatusPythonUnavailable
+				part.Status = StatusPythonError
 				part.Error = fmt.Sprintf("cmdparse: %s: %v", snipID, errNoResult)
 				continue
 			}
@@ -210,9 +226,13 @@ type callParser struct {
 	existingOnly bool
 	// shellDepth counts the literal -c strings the walk is inside, up to
 	// maxShellDepth; globLookups the directory reads and stats the call's
-	// globs have spent, up to maxGlobLookups.
-	shellDepth  int
-	globLookups int
+	// globs have spent, up to maxGlobLookups; globEntries the directory
+	// entries they read, up to maxGlobEntries; globDeadline maxGlobTime past
+	// their first lookup (zero before it).
+	shellDepth   int
+	globLookups  int
+	globEntries  int
+	globDeadline time.Time
 }
 
 // pyPart is a Python part awaiting its scan: where it sits among the parts

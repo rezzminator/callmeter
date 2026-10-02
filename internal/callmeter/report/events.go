@@ -20,6 +20,7 @@ const eventValue = `COALESCE(NULLIF(e.source, ''), NULLIF(e.reason, ''), NULLIF(
 func Events(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty:  "callmeter: no events in window",
 		Title:  f.title("events", n),
 		Header: []string{"EVENT", "VALUE", "COUNT", "FIRST", "LAST"},
 	}

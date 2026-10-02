@@ -16,6 +16,7 @@ import (
 func Tokens(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty: "callmeter: no requests in window",
 		Title: f.title("tokens", n),
 		Header: []string{
 			"MODEL", "AGENT TYPE", "REQUESTS", "INPUT", "CACHE READ", "CACHE WRITE 5M", "CACHE WRITE 1H", "CACHE WRITE",

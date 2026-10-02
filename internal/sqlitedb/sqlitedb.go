@@ -25,12 +25,14 @@ const driverName = "sqlite"
 // stop that wait on a ctx deadline, so busy is the caller's whole bound), WAL
 // — verified, since a store that silently stayed in rollback mode would make
 // concurrent hooks erase one another's writes — synchronous=NORMAL and foreign
-// keys on.
+// keys on. Every BeginTx transaction opens with BEGIN IMMEDIATE: it takes the
+// write lock at its start, so its busy wait happens there, before any of its
+// statements, and never at a later write.
 func OpenStore(ctx context.Context, path string, busy time.Duration) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory for %s: %w", path, err)
 	}
-	database, err := sql.Open(driverName, fileURI(path, ""))
+	database, err := sql.Open(driverName, fileURI(path, "_txlock=immediate"))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database %s: %w", path, err)
 	}

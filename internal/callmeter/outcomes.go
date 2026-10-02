@@ -99,7 +99,7 @@ func countLines(s string) int64 {
 
 // gitCommitCommand finds `git` before `commit` anywhere in a command, so
 // `git -C dir commit`, `git commit --amend` and `git add . && git commit`
-// all count; the stdout line is what proves a commit was made.
+// all count; the result line is what proves a commit was made.
 var gitCommitCommand = regexp.MustCompile(`(?s)\bgit\b.*\bcommit\b`)
 
 // commitLine is git's own summary of a commit, `[branch sha] subject`; a first
@@ -122,13 +122,22 @@ func commitColumns(c *Call, input, response json.RawMessage) error {
 	if fields.Stdout == nil {
 		return nil
 	}
-	for _, line := range strings.Split(*fields.Stdout, "\n") {
+	CommitFromText(c, command, *fields.Stdout)
+	return nil
+}
+
+// CommitFromText sets a git commit's SHA and branch from its summary in text,
+// whether stdout or an error result, without retaining the commit message.
+func CommitFromText(c *Call, command, text string) {
+	if !gitCommitCommand.MatchString(command) {
+		return
+	}
+	for _, line := range strings.Split(text, "\n") {
 		if match := commitLine.FindStringSubmatch(line); match != nil {
 			c.CommitBranch, c.CommitSHA = Ptr(match[1]), Ptr(match[2])
-			return nil
+			return
 		}
 	}
-	return nil
 }
 
 // BashCommand is the command a Bash call's tool_input carries.
@@ -145,7 +154,8 @@ func BashCommand(input json.RawMessage) (string, error) {
 // TestRunnerOf names the test runner a shell command starts: go, pytest, npm,
 // vitest or cargo, "" when none. It reads the first segment (split on `;`,
 // `&&`, `||`, `|`, `&` and a newline, never inside quotes) whose leading words —
-// after any NAME=value assignments — are `go test`, `pytest`,
+// after NAME=value assignments and env, timeout or nice wrappers — are
+// `go [-C dir] test`, `pytest`,
 // `python[3] -m pytest`, `npm test`, `npm run test`, `npm t`, `[npx ]vitest` or
 // `cargo test`. A runner's name mentioned as an argument (`echo go test`) is
 // not a run.
@@ -165,8 +175,64 @@ var (
 )
 
 func runnerOfWords(words []string) string {
-	for len(words) > 0 && assignment.MatchString(words[0]) {
+	// Wrapper options mirror env, timeout and nice in cmdparse/wrappers.go.
+unwrap:
+	for len(words) > 0 {
+		if assignment.MatchString(words[0]) {
+			words = words[1:]
+			continue
+		}
+		var valueShort string
+		var valueLong map[string]bool
+		var assigns, operand, dash bool
+		switch words[0] {
+		case "env":
+			valueShort, assigns, dash = "uCS", true, true
+			valueLong = map[string]bool{"--unset": true, "--chdir": true, "--split-string": true}
+		case "timeout":
+			valueShort, operand = "ks", true
+			valueLong = map[string]bool{"--kill-after": true, "--signal": true}
+		case "nice":
+			valueShort = "n"
+			valueLong = map[string]bool{"--adjustment": true}
+		default:
+			break unwrap
+		}
 		words = words[1:]
+		flags, operandSeen := true, false
+		skip := 0
+	options:
+		for skip < len(words) {
+			word := words[skip]
+			skip++
+			switch {
+			case flags && word == "--":
+				flags = false
+			case flags && dash && word == "-":
+			case flags && strings.HasPrefix(word, "--"):
+				name, _, hasValue := strings.Cut(word, "=")
+				if !hasValue && valueLong[name] && skip < len(words) {
+					skip++
+				}
+			case flags && len(word) > 1 && word[0] == '-':
+				for j := 1; j < len(word); j++ {
+					if strings.IndexByte(valueShort, word[j]) < 0 {
+						continue
+					}
+					if j == len(word)-1 && skip < len(words) {
+						skip++
+					}
+					break
+				}
+			case assigns && assignment.MatchString(word):
+			case operand && !operandSeen:
+				operandSeen = true
+			default:
+				skip--
+				break options
+			}
+		}
+		words = words[skip:]
 	}
 	at := func(i int) string {
 		if i < len(words) {
@@ -175,7 +241,7 @@ func runnerOfWords(words []string) string {
 		return ""
 	}
 	switch {
-	case at(0) == "go" && at(1) == "test":
+	case at(0) == "go" && (at(1) == "test" || at(1) == "-C" && at(2) != "" && at(3) == "test"):
 		return "go"
 	case at(0) == "pytest", pythonCommand.MatchString(at(0)) && at(1) == "-m" && at(2) == "pytest":
 		return "pytest"

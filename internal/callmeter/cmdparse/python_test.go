@@ -81,6 +81,68 @@ func TestMissingInterpreterMarksPythonUnavailable(t *testing.T) {
 	}
 }
 
+func TestPythonResolves(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		py   PythonRunner
+		want bool
+	}{
+		{"nil", nil, true},
+		{"default", Python3{}, true},
+		{"missing", Python3{Runner: runner.Real{}, Program: "callmeter-cmdparse-no-such-python"}, false},
+		{"injected", failingPython{}, true},
+		{"embedded-default", droppingPython{}, true},
+		{"embedded-missing", droppingPython{Python3{Program: "callmeter-cmdparse-no-such-python"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PythonResolves(tc.py); got != tc.want {
+				t.Errorf("PythonResolves = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// droppingPython scans with the real interpreter, then loses one result.
+type droppingPython struct{ Python3 }
+
+func (p droppingPython) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error) {
+	results, err := p.Python3.Analyze(ctx, snippets)
+	if err != nil {
+		return nil, err
+	}
+	return results[:len(results)-1], nil
+}
+
+func TestParseBatchPythonCrashIsPythonError(t *testing.T) {
+	for _, tc := range []struct {
+		name, script string
+	}{
+		{"nonzero", "#!/bin/sh\nexit 7\n"},
+		{"undecodable", "#!/bin/sh\nprintf '%s' 'not-json'\n"},
+		{"wrong-count", "#!/bin/sh\nprintf '%s' '[]'\n"},
+		{"wrong-id", "#!/bin/sh\nprintf '%s' '[{\"id\":\"other\"}]'\n"},
+		{"cannot-start", "#!/no-such-interpreter\n"},
+		{"missing-snippet", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cwd := fixture(t)
+			var py PythonRunner = droppingPython{}
+			if tc.script != "" {
+				program := filepath.Join(cwd, "broken-python")
+				if err := os.WriteFile(program, []byte(tc.script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				py = Python3{Program: program}
+			}
+			parts := parseOne(t, cwd, `python3 -c "print(1)"`, py)
+			if len(parts) != 1 || parts[0].Status != "python-error" || parts[0].Error == "" {
+				t.Fatalf("Python status = %s, want python-error with a cause", parts[0].Status)
+			}
+		})
+	}
+}
+
 // A Python open() or Path(...) write of a file that does not exist yet is
 // attributed, Exists false, in the directory the part ran in; a bare string
 // naming nothing on disk stays unattributed.

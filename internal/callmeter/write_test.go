@@ -95,6 +95,98 @@ func TestFillEmptyNeverOverwrites(t *testing.T) {
 	}
 }
 
+func TestUpsertCallChangingCwdDropsItsParts(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial Call
+		change  Call
+		mode    Mode
+		want    int
+	}{
+		{"changed cwd", postToolUse(), Call{Cwd: Ptr("/tmp/demo-proj/start")}, Overwrite, 0},
+		{"changed input", postToolUse(), Call{Input: Ptr(`{"command":"true"}`)}, Overwrite, 0},
+		{"same cwd and input", postToolUse(), Call{Cwd: postToolUse().Cwd, Input: postToolUse().Input}, Overwrite, 1},
+		{"fill nothing", postToolUse(), Call{Cwd: Ptr("/tmp/demo-proj/start"), Input: Ptr(`{"command":"true"}`)}, FillEmpty, 1},
+		{"fill cwd", Call{ToolUseID: "toolu_1"}, Call{Cwd: Ptr("/tmp/demo-proj/start")}, FillEmpty, 0},
+		{"fill input", Call{ToolUseID: "toolu_1"}, Call{Input: Ptr(`{"command":"true"}`)}, FillEmpty, 0},
+		{"unrelated update", postToolUse(), Call{BytesDelivered: Ptr(int64(42))}, Overwrite, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			if err := store.UpsertCall(ctx, tc.initial, Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			parts := []CommandPart{{Seq: 0, Lang: "sh", Program: "cat", ParseStatus: "ok"}}
+			if err := store.ReplaceCommandParts(ctx, "toolu_1", parts); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AddFault(ctx, Fault{ToolUseID: "toolu_1", Stage: StageParse, Error: "old parse"}); err != nil {
+				t.Fatal(err)
+			}
+			tc.change.ToolUseID = "toolu_1"
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				if err := tx.UpsertCall(ctx, tc.change, tc.mode); err != nil {
+					return err
+				}
+				var got int
+				if err := tx.tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM command_parts WHERE tool_use_id = ?", "toolu_1").Scan(&got); err != nil {
+					return err
+				}
+				if got != tc.want {
+					t.Errorf("parts inside upsert transaction = %d, want %d", got, tc.want)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := count(t, store, "command_parts"); got != tc.want {
+				t.Errorf("parts after upsert = %d, want %d", got, tc.want)
+			}
+			if got := count(t, store, "faults"); got != 1 {
+				t.Errorf("parse faults = %d, want the old fault kept until re-parse", got)
+			}
+		})
+	}
+}
+
+func TestUpsertCallInvalidationErrorsRollBack(t *testing.T) {
+	for _, tc := range []struct {
+		name, setup, want string
+	}{
+		{"read", "ALTER TABLE calls RENAME TO hidden_calls", "read parse inputs"},
+		{"upsert", `CREATE TRIGGER refuse_call BEFORE UPDATE ON calls BEGIN SELECT RAISE(ABORT, 'test upsert failure'); END`, "test upsert failure"},
+		{"delete", `CREATE TRIGGER refuse_parts BEFORE DELETE ON command_parts BEGIN SELECT RAISE(ABORT, 'test invalidation failure'); END`, "invalidate command parts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			original := postToolUse()
+			if err := store.UpsertCall(ctx, original, Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReplaceCommandParts(ctx, original.ToolUseID, []CommandPart{{Seq: 0, Lang: "sh", ParseStatus: "ok"}}); err != nil {
+				t.Fatal(err)
+			}
+			err := store.Batch(ctx, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, tc.setup); err != nil {
+					return err
+				}
+				return tx.UpsertCall(ctx, Call{ToolUseID: original.ToolUseID, Cwd: Ptr("/tmp/demo-proj/start")}, Overwrite)
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("upsert error = %v, want %s", err, tc.want)
+			}
+			if got := row(t, store, "calls", "tool_use_id = ?", original.ToolUseID)["cwd"]; got != *original.Cwd {
+				t.Error("failed invalidation changed the stored cwd")
+			}
+			if got := count(t, store, "command_parts"); got != 1 {
+				t.Errorf("parts after rollback = %d, want 1", got)
+			}
+		})
+	}
+}
+
 func TestUpsertCutsError(t *testing.T) {
 	store := openTestStore(t)
 	if err := store.UpsertCall(
@@ -577,5 +669,50 @@ func TestCallTSKeepsTheEarliest(t *testing.T) {
 				t.Errorf("mode %d, %s: ts = %v, want 1000", mode, name, got)
 			}
 		}
+	}
+}
+
+func TestUnfinishedCallsSkipsALandedEdit(t *testing.T) {
+	ctx := context.Background()
+	for _, response := range noRealOutputResponses(t) {
+		t.Run(response.name, func(t *testing.T) {
+			store := openTestStore(t)
+			real, err := RealBytes(response.tool, response.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range []Call{
+				{ToolUseID: "landed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: real, Source: Ptr(SourceHook)},
+				{ToolUseID: "rebuilt", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: real, BytesDelivered: Ptr(int64(7)), Source: Ptr(SourceTranscript)},
+				{ToolUseID: "failed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(true)},
+				{ToolUseID: "not-landed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main")},
+				{ToolUseID: "old", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: Ptr(int64(42))},
+			} {
+				if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls, err := store.UnfinishedCalls(ctx, "sess-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			for _, call := range calls {
+				ids = append(ids, call.ToolUseID)
+			}
+			if !reflect.DeepEqual(ids, []string{"not-landed"}) {
+				t.Errorf("UnfinishedCalls ids = %v, want only not-landed", ids)
+			}
+			var open int
+			if err := store.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM calls c WHERE "+callOpen("c")).Scan(&open); err != nil {
+				t.Fatal(err)
+			}
+			if open != 1 {
+				t.Errorf("callOpen count = %d, want only not-landed", open)
+			}
+			if got := row(t, store, "calls", "tool_use_id = 'old'")["bytes_real"]; got != int64(42) {
+				t.Errorf("old bytes_real = %v, want 42", got)
+			}
+		})
 	}
 }

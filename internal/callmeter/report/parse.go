@@ -25,8 +25,10 @@ type ParseSummary struct {
 }
 
 // EnsureParsed parses every Bash call that has no command_parts rows from
-// this parser (cmdparse.Version) and caches its parts, replacing an older
-// parser's; a parser error adds a parse fault with its message. home is where
+// this parser (cmdparse.Version), a python-error part at every run, or a
+// python-unavailable part only when python3 resolves at this run. It caches
+// parts, replacing an older parser's; a parser error adds a parse fault with
+// its message. home is where
 // a leading `~` expands (runtime.Paths.Home: the commands ran as this user). A
 // call whose cwd is not absolute stays unparsed (cmdparse refuses it) and is
 // counted, as is one whose stored input carries no command.
@@ -43,11 +45,19 @@ func EnsureParsed(
 		ts        int64
 	}
 	var todo []pending
+	retryUnavailable := cmdparse.PythonResolves(runner)
+	retryStatuses := "?"
+	args := []any{cmdparse.Version, cmdparse.StatusPythonError}
+	if retryUnavailable {
+		retryStatuses += ", ?"
+		args = append(args, cmdparse.StatusPythonUnavailable)
+	}
 	err := query(ctx, store, "unparsed Bash calls",
 		`SELECT c.tool_use_id, COALESCE(c.session_id, ''), COALESCE(c.ts, 0), COALESCE(c.input, ''), COALESCE(c.cwd, '')
 		FROM calls c WHERE c.tool = 'Bash'
-		AND NOT EXISTS (SELECT 1 FROM command_parts p WHERE p.tool_use_id = c.tool_use_id AND p.parser = ?)
-		ORDER BY c.ts, c.tool_use_id`, []any{cmdparse.Version},
+		AND (NOT EXISTS (SELECT 1 FROM command_parts p WHERE p.tool_use_id = c.tool_use_id AND p.parser = ?)
+		OR EXISTS (SELECT 1 FROM command_parts p WHERE p.tool_use_id = c.tool_use_id AND p.parse_status IN (`+retryStatuses+`)))
+		ORDER BY c.ts, c.tool_use_id`, args,
 		func(r rowSource) error {
 			var p pending
 			var input string
@@ -55,20 +65,21 @@ func EnsureParsed(
 				return err
 			}
 			var fields struct {
-				Command *string `json:"command"`
+				Command json.RawMessage `json:"command"`
 			}
 			if input != "" {
 				if err := json.Unmarshal([]byte(input), &fields); err != nil {
 					return fmt.Errorf("decode input of call %s: %w", p.call.ID, err)
 				}
 			}
+			var command *string
 			switch {
-			case fields.Command == nil:
+			case len(fields.Command) == 0 || json.Unmarshal(fields.Command, &command) != nil || command == nil:
 				summary.SkippedNoInput++
 			case !filepath.IsAbs(p.call.Cwd):
 				summary.SkippedRelative++
 			default:
-				p.call.Command, p.call.Home = *fields.Command, home
+				p.call.Command, p.call.Home = *command, home
 				todo = append(todo, p)
 			}
 			return nil
@@ -93,23 +104,28 @@ func EnsureParsed(
 		}
 		for _, p := range batch {
 			parts := toStoreParts(parsed[p.call.ID])
-			if err := store.ReplaceCommandParts(ctx, p.call.ID, parts); err != nil {
-				return summary, fmt.Errorf("callmeter report: cache parts: %w", err)
-			}
-			for j := range parsed[p.call.ID] {
-				part := &parsed[p.call.ID][j]
-				if part.Status != cmdparse.StatusError {
-					continue
+			if err := store.Batch(ctx, func(tx *callmeter.Tx) error {
+				if err := tx.ReplaceCommandParts(ctx, p.call.ID, parts); err != nil {
+					return fmt.Errorf("callmeter report: cache parts: %w", err)
 				}
-				if err := store.AddFault(ctx, callmeter.Fault{
-					TS:        p.ts,
-					SessionID: p.sessionID,
-					ToolUseID: p.call.ID,
-					Stage:     callmeter.StageParse,
-					Error:     callmeter.ParseFault(part.Seq, part.Program, part.Error),
-				}); err != nil {
-					return summary, fmt.Errorf("callmeter report: record parse fault: %w", err)
+				for j := range parsed[p.call.ID] {
+					part := &parsed[p.call.ID][j]
+					if part.Status != cmdparse.StatusError {
+						continue
+					}
+					if err := tx.AddFault(ctx, callmeter.Fault{
+						TS:        p.ts,
+						SessionID: p.sessionID,
+						ToolUseID: p.call.ID,
+						Stage:     callmeter.StageParse,
+						Error:     callmeter.ParseFault(part.Seq, part.Program, part.Error),
+					}); err != nil {
+						return fmt.Errorf("callmeter report: record parse fault: %w", err)
+					}
 				}
+				return nil
+			}); err != nil {
+				return summary, err
 			}
 			summary.Parsed++
 		}

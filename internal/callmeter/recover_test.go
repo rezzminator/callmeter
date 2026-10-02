@@ -1621,3 +1621,290 @@ func TestRecoverQuietSizesAHookCallFromItsToolUseResult(t *testing.T) {
 		})
 	}
 }
+
+// Walker C: a long-lived session whose early rows were pruned gets them back
+// from recovery, which reads from sessions.first_ts.
+func TestRecoverQuietNeverResurrectsPrunedRows(t *testing.T) {
+	ctx := context.Background()
+	q := quietStore{store: openTestStore(t), now: time.Now()}
+	dir := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj")
+	q.main = filepath.Join(dir, "sess-1.jsonl")
+	old := q.now.Add(-40 * 24 * time.Hour)
+	recent := q.now.Add(-2 * time.Hour)
+	q.writeTranscript(t, q.main,
+		promptLine("prompt-old", secretPrompt, old),
+		toolUseLine("msg_old", "toolu_old", 5, old.Add(time.Second)),
+		quietResultLine("toolu_old", "ok", false, old.Add(2*time.Second)),
+		promptLine("prompt-new", secretPrompt, recent),
+		toolUseLine("msg_new", "toolu_new", 5, recent.Add(time.Second)),
+		quietResultLine("toolu_new", "ok", false, recent.Add(2*time.Second)),
+	)
+	if err := os.Chtimes(q.main, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+	err := q.store.Batch(ctx, func(tx *Tx) error {
+		if err := tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: old.UnixMilli(), TranscriptPath: Ptr(q.main)}); err != nil {
+			return err
+		}
+		if err := tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: recent.Add(3 * time.Second).UnixMilli()}); err != nil {
+			return err
+		}
+		for _, c := range []Call{
+			{ToolUseID: "toolu_old", SessionID: Ptr("sess-1"), TS: Ptr(old.Add(time.Second).UnixMilli()), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
+				RequestID: Ptr("msg_old"), BytesReal: Ptr(int64(2)), BytesDelivered: Ptr(int64(2)), Failed: Ptr(false)},
+			{ToolUseID: "toolu_new", SessionID: Ptr("sess-1"), TS: Ptr(recent.Add(time.Second).UnixMilli()), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
+				RequestID: Ptr("msg_new"), BytesReal: Ptr(int64(2)), BytesDelivered: Ptr(int64(2)), Failed: Ptr(false)},
+		} {
+			if err := tx.UpsertCall(ctx, c, Overwrite); err != nil {
+				return err
+			}
+		}
+		for _, r := range []Request{
+			{RequestID: "msg_old", SessionID: Ptr("sess-1"), TS: Ptr(old.Add(time.Second).UnixMilli()), Pending: Ptr(false), Source: Ptr(SourceHook), Model: Ptr("m"), StopReason: Ptr("tool_use"), InputTokens: Ptr(int64(1)), CacheReadTokens: Ptr(int64(1)), CacheCreationTokens: Ptr(int64(1)), ContextTokens: Ptr(int64(3)), OutputTokens: Ptr(int64(5)), Calls: Ptr(int64(1))},
+			{RequestID: "msg_new", SessionID: Ptr("sess-1"), TS: Ptr(recent.Add(time.Second).UnixMilli()), Pending: Ptr(false), Source: Ptr(SourceHook), Model: Ptr("m"), StopReason: Ptr("tool_use"), Calls: Ptr(int64(1))},
+		} {
+			if err := tx.UpsertRequest(ctx, r, Overwrite); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := q.store.Prune(ctx, q.now.Add(-30*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prune 1 removed %d rows; calls=%d requests=%d", removed, count(t, q.store, "calls"), count(t, q.store, "requests"))
+	if row(t, q.store, "calls", "tool_use_id = 'toolu_old'") != nil {
+		t.Fatalf("prune kept toolu_old")
+	}
+	summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Skipped) != 0 {
+		t.Fatalf("RecoverQuiet skipped %v", summary.Skipped)
+	}
+	c := row(t, q.store, "calls", "tool_use_id = 'toolu_old'")
+	r := row(t, q.store, "requests", "request_id = 'msg_old'")
+	t.Logf("after recovery: toolu_old=%v", c != nil)
+	t.Logf("after recovery: msg_old=%v", r != nil)
+	if c != nil {
+		t.Logf("resurrected call source=%v ts=%v", c["source"], c["ts"])
+	}
+	cutoff := q.now.Add(-30 * 24 * time.Hour).UnixMilli()
+	for _, table := range []string{"calls", "requests"} {
+		var expired int
+		if err := q.store.DB().QueryRow("SELECT COUNT(*) FROM "+table+" WHERE ts < ?", cutoff).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired != 0 {
+			t.Errorf("recovery resurrected pruned rows: %s has %d expired rows", table, expired)
+		}
+	}
+	if row(t, q.store, "requests", "request_id = 'msg_new'") == nil {
+		t.Error("recovery lost the recent request")
+	}
+	if c != nil || r != nil {
+		t.Errorf("recovery resurrected pruned rows: call %v request %v", c != nil, r != nil)
+	}
+}
+
+// Walker C: a session row pruned and archived, then the session resumed and
+// pruned again: the newer row is deleted while the archive keeps the old copy.
+
+func TestRecoverQuietResolvedPendingRefreshesSessionModel(t *testing.T) {
+	q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+	ctx := context.Background()
+	key := ProvisionalKey(q.toolMain)
+	if err := q.store.Batch(ctx, func(tx *Tx) error {
+		if err := tx.UpsertRequest(ctx, Request{RequestID: key, SessionID: Ptr("sess-1"), TS: Ptr(q.callTS), Pending: Ptr(true),
+			Calls: Ptr(int64(1)), Source: Ptr(SourceHook)}, Overwrite); err != nil {
+			return err
+		}
+		return tx.UpsertCall(ctx, Call{ToolUseID: q.toolMain, RequestID: Ptr(key), BytesDelivered: Ptr(int64(5))}, Overwrite)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q.recover(t)
+	req := row(t, q.store, "requests", "request_id = 'msg_main'")
+	sess := row(t, q.store, "sessions", "session_id = 'sess-1'")
+	t.Logf("resolved main request model=%v agent=%v; sessions.model=%v", req["model"], req["agent_id"], sess["model"])
+	if req["model"] == nil || sess["model"] != req["model"] {
+		t.Errorf("sessions.model stays NULL after recovery resolved the session's only main-chat request to model %v", req["model"])
+	}
+}
+
+func TestRecoverQuietReadsTheNewestTranscriptPath(t *testing.T) {
+	for i, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			start := time.UnixMilli(q.firstTS).Add(time.Minute)
+			q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), endTurnLine("msg_end", 9, start.Add(time.Second)))
+			if err := os.Chtimes(q.main, start, start); err != nil {
+				t.Fatal(err)
+			}
+			// A second run names the current file; the first run's root is gone.
+			if _, err := q.store.DB().Exec("DELETE FROM sessions"); err != nil {
+				t.Fatal(err)
+			}
+			runs := []Session{
+				{SessionID: "sess-1", TS: q.firstTS, TranscriptPath: Ptr(filepath.Join(t.TempDir(), "gone", "sess-1.jsonl"))},
+				{SessionID: "sess-1", TS: start.UnixMilli(), TranscriptPath: Ptr(q.main)},
+			}
+			if reverse {
+				runs[0], runs[1] = runs[1], runs[0]
+			}
+			touchSessionRuns(t, q.store, runs)
+			putRows(t, q.store, []Event{promptEvent("u1", "sess-1", start.UnixMilli())}, nil)
+			q.recover(t)
+			if n := countWhere(t, q.store, "SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND session_id = 'sess-1'"); n != 1 {
+				t.Errorf("rebuilt Stop rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestRecoverQuietFindsAMovedTranscript(t *testing.T) {
+	for _, viaSeat := range []bool{false, true} {
+		t.Run(fmt.Sprintf("seat=%v", viaSeat), func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			start := time.UnixMilli(q.firstTS).Add(time.Minute)
+			q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), endTurnLine("msg_end", 9, start.Add(time.Second)))
+			if err := os.Chtimes(q.main, start, start); err != nil {
+				t.Fatal(err)
+			}
+			projects := filepath.Dir(filepath.Dir(q.main))
+			if err := os.Rename(filepath.Dir(q.main), filepath.Join(projects, "-tmp-moved-proj")); err != nil {
+				t.Fatal(err)
+			}
+			if viaSeat {
+				dead := filepath.Join(t.TempDir(), "gone", "sess-1.jsonl")
+				if _, err := q.store.DB().Exec("UPDATE sessions SET transcript_path = ?, seat_dir = ?", dead, filepath.Dir(projects)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			putRows(t, q.store, []Event{promptEvent("u1", "sess-1", start.UnixMilli())}, nil)
+			q.recover(t)
+			if n := countWhere(t, q.store, "SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND session_id = 'sess-1'"); n != 1 {
+				t.Errorf("rebuilt Stop rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestResolveTranscriptKeepsTheStoredPathOrFindsTheFirstMatch(t *testing.T) {
+	root := t.TempDir()
+	stored := filepath.Join(root, "old-projects", "old", "s1.jsonl")
+	first := filepath.Join(root, "old-projects", "a", "s1.jsonl")
+	second := filepath.Join(root, "old-projects", "z", "s1.jsonl")
+	seat := filepath.Join(root, "seat")
+	seatPath := filepath.Join(seat, "projects", "a", "s1.jsonl")
+	for _, path := range []string{stored, second, first, seatPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(name, path, seatDir, session, want string) {
+		t.Helper()
+		if got := ResolveTranscript(path, seatDir, session); got != want {
+			t.Errorf("%s: resolved path = %q, want %q", name, got, want)
+		}
+	}
+	check("existing stored path wins", stored, seat, "s1", stored)
+	if err := os.Remove(stored); err != nil {
+		t.Fatal(err)
+	}
+	check("stored root first sorted match", stored, seat, "s1", first)
+	dead := filepath.Join(root, "gone-projects", "old", "s1.jsonl")
+	check("seat root fallback", dead, seat, "s1", seatPath)
+	check("empty stored path", "", seat, "s1", seatPath)
+	check("no match preserves stored path", stored, seat, "absent", stored)
+	check("no recorded roots", "", "", "s1", "")
+}
+
+func TestRecoverQuietSettlesAnEditWithoutARealSize(t *testing.T) {
+	for _, response := range noRealOutputResponses(t) {
+		for _, state := range []string{"lost PostToolUse", "batch only", "rebuilt", "landed"} {
+			t.Run(response.name+"/"+state, func(t *testing.T) {
+				q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+				start := time.UnixMilli(q.callTS)
+				use := strings.Replace(toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)), `"name":"Bash"`, `"name":"`+response.tool+`"`, 1)
+				use = strings.Replace(use, `"input":{"command":"false","description":"Fail"}`, `"input":`+string(response.input), 1)
+				q.writeTranscript(t, q.main,
+					promptLine("prompt-1", secretPrompt, start), use,
+					textLine("msg_main", secretMessage, 77, start.Add(2*time.Second)),
+					resultWithUseResult(q.toolMain, secretResult, string(response.raw), start.Add(3*time.Second)),
+				)
+				if err := os.Chtimes(q.main, start, start); err != nil {
+					t.Fatal(err)
+				}
+				call := Call{ToolUseID: q.toolMain, Tool: Ptr(response.tool)}
+				if state == "batch only" {
+					call.BytesDelivered = Ptr(int64(len(secretResult)))
+				}
+				if state == "landed" {
+					call.Failed = Ptr(false)
+					call.RequestID = Ptr("msg_main")
+				}
+				if state == "rebuilt" {
+					if _, err := q.store.DB().Exec("DELETE FROM calls WHERE tool_use_id = ?", q.toolMain); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := q.store.UpsertCall(context.Background(), call, Overwrite); err != nil {
+					t.Fatal(err)
+				}
+				first := q.recover(t)
+				main := row(t, q.store, "calls", "tool_use_id = ?", q.toolMain)
+				if main["bytes_real"] != nil || main["failed"] != int64(0) {
+					t.Errorf("real=%v failed=%v, want NULL, 0", main["bytes_real"], main["failed"])
+				}
+				if state != "landed" && main["bytes_delivered"] != int64(len(secretResult)) {
+					t.Errorf("delivered=%v, want %d", main["bytes_delivered"], len(secretResult))
+				}
+				if first.Unfillable != 0 {
+					t.Errorf("RecoverQuiet unfillable=%d, want 0", first.Unfillable)
+				}
+				var n int
+				if err := q.store.DB().QueryRow("SELECT COUNT(*) FROM faults WHERE tool_use_id = ? AND error LIKE ?", q.toolMain, "%"+UnfilledCall+"%").Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				if n != 0 {
+					t.Errorf("call markers=%d, want 0", n)
+				}
+				if calls, err := q.store.UnfinishedCalls(context.Background(), "sess-1"); err != nil {
+					t.Fatal(err)
+				} else {
+					for _, c := range calls {
+						if c.ToolUseID == q.toolMain {
+							t.Error("landed call remains unfinished")
+						}
+					}
+				}
+				if candidates := q.candidates(t); len(candidates) != 0 {
+					t.Errorf("quietCandidates = %d, want 0", len(candidates))
+				}
+				before := q.snapshot(t)
+				if again := q.recover(t); again.Sessions != 0 || again.Calls != 0 || again.Requests != 0 || again.Rebuilt != 0 || again.Unfillable != 0 {
+					t.Errorf("second RecoverQuiet=%+v, want nothing to do", again)
+				}
+				if !reflect.DeepEqual(before, q.snapshot(t)) {
+					t.Error("second recovery changed stored rows")
+				}
+				for _, r := range q.snapshot(t) {
+					for _, value := range r {
+						text := fmt.Sprint(value)
+						if strings.Contains(text, secretResult) || strings.Contains(text, secretMessage) || strings.Contains(text, secretPrompt) {
+							t.Fatal("transcript text stored")
+						}
+					}
+				}
+			})
+		}
+	}
+}

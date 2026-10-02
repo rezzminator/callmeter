@@ -65,6 +65,7 @@ const hookBinary = "/libexec/callmeter"
 func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty:  "callmeter: every transcript in the window is recorded",
 		Title:  f.title("coverage", n),
 		Header: []string{"SEAT", "PROJECT", "SESSION", "STARTED", "MODIFIED", "BYTES", "WHY"},
 	}

@@ -3,7 +3,7 @@
 # stdout: a JSON list of {"id", "calls", "strings", "error"}, same order.
 # A snippet that does not parse carries its error and no calls; any other
 # failure exits non-zero with the traceback on stderr, so the Go side marks
-# the batch python-unavailable with the cause instead of reading silence.
+# the batch python-error with the cause instead of reading silence.
 import ast
 import json
 import shlex

@@ -55,6 +55,7 @@ var detailNamed = map[string][]string{
 	"StopFailure":               {"error"},
 	"InstructionsLoaded":        {"load_reason", "memory_type", "file_path"},
 	"PermissionRequest":         {"tool_name"},
+	"PermissionDenied":          {"tool_name"},
 	"UserPromptSubmit":          {"prompt"},
 	"UserPromptExpansion":       {"command_name", "prompt"},
 	"TaskCreated":               {"task_id"},
@@ -96,7 +97,7 @@ func (run *callmeterRun) eventOf() *callmeter.Event {
 		}
 	case "InstructionsLoaded":
 		e.LoadReason, e.MemoryType, e.FilePath = presentString(p.LoadReason), presentString(p.MemoryType), presentString(p.FilePath)
-	case "PermissionRequest":
+	case "PermissionRequest", "PermissionDenied":
 		e.ToolName = presentString(p.ToolName)
 	case "UserPromptSubmit":
 		e.PromptBytes = run.stringBytes("prompt", p.Prompt)
@@ -246,16 +247,28 @@ func absent(raw json.RawMessage) bool {
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
-// effortOf is the effort a payload ran under: its effort.level, else the
-// hook process's CLAUDE_EFFORT, else nil.
-func effortOf(raw json.RawMessage, getenv paths.Getenv) *string {
+// effortOf keeps payload effort; events that never carry it may use the
+// process's CLAUDE_EFFORT when their session model supports effort.
+func effortOf(raw json.RawMessage, event string, getenv paths.Getenv, modelOf func() (string, error)) *string {
 	var effort struct {
 		Level string `json:"level"`
 	}
 	if !absent(raw) && json.Unmarshal(raw, &effort) == nil && effort.Level != "" {
 		return &effort.Level
 	}
-	return presentString(getenv("CLAUDE_EFFORT"))
+	switch event {
+	case "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", eventStop, callmeter.EventSubagentStop, callmeter.EventStopFailure:
+		return nil
+	}
+	fallback := presentString(getenv("CLAUDE_EFFORT"))
+	if fallback == nil {
+		return nil
+	}
+	model, err := modelOf()
+	if err != nil || model == "" || strings.Contains(model, "haiku") {
+		return nil
+	}
+	return fallback
 }
 
 // runRows writes the rows this run owns beside its event's own: the session
@@ -277,7 +290,7 @@ func (run *callmeterRun) runRows(tx *callmeter.Tx) error {
 		// This hook's own turn end, written in the same transaction, replaces
 		// the one SessionEnd or a quiet-session recovery rebuilt from the
 		// transcript when this hook was thought lost (recoverTurnEnd).
-		if err := tx.DropRecoveredTurnEnd(run.ctx, run.payload.SessionID, run.now); err != nil {
+		if err := tx.DropRecoveredTurnEnd(run.ctx, run.payload.SessionID, run.now, run.payload.PromptID); err != nil {
 			return err
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -257,6 +259,12 @@ func payloadField(t *testing.T, line string, path ...string) any {
 }
 
 func TestCallmeterCapturedPayloads(t *testing.T) {
+	t.Run("agent result alone", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		lab.feed(lab.payloads("scripted.jsonl")[9])
+		expect(t, "agent result", lab.row("SELECT * FROM agents WHERE agent_id = ?", cmSubagent),
+			map[string]any{"total_tokens": nil, "tool_uses": nil})
+	})
 	lab := newCallmeterLab(t)
 	configDir, err := filepath.EvalSymlinks(filepath.Join(lab.home, ".claude"))
 	if err != nil {
@@ -292,7 +300,7 @@ func TestCallmeterCapturedPayloads(t *testing.T) {
 		"tool": "Read", "failed": 0, "bytes_real": len(readContent), "file_path": filepath.Join(lab.proj, "fixture.go"),
 		"file_bytes": len(fixture), "read_start": 1, "read_lines": 152, "read_total_lines": 152,
 		"session_id": cmSessionA, "agent_id": nil, "cwd": lab.proj, "source": callmeter.SourceHook,
-		"config_dir": configDir, "ts": lab.clock.Now().UnixMilli(), "duration_ms": 2,
+		"config_dir": configDir, "ts": lab.clock.Now().UnixMilli() - 2, "duration_ms": 2,
 	})
 	expect(t, "ranged Read", lab.call("toolu_01BQAycMmK5m23hu7UWYnSHr"), map[string]any{
 		"read_start": 20, "read_lines": 15, "read_total_lines": 152,
@@ -333,7 +341,7 @@ func TestCallmeterCapturedPayloads(t *testing.T) {
 		},
 	)
 	expect(t, "Agent call", lab.call("toolu_01WWJxCy1xfH6wrvmTc7oF5c"), map[string]any{
-		"tool": "Agent", "bytes_real": 3, "duration_ms": 4365,
+		"tool": "Agent", "bytes_real": "<nil>", "duration_ms": 4365,
 	})
 	agentTranscript, _ := payloadField(t, scripted[8], "agent_transcript_path").(string)
 	expect(t, "agent", lab.row("SELECT * FROM agents WHERE agent_id = ?", cmSubagent), map[string]any{
@@ -559,6 +567,39 @@ func TestCallmeterStoreUnopenable(t *testing.T) {
 // TestCallmeterEntryUsesHome: the store lands under CALLMETER_HOME, never
 // under the user's HOME the environment also carries — a hook that ignored
 // CALLMETER_HOME wrote a test run's rows into the operator's real store.
+func TestCallmeterBatchWithoutCallsFault(t *testing.T) {
+	lab := newCallmeterLab(t)
+	lab.feed(hookPayload(t, "PostToolBatch", map[string]any{"tool_calls": dropKey}))
+	expect(t, "fault", lab.row("SELECT stage, error, tool_use_id FROM faults"), map[string]any{
+		"stage": callmeter.StagePayload, "error": callmeter.BatchWithoutCalls, "tool_use_id": nil,
+	})
+}
+
+func TestCallmeterPanicAfterTheEventCommitsIsAccounted(t *testing.T) {
+	lab := newCallmeterLab(t)
+	lab.storePath = paths.Store(lab.root)
+	previous := afterEventCommit
+	afterEventCommit = func() { panic("boom") }
+	t.Cleanup(func() { afterEventCommit = previous })
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		var stderr bytes.Buffer
+		Callmeter(strings.NewReader(lab.rewrite(hookPayload(t, "SessionStart", nil))), &stderr,
+			mapEnv(map[string]string{paths.EnvHome: lab.root, "HOME": lab.home}))
+	}()
+	accounted, ok := recovered.(AccountedPanic)
+	if !ok || accounted.Value != "boom" {
+		t.Errorf("panic = %T %v, want AccountedPanic carrying boom", recovered, recovered)
+	}
+	if n := lab.count("SELECT count(*) FROM events WHERE event = 'SessionStart'"); n != 1 {
+		t.Errorf("committed events = %d, want 1", n)
+	}
+	if missed, err := os.ReadFile(paths.Missed(lab.root)); !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
+		t.Errorf("missed.log has %d bytes (%v), want no line", len(missed), err)
+	}
+}
+
 func TestCallmeterEntryUsesHome(t *testing.T) {
 	lab := newCallmeterLab(t)
 	var stderr bytes.Buffer
@@ -594,10 +635,11 @@ func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {
 	}
 }
 
-// TestCallmeterEntryStoreUnopenableIsSaidTwice: CALLMETER_HOME is a regular
-// file, so neither the store nor the log can be created: exit 0 and one stderr
-// line for the store error, one for the failed log append, no panic.
-func TestCallmeterEntryStoreUnopenableIsSaidTwice(t *testing.T) {
+// TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME is a regular file,
+// so neither the store, the log nor missed.log can be created: exit 0, a
+// stderr line for the store error and one for the failed missed.log append,
+// each followed by its failed log append, no panic.
+func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	lab := newCallmeterLab(t)
 	blocker := filepath.Join(lab.root, "a-file")
 	lab.write(blocker, []byte("a file where the home should be"))
@@ -607,10 +649,13 @@ func TestCallmeterEntryStoreUnopenableIsSaidTwice(t *testing.T) {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
 		!strings.Contains(lines[0], "toolu_01UGaJs715PJE1hKtJWM2ANC") ||
-		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) {
-		t.Errorf("stderr = %q, want the store error then the failed log append", stderr.String())
+		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) ||
+		!strings.HasPrefix(lines[2], "callmeter: "+callmeter.StageTerminated+": ") ||
+		!strings.Contains(lines[2], paths.Missed(blocker)) ||
+		!strings.HasPrefix(lines[3], "callmeter: log "+paths.Log(blocker)) {
+		t.Errorf("stderr = %q, want the store error and the failed missed.log append, each then the failed log append", stderr.String())
 	}
 }
 
@@ -811,9 +856,25 @@ func TestCallmeterSubagentStopFillsTotals(t *testing.T) {
 	t.Run("agent result first", func(t *testing.T) {
 		lab := newCallmeterLab(t)
 		scripted := lab.payloads("scripted.jsonl")
-		lab.feed(scripted[5], scripted[9], scripted[8])
+		lab.feed(scripted[5], scripted[9])
+		expect(t, "before stop", agentRow(lab), map[string]any{"total_tokens": nil, "tool_uses": nil})
+		lab.feed(scripted[8])
 		expect(t, "foreground agent", agentRow(lab), map[string]any{
 			"total_tokens": 18107, "tool_uses": 2, "model": "claude-haiku-4-5-20251001",
+		})
+	})
+	t.Run("agent result after stop", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		scripted := lab.payloads("scripted.jsonl")
+		lab.feed(scripted[5], scripted[8])
+		before := agentRow(lab)
+		// Derived from scripted.jsonl's Agent result: its first-turn counts
+		// deliberately disagree with the whole-transcript totals at the stop.
+		response := decoded(t, scripted[9])["tool_response"].(map[string]any)
+		response["totalTokens"], response["totalToolUseCount"] = 1, 1
+		lab.feed(withFields(t, scripted[9], map[string]any{"tool_response": response}))
+		expect(t, "after result", agentRow(lab), map[string]any{
+			"total_tokens": before["total_tokens"], "tool_uses": before["tool_uses"],
 		})
 	})
 	t.Run("unreadable agent transcript", func(t *testing.T) {
@@ -997,6 +1058,36 @@ func TestCallmeterStopWaitsForASecondTurnsTextReply(t *testing.T) {
 
 // A PostToolBatch carries no top-level tool_use_id: a store it cannot open
 // still names every call whose record is lost.
+func TestCallmeterStoreUnopenablePayloadIDs(t *testing.T) {
+	for _, id := range []string{"", cmEchoCall} {
+		t.Run("id="+id, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			blocker := filepath.Join(lab.root, "blocker")
+			lab.write(blocker, []byte("blocked"))
+			// Derived from probe5.jsonl's batch, either empty or with a
+			// top-level tool_use_id that takes precedence over the batch ids.
+			fields := map[string]any{"tool_use_id": id}
+			if id == "" {
+				fields["tool_calls"] = []any{}
+			}
+			payload := withFields(t, lab.payloads("probe5.jsonl")[3], fields)
+			var stderr bytes.Buffer
+			if code := runCallmeter(lab.ctx, strings.NewReader(payload), &stderr,
+				callmeterFiles{store: filepath.Join(blocker, "callmeter.db"), log: lab.logPath, missed: lab.missed},
+				lab.clock, callmeterSeat{}, mapEnv(nil)); code != 0 {
+				t.Fatalf("exit code = %d, want 0", code)
+			}
+			if n := strings.Count(stderr.String(), "\n"); n != 1 {
+				t.Errorf("fault lines = %d, want 1", n)
+			}
+			if id != "" && !strings.Contains(stderr.String(), id) {
+				t.Error("fault does not name the top-level tool_use_id")
+			}
+			assertLogged(t, lab.logPath, callmeter.StageStore)
+		})
+	}
+}
+
 func TestCallmeterStoreUnopenableNamesBatchCalls(t *testing.T) {
 	lab := newCallmeterLab(t)
 	blocker := filepath.Join(lab.root, "blocker")
@@ -1008,17 +1099,48 @@ func TestCallmeterStoreUnopenableNamesBatchCalls(t *testing.T) {
 		lab.ctx,
 		strings.NewReader(batch),
 		&stderr,
-		callmeterFiles{store: storePath, log: lab.logPath},
+		callmeterFiles{store: storePath, log: lab.logPath, missed: lab.missed},
 		lab.clock,
 		callmeterSeat{},
 		mapEnv(nil),
 	); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	for _, id := range []string{cmBatchLead, "toolu_014w33S7y4Hmv2iQj3NzzEWV", "toolu_01LV57SCFxiU1LaMWZm3ixg6"} {
-		if !strings.Contains(stderr.String(), id) {
-			t.Errorf("stderr = %q, want the lost call %s named", stderr.String(), id)
+	ids := []string{cmBatchLead, "toolu_014w33S7y4Hmv2iQj3NzzEWV", "toolu_01LV57SCFxiU1LaMWZm3ixg6"}
+	log, err := os.ReadFile(lab.logPath)
+	if err != nil {
+		t.Fatalf("read failure log: %v", err)
+	}
+	for name, output := range map[string]string{"stderr": stderr.String(), "log": string(log)} {
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		if len(lines) != len(ids) {
+			t.Errorf("%s has %d fault lines, want %d", name, len(lines), len(ids))
 		}
+		for _, id := range ids {
+			n := 0
+			for _, line := range lines {
+				if !strings.Contains(line, id) {
+					continue
+				}
+				n++
+				for _, other := range ids {
+					if other != id && strings.Contains(line, other) {
+						t.Errorf("%s fault for %s also names %s", name, id, other)
+					}
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s has %d faults for %s, want 1", name, n, id)
+			}
+		}
+	}
+	missed, err := os.ReadFile(lab.missed)
+	if err != nil {
+		t.Fatalf("read missed.log: %v", err)
+	}
+	want := regexp.MustCompile(`^\d+\tPostToolBatch\tstore unavailable: \w+\t` + cmSessionB + `\n$`)
+	if !want.Match(missed) {
+		t.Error("missed.log does not hold exactly one classified line for the batch")
 	}
 	assertLogged(t, lab.logPath, callmeter.StageStore)
 }
@@ -1487,6 +1609,24 @@ func TestCallmeterResolvedPendingRequestCarriesTheSplit(t *testing.T) {
 
 // TestCallmeterOutcomeColumns: the outcome of each call kind, on success and on
 // failure alike where the test runner is concerned.
+// Derived from testdata/verify/payloads.jsonl's failed Bash hook, with a commit followed by
+// a failed push, as in the A-S3 scratch proof.
+func TestCallmeterCommitInAFailedCall(t *testing.T) {
+	lab := newCallmeterLab(t)
+	lab.feed(toolPayload(t, "PostToolUseFailure", "toolu_commitpush", "Bash",
+		map[string]any{"command": `git commit -m "fix: thing" && git push`},
+		map[string]any{"error": "Exit code 1\n[develop 1a2b3c4] fix: thing\n 1 file changed, 2 insertions(+)\nfatal: No configured push destination."}))
+	expect(t, "commit+push", lab.call("toolu_commitpush"), map[string]any{
+		"failed": 1, "commit_sha": "1a2b3c4", "commit_branch": "develop", "error": "Exit code 1",
+	})
+	stored := lab.storeText()
+	for _, private := range []string{"fix: thing", "No configured push destination", "1 file changed"} {
+		if strings.Contains(stored, private) {
+			t.Error("failed-call commit output text reached the store")
+		}
+	}
+}
+
 func TestCallmeterOutcomeColumns(t *testing.T) {
 	lab := newCallmeterLab(t)
 	bash := func(command string) map[string]any { return map[string]any{"command": command} }
@@ -1504,20 +1644,27 @@ func TestCallmeterOutcomeColumns(t *testing.T) {
 		toolPayload(t, "PostToolUse", "toolu_detached", "Bash", bash(`git commit -m x`), bashOut("[detached HEAD abc1234] x\n")),
 		toolPayload(t, "PostToolUseFailure", "toolu_nocommit", "Bash", bash(`git commit -m x`),
 			map[string]any{"error": "Exit code 1\nnothing to commit"}),
+		// Derived from testdata/verify/payloads.jsonl's failed Bash hook, with and without a commit summary.
+		toolPayload(t, "PostToolUseFailure", "toolu_commitpush", "Bash", bash(`git commit -m x && git push`),
+			map[string]any{"error": "Exit code 1\n[develop 1a2b3c4] x\nfatal: push failed"}),
+		toolPayload(t, "PostToolUseFailure", "toolu_pushonly", "Bash", bash(`git push`),
+			map[string]any{"error": "Exit code 1\nfatal: push failed"}),
 		toolPayload(t, "PostToolUse", "toolu_gotest", "Bash", bash(`go test ./...`), bashOut("ok  \tdemo\t0.1s\n")),
 		toolPayload(t, "PostToolUseFailure", "toolu_pytest", "Bash", bash(`pytest -q`),
 			map[string]any{"error": "Exit code 1\n1 failed"}),
 		toolPayload(t, "PostToolUse", "toolu_build", "Bash", bash(`go build ./... && echo "go test"`), bashOut("go test\n")),
 	)
 	for id, want := range map[string]map[string]any{
-		"toolu_write":    {"lines_added": 3, "lines_removed": 0, "commit_sha": "<nil>"},
-		"toolu_commit":   {"commit_sha": "1a2b3c4", "commit_branch": "develop", "test_runner": "<nil>"},
-		"toolu_root":     {"commit_sha": "abc1234", "commit_branch": "main"},
-		"toolu_detached": {"commit_sha": "abc1234", "commit_branch": "detached HEAD"},
-		"toolu_nocommit": {"commit_sha": "<nil>", "commit_branch": "<nil>", "failed": 1},
-		"toolu_gotest":   {"test_runner": "go", "failed": 0},
-		"toolu_pytest":   {"test_runner": "pytest", "failed": 1},
-		"toolu_build":    {"test_runner": "<nil>"},
+		"toolu_write":      {"lines_added": 3, "lines_removed": 0, "commit_sha": "<nil>"},
+		"toolu_commit":     {"commit_sha": "1a2b3c4", "commit_branch": "develop", "test_runner": "<nil>"},
+		"toolu_root":       {"commit_sha": "abc1234", "commit_branch": "main"},
+		"toolu_detached":   {"commit_sha": "abc1234", "commit_branch": "detached HEAD"},
+		"toolu_nocommit":   {"commit_sha": "<nil>", "commit_branch": "<nil>", "failed": 1},
+		"toolu_commitpush": {"commit_sha": "1a2b3c4", "commit_branch": "develop", "failed": 1},
+		"toolu_pushonly":   {"commit_sha": "<nil>", "commit_branch": "<nil>", "failed": 1},
+		"toolu_gotest":     {"test_runner": "go", "failed": 0},
+		"toolu_pytest":     {"test_runner": "pytest", "failed": 1},
+		"toolu_build":      {"test_runner": "<nil>"},
 	} {
 		expect(t, id, lab.call(id), want)
 	}
@@ -1660,16 +1807,16 @@ func TestCallmeterTier1OnCalls(t *testing.T) {
 		}))
 		expect(t, "call", lab.call("toolu_t1"), map[string]any{"prompt_id": "p-1", "effort": "high", "permission_mode": "acceptEdits"})
 	})
-	t.Run("effort from env", func(t *testing.T) {
+	t.Run("tool and stop effort require the payload", func(t *testing.T) {
 		lab := newCallmeterLab(t)
 		lab.env["CLAUDE_EFFORT"] = "xhigh"
 		lab.feed(
-			toolPayload(t, "PostToolUse", "toolu_t1", "Bash", echo, map[string]any{"tool_response": map[string]any{"stdout": "hi\n"}}),
-			hookPayload(t, "Stop", map[string]any{"stop_hook_active": false}),
+			toolPayload(t, "PostToolUse", "toolu_t1", "Bash", echo, map[string]any{"effort": dropKey, "tool_response": map[string]any{"stdout": "hi\n"}}),
+			hookPayload(t, "Stop", map[string]any{"effort": dropKey, "stop_hook_active": false}),
 		)
-		expect(t, "call", lab.call("toolu_t1"), map[string]any{"effort": "xhigh"})
-		expect(t, "turn", lab.row("SELECT effort FROM turns"), map[string]any{"effort": "xhigh"})
-		expect(t, "event", lab.row("SELECT effort FROM events"), map[string]any{"effort": "xhigh"})
+		expect(t, "call", lab.call("toolu_t1"), map[string]any{"effort": nil})
+		expect(t, "turn", lab.row("SELECT effort FROM turns"), map[string]any{"effort": nil})
+		expect(t, "event", lab.row("SELECT effort FROM events"), map[string]any{"effort": nil})
 	})
 	t.Run("effort absent", func(t *testing.T) {
 		lab := newCallmeterLab(t)
@@ -1701,7 +1848,7 @@ func TestCallmeterTier1OnCalls(t *testing.T) {
 		for name, order := range map[string][]string{"pre first": {pre, post}, "post first": {post, pre}} {
 			lab := newCallmeterLab(t)
 			lab.feed(order...)
-			expect(t, name, lab.call("toolu_t1"), map[string]any{"prompt_id": "p-post", "permission_mode": "default"})
+			expect(t, name, lab.call("toolu_t1"), map[string]any{"prompt_id": "p-pre", "permission_mode": "default"})
 		}
 	})
 }
@@ -2454,6 +2601,82 @@ func TestCallmeterSessionEndWaitsForAnInFlightCallsResult(t *testing.T) {
 	})
 }
 
+// TestCallmeterPromptIDIsTheIssuingPrompts: a call's prompt is the one its
+// PreToolUse or batch names, in either landing order against a PostToolUse
+// naming a later prompt; a PostToolUse alone fills it.
+func TestCallmeterPromptIDIsTheIssuingPrompts(t *testing.T) {
+	for _, event := range []string{"PostToolUse", "PostToolUseFailure"} {
+		for _, source := range []string{"PreToolUse", "PostToolBatch"} {
+			for _, first := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/issuing-first=%v", source, event, first), func(t *testing.T) {
+					lab := newCallmeterLab(t)
+					// Derived from testdata/verify/payloads.jsonl's Bash hooks and probe5.jsonl's batch;
+					// only prompt ids differ between issuance and completion.
+					input := map[string]any{"command": "echo hi"}
+					pre := toolPayload(t, "PreToolUse", cmEchoCall, "Bash", input, map[string]any{"prompt_id": "p1"})
+					post := toolPayload(t, event, cmEchoCall, "Bash", input, map[string]any{"prompt_id": "p2"})
+					id := text(decoded(t, pre), "tool_use_id")
+					if source == "PostToolBatch" {
+						pre = withFields(t, lab.payloads("probe5.jsonl")[3], map[string]any{"prompt_id": "p1"})
+						id = cmBatchLead
+						post = withFields(t, post, map[string]any{"tool_use_id": id})
+					}
+					order := []string{pre, post, post}
+					if !first {
+						order = []string{post, pre, post}
+					}
+					lab.feed(order...)
+					expect(t, "issuing prompt", lab.call(id), map[string]any{"prompt_id": "p1"})
+				})
+			}
+		}
+		t.Run(event+"/post alone fills", func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			// Derived from testdata/verify/payloads.jsonl's Bash hook, with prompt p2.
+			post := toolPayload(t, event, cmEchoCall, "Bash", map[string]any{"command": "echo hi"}, map[string]any{"prompt_id": "p2"})
+			lab.feed(post)
+			expect(t, "post alone", lab.call(text(decoded(t, post), "tool_use_id")), map[string]any{"prompt_id": "p2"})
+		})
+	}
+}
+
+func TestCallmeterCallTSIsTheStartWhenOnlyPostToolUseLands(t *testing.T) {
+	const now = int64(10000)
+	for _, event := range []string{"PostToolUse", "PostToolUseFailure"} {
+		for _, duration := range []struct {
+			name  string
+			value any
+			want  int64
+		}{{"five seconds", 5000, 5000}, {"missing", dropKey, now}, {"negative", -1, now}} {
+			t.Run(event+"/"+duration.name, func(t *testing.T) {
+				lab := newCallmeterLab(t)
+				// Derived from testdata/verify/payloads.jsonl's Bash payload, with duration_ms changed.
+				post := toolPayload(t, event, cmEchoCall, "Bash", map[string]any{"command": "echo hi"},
+					map[string]any{"duration_ms": duration.value})
+				lab.feedAt(now, post)
+				expect(t, "start", lab.call(cmEchoCall), map[string]any{"ts": duration.want})
+			})
+		}
+		for _, preFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/pre-first=%v", event, preFirst), func(t *testing.T) {
+				lab := newCallmeterLab(t)
+				// Derived from testdata/verify/payloads.jsonl's Bash hooks, with duration_ms 5000.
+				input := map[string]any{"command": "echo hi"}
+				pre := toolPayload(t, "PreToolUse", cmEchoCall, "Bash", input, nil)
+				post := toolPayload(t, event, cmEchoCall, "Bash", input, map[string]any{"duration_ms": 5000})
+				if preFirst {
+					lab.feedAt(4000, pre)
+					lab.feedAt(now, post)
+				} else {
+					lab.feedAt(now, post)
+					lab.feedAt(4000, pre)
+				}
+				expect(t, "earlier PreToolUse", lab.call(cmEchoCall), map[string]any{"ts": 4000})
+			})
+		}
+	}
+}
+
 // TestCallmeterCallTSIsTheEarliestHook: a call's ts is the earliest hook that
 // saw it, in every landing order of its PreToolUse, PostToolUse and batch; a
 // call Claude Code refused before any PreToolUse (here a tool name it does not
@@ -2609,5 +2832,162 @@ func TestHookTimeoutsAgreeWithHooksJSON(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestCallmeterStoreUnavailableLeavesAMissedLine: a hook whose store can take
+// neither its event nor its fault (a store a newer callmeter raised the schema
+// of, a store refusing every insert as a full disk would) leaves exactly one
+// missed.log line `store unavailable: {class}` naming its event and session,
+// never the raw error, and a report over the healed store counts that event.
+func TestCallmeterStoreUnavailableLeavesAMissedLine(t *testing.T) {
+	refusals := []string{"calls", "faults"}
+	cases := map[string]struct {
+		event, class string
+		refuse, heal func(*callmeterLab)
+	}{
+		"newer schema": {
+			event: "PostToolUse", class: callmeter.StoreClassNewerSchema,
+			refuse: func(lab *callmeterLab) {
+				store, err := callmeter.OpenDB(lab.ctx, lab.storePath)
+				if err != nil {
+					lab.t.Fatalf("create the store: %v", err)
+				}
+				if err := store.Close(); err != nil {
+					lab.t.Fatalf("close the store: %v", err)
+				}
+				setUserVersion(lab.t, lab.storePath, callmeter.SchemaVersion+1)
+			},
+			heal: func(lab *callmeterLab) { setUserVersion(lab.t, lab.storePath, callmeter.SchemaVersion) },
+		},
+		"every insert refused": {
+			event: "PreToolUse", class: callmeter.StoreClassOther,
+			refuse: func(lab *callmeterLab) {
+				for _, table := range refusals {
+					if _, err := lab.db().DB().ExecContext(lab.ctx, "CREATE TRIGGER refuse_"+table+" BEFORE INSERT ON "+table+
+						" BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+						lab.t.Fatalf("create the refusing trigger on %s: %v", table, err)
+					}
+				}
+			},
+			heal: func(lab *callmeterLab) {
+				for _, table := range refusals {
+					if _, err := lab.db().DB().ExecContext(lab.ctx, "DROP TRIGGER refuse_"+table); err != nil {
+						lab.t.Fatalf("drop the refusing trigger on %s: %v", table, err)
+					}
+				}
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			c.refuse(lab)
+			lab.feed(hookPayload(t, c.event, nil))
+			missed, err := os.ReadFile(lab.missed)
+			if err != nil {
+				t.Fatalf("read missed.log: %v", err)
+			}
+			reason := callmeter.StoreUnavailableReason + c.class
+			want := regexp.MustCompile(`^\d+\t` + c.event + `\t` + regexp.QuoteMeta(reason) + `\t` + cmSessionA + `\n$`)
+			if !want.Match(missed) {
+				t.Fatalf("missed.log = %q, want one line matching %s", missed, want)
+			}
+
+			c.heal(lab)
+			lab.feed(hookPayload(t, callmeter.EventSessionStart, map[string]any{"source": "startup"}))
+			if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND session_id = ? AND error = ?",
+				callmeter.StageTerminated, cmSessionA, c.event+": "+reason); n != 1 {
+				t.Errorf("terminated faults of the lost %s = %d, want 1", c.event, n)
+			}
+			table, err := report.Faults(lab.ctx, lab.db(), report.Filter{}, nil)
+			if err != nil {
+				t.Fatalf("faults report: %v", err)
+			}
+			if note := "1 events unrecorded: hook terminated before recording"; !slices.Contains(table.Notes, note) {
+				t.Errorf("report notes = %q, want %q", table.Notes, note)
+			}
+		})
+	}
+}
+
+// setUserVersion sets the store's schema version, a store OpenDB would refuse
+// included.
+func setUserVersion(t *testing.T, path string, version int) {
+	t.Helper()
+	db, err := sqlitedb.OpenReadWrite(path, time.Second)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		t.Errorf("set user_version %d: %v", version, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("close %s: %v", path, err)
+	}
+}
+
+func TestCallmeterNoRealOutputToolsStoreNullBytesReal(t *testing.T) {
+	seen := map[string]bool{}
+	for _, file := range []string{"callmeter/scripted.jsonl", "gym/S2/payloads.jsonl"} {
+		data, err := os.ReadFile(filepath.Join("testdata", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var p callmeterPayload
+			if err := json.Unmarshal([]byte(line), &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.HookEventName != "PostToolUse" || (p.ToolName != "Edit" && p.ToolName != "Write" && p.ToolName != "Agent") {
+				continue
+			}
+			var shape struct {
+				Async bool `json:"isAsync"`
+			}
+			if err := json.Unmarshal(p.ToolResponse, &shape); err != nil {
+				t.Fatal(err)
+			}
+			name := p.ToolName
+			if shape.Async {
+				name += " async"
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			t.Run(name, func(t *testing.T) {
+				lab := newCallmeterLab(t)
+				lab.feed(lab.rewrite(line))
+				expect(t, "landed call", lab.call(p.ToolUseID), map[string]any{"tool": p.ToolName, "bytes_real": "<nil>", "bytes_delivered": "<nil>", "failed": 0})
+			})
+		}
+	}
+	if len(seen) != 4 {
+		t.Fatalf("captured response shapes = %d, want 4", len(seen))
+	}
+	t.Run("failed Edit", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		failure := "Error: PRIVATE-EDIT-FAILURE"
+		lab.feed(toolPayload(t, "PostToolUseFailure", "toolu_failed_edit", "Edit", capturedLine(t, "PostToolUse", "Edit")["tool_input"], map[string]any{"error": failure}))
+		expect(t, "failed Edit", lab.call("toolu_failed_edit"), map[string]any{"failed": 1, "bytes_real": len(failure)})
+		if strings.Contains(lab.storeText(), failure) {
+			t.Fatal("failure content stored")
+		}
+	})
+	for _, c := range []struct {
+		name     string
+		response any
+	}{
+		{"malformed object", map[string]any{"agentId": 42}},
+		{"malformed non-object", 42},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			lab.feed(toolPayload(t, "PostToolUse", "toolu_malformed_edit", "Edit", capturedLine(t, "PostToolUse", "Edit")["tool_input"], map[string]any{"tool_response": c.response}))
+			if lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'payload' AND tool_use_id = ?", "toolu_malformed_edit") != 1 {
+				t.Fatal("malformed response must have one payload fault")
+			}
+		})
 	}
 }

@@ -38,7 +38,10 @@ const SourceTranscript = "transcript"
 
 // Fault stages: where a failure to record or parse happened. StageBinary and
 // StageTerminated rows come only from ingesting missed.log (IngestMissed):
-// binary from a wrapper line, terminated from a line the binary itself wrote.
+// binary from a wrapper line, terminated from a line the binary itself wrote
+// (a signal, a busy or unavailable store, a panic: parseMissedLine).
+// IngestMissed writes such a row only beyond the identical rows already
+// stored, so a missed.log claim ingested again adds none.
 const (
 	StagePayload    = "payload"
 	StageStore      = "store"
@@ -282,6 +285,11 @@ func IsBusy(err error) bool {
 	return errors.As(err, &sqliteError) && sqliteError.Code()&0xff == sqliteBusy
 }
 
+// ErrNewerSchema is wrapped by the refusal to open a store whose schema
+// version is newer than SchemaVersion (a seat on a newer callmeter raised it):
+// the hook names it `store unavailable: newer schema` (StoreFailureClass).
+var ErrNewerSchema = errors.New("refusing to open it")
+
 func openAndPrepare(ctx context.Context, path string, wait time.Duration) (*Store, error) {
 	db, err := sqlitedb.OpenStore(ctx, path, wait)
 	if err != nil {
@@ -303,10 +311,11 @@ func prepare(ctx context.Context, db *sql.DB, path string) error {
 	}
 	if version > SchemaVersion {
 		return fmt.Errorf(
-			"callmeter store %s has schema version %d, newer than this callmeter's version %d: refusing to open it",
+			"callmeter store %s has schema version %d, newer than this callmeter's version %d: %w",
 			path,
 			version,
 			SchemaVersion,
+			ErrNewerSchema,
 		)
 	}
 	if version == SchemaVersion {
@@ -375,7 +384,13 @@ type Fault struct {
 // AddFault records f in its own transaction; an empty SessionID or ToolUseID
 // is stored as NULL.
 func (s *Store) AddFault(ctx context.Context, f Fault) error {
-	return s.Batch(ctx, func(tx *Tx) error { return tx.AddFault(ctx, f) })
+	return s.AddFaultHeld(ctx, f, nil)
+}
+
+// AddFaultHeld is AddFault with held called once its transaction holds the
+// store's write lock (BatchHeld).
+func (s *Store) AddFaultHeld(ctx context.Context, f Fault, held func()) error {
+	return s.BatchHeld(ctx, held, func(tx *Tx) error { return tx.AddFault(ctx, f) })
 }
 
 // AddFault records f as part of the transaction; an empty SessionID or
@@ -394,6 +409,7 @@ func (t *Tx) AddFault(ctx context.Context, f Fault) error {
 // aged out and the columns that identify one row in the store and the archive.
 type pruneTable struct {
 	name     string
+	verb     string   // REPLACE for aggregates, IGNORE for distinct facts
 	key      []string // the row's identity, the same columns in the archive
 	expired  string   // the rows that aged out; the cutoff is its one argument when it holds a ?
 	archived string   // the rows phase 1 copies; empty means expired
@@ -411,18 +427,19 @@ const callsExpired = "COALESCE(ts, (SELECT r.ts FROM requests r WHERE r.request_
 // deleted, removes the parts whose call is gone: an orphan has no cutoff of its
 // own.
 var pruneTables = []pruneTable{
-	{name: "calls", key: []string{"tool_use_id"}, expired: callsExpired},
-	{name: "requests", key: []string{"request_id"}, expired: "ts < ?"},
-	{name: "turns", key: []string{"event_id"}, expired: "ts < ?"},
-	{name: "events", key: []string{"event_id"}, expired: "ts < ?"},
-	// fault_id alone is a number a recreated store hands out again; the archived
-	// columns beside it tell a different fault under a reused id from its copy.
-	{name: "faults", key: []string{"fault_id", "ts", "session_id", "tool_use_id", "stage"}, expired: "ts < ?"},
-	{name: "agents", key: []string{"agent_id"}, expired: "COALESCE(stopped, started) < ?"},
-	{name: "agent_turns", key: []string{"agent_id", "seq"}, expired: "COALESCE(stopped, started) < ?"},
-	{name: "sessions", key: []string{"session_id"}, expired: "last_ts < ?"},
+	{name: "calls", verb: "REPLACE", key: []string{"tool_use_id"}, expired: callsExpired},
+	{name: "requests", verb: "REPLACE", key: []string{"request_id"}, expired: "ts < ?"},
+	{name: "turns", verb: "IGNORE", key: []string{"event_id"}, expired: "ts < ?"},
+	{name: "events", verb: "IGNORE", key: []string{"event_id"}, expired: "ts < ?"},
+	// A recreated store can reuse fault_id; inArchive checks the entire copy
+	// before deletion, while phase 1 leaves the original archived fact intact.
+	{name: "faults", verb: "IGNORE", key: []string{"fault_id"}, expired: "ts < ?"},
+	{name: "agents", verb: "REPLACE", key: []string{"agent_id"}, expired: "COALESCE(stopped, started) < ?"},
+	{name: "agent_turns", verb: "IGNORE", key: []string{"agent_id", "seq"}, expired: "COALESCE(stopped, started) < ?"},
+	{name: "sessions", verb: "REPLACE", key: []string{"session_id"}, expired: "last_ts < ?"},
 	{
 		name:    "command_parts",
+		verb:    "IGNORE",
 		key:     []string{"tool_use_id", "seq"},
 		expired: "tool_use_id NOT IN (SELECT tool_use_id FROM calls)",
 		archived: "tool_use_id NOT IN (SELECT tool_use_id FROM calls) OR tool_use_id IN (SELECT tool_use_id FROM calls WHERE " +
@@ -438,12 +455,15 @@ func (t pruneTable) archivePredicate() string {
 	return t.expired
 }
 
-// inArchive is the condition that the store row of t has its key in the
-// archive; it is meant for an EXISTS over archive.{table} aliased a. IS
-// matches a NULL key column, which = never does.
+// inArchive requires an identical copy on every column the archive keeps.
+// IS compares NULLs as well as values; omitted text is never compared.
 func (t pruneTable) inArchive() string {
-	matches := make([]string, len(t.key))
-	for i, column := range t.key {
+	return t.archiveMatch(archiveTables[t.name].columns)
+}
+
+func (t pruneTable) archiveMatch(columns []string) string {
+	matches := make([]string, len(columns))
+	for i, column := range columns {
 		matches[i] = fmt.Sprintf("a.%[1]s IS %[2]s.%[1]s", column, t.name)
 	}
 	return strings.Join(matches, " AND ")
@@ -522,14 +542,13 @@ var pruneAfterArchive func() error
 // sessions by last_ts; then every command_parts row whose call is gone. It
 // returns how many store rows went.
 //
-// A commit spanning two WAL databases is atomic per file only, so the prune is
-// two single-file transactions. Phase 1 writes only archive.db: it copies every
-// row the prune will remove, with INSERT OR IGNORE, and commits. Phase 2 writes
-// only callmeter.db: it deletes each expired row whose key is in the archive
-// and commits. Any failure rolls back its phase and ends the prune, the archive's
-// included, so a row is never deleted without its archive copy. A stop between
-// the phases leaves rows in both files, which the next prune deletes from the
-// store and does not copy again.
+// A commit spanning two WAL databases is atomic per file only, so each
+// transaction writes one file. Phase 1 uses deferred archive transactions of
+// at most pruneChunk rows: aggregates replace an older copy, facts retain the
+// first copy of their key. Phase 2 uses short immediate store transactions and
+// deletes only rows identical to their committed archive copy. A changed fact
+// whose key the archive already holds stays in the store past retention.
+// Committed chunks survive a failure; the next prune resumes from those copies.
 //
 // A store with no row to archive is left alone and archive.db is never
 // attached, so a prune with nothing to do creates no file beside the store.
@@ -557,13 +576,11 @@ func (s *Store) Prune(ctx context.Context, before time.Time) (removed int64, err
 		return 0, fmt.Errorf("callmeter store %s: archive attach %s: %w", s.path, archivePath, err)
 	}
 	defer func() {
-		if _, detachErr := conn.ExecContext(ctx, "DETACH DATABASE archive"); detachErr != nil {
+		if _, detachErr := conn.ExecContext(context.WithoutCancel(ctx), "DETACH DATABASE archive"); detachErr != nil {
 			err = errors.Join(err, fmt.Errorf("callmeter store %s: archive detach %s: %w", s.path, archivePath, detachErr))
 		}
 	}()
-	if err := s.pruneTransaction(ctx, conn, "phase 1 (archive)", func() error {
-		return archiveExpired(ctx, conn, archivePath, cutoff)
-	}); err != nil {
+	if err := s.archiveExpired(ctx, conn, archivePath, cutoff); err != nil {
 		return 0, err
 	}
 	if pruneAfterArchive != nil {
@@ -571,24 +588,17 @@ func (s *Store) Prune(ctx context.Context, before time.Time) (removed int64, err
 			return 0, fmt.Errorf("callmeter store %s: prune stopped between phase 1 (archive) and phase 2 (delete): %w", s.path, err)
 		}
 	}
-	if err := s.pruneTransaction(ctx, conn, "phase 2 (delete)", func() (err error) {
-		removed, err = deleteArchived(ctx, conn, cutoff)
-		return err
-	}); err != nil {
-		return 0, err
-	}
-	return removed, nil
+	return s.deleteArchived(ctx, conn, cutoff)
 }
 
-// pruneTransaction runs fn on conn in one transaction that takes the write lock
-// at BEGIN IMMEDIATE. A failure rolls the transaction back and names the store
-// and the phase.
-func (s *Store) pruneTransaction(ctx context.Context, conn *sql.Conn, phase string, fn func() error) error {
-	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+// pruneTransaction uses the phase's transaction mode and rolls back only the
+// current chunk on failure, even when the caller's context was cancelled.
+func (s *Store) pruneTransaction(ctx context.Context, conn *sql.Conn, begin, phase string, fn func() error) error {
+	if _, err := conn.ExecContext(ctx, begin); err != nil {
 		return fmt.Errorf("callmeter store %s: begin prune %s: %w", s.path, phase, err)
 	}
 	rollback := func(cause error) error {
-		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); err != nil {
 			return errors.Join(cause, fmt.Errorf("callmeter store %s: roll back prune %s: %w", s.path, phase, err))
 		}
 		return cause
@@ -621,46 +631,116 @@ func (s *Store) anyToArchive(ctx context.Context, cutoff int64) (bool, error) {
 	return false, nil
 }
 
-// archiveExpired is phase 1 of Prune, inside its transaction: it creates the
-// archive's tables and copies the rows of every pruneTables entry, leaving the
-// store alone.
-func archiveExpired(ctx context.Context, conn *sql.Conn, archivePath string, cutoff int64) error {
-	if err := prepareArchive(ctx, conn, archivePath); err != nil {
+const pruneChunk = 2000
+
+// archiveExpired commits archive-only chunks without reserving the main store's
+// write lock. Missing keys select facts; missing identical copies select aggregates.
+func (s *Store) archiveExpired(ctx context.Context, conn *sql.Conn, archivePath string, cutoff int64) error {
+	if err := s.pruneTransaction(ctx, conn, "BEGIN", "phase 1 (archive)", func() error {
+		return prepareArchive(ctx, conn, archivePath)
+	}); err != nil {
 		return err
 	}
 	for _, table := range pruneTables {
 		columns := strings.Join(archiveTables[table.name].columns, ", ")
 		predicate := table.archivePredicate()
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf(
-			"INSERT OR IGNORE INTO archive.%s (%s) SELECT %s FROM %s WHERE %s",
-			table.name, columns, columns, table.name, predicate,
-		), predicateArgs(predicate, cutoff)...); err != nil {
-			return fmt.Errorf("archive %s: %w", table.name, err)
+		match := table.archiveMatch(table.key)
+		if table.verb == "REPLACE" {
+			match = table.inArchive()
+		}
+		for {
+			var copied int64
+			err := s.pruneTransaction(ctx, conn, "BEGIN", "phase 1 (archive)", func() error {
+				result, err := conn.ExecContext(ctx, fmt.Sprintf(
+					"INSERT OR %s INTO archive.%s (%s) SELECT %s FROM %s WHERE (%s) AND NOT EXISTS (SELECT 1 FROM archive.%s a WHERE %s) LIMIT %d",
+					table.verb, table.name, columns, columns, table.name, predicate, table.name, match, pruneChunk,
+				), predicateArgs(predicate, cutoff)...)
+				if err != nil {
+					return fmt.Errorf("archive %s: %w", table.name, err)
+				}
+				copied, err = result.RowsAffected()
+				if err != nil {
+					return fmt.Errorf("count the archived %s: %w", table.name, err)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if copied == 0 {
+				break
+			}
 		}
 	}
 	return nil
 }
 
-// deleteArchived is phase 2 of Prune, inside its transaction: it deletes from
-// each pruneTables entry, in order, the expired rows whose key is in the
-// archive, and returns how many went. An expired row the archive lacks (it
-// arrived after phase 1) stays for the next prune.
-func deleteArchived(ctx context.Context, conn *sql.Conn, cutoff int64) (removed int64, err error) {
+// deleteArchived selects candidates without the write lock, then rechecks their
+// expiry and identical copies under it. A large prefix of conflicting facts
+// therefore cannot turn a candidate scan into a long write transaction.
+func (s *Store) deleteArchived(ctx context.Context, conn *sql.Conn, cutoff int64) (removed int64, err error) {
 	for _, table := range pruneTables {
-		result, err := conn.ExecContext(ctx, fmt.Sprintf(
-			"DELETE FROM %s WHERE %s AND EXISTS (SELECT 1 FROM archive.%s a WHERE %s)",
-			table.name, table.expired, table.name, table.inArchive(),
-		), predicateArgs(table.expired, cutoff)...)
-		if err != nil {
-			return 0, fmt.Errorf("delete %s: %w", table.name, err)
+		predicate := fmt.Sprintf("(%s) AND EXISTS (SELECT 1 FROM archive.%s a WHERE %s)", table.expired, table.name, table.inArchive())
+		for {
+			ids, err := pruneRowIDs(ctx, conn, table.name, predicate, cutoff)
+			if err != nil {
+				return removed, err
+			}
+			if len(ids) == 0 {
+				break
+			}
+			var deleted int64
+			err = s.pruneTransaction(ctx, conn, "BEGIN IMMEDIATE", "phase 2 (delete)", func() error {
+				marks := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+				args := append(predicateArgs(predicate, cutoff), ids...)
+				result, err := conn.ExecContext(ctx, fmt.Sprintf(
+					"DELETE FROM %s WHERE %s AND rowid IN (%s)", table.name, predicate, marks,
+				), args...)
+				if err != nil {
+					return fmt.Errorf("delete %s: %w", table.name, err)
+				}
+				deleted, err = result.RowsAffected()
+				if err != nil {
+					return fmt.Errorf("count the deleted %s: %w", table.name, err)
+				}
+				return nil
+			})
+			if err != nil {
+				return removed, err
+			}
+			removed += deleted
+			if deleted == 0 {
+				break
+			}
+			// Give a waiting hook a chance to acquire the lock before the next chunk.
+			if err := clock.Real.Sleep(ctx, time.Millisecond); err != nil {
+				return removed, err
+			}
 		}
-		n, err := result.RowsAffected()
-		if err != nil {
-			return 0, fmt.Errorf("count the deleted %s: %w", table.name, err)
-		}
-		removed += n
 	}
 	return removed, nil
+}
+
+func pruneRowIDs(ctx context.Context, conn *sql.Conn, table, predicate string, cutoff int64) ([]any, error) {
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
+		"SELECT rowid FROM %s WHERE %s LIMIT %d", table, predicate, pruneChunk,
+	), predicateArgs(predicate, cutoff)...)
+	if err != nil {
+		return nil, fmt.Errorf("select %s prune chunk: %w", table, err)
+	}
+	defer rows.Close()
+	ids := make([]any, 0, pruneChunk)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("read %s prune chunk: %w", table, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read %s prune chunk: %w", table, err)
+	}
+	return ids, nil
 }
 
 // prepareArchive creates the archive's tables on first use and stamps its
