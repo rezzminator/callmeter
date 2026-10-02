@@ -608,6 +608,9 @@ type UnfinishedCall struct {
 	// Delivered: bytes_delivered is set, so the batch already stored the call's
 	// size; RecoverQuiet settles only a call whose size is still unknown.
 	Delivered bool
+	// Rebuilt: a call recovery rebuilt from a transcript (source transcript)
+	// that did not fail, so its real size is its result's toolUseResult.
+	Rebuilt bool
 }
 
 // UnfinishedCalls lists the session's calls with no real size: running, ended
@@ -615,7 +618,8 @@ type UnfinishedCall struct {
 // or refused by Claude Code before any PostToolUse, its batch alone landed.
 func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]UnfinishedCall, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL FROM calls
+		`SELECT tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL,
+		COALESCE(source, '') = `+sqlText(SourceTranscript)+` AND COALESCE(failed, 0) = 0 FROM calls
 		WHERE session_id = ? AND bytes_real IS NULL
 		ORDER BY ts, tool_use_id`, sessionID)
 	if err != nil {
@@ -624,7 +628,7 @@ func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]Unfini
 	var calls []UnfinishedCall
 	for rows.Next() {
 		var c UnfinishedCall
-		if err := rows.Scan(&c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered); err != nil {
+		if err := rows.Scan(&c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered, &c.Rebuilt); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("callmeter store %s: scan unfinished call: %w", s.path, err),
 				rows.Close(),

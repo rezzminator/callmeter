@@ -167,10 +167,11 @@ func (t *Tx) InsertEvent(ctx context.Context, e Event) (bool, error) {
 	return t.insertEarliest(ctx, "events", "event_id", e.EventID, e.TS, e.columns())
 }
 
-// RecoveredDetail is the detail of a main-chat turn end, a Stop or a
-// StopFailure, rebuilt from the transcript because its hook was lost (Claude
-// Code cancels it as a headless process exits): a hook's own row never carries
-// it. A rebuilt Stop's turns row shares its events row's id.
+// RecoveredDetail is the detail of a turn end rebuilt from the transcript
+// because its hook was lost: a main-chat Stop or StopFailure (Claude Code
+// cancels it as a headless process exits), or a sub-agent's SubagentStop
+// (RecoverAgentStop). A hook's own row never carries it. A rebuilt Stop's or
+// SubagentStop's turns row shares its events row's id.
 const RecoveredDetail = `{"from_transcript":true}`
 
 // latestPromptTS is the SQL ts of session's latest main-chat prompt, 0 when it
@@ -271,6 +272,123 @@ func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS 
 	} {
 		if _, err := t.tx.ExecContext(ctx, statement, sessionID, RecoveredDetail, hookTS); err != nil {
 			return fmt.Errorf("callmeter store %s: drop the rebuilt turn end of session %q: %w", t.path, sessionID, err)
+		}
+	}
+	return nil
+}
+
+// AgentStop is a sub-agent turn's end read from its quiet transcript
+// (RecoverAgentStop): the agent's latest turn, seq, still open, the ts of the
+// transcript entry that ended it, and the agent's transcript totals.
+type AgentStop struct {
+	AgentID string
+	Seq     int64
+	TS      int64 // the turn-end entry's own timestamp, Unix ms UTC
+	Totals  AgentTotals
+	SeatDir *string
+}
+
+// fromNull is n as a column value: nil when NULL.
+func fromNull(n sql.NullString) *string {
+	if !n.Valid {
+		return nil
+	}
+	return &n.String
+}
+
+// RecoverAgentStop writes stop as the SubagentStop its hook would have, rebuilt
+// from the agent's transcript (RecoveredDetail) because the hook's event was
+// lost, and reports whether a row went in: an events row and a turns row under
+// one id, dated at the transcript entry that ended the turn and never before
+// the turn's start, the turns columns only a hook carries NULL; the agent's
+// turns rebuilt from its events, so the turn closes at it; the agent's stopped
+// kept at the latest, its session, type and prompt filled, and, as the hook
+// does at the agent's latest stop, its total_tokens and tool_uses from the
+// transcript, its model filled. It writes nothing unless turn stop.Seq is still
+// the agent's latest and has no stop: a stop stored since (the hook's, or an
+// earlier recovery's) wins. The id follows from the agent and the turn's start,
+// so a repeated recovery is a no-op by event_id too. The SubagentStop hook,
+// landing later, drops it (DropRecoveredAgentStop). Call it after the
+// transaction's first write, which holds the lock.
+func (t *Tx) RecoverAgentStop(ctx context.Context, stop AgentStop) (bool, error) {
+	if stop.AgentID == "" {
+		return false, fmt.Errorf("callmeter store %s: recover a SubagentStop without an agent_id", t.path)
+	}
+	var sessionID, agentType, promptID sql.NullString
+	var started int64
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT session_id, agent_type, prompt_id, COALESCE(started, 0) FROM agent_turns
+		WHERE agent_id = ?1 AND seq = ?2 AND stopped IS NULL
+		AND seq = (SELECT MAX(x.seq) FROM agent_turns x WHERE x.agent_id = ?1)`, stop.AgentID, stop.Seq).
+		Scan(&sessionID, &agentType, &promptID, &started)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: read the open turn %d of agent %q: %w", t.path, stop.Seq, stop.AgentID, err)
+	}
+	sum := sha256.Sum256([]byte("callmeter recovered " + EventSubagentStop + "\x00" + stop.AgentID + "\x00" + strconv.FormatInt(started, 10)))
+	ts := max(stop.TS, started)
+	e := Event{EventID: hex.EncodeToString(sum[:]), Event: EventSubagentStop, TS: ts, SessionID: fromNull(sessionID),
+		AgentID: Ptr(stop.AgentID), AgentType: fromNull(agentType), PromptID: fromNull(promptID),
+		Detail: Ptr(RecoveredDetail), SeatDir: stop.SeatDir}
+	inserted, err := t.InsertEvent(ctx, e)
+	if err != nil {
+		return false, fmt.Errorf("recover the SubagentStop of agent %q: %w", stop.AgentID, err)
+	}
+	turn := Turn{EventID: e.EventID, Event: EventSubagentStop, SessionID: e.SessionID, AgentID: e.AgentID,
+		AgentType: e.AgentType, PromptID: e.PromptID, TS: ts, SeatDir: stop.SeatDir}
+	if _, err := t.InsertTurn(ctx, turn); err != nil {
+		return false, fmt.Errorf("recover the SubagentStop turn of agent %q: %w", stop.AgentID, err)
+	}
+	if err := t.RebuildAgentTurns(ctx, stop.AgentID); err != nil {
+		return false, err
+	}
+	_, stopped, err := t.AgentSpan(ctx, stop.AgentID)
+	if err != nil {
+		return false, err
+	}
+	latest := !stopped.Valid || ts >= stopped.Int64
+	for _, write := range []struct {
+		agent Agent
+		mode  Mode
+	}{
+		{Agent{AgentID: stop.AgentID, SessionID: e.SessionID, AgentType: e.AgentType, PromptID: e.PromptID}, FillEmpty},
+		{Agent{AgentID: stop.AgentID, Stopped: Ptr(ts)}, KeepMax},
+	} {
+		if err := t.UpsertAgent(ctx, write.agent, write.mode); err != nil {
+			return false, fmt.Errorf("recover the SubagentStop of agent %q: %w", stop.AgentID, err)
+		}
+	}
+	if !latest {
+		return inserted, nil // an earlier stop than the one stored keeps the stored totals
+	}
+	totals := Agent{AgentID: stop.AgentID, TotalTokens: Ptr(stop.Totals.TotalTokens), ToolUses: Ptr(stop.Totals.ToolUses)}
+	if err := t.UpsertAgent(ctx, totals, Overwrite); err != nil {
+		return false, fmt.Errorf("recover the totals of agent %q: %w", stop.AgentID, err)
+	}
+	if err := t.UpsertAgent(ctx, Agent{AgentID: stop.AgentID, Model: presentString(stop.Totals.Model)}, FillEmpty); err != nil {
+		return false, fmt.Errorf("recover the model of agent %q: %w", stop.AgentID, err)
+	}
+	return inserted, nil
+}
+
+// DropRecoveredAgentStop deletes the agent's rebuilt SubagentStop
+// (RecoverAgentStop) of the turn a SubagentStop hook delivered at hookTS
+// ends, its turns row with its events row: the hook's own row replaces them,
+// and the agent's turns are rebuilt after it. Only a rebuilt row
+// (RecoveredDetail) from that turn's start, the agent's latest SubagentStart
+// at or before hookTS, to its next start goes.
+func (t *Tx) DropRecoveredAgentStop(ctx context.Context, agentID string, hookTS int64) error {
+	rebuilt := `SELECT event_id FROM events WHERE event = 'SubagentStop' AND agent_id = ?1 AND detail = ?2
+		AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts <= ?3)
+		AND ts < (SELECT COALESCE(MIN(ts), 9223372036854775807) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts > ?3)`
+	for _, statement := range []string{
+		`DELETE FROM turns WHERE event_id IN (` + rebuilt + `)`,
+		`DELETE FROM events WHERE event_id IN (` + rebuilt + `)`,
+	} {
+		if _, err := t.tx.ExecContext(ctx, statement, agentID, RecoveredDetail, hookTS); err != nil {
+			return fmt.Errorf("callmeter store %s: drop the rebuilt SubagentStop of agent %q: %w", t.path, agentID, err)
 		}
 	}
 	return nil
@@ -598,6 +716,27 @@ func (t *Tx) AgentSpan(ctx context.Context, agentID string) (started, stopped sq
 	return started, stopped, nil
 }
 
+// sessionModel is the SQL model of the session named by the expression
+// session: that of its latest main-chat request with a model, else of its
+// latest SessionStart carrying one.
+func sessionModel(session string) string {
+	return `COALESCE(
+				(SELECT model FROM requests WHERE session_id = ` + session + ` AND agent_id IS NULL AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
+				(SELECT model FROM events WHERE session_id = ` + session + ` AND event = '` + EventSessionStart + `' AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))`
+}
+
+// RefreshSessionModel recomputes only the session's model (sessionModel),
+// keeping the stored one when the rows name none: report-time recovery writes
+// main-chat requests no Stop or SessionEnd hook will refresh the session from,
+// and it must not touch end_reason, which RefreshSession recomputes from
+// SessionEnd events alone.
+func (t *Tx) RefreshSessionModel(ctx context.Context, sessionID string) error {
+	if _, err := t.tx.ExecContext(ctx, `UPDATE sessions SET model = COALESCE(`+sessionModel("?1")+`, model) WHERE session_id = ?1`, sessionID); err != nil {
+		return fmt.Errorf("callmeter store %s: refresh the model of session %q: %w", t.path, sessionID, err)
+	}
+	return nil
+}
+
 // RefreshSession recomputes the derived columns of the sessions row of
 // sessionID from the rows stored: start_source is the source of its earliest
 // SessionStart, end_reason the reason of its latest SessionEnd, and model that
@@ -608,9 +747,7 @@ func (t *Tx) RefreshSession(ctx context.Context, sessionID string) error {
 		`UPDATE sessions SET
 			start_source = (SELECT source FROM events WHERE session_id = ?1 AND event = ?2 ORDER BY ts, event_id LIMIT 1),
 			end_reason = (SELECT reason FROM events WHERE session_id = ?1 AND event = ?3 ORDER BY ts DESC, event_id DESC LIMIT 1),
-			model = COALESCE(
-				(SELECT model FROM requests WHERE session_id = ?1 AND agent_id IS NULL AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
-				(SELECT model FROM events WHERE session_id = ?1 AND event = ?2 AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))
+			model = `+sessionModel("?1")+`
 		WHERE session_id = ?1`,
 		sessionID, EventSessionStart, EventSessionEnd)
 	if err != nil {

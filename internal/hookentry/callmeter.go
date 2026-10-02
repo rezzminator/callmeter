@@ -84,21 +84,16 @@ func (p callmeterPayload) calls() string {
 }
 
 // callmeterResponse is the part of a PostToolUse tool_response callmeter
-// reads for itself: the output sizes and an Agent call's sub-agent totals. The
-// file columns are callmeter.FileColumnsFromResult's.
+// reads for itself: the persisted path and an Agent call's sub-agent totals.
+// The output size is callmeter.RealBytes's and the file columns
+// callmeter.FileColumnsFromResult's.
 type callmeterResponse struct {
-	Stdout              *string         `json:"stdout"`
-	PersistedOutputPath *string         `json:"persistedOutputPath"`
-	PersistedOutputSize *float64        `json:"persistedOutputSize"`
-	Content             json.RawMessage `json:"content"`
-	File                *struct {
-		Content *string `json:"content"`
-	} `json:"file"`
-	AgentID           string   `json:"agentId"`
-	AgentType         string   `json:"agentType"`
-	TotalTokens       *float64 `json:"totalTokens"`
-	TotalToolUseCount *float64 `json:"totalToolUseCount"`
-	ResolvedModel     *string  `json:"resolvedModel"`
+	PersistedOutputPath *string  `json:"persistedOutputPath"`
+	AgentID             string   `json:"agentId"`
+	AgentType           string   `json:"agentType"`
+	TotalTokens         *float64 `json:"totalTokens"`
+	TotalToolUseCount   *float64 `json:"totalToolUseCount"`
+	ResolvedModel       *string  `json:"resolvedModel"`
 }
 
 // callmeterRun is one `callmeter hook` invocation: one payload, one store, one
@@ -738,12 +733,12 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 	p := run.payload
 	trimmed := bytes.TrimSpace(p.ToolResponse)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		size, err := callmeter.DeliveredBytes(trimmed)
+		size, err := callmeter.RealBytes(trimmed)
 		if err != nil {
 			run.fault(callmeter.StagePayload, p.ToolUseID, err)
 			return nil
 		}
-		call.BytesReal = callmeter.Ptr(size)
+		call.BytesReal = size
 		return nil
 	}
 	var response callmeterResponse
@@ -751,22 +746,13 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 		run.fault(callmeter.StagePayload, p.ToolUseID, fmt.Errorf("decode %s tool_response: %w", p.ToolName, err))
 		return nil
 	}
-	switch {
-	case response.PersistedOutputSize != nil:
-		call.BytesReal = wholeNumber(response.PersistedOutputSize)
-	case response.Stdout != nil:
-		call.BytesReal = callmeter.Ptr(int64(len(*response.Stdout)))
-	case response.File != nil && response.File.Content != nil:
-		call.BytesReal = callmeter.Ptr(int64(len(*response.File.Content)))
-	case len(response.Content) > 0 && !bytes.Equal(response.Content, []byte("null")):
-		size, err := callmeter.DeliveredBytes(response.Content)
-		if err != nil {
-			run.fault(callmeter.StagePayload, p.ToolUseID, err)
-		} else {
-			call.BytesReal = callmeter.Ptr(size)
-		}
-	default:
-		call.BytesReal = callmeter.Ptr(int64(len(trimmed)))
+	// The size is callmeter.RealBytes's, the one path a transcript's
+	// toolUseResult is measured by too.
+	size, err := callmeter.RealBytes(trimmed)
+	if err != nil {
+		run.fault(callmeter.StagePayload, p.ToolUseID, err)
+	} else {
+		call.BytesReal = size
 	}
 	call.PersistedPath = response.PersistedOutputPath
 	if err := callmeter.FileColumnsFromResult(call, p.ToolName, trimmed); err != nil {

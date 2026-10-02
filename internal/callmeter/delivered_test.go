@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -108,7 +109,8 @@ func TestFindResultsOutcome(t *testing.T) {
 		{"killed command", "Exit code 137", true, Result{Failed: true, Outcome: "Exit code 137"}},
 		{"failed command", "Exit code 1\nprivate-stderr-line", true, Result{Failed: true, Outcome: "Exit code 1"}},
 		{"other failure", "File does not exist: private-path", true, Result{Failed: true, Outcome: ErrorNotStored}},
-		{"success", "private-output-line", false, Result{}},
+		// resultLine's toolUseResult is "Error: "+content, a string: RealBytes measures it as DeliveredBytes does.
+		{"success", "private-output-line", false, Result{Real: Ptr(int64(len("Error: private-output-line")))}},
 	}
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	var transcript strings.Builder
@@ -129,7 +131,7 @@ func TestFindResultsOutcome(t *testing.T) {
 			want := c.want
 			want.Bytes = int64(len(c.content))
 			got, ok := found[ids[i]]
-			if !ok || got != want {
+			if !ok || !reflect.DeepEqual(got, want) {
 				t.Fatalf("FindResults[%s] = %+v (found %v), want %+v", c.name, got, ok, want)
 			}
 			if strings.Contains(got.Outcome, "private") {
@@ -137,4 +139,118 @@ func TestFindResultsOutcome(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRealBytes: the real size of a tool_response, in the precedence the
+// PostToolUse hook stores it: persistedOutputSize, stdout, file.content, the
+// delivered size of content, else the response JSON's own length.
+func TestRealBytes(t *testing.T) {
+	tests := []struct {
+		name, raw string
+		want      int64
+		wantErr   bool
+	}{
+		{name: "string", raw: `"hello world"`, want: 11},
+		{name: "content block array", raw: `[{"type":"text","text":"abc"},{"type":"image","text":"x"}]`, want: 3},
+		{name: "empty", raw: ``, want: 0},
+		{name: "null", raw: `null`, want: 0},
+		{name: "stdout", raw: `{"stdout":"hi\n","stderr":"err"}`, want: 3},
+		{name: "empty stdout", raw: `{"stdout":"","stderr":"err"}`, want: 0},
+		{name: "persistedOutputSize beats stdout", raw: `{"stdout":"preview","persistedOutputPath":"/tmp/o","persistedOutputSize":4096}`, want: 4096},
+		{name: "persistedOutputSize 0 is a size", raw: `{"stdout":"preview","persistedOutputSize":0}`, want: 0},
+		{name: "stdout beats file", raw: `{"stdout":"ab","file":{"content":"abcdef"}}`, want: 2},
+		{name: "file.content", raw: `{"type":"text","file":{"filePath":"/tmp/f","content":"abcdef"}}`, want: 6},
+		{name: "content blocks", raw: `{"content":[{"type":"text","text":"abc"},{"type":"text","text":"de"}]}`, want: 5},
+		{name: "content string", raw: `{"content":"abcd","prompt":"long prompt"}`, want: 4},
+		{name: "null content falls back", raw: `{"content":null}`, want: int64(len(`{"content":null}`))},
+		{name: "fallback is the response length", raw: `{"agentId":"a1","status":"completed"}`, want: int64(len(`{"agentId":"a1","status":"completed"}`))},
+		{name: "unmeasurable content", raw: `{"content":{"x":1}}`, wantErr: true},
+		{name: "number", raw: `42`, wantErr: true},
+		{name: "malformed object", raw: `{"stdout":5}`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := RealBytes(json.RawMessage(tt.raw))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("RealBytes(%q) = %v, nil; want an error", tt.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RealBytes(%q) unexpected error: %v", tt.raw, err)
+			}
+			if got == nil || *got != tt.want {
+				t.Fatalf("RealBytes(%q) = %v, want %d", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFindResultsReal: a successful call's Real is RealBytes of the line's
+// toolUseResult; a line with none, a null one, a failed call and a line holding
+// several tool_results have none, and a toolUseResult RealBytes cannot measure
+// is an error naming the tool_use_id.
+func TestFindResultsReal(t *testing.T) {
+	line := func(useResult string, ids ...string) string {
+		var blocks []string
+		for _, id := range ids {
+			blocks = append(blocks, `{"type":"tool_result","tool_use_id":"`+id+`","content":"preview"}`)
+		}
+		out := `{"type":"user","message":{"role":"user","content":[` + strings.Join(blocks, ",") + `]}`
+		if useResult != "" {
+			out += `,"toolUseResult":` + useResult
+		}
+		return out + "}\n"
+	}
+	write := func(t *testing.T, lines ...string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "session.jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "")), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Run("an object", func(t *testing.T) {
+		path := write(t, line(`{"stdout":"preview","persistedOutputSize":4096}`, "toolu_a"), line(`{"agentId":"a1","status":"completed"}`, "toolu_b"))
+		found, err := FindResults(path, []string{"toolu_a", "toolu_b"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := found["toolu_a"]; got.Real == nil || *got.Real != 4096 || got.Bytes != int64(len("preview")) {
+			t.Errorf("toolu_a = %+v, want Real 4096 and Bytes 7", got)
+		}
+		if got := found["toolu_b"]; got.Real == nil || *got.Real != int64(len(`{"agentId":"a1","status":"completed"}`)) {
+			t.Errorf("toolu_b = %+v, want the response's own length", got)
+		}
+	})
+	t.Run("none", func(t *testing.T) {
+		path := write(t, line("", "toolu_a"), line("null", "toolu_b"), line(`{"stdout":"x"}`, "toolu_c", "toolu_d"))
+		found, err := FindResults(path, []string{"toolu_a", "toolu_b", "toolu_c", "toolu_d"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []string{"toolu_a", "toolu_b", "toolu_c", "toolu_d"} {
+			if got, ok := found[id]; !ok || got.Real != nil {
+				t.Errorf("%s = %+v (found %v), want a result with no Real", id, got, ok)
+			}
+		}
+	})
+	t.Run("a failed call", func(t *testing.T) {
+		path := write(t, resultLine(t, "toolu_a", "Exit code 1", true))
+		found, err := FindResults(path, []string{"toolu_a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := found["toolu_a"]; !got.Failed || got.Real != nil {
+			t.Errorf("toolu_a = %+v, want failed with no Real", got)
+		}
+	})
+	t.Run("an unmeasurable toolUseResult", func(t *testing.T) {
+		path := write(t, line(`{"content":{"x":1}}`, "toolu_a"))
+		_, err := FindResults(path, []string{"toolu_a"})
+		if err == nil || !strings.Contains(err.Error(), "toolu_a") {
+			t.Fatalf("FindResults error = %v, want one naming toolu_a", err)
+		}
+	})
 }

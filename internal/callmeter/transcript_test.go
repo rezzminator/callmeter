@@ -1,6 +1,7 @@
 package callmeter
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -367,13 +368,14 @@ func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
 				InputTokens: 3, CacheReadTokens: 40, CacheCreationTokens: 5, ContextTokens: 48, OutputTokens: 643,
 			},
 			PromptID: "prompt-invented-1", ToolUseIDs: []string{"toolu_first", "toolu_last"},
+			ToolUses: []ToolUse{{ID: "toolu_first", Name: "Bash", Input: json.RawMessage(`{}`)}, {ID: "toolu_last", Name: "Bash", Input: json.RawMessage(`{}`)}},
 		},
 		{
 			RequestUsage: RequestUsage{
 				MessageID: "msg_reply", TS: 1790125209000, Model: "claude-opus-4-1", StopReason: "end_turn",
 				InputTokens: 1, CacheReadTokens: 90, CacheCreationTokens: 2, ContextTokens: 93, OutputTokens: 212,
 			},
-			PromptID: "prompt-invented-1",
+			PromptID: "prompt-invented-1", EndTS: 1790125209000,
 		},
 	}
 	if !reflect.DeepEqual(requests, want) {

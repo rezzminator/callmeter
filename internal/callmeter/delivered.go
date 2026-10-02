@@ -59,6 +59,54 @@ func ResultText(raw json.RawMessage) (string, error) {
 	}
 }
 
+// realResponse is the part of a tool_response RealBytes measures.
+type realResponse struct {
+	Stdout              *string         `json:"stdout"`
+	PersistedOutputSize *float64        `json:"persistedOutputSize"`
+	Content             json.RawMessage `json:"content"`
+	File                *struct {
+		Content *string `json:"content"`
+	} `json:"file"`
+}
+
+// RealBytes is the real output size of a tool's response: the size PostToolUse
+// stores in bytes_real, and the transcript's toolUseResult is the same object.
+// A response that is not an object is measured as DeliveredBytes measures it;
+// an object is the first of persistedOutputSize, the length of stdout, of
+// file.content, DeliveredBytes of content, else the length of the response
+// JSON itself. A response that does not decode, or whose content cannot be
+// measured, is an error, never a guess.
+func RealBytes(response json.RawMessage) (*int64, error) {
+	trimmed := bytes.TrimSpace(response)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		size, err := DeliveredBytes(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		return Ptr(size), nil
+	}
+	var decoded realResponse
+	if err := json.Unmarshal(trimmed, &decoded); err != nil {
+		return nil, fmt.Errorf("decode tool_response: %w", err)
+	}
+	switch {
+	case decoded.PersistedOutputSize != nil:
+		return Ptr(int64(*decoded.PersistedOutputSize)), nil
+	case decoded.Stdout != nil:
+		return Ptr(int64(len(*decoded.Stdout))), nil
+	case decoded.File != nil && decoded.File.Content != nil:
+		return Ptr(int64(len(*decoded.File.Content))), nil
+	case len(decoded.Content) > 0 && !bytes.Equal(decoded.Content, []byte("null")):
+		size, err := DeliveredBytes(decoded.Content)
+		if err != nil {
+			return nil, err
+		}
+		return Ptr(size), nil
+	default:
+		return Ptr(int64(len(trimmed))), nil
+	}
+}
+
 // The outcome of a call Claude Code never ran, stored in its error column: a
 // fixed label, never the result's own text — a hook's or a prompt's reason is
 // content.
@@ -114,6 +162,10 @@ type Result struct {
 	// Refused: the result is Claude Code's own text in place of a run (a
 	// harness refusal, a denial, a rejection), so that text is the whole output.
 	Refused bool
+	// Real is the real output size (RealBytes) of the line's toolUseResult;
+	// nil for a failed call (its text is its whole output), and when the line
+	// carries none or holds more than one tool_result.
+	Real *int64
 }
 
 // SettledCall is the calls row a transcript's result settles: the delivered
@@ -184,6 +236,7 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 		Message struct {
 			Content json.RawMessage `json:"content"`
 		} `json:"message"`
+		ToolUseResult json.RawMessage `json:"toolUseResult"`
 	}
 	if err := json.Unmarshal(line, &entry); err != nil {
 		return fmt.Errorf("decode transcript line: %w", err)
@@ -201,6 +254,16 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 	if err := json.Unmarshal(content, &blocks); err != nil {
 		return fmt.Errorf("decode message content: %w", err)
 	}
+	// Claude Code writes one tool_result per line, so the line's toolUseResult
+	// is that call's; a line holding several results has no way to say whose.
+	results := 0
+	for _, block := range blocks {
+		if block.Type == "tool_result" {
+			results++
+		}
+	}
+	useResult := bytes.TrimSpace(entry.ToolUseResult)
+	hasUseResult := results == 1 && len(useResult) > 0 && !bytes.Equal(useResult, []byte("null"))
 	for _, block := range blocks {
 		if block.Type != "tool_result" || !slices.Contains(ids, block.ToolUseID) {
 			continue
@@ -214,7 +277,13 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 		if failed && outcome == "" {
 			outcome = SanitizeError(text)
 		}
-		found[block.ToolUseID] = Result{Bytes: int64(len(text)), Failed: failed, Outcome: outcome, Refused: refused}
+		result := Result{Bytes: int64(len(text)), Failed: failed, Outcome: outcome, Refused: refused}
+		if hasUseResult && !failed { // a failed call's whole output is its text
+			if result.Real, err = RealBytes(useResult); err != nil {
+				return fmt.Errorf("tool_result %s: toolUseResult: %w", block.ToolUseID, err)
+			}
+		}
+		found[block.ToolUseID] = result
 	}
 	return nil
 }
