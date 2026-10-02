@@ -17,7 +17,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: gofmt
-        run: test -z "$(gofmt -l .)"
+        run: |
+          unformatted=$(gofmt -l .)
+          [ -z "$unformatted" ] || { printf 'gofmt: not formatted:\n%s\n' "$unformatted"; exit 1; }
       - name: vet
         run: go vet ./...
       - name: test
