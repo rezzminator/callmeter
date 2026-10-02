@@ -2616,6 +2616,56 @@ func TestCallmeterSessionEdgeSweepsEveryRequest(t *testing.T) {
 	}
 }
 
+// TestCallmeterForkSweepLeavesItsParentsRequest: a forked session's
+// transcript opens with a copy of its parent's history under the same message
+// ids, and Claude Code wrote one copied message with all-zero usage. The
+// fork's Stop or SessionEnd sweep must leave the parent's request row, its
+// tokens and owner, as the parent's own sweep stored them.
+func TestCallmeterForkSweepLeavesItsParentsRequest(t *testing.T) {
+	for _, edge := range []string{eventStop, callmeter.EventSessionEnd} {
+		t.Run(edge, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			const fork = "f0f0f0f0-0000-4000-8000-00000000f0f0"
+			parentPath, forkPath := lab.transcript(cmSessionA), lab.transcript(fork)
+			stop := func(session, transcript, event string) string {
+				encoded, err := json.Marshal(map[string]any{
+					"hook_event_name": event, "session_id": session, "transcript_path": transcript, "reason": "other",
+				})
+				if err != nil {
+					t.Fatalf("encode payload: %v", err)
+				}
+				return string(encoded)
+			}
+			copied := sweepEntry("msg_fork_copied", "01", `"end_turn"`, 583, `{"type":"text","text":"invented"}`)
+			lab.write(parentPath, []byte(copied))
+			// The parent's first run precedes the message, so its sweep writes it;
+			// the fork's is after it, so the fork's sweep is the stored-row UPDATE.
+			lab.clock = clock.NewFake(time.UnixMilli(1790125200000))
+			lab.feed(stop(cmSessionA, parentPath, eventStop))
+			want := map[string]any{
+				"input_tokens": 3, "cache_read_tokens": 40, "cache_creation_tokens": 5, "output_tokens": 583,
+				"session_id": cmSessionA, "agent_id": "<nil>",
+			}
+			query := "SELECT input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, session_id, agent_id " +
+				"FROM requests WHERE request_id = 'msg_fork_copied'"
+			expect(t, "parent's request", lab.row(query), want)
+			zeroed := strings.Replace(copied,
+				`"usage":{"input_tokens":3,"cache_read_input_tokens":40,"cache_creation_input_tokens":5,"output_tokens":583}`,
+				`"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}`, 1)
+			if zeroed == copied {
+				t.Fatalf("the fork's copy kept its usage: %s", copied)
+			}
+			lab.write(forkPath, []byte(zeroed))
+			lab.clock = clock.NewFake(time.UnixMilli(1790125400000))
+			lab.feed(stop(fork, forkPath, edge))
+			expect(t, "parent's request after the fork's sweep", lab.row(query), want)
+			if n := lab.count("SELECT count(*) FROM requests"); n != 1 {
+				t.Errorf("requests rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
 // TestCallmeterSessionEndReadsASettledAgentLast: a sub-agent whose
 // SubagentStop came after its last start had its transcript swept by that
 // stop. SessionEnd reads it again only after every agent no stop settled, and

@@ -367,8 +367,19 @@ func mergeSet(table, name string, mode Mode, own *Mode) string {
 }
 
 func (t *Tx) upsert(ctx context.Context, table, keyName, key string, columns []column, mode Mode) error {
+	_, err := t.upsertWhere(ctx, table, keyName, key, columns, mode, "")
+	return err
+}
+
+// upsertWhere is upsert whose update of a stored row runs only where guard (a
+// condition over the stored row, its columns named table.column) holds, with
+// guardArgs bound in order; an empty guard always updates. It returns the rows
+// written: 0 when the guard kept a stored row as it stands.
+func (t *Tx) upsertWhere(
+	ctx context.Context, table, keyName, key string, columns []column, mode Mode, guard string, guardArgs ...any,
+) (int64, error) {
 	if key == "" {
-		return fmt.Errorf("callmeter store %s: upsert into %s without a %s", t.path, table, keyName)
+		return 0, fmt.Errorf("callmeter store %s: upsert into %s without a %s", t.path, table, keyName)
 	}
 	names := []string{keyName}
 	marks := []string{"?"}
@@ -383,13 +394,22 @@ func (t *Tx) upsert(ctx context.Context, table, keyName, key string, columns []c
 	conflict := "DO NOTHING"
 	if len(sets) > 0 {
 		conflict = "DO UPDATE SET " + strings.Join(sets, ", ")
+		if guard != "" {
+			conflict += " WHERE " + guard
+			values = append(values, guardArgs...)
+		}
 	}
 	statement := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT(%s) %s",
 		table, strings.Join(names, ", "), strings.Join(marks, ", "), keyName, conflict)
-	if _, err := t.tx.ExecContext(ctx, statement, values...); err != nil {
-		return fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
+	result, err := t.tx.ExecContext(ctx, statement, values...)
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
 	}
-	return nil
+	written, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
+	}
+	return written, nil
 }
 
 // ResolveRequest merges the provisional row provisionalID into the row keyed
@@ -492,15 +512,18 @@ func (t *Tx) ResolvePendingFrom(ctx context.Context, pending []PendingRequest, f
 // A request older than since (the session's first recorded run) is written
 // only over a row a batch already stored: the transcript lines before callmeter
 // first saw the session (enabled mid-session, or a resumed history) are not
-// back-filled.
+// back-filled. Only a row r's session and agent own is written (ownedBy): a
+// forked session's transcript opens with a copy of its parent's history under
+// the same message ids, and the copy's usage (Claude Code wrote one all zero)
+// never overwrites the parent's.
 func (t *Tx) SettleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
 	return t.settleRequest(ctx, r, toolUseIDs, since, Overwrite)
 }
 
 // RecoverRequest is SettleRequest for a request read from the transcript of a
 // session gone quiet (RecoverQuiet): every column only fills, so a value a
-// hook stored is never overwritten, and the calls pointing, the since rule and
-// the recount are SettleRequest's.
+// hook stored is never overwritten, and the calls pointing, the since rule, the
+// owner rule and the recount are SettleRequest's.
 func (t *Tx) RecoverRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
 	return t.settleRequest(ctx, r, toolUseIDs, since, FillEmpty)
 }
@@ -517,8 +540,13 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		}
 	}
 	if r.TS != nil && *r.TS >= since {
-		if err := t.upsert(ctx, "requests", "request_id", r.RequestID, columns, mode); err != nil {
+		written, err := t.upsertWhere(ctx, "requests", "request_id", r.RequestID, columns, mode,
+			ownedBy("requests."), r.SessionID, r.AgentID)
+		if err != nil {
 			return err
+		}
+		if written == 0 {
+			return nil
 		}
 	} else {
 		// An UPDATE, never a read before the write: a transaction that reads
@@ -539,7 +567,8 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 			values = append(values, c.value)
 		}
 		result, err := t.tx.ExecContext(ctx,
-			"UPDATE requests SET "+strings.Join(sets, ", ")+" WHERE request_id = ?", append(values, r.RequestID)...)
+			"UPDATE requests SET "+strings.Join(sets, ", ")+" WHERE request_id = ? AND "+ownedBy(""),
+			append(values, r.RequestID, r.SessionID, r.AgentID)...)
 		if err != nil {
 			return fmt.Errorf("callmeter store %s: settle stored request %q: %w", t.path, r.RequestID, err)
 		}
@@ -559,6 +588,15 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		}
 	}
 	return t.RecountRequest(ctx, r.RequestID)
+}
+
+// ownedBy is the condition that a stored requests row belongs to the writing
+// session and agent, its columns named with prefix ("requests." inside an
+// upsert): session_id NULL (not yet known) or the session's, and agent_id the
+// agent's, NULL being the main chat. Its two arguments are the session id and
+// the agent id, a nil one binding NULL.
+func ownedBy(prefix string) string {
+	return fmt.Sprintf("(%[1]ssession_id IS NULL OR %[1]ssession_id = ?) AND %[1]sagent_id IS ?", prefix)
 }
 
 // RecountRequest sets requestID's calls to the number of calls rows carrying

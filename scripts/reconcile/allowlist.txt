@@ -31,6 +31,10 @@
 # their transcripts begin 2026-09-29 (f0d28042) and 2026-10-01 00:17
 # (f8e9fb29); hooks reached them only from their first store row.
 session-pre-first-row | f0d28042 f8e9fb29 | session already running when the plugin was enabled; hooks reached it only from its first store row
+# Seat 1 at install (store first row 11:29:09Z): the main transcripts hold
+# assistant lines before each first row; 7cd99294 and ae3d8096 were resumed
+# into the hooks at 12:38Z, 96b51bab loaded them with /reload-plugins.
+session-pre-first-row | 7cd99294 96b51bab ae3d8096 | session already running when callmeter loaded in that chat (install time); hooks reached it only from its first store row
 
 # --- rows the binary before T wrote ---
 
@@ -89,11 +93,14 @@ session-promptless | 489dee09 | /clear landing session: the user exited at the e
 
 # Claude Code sends a sub-agent's compaction hooks without agent_id, and its
 # transcript_path is the main transcript (live probe 76a01ba7).
-event-compact-subagent | 92cb932e c222fd5d e00f5098 ae3d8096 | Claude Code sends a sub-agent's PreCompact/PostCompact/SessionStart(compact) without agent_id and with the main transcript_path, so no store row can name the sub-agent
+event-compact-subagent | 92cb932e c222fd5d e00f5098 ae3d8096 b210fe1d | Claude Code sends a sub-agent's PreCompact/PostCompact/SessionStart(compact) without agent_id and with the main transcript_path, so no store row can name the sub-agent
 # PROVISIONAL (the dedupe part): the running sibling call-residuals may change
 # how byte-identical payloads collapse; recheck these after it lands.
 event-compact | ca215ad9 e00f5098 f0d28042 | sub-agent compactions fire the main session's hooks (some write no boundary); a cancelled /compact (ca215ad9 15:35:43) fires PreCompact only; byte-identical payloads collapse into one row (docs/design.md:201; provisional)
 event-precompact-unfinished | ca215ad9 e00f5098 | sub-agent compactions fire the main session's hooks (some write no boundary); a cancelled /compact (ca215ad9 15:35:43) fires PreCompact only; byte-identical payloads collapse into one row (docs/design.md:201; provisional)
+# Two byte-identical auto PreCompact payloads 7.1 s apart; the model kept
+# working after the first, and only the second led to a compact_boundary.
+event-precompact-unfinished | aadff338 | Claude Code fired an auto PreCompact and did not compact: the model kept working, and a second PreCompact 7 s later led to the boundary, so one PreCompact has no PostCompact
 # A /reload submit blocked by a UserPromptSubmit hook leaves no prompt line.
 event-prompt-extra | d998e317 31ff639e a141a9a7 | a /reload submit blocked by a UserPromptSubmit hook: the hook ran, Claude Code wrote no transcript prompt line
 # The headless limits-picker "ACK" probe: async StopFailure cancelled at exit.
@@ -146,6 +153,8 @@ session-unrecorded | 4a9e3004 7e00a681 | hook-ran: runtime-check / rt-after-inst
 # no-hook: launched with project-only setting sources, so user-scope
 # enabledPlugins never load; its scratch CALLMETER_HOME holds no store.
 session-unrecorded | cc9fabfb | no-hook: the settingsources probe's project-only arm; user-scope enabledPlugins never load, and its scratch CALLMETER_HOME holds no store
+# The round-1 B1 `claude -p` probe (entrypoint sdk-cli, 27 lines over 3 s).
+session-unrecorded | f55c2fe1 | probe: the round-1 B1 `claude -p` run recorded in its own scratch CALLMETER_HOME, since deleted
 
 # Test chats (2026-10-01 21:09-23:49 UTC, cwd the professor checkout): their
 # transcripts were deleted after the run under the 2026-10-02 test-chat ruling
@@ -157,6 +166,17 @@ request-extra | 11569871 19837743 222da865 406d4836 41e368d1 5bb5bb7f 5ec15fab 6
 agent-extra | 19837743 222da865 5bb5bb7f 5ec15fab ce683014 ea295923 ebc61c89 | its session's transcript, sub-agents included, was deleted after the run (2026-10-02 test-chat ruling)
 
 # --- Claude Code's own behaviour, proven per id from the transcript ---
+
+# A prompt typed while a turn is ending fires UserPromptSubmit at submit time
+# with the running turn's prompt_id; the turn ends first, so Claude Code runs
+# it as a new turn under a new promptId and fires no second UserPromptSubmit.
+# The missing prompt is that new turn; the repeat is its UPS, paired with no
+# queued_command (27a0106d 17:30:53Z; ae3d8096 16:53:44Z and 18:04:12Z).
+event-prompt-missing | a1186b3b 48e985b9 | a prompt submitted while the turn was ending: its UserPromptSubmit carried the running turn's prompt_id, and Claude Code ran it as a new turn under this promptId with no second UserPromptSubmit
+event-prompt-repeat | 27a0106d ae3d8096 | each unpaired repeat is the UserPromptSubmit of a prompt submitted while the turn was ending, carrying the running turn's prompt_id (the event-prompt-missing lines above); every other repeat pairs with a queued_command
+# The fork inherited its parent's running turn; a task notification moved into
+# its queue was delivered mid-turn and fired no UserPromptSubmit.
+event-prompt-repeat | 3e663996 | the fork inherited its parent's running turn, and a task notification queued in the fork was delivered mid-turn with no UserPromptSubmit
 
 # The rate-limited turn: an api-error <synthetic> assistant (15:33:22.975),
 # then its turn_duration (15:33:22.988), no assistant between; the store holds

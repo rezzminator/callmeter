@@ -2104,3 +2104,258 @@ func TestReconcileLandedCallWithoutARealSize(t *testing.T) {
 		})
 	}
 }
+
+// setTranscriptPath points a fixture session's sessions row at its transcript.
+func setTranscriptPath(t *testing.T, f fixture, session, path string) {
+	t.Helper()
+	store, err := callmeter.OpenDB(context.Background(), f.db)
+	if err != nil {
+		t.Fatalf("open fixture store: %v", err)
+	}
+	_, updateErr := store.DB().Exec(`UPDATE sessions SET transcript_path=? WHERE session_id=?`, path, session)
+	closeErr := store.Close()
+	if updateErr != nil || closeErr != nil {
+		t.Fatalf("set transcript path: %v; close store: %v", updateErr, closeErr)
+	}
+}
+
+// TestForkCopiedHistoryIsNotPreFirstRow: a fork's transcript opens with its
+// parent's lines, same message ids and timestamps (real shape: the assistant
+// lines of a `start_source=fork` session dated before its first row, whose
+// message.id the store holds under the parent's session_id). They belong to
+// the parent; the product never back-fills before a session's first row.
+func TestForkCopiedHistoryIsNotPreFirstRow(t *testing.T) {
+	for _, tc := range []struct {
+		name, msgID string
+		flagged     bool
+	}{
+		{name: "copied from the parent", msgID: "msg_A1"},
+		{name: "its own pre-row line", msgID: "msg_F0", flagged: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, nil, []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source) VALUES('%s', %d, %d, 'fork')`, fxSession2, fxMS(40), fxMS(41)),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('k1', 'SessionStart', %d, '%s', 'fork')`, fxMS(40), fxSession2),
+			})
+			path := filepath.Join(f.projects, "-tmp-demo-proj", fxSession2+".jsonl")
+			writeLines(t, path, []string{
+				assistantLine(t, 2, tc.msgID, 5, nil, toolUse("toolu_A1", "Bash")),
+				assistantLine(t, 2.1, tc.msgID, 50, "tool_use", toolUse("toolu_A2", "Agent")),
+				jsonLine(t, map[string]any{"type": "system", "subtype": "local_command", "timestamp": fxTS(40.5), "sessionId": fxSession2, "content": fxSecret}),
+			})
+			setTranscriptPath(t, f, fxSession2, path)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			want := "MISMATCH session-pre-first-row session=" + fxSession2 + " first_row=2030-01-01T00:00:40Z assistant_lines=2 tool_uses=2 start_source=fork"
+			if got := strings.Contains(out, "session-pre-first-row session="+fxSession2); got != tc.flagged || (tc.flagged && !strings.Contains(out, want)) {
+				t.Fatalf("pre-first-row flagged=%t, want %t (%q):\n%s", got, tc.flagged, want, out)
+			}
+		})
+	}
+}
+
+// TestAgentToolUsesBeforeSince: ReadAgentTotals counts every distinct tool_use
+// of the whole agent transcript, so one dated before --since still counts.
+func TestAgentToolUsesBeforeSince(t *testing.T) {
+	for _, count := range []int{2, 1} {
+		t.Run(fmt.Sprintf("store tool uses=%d", count), func(t *testing.T) {
+			f := newFixture(t, nil, []string{fmt.Sprintf(`UPDATE agents SET tool_uses=%d`, count)})
+			writeLines(t, agentFile(f), append([]string{assistantLine(t, -10, "msg_B0", 4, "tool_use", toolUse("toolu_B0", "Read"))}, agentLines(t)...))
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if count == 2 {
+				if strings.Contains(out, "agent-tool-uses") {
+					t.Fatalf("whole transcript count agrees:\n%s", out)
+				}
+				return
+			}
+			if want := fmt.Sprintf("MISMATCH agent-tool-uses session=%s ids=%s transcript=2 store=1", fxSession, fxAgent); !strings.Contains(out, want) {
+				t.Fatalf("want %q:\n%s", want, out)
+			}
+		})
+	}
+}
+
+// TestTaskNotificationWakeClosesAgentTurn: a sub-agent woken by a task
+// notification gets the wake as a user line (real shape: isMeta true,
+// origin.kind "task-notification", a promptId) after a final message whose
+// stop_reason stayed null. Claude Code fired SubagentStop for that turn and
+// SubagentStart for the wake: every pair is a turn.
+func TestTaskNotificationWakeClosesAgentTurn(t *testing.T) {
+	for _, turns := range []int{2, 1, 3} {
+		t.Run(fmt.Sprintf("store turns=%d", turns), func(t *testing.T) {
+			rows := []string{
+				fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 7, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(9.7)),
+			}
+			for seq := 2; seq <= turns; seq++ {
+				rows = append(rows, fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started, stopped) VALUES('%s', %d, '%s', 'demo-agent', %d, %d)`, fxAgent, seq, fxSession, fxMS(9.5), fxMS(9.8)))
+			}
+			f := newFixture(t, nil, rows)
+			lines := agentLines(t)
+			lines[len(lines)-1] = assistantLine(t, 8, "msg_B2", 30, nil, map[string]any{"type": "text", "text": fxSecret})
+			wake := jsonLine(t, map[string]any{"type": "user", "timestamp": fxTS(9.5), "sessionId": fxSession, "entrypoint": "cli", "promptId": fxPrompt, "isMeta": true,
+				"origin": map[string]any{"kind": "task-notification"}, "message": map[string]any{"role": "user", "content": fxSecret}})
+			writeLines(t, agentFile(f), append(lines, wake, assistantLine(t, 9.7, "msg_B3", 7, "end_turn", map[string]any{"type": "text", "text": fxSecret})))
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if turns == 2 {
+				if code != 0 || strings.Contains(out, "agent-turns") {
+					t.Fatalf("two turns: exit %d, want 0 and no turn mismatch:\n%s", code, out)
+				}
+				return
+			}
+			if want := fmt.Sprintf("MISMATCH agent-turns session=%s ids=%s transcript_turns=2 store_turns=%d", fxSession, fxAgent, turns); code != 1 || !strings.Contains(out, want) {
+				t.Fatalf("exit %d, want 1 and %q:\n%s", code, want, out)
+			}
+		})
+	}
+}
+
+// TestBlockedPromptIsExpected: a prompt another UserPromptSubmit hook blocked
+// fired its UserPromptSubmit, and Claude Code wrote no prompt line, only a
+// system line (real shape: subtype "informational", level "warning",
+// preventContinuation true) right after it.
+func TestBlockedPromptIsExpected(t *testing.T) {
+	const blocked = "33333333-aaaa-4bbb-8ccc-000000000007"
+	row := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e9', 'UserPromptSubmit', %d, '%s', '%s')`, fxMS(30), fxSession, blocked)
+	warning := func(sec float64) string {
+		return jsonLine(t, map[string]any{"type": "system", "subtype": "informational", "level": "warning", "preventContinuation": true, "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli", "content": fxSecret})
+	}
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"warning right after", []string{warning(30.2)}, "EXPECTED event-prompt-extra session=" + fxSession + " ids=" + blocked + " store_prompts=2: expected: " + reasonBlockedPrompt},
+		{"no warning", nil, "MISMATCH event-prompt-extra session=" + fxSession + " ids=" + blocked},
+		{"warning long after", []string{warning(40)}, "MISMATCH event-prompt-extra session=" + fxSession + " ids=" + blocked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.extra, []string{row})
+			if _, out := f.run(t, "2030-01-01T00:00:00Z"); !strings.Contains(out, tc.want) {
+				t.Fatalf("want %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// TestTranscriptOnlyNotificationIsNoPrompt: a task notification Claude Code
+// writes on resume without submitting it (real shape: a user line with
+// origin.kind "task-notification", promptSource "system", queueTranscriptOnly
+// and queueSkipAttachments true, its own promptId) fires no UserPromptSubmit.
+func TestTranscriptOnlyNotificationIsNoPrompt(t *testing.T) {
+	const pending = "33333333-aaaa-4bbb-8ccc-000000000008"
+	for _, transcriptOnly := range []bool{true, false} {
+		t.Run(fmt.Sprintf("queueTranscriptOnly=%t", transcriptOnly), func(t *testing.T) {
+			v := map[string]any{"type": "user", "timestamp": fxTS(25), "sessionId": fxSession, "entrypoint": "cli", "promptId": pending,
+				"origin": map[string]any{"kind": "task-notification"}, "promptSource": "system", "queueSkipAttachments": true,
+				"message": map[string]any{"role": "user", "content": fxSecret}}
+			if transcriptOnly {
+				v["queueTranscriptOnly"] = true
+			}
+			f := newFixture(t, []string{jsonLine(t, v)}, nil)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if transcriptOnly {
+				if code != 0 || strings.Contains(out, "event-prompt-missing") {
+					t.Fatalf("a transcript-only notification is no prompt (exit %d):\n%s", code, out)
+				}
+				return
+			}
+			if want := "MISMATCH event-prompt-missing session=" + fxSession + " ids=" + pending; code != 1 || !strings.Contains(out, want) {
+				t.Fatalf("exit %d, want 1 and %q:\n%s", code, want, out)
+			}
+		})
+	}
+}
+
+// TestFailedTurnEndsInStopFailure: a turn ending in an API error (real shape:
+// an assistant line with isApiErrorMessage true and model "<synthetic>") fires
+// StopFailure, not Stop, and Claude Code may still write its turn_duration.
+func TestFailedTurnEndsInStopFailure(t *testing.T) {
+	apiError := jsonLine(t, map[string]any{"type": "assistant", "timestamp": fxTS(30), "sessionId": fxSession, "entrypoint": "cli", "isApiErrorMessage": true,
+		"message": map[string]any{"id": "33333333-aaaa-4bbb-8ccc-00000000000a", "model": "<synthetic>", "stop_reason": "stop_sequence", "content": []map[string]any{{"type": "text", "text": fxSecret}}}})
+	duration := jsonLine(t, map[string]any{"type": "system", "subtype": "turn_duration", "timestamp": fxTS(30.1), "sessionId": fxSession, "entrypoint": "cli"})
+	failure := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e9', 'StopFailure', %d, '%s')`, fxMS(30), fxSession)
+	for _, tc := range []struct {
+		name  string
+		extra []string
+		rows  []string
+		want  string
+	}{
+		{name: "turn_duration after the error", extra: []string{apiError, duration}, rows: []string{failure}},
+		{name: "no turn_duration after the error", extra: []string{apiError}, rows: []string{failure}},
+		{name: "turn_duration with no error", extra: []string{duration}, rows: []string{failure}, want: "MISMATCH event-stop session=" + fxSession + " transcript_turns=2 store_stop=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.extra, tc.rows)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if tc.want == "" {
+				if code != 0 || strings.Contains(out, "event-stop") {
+					t.Fatalf("Stop and StopFailure end the turns (exit %d):\n%s", code, out)
+				}
+				return
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Fatalf("want %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// TestSessionEndBudgetFaultIsExpected: SessionEnd records its spent
+// transcript-read budget as an id-less transcript fault by design
+// (internal/hookentry/callmeter.go, sessionEndBudget); it hides nothing when
+// none of the session's calls, requests or agents mismatch.
+func TestSessionEndBudgetFaultIsExpected(t *testing.T) {
+	fault := fmt.Sprintf(`INSERT INTO faults(ts, session_id, stage, error) VALUES(%d, '%s', 'transcript', 'SessionEnd spent its 1.2s budget: 1 transcript reads skipped, their requests and calls left as their hooks wrote them')`, fxMS(21), fxSession)
+	for _, tc := range []struct {
+		name, want string
+		rows       []string
+	}{
+		{"session reconciles", "EXPECTED fault-transcript session=" + fxSession + " at=2030-01-01T00:00:21Z", []string{fault}},
+		{"a request mismatches", "MISMATCH fault-transcript session=" + fxSession, []string{fault, `UPDATE requests SET output_tokens=1 WHERE request_id='msg_A1'`}},
+		{"another transcript fault", "MISMATCH fault-transcript session=" + fxSession, []string{strings.Replace(fault, "SessionEnd spent its", "read stalled after", 1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, nil, tc.rows)
+			if _, out := f.run(t, "2030-01-01T00:00:00Z"); !strings.Contains(out, tc.want) {
+				t.Fatalf("want %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}
+
+// TestIdleNotificationOnlySessionIsExpected: a chat already open when the hooks
+// loaded (a /reload-plugins, a local command firing no SessionStart or
+// UserPromptSubmit) whose first hook was an idle Notification. Real shape: the
+// store's only rows are a sessions row and Notification events; the transcript
+// holds a meta user line, a `<command-name>` user line and a system
+// local_command line, and no assistant line.
+func TestIdleNotificationOnlySessionIsExpected(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, want string
+	}{
+		{name: "Notification only", want: "EXPECTED session-promptless session=" + fxSession2 + " model=- start_source=- events=Notification:1: expected: " + reasonIdleNotification},
+		{name: "with a prompt", extra: "UserPromptSubmit", want: "MISMATCH session-promptless session=" + fxSession2},
+		{name: "with a SessionStart", extra: "SessionStart", want: "session-promptless session=" + fxSession2 + " model=- start_source=- events=Notification:1,SessionStart:1\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts) VALUES('%s', %d, %d)`, fxSession2, fxMS(40), fxMS(40)),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('n1', 'Notification', %d, '%s')`, fxMS(40), fxSession2),
+			}
+			if tc.extra != "" {
+				rows = append(rows, fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('n2', '%s', %d, '%s')`, tc.extra, fxMS(39), fxSession2))
+			}
+			f := newFixture(t, nil, rows)
+			path := filepath.Join(f.projects, "-tmp-demo-proj", fxSession2+".jsonl")
+			writeLines(t, path, []string{
+				jsonLine(t, map[string]any{"type": "user", "timestamp": fxTS(35), "sessionId": fxSession2, "isMeta": true, "message": map[string]any{"role": "user", "content": fxSecret}}),
+				jsonLine(t, map[string]any{"type": "user", "timestamp": fxTS(35), "sessionId": fxSession2, "promptId": fxPrompt, "message": map[string]any{"role": "user", "content": "<command-name>/reload-plugins</command-name>"}}),
+				jsonLine(t, map[string]any{"type": "system", "subtype": "local_command", "timestamp": fxTS(35.1), "sessionId": fxSession2, "content": fxSecret}),
+			})
+			setTranscriptPath(t, f, fxSession2, path)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if !strings.Contains(out, tc.want) || (tc.name != "Notification only" && strings.Contains(out, "EXPECTED session-promptless")) {
+				t.Fatalf("want %q:\n%s", tc.want, out)
+			}
+		})
+	}
+}

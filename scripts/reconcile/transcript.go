@@ -82,7 +82,15 @@ type transcript struct {
 	preLines             int
 	preAssistants        int
 	preToolUses          map[string]bool
+	preByMsg             map[string]*preCount // pre-row assistant lines and tool uses, by message id
+	earlyToolUses        map[string]bool      // an agent transcript's tool uses before --since
+	failedDurations      int                  // turn_duration lines ending a turn an API error ended
+	afterAPIError        bool                 // the latest assistant line is an API error
+	blocks               []int64              // system lines with preventContinuation (unix ms)
 }
+
+// preCount is one message's lines before its session's first store row.
+type preCount struct{ lines, tools int }
 
 // world is everything the transcripts say, inside the window.
 type world struct {
@@ -200,16 +208,21 @@ func (w *world) readSession(session, path string) error {
 }
 
 type line struct {
-	Type          string `json:"type"`
-	Subtype       string `json:"subtype"`
-	Timestamp     string `json:"timestamp"`
-	PromptID      string `json:"promptId"`
-	IsMeta        bool   `json:"isMeta"`
-	TurnOrigin    string `json:"turnOrigin"`
-	IsCompactSumm bool   `json:"isCompactSummary"`
-	IsAPIError    bool   `json:"isApiErrorMessage"`
-	Entrypoint    string `json:"entrypoint"`
-	Origin        *struct {
+	Type       string `json:"type"`
+	Subtype    string `json:"subtype"`
+	Timestamp  string `json:"timestamp"`
+	PromptID   string `json:"promptId"`
+	IsMeta     bool   `json:"isMeta"`
+	TurnOrigin string `json:"turnOrigin"`
+	// QueueTranscriptOnly: a queued line written to the transcript and never
+	// submitted (a pending task notification on resume); no UserPromptSubmit.
+	QueueTranscriptOnly bool `json:"queueTranscriptOnly"`
+	// PreventContinuation: a system warning that a hook stopped the prompt.
+	PreventContinuation bool   `json:"preventContinuation"`
+	IsCompactSumm       bool   `json:"isCompactSummary"`
+	IsAPIError          bool   `json:"isApiErrorMessage"`
+	Entrypoint          string `json:"entrypoint"`
+	Origin              *struct {
 		Kind string `json:"kind"`
 	} `json:"origin"`
 	Attachment *struct {
@@ -266,7 +279,7 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	t := &transcript{
 		path: real, session: session, agent: agent,
 		prompts: map[string]bool{}, toolUses: map[string]bool{}, endTurns: map[string]bool{}, nullEnds: map[string]bool{},
-		entrypoints: map[string]bool{}, preToolUses: map[string]bool{},
+		entrypoints: map[string]bool{}, preToolUses: map[string]bool{}, preByMsg: map[string]*preCount{}, earlyToolUses: map[string]bool{},
 	}
 	lower := w.lower(session)
 	sc := bufio.NewScanner(f)
@@ -311,6 +324,15 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 				w.results[b.ToolUseID] = result{ts: ms, isError: b.IsError}
 			}
 		}
+		// ReadAgentTotals counts every tool use of the whole agent transcript,
+		// one dated before --since too.
+		if t.agent != "" && ms < w.since && l.Type == "assistant" {
+			for _, b := range blocks {
+				if b.Type == "tool_use" && b.ID != "" {
+					t.earlyToolUses[b.ID] = true
+				}
+			}
+		}
 		if !w.inWindow(ms) {
 			continue
 		}
@@ -318,8 +340,21 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 			t.preLines++
 			if l.Type == "assistant" {
 				t.preAssistants++
+				id := ""
+				if l.Message != nil {
+					id = l.Message.ID
+				}
+				c := t.preByMsg[id]
+				if c == nil {
+					c = &preCount{}
+					t.preByMsg[id] = c
+				}
+				c.lines++
 				for _, b := range blocks {
 					if b.Type == "tool_use" {
+						if !t.preToolUses[b.ID] {
+							c.tools++
+						}
 						t.preToolUses[b.ID] = true
 					}
 				}
@@ -335,6 +370,7 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 		}
 		switch l.Type {
 		case "assistant":
+			t.afterAPIError = l.IsAPIError
 			if err := w.assistant(t, &l, blocks, ms); err != nil {
 				return nil, fmt.Errorf("transcript %s line %d: %w", real, n, err)
 			}
@@ -342,11 +378,23 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 			if t.agent == "" {
 				w.notice(&l, ms)
 			}
+			// A queued line written transcript-only was never submitted: it
+			// fires no UserPromptSubmit and starts no turn.
+			if l.QueueTranscriptOnly {
+				continue
+			}
+			// A sub-agent woken by a task notification gets the wake as a meta
+			// user line: Claude Code fired SubagentStop for the turn before it,
+			// whose final message may keep a null stop_reason.
+			if t.agent != "" && l.IsMeta && taskNotification(&l) && t.lastMsg != "" && t.lastStop == "" {
+				t.nullEnds[t.lastMsg] = true
+			}
 			if (l.IsMeta && !peerMessage(&l) && !scheduledPrompt(&l)) || l.IsCompactSumm || l.Message == nil {
 				continue
 			}
 			if l.PromptID != "" && isPrompt(l.Message.Content, blocks) {
 				t.prompts[l.PromptID] = true
+				t.afterAPIError = false
 				// The hook's SubagentStop ends the turn whatever the stop_reason.
 				if t.lastMsg != "" && t.lastStop == "" {
 					t.nullEnds[t.lastMsg] = true
@@ -360,11 +408,19 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 				t.queued++
 			}
 		case "system":
+			if l.PreventContinuation {
+				t.blocks = append(t.blocks, ms)
+			}
 			switch l.Subtype {
 			case "compact_boundary":
 				t.compacts++
 			case "turn_duration":
 				t.turnDurations++
+				// A turn an API error ended fires StopFailure, not Stop.
+				if t.afterAPIError {
+					t.failedDurations++
+					t.afterAPIError = false
+				}
 			}
 		}
 	}
@@ -424,6 +480,10 @@ func noticeAgent(body string) (agentID string, ok bool) {
 // is a model-bound prompt like a typed one. A plain isMeta line (a
 // system-reminder, a local-command caveat) fires none.
 func peerMessage(l *line) bool { return l.Origin != nil && l.Origin.Kind == "peer" }
+
+// taskNotification reports whether a user line is a task notification's
+// delivery (origin.kind "task-notification").
+func taskNotification(l *line) bool { return l.Origin != nil && l.Origin.Kind == "task-notification" }
 
 // scheduledPrompt reports whether a scheduled task's prompt is written isMeta
 // with turnOrigin "scheduled" and fires UserPromptSubmit.
