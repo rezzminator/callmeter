@@ -1,6 +1,7 @@
 package hookentry
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -441,6 +442,44 @@ func TestLifecycleSubagentStopTurn(t *testing.T) {
 		"event": "SubagentStop", "agent_id": cmSubagent, "agent_type": "general-purpose",
 		"last_assistant_message_bytes": 3, "stop_hook_active": 0, "background_tasks": "[]",
 	})
+}
+
+// TestLifecycleSubagentStopReplacesARebuiltStop: a quiet-session recovery
+// rebuilt the agent's SubagentStop from its transcript while the hook's event
+// was thought lost (callmeter.RecoverAgentStop); the hook's own SubagentStop,
+// landing later, is the one left: one events row, one turns row, the turn
+// closed by the hook's.
+func TestLifecycleSubagentStopReplacesARebuiltStop(t *testing.T) {
+	ctx := context.Background()
+	lab := newCallmeterLab(t)
+	scripted := lab.payloads("scripted.jsonl")
+	base := time.Now().Add(-time.Hour).UnixMilli()
+	lab.feedAt(base, scripted[5])
+	if err := lab.db().Batch(ctx, func(tx *callmeter.Tx) error {
+		if err := tx.TouchSession(ctx, callmeter.Session{SessionID: cmSessionA, TS: base}); err != nil {
+			return err
+		}
+		_, err := tx.RecoverAgentStop(ctx, callmeter.AgentStop{AgentID: cmSubagent, Seq: 1, TS: base + 100})
+		return err
+	}); err != nil {
+		t.Fatalf("rebuild the SubagentStop: %v", err)
+	}
+	if n := lab.count("SELECT count(*) FROM events WHERE event = 'SubagentStop' AND detail = ?", callmeter.RecoveredDetail); n != 1 {
+		t.Fatalf("rebuilt SubagentStop events = %d, want 1 before the hook lands", n)
+	}
+	lab.feedAt(base+200, scripted[8])
+	for query, want := range map[string]int{
+		"SELECT count(*) FROM events WHERE event = 'SubagentStop'":                                                  1,
+		"SELECT count(*) FROM turns WHERE event = 'SubagentStop'":                                                   1,
+		"SELECT count(*) FROM events WHERE event = 'SubagentStop' AND detail = '" + callmeter.RecoveredDetail + "'": 0,
+		"SELECT count(*) FROM agent_turns":                                                                          1,
+		"SELECT count(*) FROM agent_turns WHERE stop_event_id IN (SELECT event_id FROM events)":                     1,
+	} {
+		if n := lab.count(query); n != want {
+			t.Errorf("%s = %d, want %d", query, n, want)
+		}
+	}
+	expect(t, "agent turn", lab.row("SELECT * FROM agent_turns"), map[string]any{"stopped": base + 200})
 }
 
 // A compaction ends with an untyped SubagentStop whose transcript was never

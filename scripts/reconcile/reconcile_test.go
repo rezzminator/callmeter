@@ -958,6 +958,95 @@ func TestLostHookFaultNamingItsSession(t *testing.T) {
 	}
 }
 
+// TestLostHookPairsWithItsRow: a SubagentStop, PreToolUse, PostToolUse,
+// PostToolUseFailure or PostToolBatch fault naming its session (the binary's
+// `terminated by …`, or the wrapper's `binary` line), and a binary-stage Stop
+// naming one, is expected only when the row that hook would have written
+// exists (hook-written or rebuilt by recovery); otherwise it stays a mismatch
+// naming the session. One fault pairs one candidate.
+func TestLostHookPairsWithItsRow(t *testing.T) {
+	fault := func(stage, err string, sec float64) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id) VALUES(%d, '%s', '%s', '%s')`, fxMS(sec), stage, err, fxSession)
+	}
+	marker := func(id string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id, tool_use_id) VALUES(%d, 'transcript', 'call %s: open', '%s', '%s')`, fxMS(22), id, fxSession, id)
+	}
+	// The fixture's transcript holds three calls (A1 results at 3, B1 at 7, A2 at 20).
+	delivered := `UPDATE calls SET bytes_delivered=10, bytes_real=NULL`
+	unsized := `UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_B1'`
+	undelivered := `UPDATE calls SET bytes_delivered=NULL WHERE tool_use_id='toolu_B1'`
+	pending := `UPDATE calls SET request_id='pending:toolu_B1' WHERE tool_use_id='toolu_B1'`
+	dropB1 := `DELETE FROM calls WHERE tool_use_id='toolu_B1'`
+	dropStop := `DELETE FROM events WHERE event_id = 'e5'`
+	openTurn := `UPDATE agent_turns SET stopped=NULL`
+	at := " at=2030-01-01T00:00:22Z"
+	id := " session=" + fxSession
+	for _, c := range []struct {
+		name string
+		sql  []string
+		want string
+	}{
+		{"SubagentStop, its turn stopped", []string{fault("terminated", "SubagentStop: terminated by store busy", 10)},
+			"EXPECTED fault-terminated" + id + " event=SubagentStop at=2030-01-01T00:00:10Z: expected: " + reasonLostSubagentStop},
+		{"SubagentStop wrapper line, its turn stopped", []string{fault("binary", "SubagentStop: killed by signal", 10)},
+			"EXPECTED fault-binary" + id + " event=SubagentStop"},
+		{"SubagentStop, two faults, one turn", []string{fault("terminated", "SubagentStop: terminated by store busy", 10), fault("terminated", "SubagentStop: terminated by store busy", 10)},
+			"MISMATCH fault-terminated" + id + " event=SubagentStop unpaired_subagentstop=0"},
+		{"SubagentStop, no turn stopped in its window", []string{fault("terminated", "SubagentStop: terminated by store busy", 100)},
+			"MISMATCH fault-terminated" + id + " event=SubagentStop unpaired_subagentstop=0"},
+		{"SubagentStop, a turn of the session is open", []string{openTurn, fault("terminated", "SubagentStop: terminated by store busy", 10)},
+			"MISMATCH fault-terminated" + id + " event=SubagentStop open_agent_turn=" + fxAgent},
+
+		{"PostToolUse, every call settled", []string{fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"EXPECTED fault-terminated" + id + " event=PostToolUse" + at + ": expected: " + reasonLostPostToolUse},
+		{"PostToolUseFailure wrapper line, every call settled", []string{fault("binary", "PostToolUseFailure: killed by signal", 22)},
+			"EXPECTED fault-binary" + id + " event=PostToolUseFailure"},
+		{"PostToolUse, a call has no size", []string{unsized, fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"MISMATCH fault-terminated" + id + " event=PostToolUse unsettled_call=toolu_B1"},
+		{"PostToolUse, the unsized call carries a marker", []string{unsized, marker("toolu_B1"), fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"EXPECTED fault-terminated" + id + " event=PostToolUse"},
+		{"PostToolUse and PostToolUseFailure share three calls", []string{
+			fault("terminated", "PostToolUse: terminated by store busy", 22), fault("terminated", "PostToolUseFailure: terminated by store busy", 22),
+			fault("terminated", "PostToolUse: terminated by store busy", 22), fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"MISMATCH fault-terminated" + id + " event=PostToolUse unpaired_call=0"},
+		{"PostToolUse, no result in its window", []string{fault("terminated", "PostToolUse: terminated by store busy", 100)},
+			"MISMATCH fault-terminated" + id + " event=PostToolUse unpaired_call=0"},
+
+		{"PostToolBatch, every call delivered", []string{delivered, fault("terminated", "PostToolBatch: terminated by store busy", 22)},
+			"EXPECTED fault-terminated" + id + " event=PostToolBatch" + at + ": expected: " + reasonLostPostToolBatch},
+		{"PostToolBatch, a call not delivered", []string{delivered, undelivered, fault("terminated", "PostToolBatch: terminated by store busy", 22)},
+			"MISMATCH fault-terminated" + id + " event=PostToolBatch unsettled_call=toolu_B1"},
+		{"PostToolBatch, a call's request still provisional", []string{delivered, pending, fault("binary", "PostToolBatch: killed by signal", 22)},
+			"MISMATCH fault-binary" + id + " event=PostToolBatch unsettled_call=toolu_B1"},
+		{"PostToolBatch, none delivered, no result in its window", []string{fault("terminated", "PostToolBatch: terminated by store busy", 100)},
+			"MISMATCH fault-terminated" + id + " event=PostToolBatch unpaired_call=0"},
+
+		{"PreToolUse, every call has its row", []string{fault("terminated", "PreToolUse: terminated by store busy", 22)},
+			"EXPECTED fault-terminated" + id + " event=PreToolUse" + at + ": expected: " + reasonLostPreToolUse},
+		{"PreToolUse, a call has no row", []string{dropB1, fault("terminated", "PreToolUse: terminated by store busy", 22)},
+			"MISMATCH fault-terminated" + id + " event=PreToolUse unsettled_call=toolu_B1"},
+		{"PreToolUse, the missing row carries a marker", []string{dropB1, marker("toolu_B1"), fault("binary", "PreToolUse: killed by signal", 22)},
+			"EXPECTED fault-binary" + id + " event=PreToolUse"},
+		{"PreToolUse, no call in its window", []string{fault("terminated", "PreToolUse: terminated by store busy", 100)},
+			"MISMATCH fault-terminated" + id + " event=PreToolUse unpaired_call=0"},
+
+		{"wrapper Stop, its turn has a Stop", []string{fault("binary", "Stop: killed by signal", 22)},
+			"EXPECTED fault-binary" + id + " event=Stop"},
+		{"wrapper Stop, its turn has none", []string{dropStop, fault("binary", "Stop: killed by signal", 22)},
+			"MISMATCH fault-binary" + id + " event=Stop open_turn=" + fxSession},
+		{"wrapper StopFailure, its turn has none", []string{fault("binary", "StopFailure: killed by signal", 22)},
+			"MISMATCH fault-binary" + id + " event=StopFailure unpaired_stopfailure=0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if !strings.Contains(out, c.want) {
+				t.Fatalf("want %q:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
 // TestAllowlistNamesLinesMatchingNothing: the summary names every allowlist
 // line no mismatch matched, so a dead line shows.
 func TestAllowlistNamesLinesMatchingNothing(t *testing.T) {
@@ -1177,6 +1266,37 @@ func TestUnfillableMarkerIsExplainedByItsOwnParse(t *testing.T) {
 	}
 	stopReply := []string{assistantLine(t, 21.5, "msg_A2", 9, "end_turn", map[string]any{"type": "text", "text": fxSecret})}
 	stopReplyRow := fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A2', '%s', %d, 'claude-demo', 'end_turn', 3, 9, 100, 20, 0, 0)`, fxSession, fxMS(21.5))
+	// The marker of a prompt with no turn end, stamped at sec (the session's last
+	// hook when recovery marked it), naming prompt and its UserPromptSubmit event
+	// (the fixture's e2).
+	turnEndFault := func(sec float64, prompt, tail string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, session_id, stage, error) VALUES(%d, '%s', 'transcript', 'prompt %s UserPromptSubmit e2: %s')`,
+			fxMS(sec), fxSession, prompt, strings.ReplaceAll(tail, "'", "''"))
+	}
+	// A hook of the session after the turn-end marker: it reopened the session.
+	laterHook := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e-later', 'Notification', %d, '%s')`, fxMS(30), fxSession)
+	// The marker of an open call, stamped at sec (the session's last hook when
+	// recovery marked it, 21 s in the fixture).
+	callFault := func(sec float64, id, tail string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, session_id, tool_use_id, stage, error) VALUES(%d, '%s', '%s', 'transcript', 'call %s: %s')`,
+			fxMS(sec), fxSession, id, id, strings.ReplaceAll(tail, "'", "''"))
+	}
+	// toolu_A9: a Bash call of msg_A9 at 2.5 s, its row with a request and,
+	// when sized, a size; its result line at sec.
+	openUse := []string{assistantLine(t, 2.5, "msg_A9", 9, "tool_use", toolUse("toolu_A9", "Bash"))}
+	openRows := func(sized bool) []string {
+		size := "NULL"
+		if sized {
+			size = "10"
+		}
+		return []string{
+			fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A9', '%s', %d, 'claude-demo', 'tool_use', 3, 9, 100, 20, 1, 0)`, fxSession, fxMS(2.5)),
+			fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real) VALUES('toolu_A9', '%s', 'msg_A9', %d, 'Bash', %s)`, fxSession, fxMS(2.5), size),
+		}
+	}
+	openResult := func(sec float64) []string { return append(slices.Clone(openUse), toolResult(t, sec, "toolu_A9")) }
+	reopen := fmt.Sprintf(`UPDATE sessions SET last_ts = %d WHERE session_id = '%s'`, fxMS(30), fxSession)
+	expectedCall := "EXPECTED fault-transcript-unfillable session=" + fxSession + " call=toolu_A9 "
 	expectedAgent := "EXPECTED fault-transcript-unfillable session=" + fxSession + " agent=" + fxAgent + " "
 	expectedStop := "EXPECTED fault-transcript-unfillable session=" + fxSession + " prompt=" + fxPrompt + " "
 	unexplained := "MISMATCH fault-transcript session=" + fxSession + " "
@@ -1195,6 +1315,26 @@ func TestUnfillableMarkerIsExplainedByItsOwnParse(t *testing.T) {
 		{name: "stop: no final request of the prompt", fault: stopFault(unfilledStopReply), want: expectedStop, code: 0},
 		{name: "stop: the transcript holds a final request of the prompt", extraMain: stopReply, sql: []string{stopReplyRow}, fault: stopFault(unfilledStopReply), want: unexplained, code: 1},
 		{name: "another text is no marker", fault: stopFault("something else"), want: unexplained, code: 1},
+		// The reply ending the prompt's turn is on disk at 21.5 s.
+		{name: "turn end: the reply came after the mark and a later hook reopened the session", extraMain: stopReply, sql: []string{stopReplyRow, laterHook},
+			fault: turnEndFault(21.2, fxPrompt, unfilledTurnEnd), want: expectedStop, code: 0},
+		{name: "turn end: the reply came after the mark and no store event follows it", extraMain: stopReply, sql: []string{stopReplyRow},
+			fault: turnEndFault(21.2, fxPrompt, unfilledTurnEnd), want: unexplained, code: 1},
+		{name: "turn end: the reply is at the marking time", extraMain: stopReply, sql: []string{stopReplyRow, laterHook},
+			fault: turnEndFault(21.5, fxPrompt, unfilledTurnEnd), want: unexplained, code: 1},
+		{name: "turn end: the transcript holds no turn end at all", fault: turnEndFault(22, fxPrompt, unfilledTurnEnd), want: expectedStop, code: 0},
+		{name: "turn end: the reply was on disk by the marking time", extraMain: stopReply, sql: []string{stopReplyRow},
+			fault: turnEndFault(22, fxPrompt, unfilledTurnEnd), want: unexplained, code: 1},
+		{name: "turn end: a prompt the store does not hold", fault: turnEndFault(22, fxPrompt2, unfilledTurnEnd), want: unexplained, code: 1},
+		{name: "turn end: another text is no marker", fault: turnEndFault(22, fxPrompt, "something else"), want: unexplained, code: 1},
+		{name: "call: no result on disk", extraMain: openUse, sql: openRows(false), fault: callFault(21, "toolu_A9", unfilledCall), want: expectedCall, code: 0},
+		{name: "call: the result was on disk by the mark", extraMain: openResult(2.6), sql: openRows(false), fault: callFault(21, "toolu_A9", unfilledCall), want: unexplained, code: 1},
+		{name: "call: the result came after the mark and a later hook reopened it", extraMain: openResult(23), sql: append(openRows(true), reopen),
+			fault: callFault(21, "toolu_A9", unfilledCall), want: expectedCall, code: 0},
+		{name: "call: the result came after the mark and no hook followed", extraMain: openResult(23), sql: openRows(false),
+			fault: callFault(21, "toolu_A9", unfilledCall), want: unexplained, code: 1},
+		{name: "call: a call the store does not hold", fault: callFault(21, "toolu_A8", unfilledCall), want: unexplained, code: 1},
+		{name: "call: another text is no marker", extraMain: openUse, sql: openRows(false), fault: callFault(21, "toolu_A9", "something else"), want: unexplained, code: 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			sql := append(slices.Clone(c.sql), c.fault)
@@ -1219,11 +1359,119 @@ func TestUnfillableMarkerIsExplainedByItsOwnParse(t *testing.T) {
 	}
 }
 
+// TestOpenAgentTurnMarkerIsExplainedByItsOwnParse: recovery marks a
+// sub-agent's latest turn that has no SubagentStop and whose quiet transcript
+// shows no turn end. The fault is expected only when this check's own parse of
+// the agent's transcript shows none at or after the turn's start (or only one
+// after the mark with a later hook reopening it); otherwise it stays a mismatch.
+func TestOpenAgentTurnMarkerIsExplainedByItsOwnParse(t *testing.T) {
+	// The agent's second turn, open from 9.1 s: its tool_use msg_B3 at 9.2 s
+	// (toolu_B9, no result), and when ended its reply msg_B4 at end.
+	rows := func(end float64) []string {
+		sql := []string{
+			fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started) VALUES('%s', 2, '%s', 'demo-agent', %d)`, fxAgent, fxSession, fxMS(9.1)),
+			fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'tool_use', 3, 7, 100, 20, 1, 0)`, fxSession, fxAgent, fxMS(9.2)),
+			fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, request_id, ts, tool) VALUES('toolu_B9', '%s', '%s', 'demo-agent', 'msg_B3', %d, 'Bash')`, fxSession, fxAgent, fxMS(9.2)),
+		}
+		if end != 0 {
+			sql = append(sql, fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B4', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 5, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(end)))
+		}
+		return sql
+	}
+	lines := func(end float64) []string {
+		out := append(agentLines(t), promptLine(t, 9.05), assistantLine(t, 9.2, "msg_B3", 7, "tool_use", toolUse("toolu_B9", "Bash")))
+		if end != 0 {
+			out = append(out, assistantLine(t, end, "msg_B4", 5, "end_turn", map[string]any{"type": "text", "text": fxSecret}))
+		}
+		return out
+	}
+	fault := func(seq int, tail string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, session_id, stage, error) VALUES(%d, '%s', 'transcript', 'agent %s turn %d open: %s')`,
+			fxMS(21), fxSession, fxAgent, seq, strings.ReplaceAll(tail, "'", "''"))
+	}
+	reopen := fmt.Sprintf(`UPDATE sessions SET last_ts = %d WHERE session_id = '%s'`, fxMS(30), fxSession)
+	expected := "EXPECTED fault-transcript-unfillable session=" + fxSession + " agent=" + fxAgent + " turn-open "
+	unexplained := "MISMATCH fault-transcript session=" + fxSession + " "
+	for _, c := range []struct {
+		name  string
+		end   float64
+		sql   []string
+		fault string
+		want  string
+		code  int
+	}{
+		{name: "no turn end in the agent's transcript", fault: fault(2, unfilledAgentStop), want: expected, code: 0},
+		{name: "a turn end before the mark", end: 9.4, fault: fault(2, unfilledAgentStop), want: unexplained, code: 1},
+		{name: "a turn end after the mark and a later hook reopened it", end: 22, sql: []string{reopen,
+			fmt.Sprintf(`UPDATE agent_turns SET stopped = %d WHERE agent_id = '%s' AND seq = 2`, fxMS(22.5), fxAgent),
+			fmt.Sprintf(`UPDATE agents SET stopped = %d, tool_uses = 2 WHERE agent_id = '%s'`, fxMS(22.5), fxAgent)},
+			fault: fault(2, unfilledAgentStop), want: expected, code: 0},
+		{name: "a turn end after the mark and no hook followed", end: 22, fault: fault(2, unfilledAgentStop), want: unexplained, code: 1},
+		{name: "a turn the store does not hold open", fault: fault(1, unfilledAgentStop), want: unexplained, code: 1},
+		{name: "another text is no marker", fault: fault(2, "something else"), want: unexplained, code: 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, append(append(rows(c.end), c.sql...), c.fault))
+			writeLines(t, agentFile(f), lines(c.end))
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != c.code || !strings.Contains(out, c.want) {
+				t.Fatalf("exit %d, want %d and %q:\n%s", code, c.code, c.want, out)
+			}
+		})
+	}
+}
+
+// TestRebuiltAgentStopIsCheckedByItsOwnParse: recovery rebuilt the
+// SubagentStop of a sub-agent turn whose hook event was lost, dated at the
+// turn-end line of the agent's transcript. It stands only when this check's
+// own parse of that transcript holds a turn end at that ts, at or after the
+// turn's start; otherwise it is a mismatch.
+func TestRebuiltAgentStopIsCheckedByItsOwnParse(t *testing.T) {
+	if rebuiltDetail != callmeter.RecoveredDetail {
+		t.Fatalf("rebuiltDetail = %q, want %q", rebuiltDetail, callmeter.RecoveredDetail)
+	}
+	// The agent's second turn from 9.1 s: its tool_use msg_B3 at 9.2 s, its
+	// reply msg_B4 ending the turn at 9.4 s; the stop rebuilt at stopped.
+	rows := func(stopped float64) []string {
+		return []string{
+			fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started, stopped, stop_event_id) VALUES('%s', 2, '%s', 'demo-agent', %d, %d, 'rb-stop')`, fxAgent, fxSession, fxMS(9.1), fxMS(stopped)),
+			fmt.Sprintf(`INSERT INTO events(event_id, event, session_id, agent_id, ts, detail) VALUES('rb-stop', 'SubagentStop', '%s', '%s', %d, '%s')`, fxSession, fxAgent, fxMS(stopped), callmeter.RecoveredDetail),
+			fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'tool_use', 3, 7, 100, 20, 1, 0)`, fxSession, fxAgent, fxMS(9.2)),
+			fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, request_id, ts, tool) VALUES('toolu_B9', '%s', '%s', 'demo-agent', 'msg_B3', %d, 'Bash')`, fxSession, fxAgent, fxMS(9.2)),
+			fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B4', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 5, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(9.4)),
+			fmt.Sprintf(`UPDATE agents SET stopped = %d, tool_uses = 2 WHERE agent_id = '%s'`, fxMS(stopped), fxAgent),
+		}
+	}
+	lines := append(agentLines(t), promptLine(t, 9.05), assistantLine(t, 9.2, "msg_B3", 7, "tool_use", toolUse("toolu_B9", "Bash")),
+		assistantLine(t, 9.4, "msg_B4", 5, "end_turn", map[string]any{"type": "text", "text": fxSecret}))
+	for _, c := range []struct {
+		name    string
+		stopped float64
+		code    int
+		want    bool
+	}{
+		{name: "dated at the transcript's turn end", stopped: 9.4, code: 0},
+		{name: "dated where the transcript shows no turn end", stopped: 9.6, code: 1, want: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, rows(c.stopped))
+			writeLines(t, agentFile(f), lines)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			mismatch := "MISMATCH agent-stop-rebuilt session=" + fxSession + " "
+			if code != c.code || strings.Contains(out, mismatch) != c.want {
+				t.Fatalf("exit %d, want %d and %q shown %v:\n%s", code, c.code, mismatch, c.want, out)
+			}
+		})
+	}
+}
+
 // TestUnfillableTailsAreTheStores: reconcile reuses nothing of
-// internal/callmeter, so its copy of the two fault tails is pinned to the one
+// internal/callmeter, so its copy of the four fault tails is pinned to the one
 // RecoverQuiet writes.
 func TestUnfillableTailsAreTheStores(t *testing.T) {
-	if unfilledAgentTurn != callmeter.UnfilledAgentTurn || unfilledStopReply != callmeter.UnfilledStopReply {
-		t.Fatalf("tails = %q, %q; want %q, %q", unfilledAgentTurn, unfilledStopReply, callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply)
+	if unfilledAgentTurn != callmeter.UnfilledAgentTurn || unfilledStopReply != callmeter.UnfilledStopReply || unfilledTurnEnd != callmeter.UnfilledTurnEnd ||
+		unfilledCall != callmeter.UnfilledCall || unfilledAgentStop != callmeter.UnfilledAgentStop {
+		t.Fatalf("tails = %q, %q, %q, %q, %q; want %q, %q, %q, %q, %q", unfilledAgentTurn, unfilledStopReply, unfilledTurnEnd, unfilledCall, unfilledAgentStop,
+			callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply, callmeter.UnfilledTurnEnd, callmeter.UnfilledCall, callmeter.UnfilledAgentStop)
 	}
 }

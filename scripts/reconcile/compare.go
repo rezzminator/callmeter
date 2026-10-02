@@ -245,6 +245,7 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 	compareEvents(rep, st, w, compared)
 	killed := matchKilledStopFailures(st)
 	stops := matchTerminatedStops(st)
+	lost := matchLostHooks(st, w)
 	var unknown []sFault
 	for i, f := range st.faults {
 		v, isStop := stops[i]
@@ -253,13 +254,17 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 		case killed[i]:
 			rep.expect("fault-binary", "", f.ts, reasonKilledStopFailure, "event=StopFailure")
 		case isStop && v.session != "" && v.event == "StopFailure":
-			rep.expect("fault-terminated", v.session, f.ts, reasonTerminatedFailureNamed, "event=StopFailure")
+			rep.expect("fault-"+f.stage, v.session, f.ts, reasonTerminatedFailureNamed, "event=StopFailure")
 		case isStop && v.session != "" && f.session != "":
-			rep.expect("fault-terminated", v.session, f.ts, reasonTerminatedStopNamed, "event=Stop")
+			rep.expect("fault-"+f.stage, v.session, f.ts, reasonTerminatedStopNamed, "event=Stop")
 		case isStop && v.session != "":
 			rep.expect("fault-terminated", v.session, f.ts, reasonTerminatedStop, "event=Stop")
 		case isStop:
-			rep.add("fault-terminated", f.session, f.ts, v.detail)
+			rep.add("fault-"+f.stage, f.session, f.ts, v.detail)
+		case lost[i].ok:
+			rep.expect("fault-"+f.stage, f.session, f.ts, lostHookReason[lost[i].event], "event="+lost[i].event)
+		case lost[i].detail != "":
+			rep.add("fault-"+f.stage, f.session, f.ts, lost[i].detail)
 		case lostEnd(st, f):
 			rep.expect("fault-"+f.stage, f.session, f.ts, reasonEndKilled, "event=SessionEnd end_reason=lost")
 		case f.stage == "binary" && f.session == "" && f.err == killedUnknown:
@@ -282,35 +287,59 @@ const hookLag int64 = 10_000 // ms
 
 func (st *storeData) lagging(ts int64) bool { return ts > st.latest-hookLag }
 
+// lostHookReason is the reason a matchLostHooks pairing stands on, per event.
+var lostHookReason = map[string]string{
+	"SubagentStop":       reasonLostSubagentStop,
+	"PostToolUse":        reasonLostPostToolUse,
+	"PostToolUseFailure": reasonLostPostToolUse,
+	"PostToolBatch":      reasonLostPostToolBatch,
+	"PreToolUse":         reasonLostPreToolUse,
+}
+
 const (
 	reasonNoPrompt               = "a `claude -p` launch given no prompt: Claude Code fires SessionStart and SessionEnd, exits 1 and writes no transcript (no work rows, no other event, no model)"
-	reasonUnfillable             = "report-time recovery read every transcript of the session in full and an agent turn or a Stop still had no request to fill, and it recorded that once; this check's own parse of the transcripts confirms they hold none at or after the session's first row (callmeter.RecoverQuiet)"
+	reasonUnfillable             = "report-time recovery read every transcript of the session in full and an agent turn, a Stop, a prompt's turn end, an open call or a sub-agent's open turn still had nothing to fill it, and it recorded that once; this check's own parse of the transcripts confirms they hold none at or after the session's first row (callmeter.RecoverQuiet)"
 	reasonKilledStopFailure      = "Claude Code killed the StopFailure hook at a headless exit; the StopFailure row of the session ending right after it (hook or rebuilt from its transcript at SessionEnd) stands for it"
 	reasonTerminatedFailureNamed = "the StopFailure hook of the session the fault names ended before it recorded (store busy, or a signal); that session's turn has a StopFailure row (hook or rebuilt from its transcript) no other fault paired"
 	reasonTerminatedStopNamed    = "the Stop hook of the session the fault names ended before it recorded (store busy, or a signal); that session's turn has a Stop row (hook or rebuilt from its transcript) no other fault paired"
 	reasonTerminatedStop         = "a headless exit cancelled the async Stop hook; the session ending right after it has a Stop row for the turn it cancelled (hook or rebuilt from its transcript), and no session ending there left its turn open"
+	reasonLostSubagentStop       = "the SubagentStop hook of the session the fault names ended before it recorded (store busy, a signal, or the wrapper could not run the binary); an agent turn of that session stopped in the fault's window (hook, or rebuilt from its transcript) no other fault paired, and no turn of it is open"
+	reasonLostPostToolUse        = "the PostToolUse or PostToolUseFailure hook of the session the fault names ended before it recorded (store busy, a signal, or the wrapper could not run the binary); a call of that session finished in the fault's window and its real size or failure is settled (or recovery marked it), no other fault paired it"
+	reasonLostPostToolBatch      = "the PostToolBatch hook of the session the fault names ended before it recorded (store busy, a signal, or the wrapper could not run the binary); a call of that session finished in the fault's window and its delivered size and resolved request are settled (or recovery marked it), no other fault paired it"
+	reasonLostPreToolUse         = "the PreToolUse hook of the session the fault names ended before it recorded (store busy, a signal, or the wrapper could not run the binary); a call of that session began in the fault's window and its calls row exists (or recovery marked it), no other fault paired it"
 	reasonKilledUnknown          = "a headless teardown killed a hook before the wrapper read its hook_event_name; every session with a store row within 1 s of the kill's second was compared and holds no unexplained mismatch, so a lost event would surface on one of them"
 	reasonScriptBody             = "a part whose program reads its script from a heredoc (python3 - <<EOF) leaves the script unparsed by design: the store keeps no quoted heredoc body and of an unquoted one only its command substitutions (cmdparse.StatusScriptBody)"
 	reasonPythonUnparsedPre6     = "a parser before 6 marked a python part unparsed both for a heredoc body the store cut and for code holding an unresolved expansion, by design; the next report run reparses it as script-body or unparsed"
 	reasonPythonCodeUnresolved   = "a python -c script or here-string holding an expansion with no known value is unparsed by design: the code the interpreter ran is unknown, so it is never parsed as written (docs/design.md § Parsing a command)"
 	reasonNoEndHook              = "Claude Code ended the session without running its SessionEnd hooks: the transcript holds no SessionEnd hook entry, and report-time recovery settled the session and set end_reason never"
 	reasonEndKilled              = "the session's SessionEnd hook ran and was lost before it recorded (a headless exit or its timeout killed it, or the wrapper could not run the binary): its own missed.log line named the session, and report-time recovery set end_reason lost"
+	reasonAgentNeverStopped      = "the sub-agent's last turn never reached the SubagentStop that carries its tool count (killed mid-turn): report-time recovery read its quiet transcript and marked that turn open once, and this check's own parse confirms no turn end after its start (callmeter.UnfilledAgentStop)"
 	reasonStoppedAgent           = "TaskStop stopped the sub-agent while this call ran: Claude Code wrote the call's error result itself and the agent never spoke again, so no PostToolUse, PostToolBatch or SubagentStop fired to write its request, its size or the agent's tool count"
 	reasonScratchStore           = "the session ran with CALLMETER_HOME pointing at a scratch store, which records it"
 	reasonCommandNotStored       = "the heredoc cutter could not cut this command safely, so the store kept only command_bytes and no report can parse it (docs/design.md § Privacy)"
 )
 
 // The tails of the transcript faults report-time recovery records for an agent
-// turn or a Stop it read the transcripts in full for and could not fill
-// (callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply; a test pins both).
+// turn, a Stop, a prompt's turn end, an open call or a sub-agent's open turn it
+// read the transcripts in full for and could not fill
+// (callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply,
+// callmeter.UnfilledTurnEnd, callmeter.UnfilledCall,
+// callmeter.UnfilledAgentStop; a test pins all five).
 const (
 	unfilledAgentTurn = "no request in its span, and its quiet transcript holds none at or after the session's first hook"
 	unfilledStopReply = "no final reply request, and its quiet main transcript holds none at or after the session's first hook"
+	unfilledTurnEnd   = "no Stop or StopFailure, and its quiet main transcript shows no turn end after it"
+	unfilledCall      = "no size or no request, and no quiet transcript of the session holds its result or, at or after the session's first hook, its request"
+	unfilledAgentStop = "no SubagentStop, and its quiet transcript shows no turn end at or after the turn's start"
 )
 
 var (
 	unfilledAgentFault = regexp.MustCompile(`^agent (\S+) turn stopped (\d+): ` + regexp.QuoteMeta(unfilledAgentTurn) + `$`)
 	unfilledStopFault  = regexp.MustCompile(`^prompt (\S+) Stop (\S+): ` + regexp.QuoteMeta(unfilledStopReply) + `$`)
+
+	unfilledTurnEndFault = regexp.MustCompile(`^prompt (\S+) UserPromptSubmit (\S+): ` + regexp.QuoteMeta(unfilledTurnEnd) + `$`)
+	unfilledCallFault    = regexp.MustCompile(`^call (\S+): ` + regexp.QuoteMeta(unfilledCall) + `$`)
+	openAgentTurnFault   = regexp.MustCompile(`^agent (\S+) turn (\d+) open: ` + regexp.QuoteMeta(unfilledAgentStop) + `$`)
 )
 
 // unfillable is the detail of a transcript fault that is recovery's unfillable
@@ -318,9 +347,28 @@ var (
 // else "". An agent marker holds when the agent's transcript has no request with
 // a ts in (the agent's previous stop, the marker's stop] at or after the
 // session's first row; a Stop marker when the main transcript has no request
-// stamped with its prompt, whose stop_reason is not tool_use, at or after it. A
-// transcript this run did not read, or a turn the store does not hold, confirms
-// nothing.
+// stamped with its prompt, whose stop_reason is not tool_use, at or after it; a
+// prompt's turn-end marker when the store holds a main-chat UserPromptSubmit of
+// that prompt and every main message of the prompt at or after the session's
+// first row whose stop_reason ends the turn (end_turn or stop_sequence) is later
+// than the fault's ts, the session's last hook when it was marked, and the store
+// holds an event of the session later still (the session lived past the mark,
+// and any later hook reopens it in recovery); a turn end at or before the mark,
+// or one after it with no later store event, was there for recovery to read. A
+// call marker holds when the store holds that call in that session and this
+// check's parse holds no result for it while the store has no size, and no
+// message issuing it at or after the session's first row while the store has no
+// request, each unless it came after the fault's ts (the session's last hook
+// when marked) and the session's last hook is later still (that hook reopened
+// the call in recovery); a call the store has since settled in full needs that
+// later hook too. A sub-agent's open-turn marker holds when the store holds that
+// turn of the agent with no stop and this check's parse of the agent's
+// transcript holds no message ending a turn (end_turn or stop_sequence) at or
+// after the turn's start, unless it came after the fault's ts and the
+// session's last hook is later still (that hook reopened the turn); a turn the
+// store has since stopped needs that stop after the fault and that later hook. A
+// transcript this run did not read, or a turn or call the store does not hold,
+// confirms nothing.
 func unfillable(st *storeData, w *world, f sFault) string {
 	s := st.sessions[f.session]
 	if s == nil {
@@ -366,7 +414,102 @@ func unfillable(st *storeData, w *world, f sFault) string {
 		}
 		return "prompt=" + prompt
 	}
+	if m := unfilledTurnEndFault.FindStringSubmatch(f.err); m != nil {
+		prompt := m[1]
+		if prompt == "-" || w.mains[f.session] == nil {
+			return ""
+		}
+		held := false
+		for _, e := range st.events {
+			if e.session == f.session && e.event == "UserPromptSubmit" && e.agent == "" && e.promptID == prompt {
+				held = true
+			}
+		}
+		if !held {
+			return ""
+		}
+		later := false // the store holds an event of the session after the mark
+		for _, e := range st.events {
+			if e.session == f.session && e.ts > f.ts {
+				later = true
+			}
+		}
+		for _, msg := range w.messages {
+			if msg.agent != "" || msg.session != f.session || msg.promptID != prompt || msg.ts < s.firstTS ||
+				(msg.stopReason != "end_turn" && msg.stopReason != "stop_sequence") {
+				continue
+			}
+			if msg.ts <= f.ts || !later {
+				return ""
+			}
+		}
+		return "prompt=" + prompt + " turn-end"
+	}
+	if m := unfilledCallFault.FindStringSubmatch(f.err); m != nil {
+		id := m[1]
+		c := st.calls[id]
+		if c == nil || c.session != f.session || (f.toolUseID != "" && f.toolUseID != id) || w.mains[f.session] == nil {
+			return ""
+		}
+		reopened := s.lastTS > f.ts
+		// missed: on disk by the mark, or after it with no hook reopening the call.
+		missed := func(ts int64) bool { return ts <= f.ts || !reopened }
+		sized := c.hasSize || c.delivered
+		requested := c.requestID != "" && !strings.HasPrefix(c.requestID, "pending:")
+		if r, ok := w.results[id]; ok && !sized && missed(r.ts) {
+			return ""
+		}
+		if u := w.uses[id]; u != nil && !requested && u.msgID != "" && u.ts >= s.firstTS && missed(u.ts) {
+			return ""
+		}
+		if sized && requested && !reopened {
+			return ""
+		}
+		return "call=" + id
+	}
+	if m := openAgentTurnFault.FindStringSubmatch(f.err); m != nil {
+		agent := m[1]
+		seq, err := strconv.ParseInt(m[2], 10, 64)
+		if err != nil || w.agents[agent] == nil || w.agents[agent].session != f.session {
+			return ""
+		}
+		reopened := s.lastTS > f.ts
+		start, held := int64(0), false
+		for _, t := range st.turns[agent] {
+			switch {
+			case t.seq != seq:
+			case t.noStop:
+				start, held = t.ts, true
+			case reopened && t.ts > f.ts:
+				// Its SubagentStop came after the mark, from the hook that
+				// reopened it.
+				return "agent=" + agent + " turn-open"
+			}
+		}
+		if !held {
+			return ""
+		}
+		for _, msg := range w.messages {
+			if msg.agent == agent && msg.session == f.session && msg.ts >= start &&
+				(msg.stopReason == "end_turn" || msg.stopReason == "stop_sequence") && (msg.ts <= f.ts || !reopened) {
+				return ""
+			}
+		}
+		return "agent=" + agent + " turn-open"
+	}
 	return ""
+}
+
+// markedOpen reports whether a transcript fault marks turn seq of agent as an
+// open turn and this check's own parse confirms it (unfillable).
+func markedOpen(st *storeData, w *world, agent string, seq int64) bool {
+	for _, f := range st.faults {
+		if m := openAgentTurnFault.FindStringSubmatch(f.err); m != nil && m[1] == agent && m[2] == strconv.FormatInt(seq, 10) &&
+			unfillable(st, w, f) == "agent="+agent+" turn-open" {
+			return true
+		}
+	}
+	return false
 }
 
 // killedStopFailure is the wrapper's missed.log reason for a StopFailure hook
@@ -518,7 +661,8 @@ func matchTerminatedStops(st *storeData) map[int]stopVerdict {
 	}
 	var faults []int
 	for i, f := range st.faults {
-		if f.stage == "terminated" && (strings.HasPrefix(f.err, terminatedStop) || (f.session != "" && strings.HasPrefix(f.err, terminatedFailure))) {
+		named := f.session != "" && (strings.HasPrefix(f.err, terminatedFailure) || (f.stage == "binary" && (strings.HasPrefix(f.err, "Stop: ") || strings.HasPrefix(f.err, "StopFailure: "))))
+		if (f.stage == "terminated" && strings.HasPrefix(f.err, terminatedStop)) || named {
 			faults = append(faults, i)
 		}
 	}
@@ -531,7 +675,7 @@ func matchTerminatedStops(st *storeData) map[int]stopVerdict {
 		f := st.faults[i]
 		if f.session != "" {
 			event := "Stop"
-			if strings.HasPrefix(f.err, terminatedFailure) {
+			if strings.HasPrefix(f.err, "StopFailure: ") {
 				event = "StopFailure"
 			}
 			evs, stored := per[f.session]
@@ -587,6 +731,186 @@ func matchTerminatedStops(st *storeData) map[int]stopVerdict {
 			usedTurn[turnKey{stopped[0], "Stop", prompts[stopped[0]]}] = true
 			out[i] = stopVerdict{session: stopped[0]}
 		}
+	}
+	return out
+}
+
+// lostHookWindow (ms): a hook gives up within its store wait (at most 5 s) and
+// a teardown kill lands within seconds, so the row a lost hook would have
+// written belongs to the 60 s before its fault's second ends; the same bound as
+// callmeter's lostEndWindowMS. A fault f's window is [f.ts - lostHookWindow, f.ts + 1000).
+const lostHookWindow int64 = 60_000
+
+// hookVerdict is a matchLostHooks pairing: ok when the row the lost hook would
+// have written exists, else the detail naming what is missing.
+type hookVerdict struct {
+	event, detail string
+	ok            bool
+}
+
+// matchLostHooks judges each SubagentStop, PreToolUse, PostToolUse,
+// PostToolUseFailure and PostToolBatch fault naming its session (the binary's
+// `terminated` line or the wrapper's `binary` one), oldest first, ts then
+// index. A fault is expected only when the row its hook would have written
+// exists, hook-written or rebuilt by recovery, and no other fault of the same
+// pool paired it; a candidate pairs with at most one fault.
+//   - SubagentStop pairs with the earliest unpaired agent turn of the session
+//     whose stop (hook, or rebuilt) falls in the fault's window; a turn of the
+//     session still open at the fault may be the lost stop, so any one fails it.
+//   - PostToolUse and PostToolUseFailure share one pool: the calls of the
+//     session whose tool_result landed in the window, each settled by a real
+//     size or a failure, or marked by recovery (`call {id}: …`). An unsettled
+//     candidate may be the lost hook's call, so any one fails the fault.
+//   - PostToolBatch has its own pool of the same candidates, settled by a
+//     delivered size and a resolved request, or marked.
+//   - PreToolUse has its own pool: the calls of the session whose tool_use
+//     landed in the window, settled by a calls row, or marked.
+//
+// Not paired, so they stay mismatches: SessionStart, Setup, UserPromptSubmit,
+// UserPromptExpansion, InstructionsLoaded, PreCompact, PostCompact,
+// PermissionRequest, Notification, PermissionDenied, TaskCreated, TaskCompleted
+// and SubagentStart. Recovery rebuilds no row for them (it writes only Stop,
+// StopFailure and SubagentStop events), so a lost run's row never exists and a
+// row in the window is another run's. SessionEnd is lostEnd's, Stop and
+// StopFailure matchTerminatedStops'.
+func matchLostHooks(st *storeData, w *world) map[int]hookVerdict {
+	marked := map[string]bool{}
+	for _, f := range st.faults {
+		if f.stage == "transcript" && f.toolUseID != "" && strings.HasPrefix(f.err, "call "+f.toolUseID+": ") {
+			marked[f.toolUseID] = true
+		}
+	}
+	type turnRef struct {
+		agent  string
+		seq    int64
+		ts     int64
+		noStop bool
+		start  int64
+	}
+	var turns []turnRef
+	agents := make([]string, 0, len(st.turns))
+	for a := range st.turns {
+		agents = append(agents, a)
+	}
+	sort.Strings(agents)
+	for _, a := range agents {
+		if st.agents[a] == nil {
+			continue
+		}
+		for _, t := range st.turns[a] {
+			turns = append(turns, turnRef{a, t.seq, t.ts, t.noStop, t.start})
+		}
+	}
+	sort.SliceStable(turns, func(i, j int) bool { return turns[i].ts < turns[j].ts })
+	type callRef struct {
+		id string
+		ts int64
+	}
+	// calls returns the session's calls whose transcript ts (the tool_result's
+	// when result, else the tool_use's) lies in [lo, hi), oldest first.
+	calls := func(session string, result bool, lo, hi int64) []callRef {
+		var out []callRef
+		for id, u := range w.uses {
+			if u.session != session {
+				continue
+			}
+			ts := u.ts
+			if result {
+				r, ok := w.results[id]
+				if !ok {
+					continue
+				}
+				ts = r.ts
+			}
+			if ts >= lo && ts < hi {
+				out = append(out, callRef{id, ts})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].ts != out[j].ts {
+				return out[i].ts < out[j].ts
+			}
+			return out[i].id < out[j].id
+		})
+		return out
+	}
+	postSettled := func(id string) bool {
+		c := st.calls[id]
+		return (c != nil && (c.hasSize || c.failed == 1)) || marked[id]
+	}
+	batchSettled := func(id string) bool {
+		c := st.calls[id]
+		return (c != nil && c.delivered && c.requestID != "" && !strings.HasPrefix(c.requestID, "pending:")) || marked[id]
+	}
+	preSettled := func(id string) bool { return st.calls[id] != nil || marked[id] }
+
+	var faults []int
+	for i, f := range st.faults {
+		if f.session != "" && (f.stage == "terminated" || f.stage == "binary") {
+			faults = append(faults, i)
+		}
+	}
+	sort.SliceStable(faults, func(a, b int) bool { return st.faults[faults[a]].ts < st.faults[faults[b]].ts })
+	usedTurn := map[string]bool{}
+	usedCall := map[string]bool{} // pool + "/" + call id
+	out := map[int]hookVerdict{}
+	for _, i := range faults {
+		f := st.faults[i]
+		event, _, _ := strings.Cut(f.err, ": ")
+		lo, hi := f.ts-lostHookWindow, f.ts+1000
+		v := hookVerdict{event: event}
+		var pool string
+		var result bool
+		var settled func(string) bool
+		switch event {
+		case "SubagentStop":
+			for _, t := range turns {
+				if st.agents[t.agent].session == f.session && t.noStop && t.start < hi {
+					v.detail = "event=" + event + " open_agent_turn=" + t.agent
+					break
+				}
+			}
+			if v.detail == "" {
+				v.detail = "event=" + event + " unpaired_subagentstop=0"
+				for _, t := range turns {
+					k := fmt.Sprintf("%s/%d", t.agent, t.seq)
+					if st.agents[t.agent].session != f.session || t.noStop || usedTurn[k] || t.ts < lo || t.ts >= hi {
+						continue
+					}
+					usedTurn[k] = true
+					v.ok, v.detail = true, ""
+					break
+				}
+			}
+			out[i] = v
+			continue
+		case "PostToolUse", "PostToolUseFailure":
+			pool, result, settled = "post", true, postSettled
+		case "PostToolBatch":
+			pool, result, settled = "batch", true, batchSettled
+		case "PreToolUse":
+			pool, result, settled = "pre", false, preSettled
+		default:
+			continue
+		}
+		cands := calls(f.session, result, lo, hi)
+		for _, c := range cands {
+			if !settled(c.id) {
+				v.detail = "event=" + event + " unsettled_call=" + c.id
+				break
+			}
+		}
+		if v.detail == "" {
+			v.detail = "event=" + event + " unpaired_call=0"
+			for _, c := range cands {
+				if k := pool + "/" + c.id; !usedCall[k] {
+					usedCall[k] = true
+					v.ok, v.detail = true, ""
+					break
+				}
+			}
+		}
+		out[i] = v
 	}
 	return out
 }
@@ -1031,6 +1355,8 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 			}
 			if turns := st.turns[id]; cut > 0 && int64(len(t.toolUses))-a.toolUses == cut && len(turns) > 0 && lastTurn(turns).noStop {
 				rep.expect("agent-tool-uses", t.session, 0, reasonStoppedAgent, detail, id)
+			} else if turns := st.turns[id]; len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && lastTurn(turns).noStop && markedOpen(st, w, id, lastTurn(turns).seq) {
+				rep.expect("agent-tool-uses", t.session, 0, reasonAgentNeverStopped, detail, id)
 			} else if len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && turnOpen(st, t.session, lastTurn(turns)) && t.lastTS > st.latest-quietAfterMS {
 				// Not due: the count lands at the SubagentStop of the turn
 				// still running, as recovery waits an hour for a quiet one.
@@ -1054,6 +1380,9 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 			}
 			if turn.noStop && t.lastStop == "end_turn" && t.lastTS < w.until-settle {
 				rep.add("agent-turn-open", t.session, turn.ts, fmt.Sprintf("seq=%d", turn.seq), id)
+			}
+			if turn.rebuilt && !shownEnd(w, id, t.session, turn) {
+				rep.add("agent-stop-rebuilt", t.session, turn.ts, fmt.Sprintf("seq=%d", turn.seq), id)
 			}
 		}
 	}
@@ -1421,6 +1750,19 @@ func lastTurn(turns []sTurn) sTurn {
 		}
 	}
 	return last
+}
+
+// shownEnd reports whether this check's own parse of the agent's transcript
+// holds the turn end a SubagentStop rebuilt by recovery is dated at: a message
+// of the agent whose turn-ending stop_reason (set, not tool_use) was written at
+// the stop's ts, at or after the turn's start.
+func shownEnd(w *world, agent, session string, turn sTurn) bool {
+	for _, msg := range w.messages {
+		if msg.agent == agent && msg.session == session && msg.endTS != 0 && msg.endTS == turn.ts && msg.endTS >= turn.start {
+			return true
+		}
+	}
+	return false
 }
 
 // turnOpen reports whether a sub-agent turn has no SubagentStop and no

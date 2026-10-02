@@ -304,6 +304,14 @@ func (run *callmeterRun) runRows(tx *callmeter.Tx) error {
 		}
 	}
 	if run.agentTurns {
+		if run.payload.HookEventName == callmeter.EventSubagentStop {
+			// This hook's own SubagentStop replaces the one a quiet-session
+			// recovery rebuilt from the agent's transcript when this hook's
+			// event was thought lost (callmeter.RecoverAgentStop).
+			if err := tx.DropRecoveredAgentStop(run.ctx, run.payload.AgentID, run.now); err != nil {
+				return err
+			}
+		}
 		if err := tx.RebuildAgentTurns(run.ctx, run.payload.AgentID); err != nil {
 			return err
 		}

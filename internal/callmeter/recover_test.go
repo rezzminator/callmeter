@@ -3,6 +3,7 @@ package callmeter
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -386,28 +387,458 @@ func TestRecoverQuietSettlesAPendingRequestFromItsTranscript(t *testing.T) {
 	}
 }
 
-func TestRecoverQuietAnOpenCallStaysACandidateAndWritesNothingTwice(t *testing.T) {
-	q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
-	// A call whose tool never returned: no result on disk, so the session is a
-	// candidate at every pass.
-	if err := q.store.UpsertCall(context.Background(), Call{
-		ToolUseID: "toolu_open", SessionID: Ptr("sess-1"), TS: Ptr(q.callTS), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
-	}, Overwrite); err != nil {
-		t.Fatal(err)
+// TestRecoverQuietMarksAnOpenCallOnce: a call with no result in any transcript
+// of its quiet session (the tool never returned, or its untyped agent wrote no
+// transcript) is read once: one transcript fault names the call and the session
+// stops being a candidate, so a later report never reads it again. Any later
+// hook makes it a candidate again; a live session is never marked.
+func TestRecoverQuietMarksAnOpenCallOnce(t *testing.T) {
+	// open is a quiet store (transcripts written mtimeAge ago) with one more call
+	// whose result is nowhere on disk, made by agent (none: the main chat).
+	open := func(t *testing.T, mtimeAge time.Duration, agent *string) quietStore {
+		t.Helper()
+		q := newQuietStore(t, 2*time.Hour, mtimeAge)
+		if err := q.store.UpsertCall(context.Background(), Call{
+			ToolUseID: "toolu_open", SessionID: Ptr("sess-1"), AgentID: agent, TS: Ptr(q.callTS), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
+		}, Overwrite); err != nil {
+			t.Fatal(err)
+		}
+		return q
 	}
-	if first := q.recover(t); first.Calls != 2 || first.Requests != 2 {
-		t.Fatalf("first RecoverQuiet = %+v, want 2 calls and 2 requests", first)
+	want := "call toolu_open: " + UnfilledCall
+	// marked is an open store after the pass that marks the call.
+	marked := func(t *testing.T, agent *string) quietStore {
+		t.Helper()
+		q := open(t, 2*time.Hour, agent)
+		if first := q.recover(t); first.Calls != 2 || first.Requests != 2 || first.Unfillable != 1 {
+			t.Fatalf("first RecoverQuiet = %+v, want 2 calls, 2 requests and 1 unfillable: the open call", first)
+		}
+		lastHook := row(t, q.store, "sessions", "session_id = 'sess-1'")["last_ts"]
+		fault := row(t, q.store, "faults", "stage = 'transcript'")
+		if fault == nil || fault["session_id"] != "sess-1" || fault["tool_use_id"] != "toolu_open" || fault["ts"] != lastHook || fault["error"] != want {
+			t.Fatalf("fault = %v, want session sess-1, tool_use_id toolu_open, ts %v (the session's last hook), error %q", fault, lastHook, want)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Fatalf("quietCandidates after the marker = %v, want none", got)
+		}
+		before := q.snapshot(t)
+		if again := q.recover(t); again.Sessions != 0 || again.Calls != 0 || again.Requests != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
+			t.Fatalf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+		}
+		if n := count(t, q.store, "faults"); n != 1 {
+			t.Fatalf("faults = %d, want 1: the marker is recorded once", n)
+		}
+		if call := row(t, q.store, "calls", "tool_use_id = 'toolu_open'"); call["bytes_delivered"] != nil || call["failed"] != nil {
+			t.Errorf("open call = bytes_delivered %v failed %v, want both NULL: no result, no guess", call["bytes_delivered"], call["failed"])
+		}
+		return q
 	}
-	before := q.snapshot(t)
-	if again := q.recover(t); again.Sessions != 0 || again.Calls != 0 || again.Requests != 0 {
-		t.Errorf("second RecoverQuiet = %+v, want 0 sessions, 0 calls, 0 requests", again)
+	t.Run("a main-chat tool that never returned", func(t *testing.T) {
+		marked(t, nil)
+	})
+	t.Run("a call of an untyped agent with no transcript", func(t *testing.T) {
+		marked(t, Ptr("a-internal"))
+	})
+	t.Run("a later hook reopens it", func(t *testing.T) {
+		q := marked(t, nil)
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			return tx.TouchSession(context.Background(), Session{SessionID: "sess-1", TS: q.now.Add(time.Second).UnixMilli()})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := q.store.quietCandidates(context.Background(), q.now.Add(2*time.Hour).UnixMilli())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Errorf("quietCandidates after a later hook = %v, want the session again", got)
+		}
+		// The call itself is open again, not only the session's end, which the
+		// later hook also reopens.
+		calls, err := q.store.unmarkedOpenCalls(context.Background(), "sess-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 1 || calls[0].id != "toolu_open" || !calls[0].sizeOpen {
+			t.Errorf("unmarkedOpenCalls after a later hook = %+v, want toolu_open with no size", calls)
+		}
+	})
+	t.Run("a live session is never marked", func(t *testing.T) {
+		q := open(t, 0, nil)
+		if summary := q.recover(t); summary.Sessions != 0 || summary.Unfillable != 0 {
+			t.Errorf("RecoverQuiet = %+v, want nothing for a live session", summary)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0: a live session's call may still return", n)
+		}
+		if got := q.candidates(t); len(got) != 1 {
+			t.Errorf("quietCandidates = %v, want the live session kept", got)
+		}
+	})
+}
+
+// TestRecoverQuietRebuildsAnUnrecordedCall: a transcript tool_use no hook
+// recorded (Claude Code records only a Bash call before it runs, so a session
+// killed mid-call leaves any other call with no row) gets its row from the
+// transcript once the session is quiet: its session, tool, request, prompt, ts
+// and cwd, its input only through SanitizeInput, SourceTranscript. Its request
+// counts it, the session takes that request's model, and its result settles it
+// or, with none on disk or one that holds no toolUseResult to size it by, one
+// call marker names it. Once: a second pass writes
+// nothing.
+func TestRecoverQuietRebuildsAnUnrecordedCall(t *testing.T) {
+	lost := func(t *testing.T, answered bool) quietStore {
+		t.Helper()
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		lines := []string{
+			promptLine("prompt-1", secretPrompt, start),
+			toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)),
+			textLine("msg_main", secretMessage, 77, start.Add(2*time.Second)),
+			quietResultLine(q.toolMain, failedResult, true, start.Add(3*time.Second)),
+			toolUseLine("msg_lost", "toolu_lost", 9, start.Add(6*time.Second)),
+		}
+		if answered {
+			lines = append(lines, resultWithUseResult("toolu_lost", secretResult, `{"stdout":"out","stderr":"","interrupted":false}`, start.Add(7*time.Second)))
+		}
+		q.writeTranscript(t, q.main, lines...)
+		if err := os.Chtimes(q.main, start, start); err != nil {
+			t.Fatal(err)
+		}
+		first := q.recover(t)
+		if first.Rebuilt != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want 1 rebuilt call", first)
+		}
+		input, err := SanitizeInput("Bash", json.RawMessage(`{"command":"false","description":"Fail"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := row(t, q.store, "calls", "tool_use_id = 'toolu_lost'")
+		if call == nil || call["source"] != SourceTranscript || call["tool"] != "Bash" || call["request_id"] != "msg_lost" || call["session_id"] != "sess-1" ||
+			call["prompt_id"] != "prompt-1" || call["cwd"] != "/tmp/demo-proj" || call["ts"] != start.Add(6*time.Second).UnixMilli() || call["input"] != input || call["agent_id"] != nil {
+			t.Fatalf("rebuilt call = %v, want the transcript's session, tool, request, prompt, ts, cwd, sanitized input and source %q", call, SourceTranscript)
+		}
+		if request := row(t, q.store, "requests", "request_id = 'msg_lost'"); request == nil || request["calls"] != int64(1) {
+			t.Errorf("request msg_lost = %v, want it to count the rebuilt call", request)
+		}
+		if model := row(t, q.store, "sessions", "session_id = 'sess-1'")["model"]; model != "claude-haiku-4-5-20251001" {
+			t.Errorf("session model = %v, want its latest main-chat request's", model)
+		}
+		before := q.snapshot(t)
+		if again := q.recover(t); again.Sessions != 0 || again.Rebuilt != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
+			t.Fatalf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+		}
+		return q
 	}
-	if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
-		t.Errorf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+	t.Run("its result on disk settles it", func(t *testing.T) {
+		q := lost(t, true)
+		if call := row(t, q.store, "calls", "tool_use_id = 'toolu_lost'"); call["bytes_delivered"] == nil || call["failed"] != int64(0) {
+			t.Errorf("rebuilt call = bytes_delivered %v failed %v, want its result's size and 0", call["bytes_delivered"], call["failed"])
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0", n)
+		}
+	})
+	t.Run("no result: one call marker", func(t *testing.T) {
+		q := lost(t, false)
+		fault := row(t, q.store, "faults", "tool_use_id = 'toolu_lost'")
+		if fault == nil || fault["error"] != "call toolu_lost: "+UnfilledCall {
+			t.Errorf("fault = %v, want the call marker of toolu_lost", fault)
+		}
+		if n := count(t, q.store, "faults"); n != 1 {
+			t.Errorf("faults = %d, want 1", n)
+		}
+	})
+}
+
+// resultWithUseResult is a transcript's user line for one tool_result as Claude
+// Code writes it: the block's content plus the top-level toolUseResult, the
+// object PostToolUse's tool_response is.
+func resultWithUseResult(toolUseID, text, useResult string, at time.Time) string {
+	return fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":%q,"tool_use_id":%q}]},"timestamp":%q,"cwd":"/tmp/demo-proj","sessionId":"sess-1","toolUseResult":%s}`,
+		text, toolUseID, stamp(at), useResult)
+}
+
+// TestRecoverQuietSizesARebuiltCall: a rebuilt call whose transcript holds its
+// tool_result is written in that same run with its size settled as PostToolUse
+// would: bytes_real through RealBytes of the result's toolUseResult (the main
+// chat's transcript, or the sub-agent's own), bytes_delivered, failed and no
+// outcome label, and a second run changes nothing. One whose result is not on
+// disk keeps the call marker (TestRecoverQuietRebuildsAnUnrecordedCall).
+func TestRecoverQuietSizesARebuiltCall(t *testing.T) {
+	type want struct{ real, delivered int64 }
+	run := func(t *testing.T, id string, w want, build func(q quietStore, start time.Time)) {
+		t.Helper()
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		build(q, start)
+		for _, file := range []string{q.main, q.sub} {
+			if err := os.Chtimes(file, start, start); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if first := q.recover(t); first.Rebuilt != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want 1 rebuilt call", first)
+		}
+		where := "tool_use_id = '" + id + "'"
+		call := row(t, q.store, "calls", where)
+		if call == nil || call["bytes_real"] != w.real || call["bytes_delivered"] != w.delivered || call["failed"] != int64(0) || call["error"] != nil {
+			t.Fatalf("rebuilt call = %v, want bytes_real %d bytes_delivered %d failed 0 and no outcome label", call, w.real, w.delivered)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0", n)
+		}
+		if again := q.recover(t); again.Sessions != 0 || again.Rebuilt != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := row(t, q.store, "calls", where); !reflect.DeepEqual(call, after) {
+			t.Fatalf("second RecoverQuiet changed the call:\nbefore %v\nafter  %v", call, after)
+		}
 	}
-	if open := row(t, q.store, "calls", "tool_use_id = 'toolu_open'"); open["bytes_delivered"] != nil || open["failed"] != nil {
-		t.Errorf("open call = bytes_delivered %v failed %v, want both NULL: no result, no guess", open["bytes_delivered"], open["failed"])
+	t.Run("a main-chat call", func(t *testing.T) {
+		run(t, "toolu_lost", want{real: 4096, delivered: int64(len("preview of the output"))}, func(q quietStore, start time.Time) {
+			q.writeTranscript(t, q.main,
+				promptLine("prompt-1", secretPrompt, start),
+				toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)),
+				quietResultLine(q.toolMain, failedResult, true, start.Add(3*time.Second)),
+				toolUseLine("msg_lost", "toolu_lost", 9, start.Add(6*time.Second)),
+				resultWithUseResult("toolu_lost", "preview of the output", `{"stdout":"preview of the output","stderr":"","interrupted":false,"persistedOutputPath":"/tmp/x","persistedOutputSize":4096}`, start.Add(7*time.Second)),
+			)
+		})
+	})
+	t.Run("a sub-agent call", func(t *testing.T) {
+		run(t, "toolu_lostsub", want{real: int64(len("the whole stdout line\n")), delivered: int64(len("sub"))}, func(q quietStore, start time.Time) {
+			q.writeTranscript(t, q.sub,
+				toolUseLine("msg_sub", q.toolSub, 31, start.Add(4*time.Second)),
+				quietResultLine(q.toolSub, secretResult, false, start.Add(5*time.Second)),
+				toolUseLine("msg_lostsub", "toolu_lostsub", 9, start.Add(6*time.Second)),
+				resultWithUseResult("toolu_lostsub", "sub", `{"stdout":"the whole stdout line\n","stderr":"","interrupted":false}`, start.Add(7*time.Second)),
+			)
+		})
+	})
+}
+
+// TestRecoverQuietSizesAnEarlierRebuiltCall: a call an earlier recovery
+// rebuilt (source transcript, bytes_delivered set, bytes_real NULL, not failed)
+// is still open for its real size. A quiet session holding it is a candidate
+// even when every other call has a size; its result's toolUseResult fills
+// bytes_real alone, leaving the delivered size as it is. A result with no
+// toolUseResult cannot, so one call marker names it, and once marked it is no
+// candidate. A second run writes nothing either way.
+func TestRecoverQuietSizesAnEarlierRebuiltCall(t *testing.T) {
+	earlier := func(t *testing.T, useResult string) quietStore {
+		t.Helper()
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		// Every other call gets its size first, so only the rebuilt call is open.
+		if first := q.recover(t); first.Calls != 2 {
+			t.Fatalf("first RecoverQuiet = %+v, want the 2 recorded calls settled", first)
+		}
+		result := resultWithUseResult("toolu_lost", "preview of the output", useResult, start.Add(7*time.Second))
+		if useResult == "" {
+			result = quietResultLine("toolu_lost", "preview of the output", false, start.Add(7*time.Second))
+		}
+		q.writeTranscript(t, q.main,
+			promptLine("prompt-1", secretPrompt, start),
+			toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)),
+			textLine("msg_main", secretMessage, 77, start.Add(2*time.Second)),
+			quietResultLine(q.toolMain, failedResult, true, start.Add(3*time.Second)),
+			toolUseLine("msg_lost", "toolu_lost", 9, start.Add(6*time.Second)),
+			result,
+		)
+		if err := os.Chtimes(q.main, start, start); err != nil {
+			t.Fatal(err)
+		}
+		rebuilt := RebuiltCall("sess-1", "", "", TranscriptRequest{MessageID: "msg_lost", PromptID: "prompt-1", TS: start.Add(6 * time.Second).UnixMilli(), Cwd: "/tmp/demo-proj"}, "toolu_lost", "Bash")
+		rebuilt.BytesDelivered, rebuilt.Failed = Ptr(int64(674)), Ptr(false)
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			return tx.UpsertCall(context.Background(), rebuilt, FillEmpty)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := q.candidates(t); len(got) != 1 {
+			t.Fatalf("quietCandidates = %v, want the session: its rebuilt call has no real size", got)
+		}
+		return q
 	}
+	where := "tool_use_id = 'toolu_lost'"
+	t.Run("its toolUseResult fills the real size", func(t *testing.T) {
+		q := earlier(t, `{"stdout":"preview of the output","persistedOutputSize":4096}`)
+		if first := q.recover(t); first.Sessions != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want the session recovered", first)
+		}
+		call := row(t, q.store, "calls", where)
+		if call["bytes_real"] != int64(4096) || call["bytes_delivered"] != int64(674) || call["failed"] != int64(0) || call["source"] != SourceTranscript || call["error"] != nil {
+			t.Fatalf("call = %v, want bytes_real 4096 with bytes_delivered 674, failed 0 and source transcript untouched", call)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0", n)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Errorf("quietCandidates = %v, want none once sized", got)
+		}
+		if again := q.recover(t); again.Sessions != 0 || again.Calls != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := row(t, q.store, "calls", where); !reflect.DeepEqual(call, after) {
+			t.Fatalf("second RecoverQuiet changed the call:\nbefore %v\nafter  %v", call, after)
+		}
+	})
+	t.Run("no toolUseResult: one call marker", func(t *testing.T) {
+		q := earlier(t, "")
+		if first := q.recover(t); first.Unfillable != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want 1 unfillable call", first)
+		}
+		fault := row(t, q.store, "faults", "tool_use_id = 'toolu_lost'")
+		if fault == nil || fault["error"] != "call toolu_lost: "+UnfilledCall {
+			t.Fatalf("fault = %v, want the call marker of toolu_lost", fault)
+		}
+		call := row(t, q.store, "calls", where)
+		if call["bytes_real"] != nil || call["bytes_delivered"] != int64(674) {
+			t.Errorf("call = %v, want bytes_real NULL and bytes_delivered 674", call)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Errorf("quietCandidates = %v, want none once marked", got)
+		}
+		if again := q.recover(t); again.Sessions != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if n := count(t, q.store, "faults"); n != 1 {
+			t.Errorf("faults = %d, want 1", n)
+		}
+		if after := row(t, q.store, "calls", where); !reflect.DeepEqual(call, after) {
+			t.Fatalf("second RecoverQuiet changed the call:\nbefore %v\nafter  %v", call, after)
+		}
+	})
+}
+
+// TestRecoverQuietMarksAnOpenAgentTurnOnce: a sub-agent's latest turn with no
+// SubagentStop whose quiet transcript shows no turn end after its start (the
+// agent was killed mid-turn) is marked once by one transcript fault, and the
+// agent row takes its parent Agent call and type from the meta file beside its
+// transcript. Any later hook reopens the turn; a transcript showing the turn's
+// end is no open turn to mark: its SubagentStop was lost, and recovery rebuilds
+// it at that end line's own ts, once.
+func TestRecoverQuietMarksAnOpenAgentTurnOnce(t *testing.T) {
+	want := "agent a1 turn 1 open: " + UnfilledAgentStop
+	open := func(t *testing.T, subLines ...string) quietStore {
+		t.Helper()
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		if subLines != nil {
+			q.writeTranscript(t, q.sub, subLines...)
+		}
+		meta := strings.TrimSuffix(q.sub, ".jsonl") + ".meta.json"
+		if err := os.WriteFile(meta, []byte(`{"agentType":"Explore","toolUseId":"toolu_parent"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range []string{q.sub, meta} {
+			if err := os.Chtimes(file, start, start); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			if _, err := tx.tx.ExecContext(context.Background(), `INSERT INTO agents(agent_id, session_id, started) VALUES('a1', 'sess-1', ?1)`, start.UnixMilli()); err != nil {
+				return err
+			}
+			_, err := tx.tx.ExecContext(context.Background(), `INSERT INTO agent_turns(agent_id, seq, session_id, started) VALUES('a1', 1, 'sess-1', ?1)`, start.UnixMilli())
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	marked := func(t *testing.T) quietStore {
+		t.Helper()
+		q := open(t)
+		if first := q.recover(t); first.Unfillable != 1 || first.Parents != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want 1 unfillable (the open turn) and 1 agent linked", first)
+		}
+		lastHook := row(t, q.store, "sessions", "session_id = 'sess-1'")["last_ts"]
+		if fault := row(t, q.store, "faults", "stage = 'transcript'"); fault == nil || fault["error"] != want || fault["ts"] != lastHook {
+			t.Fatalf("fault = %v, want %q at %v (the session's last hook)", fault, want, lastHook)
+		}
+		if agent := row(t, q.store, "agents", "agent_id = 'a1'"); agent["parent_tool_use_id"] != "toolu_parent" || agent["agent_type"] != "Explore" {
+			t.Errorf("agent = %v, want parent toolu_parent and type Explore from its meta file", agent)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Fatalf("quietCandidates after the marker = %v, want none", got)
+		}
+		before := q.snapshot(t)
+		if again := q.recover(t); again.Sessions != 0 || again.Unfillable != 0 || again.Parents != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
+			t.Fatalf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+		}
+		return q
+	}
+	t.Run("marked once", func(t *testing.T) { marked(t) })
+	t.Run("a later hook reopens it", func(t *testing.T) {
+		q := marked(t)
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			return tx.TouchSession(context.Background(), Session{SessionID: "sess-1", TS: q.now.Add(time.Second).UnixMilli()})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		turns, err := q.store.unmarkedOpenAgentTurns(context.Background(), "sess-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(turns) != 1 || turns[0].agentID != "a1" || turns[0].seq != 1 {
+			t.Errorf("unmarkedOpenAgentTurns after a later hook = %+v, want a1's turn 1", turns)
+		}
+	})
+	t.Run("a turn end in its transcript is no open turn", func(t *testing.T) {
+		start := time.Now().Add(-2 * time.Hour)
+		q := open(t, toolUseLine("msg_sub", "toolu_sub", 31, start.Add(4*time.Second)),
+			quietResultLine("toolu_sub", secretResult, false, start.Add(5*time.Second)),
+			textLine("msg_sub_end", secretMessage, 3, start.Add(6*time.Second)),
+			endTurnLine("msg_sub_end", 7, start.Add(6500*time.Millisecond)))
+		if first := q.recover(t); first.AgentStops != 1 {
+			t.Errorf("RecoverQuiet = %+v, want 1 agent stop rebuilt", first)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0: the transcript shows the turn's end", n)
+		}
+		end := start.Add(6500 * time.Millisecond).UnixMilli() // the end line's own ts, not the message's first line
+		stop := row(t, q.store, "events", "event = 'SubagentStop'")
+		if stop == nil || stop["agent_id"] != "a1" || stop["session_id"] != "sess-1" || stop["ts"] != end || stop["detail"] != RecoveredDetail {
+			t.Fatalf("SubagentStop event = %v, want agent a1 of sess-1 at %d, %s", stop, end, RecoveredDetail)
+		}
+		turn := row(t, q.store, "turns", "event = 'SubagentStop'")
+		if turn == nil || turn["event_id"] != stop["event_id"] || turn["agent_id"] != "a1" || turn["ts"] != end || turn["last_assistant_message_bytes"] != nil {
+			t.Errorf("SubagentStop turn = %v, want the event's id, agent a1 at %d, no reply size", turn, end)
+		}
+		agentTurn := row(t, q.store, "agent_turns", "agent_id = 'a1'")
+		if agentTurn["stopped"] != end || agentTurn["stop_event_id"] != stop["event_id"] || count(t, q.store, "agent_turns") != 1 {
+			t.Errorf("agent turn = %v, want its one turn stopped at %d by the rebuilt event", agentTurn, end)
+		}
+		agent := row(t, q.store, "agents", "agent_id = 'a1'")
+		if agent["stopped"] != end || agent["tool_uses"] != int64(1) || agent["total_tokens"] == nil {
+			t.Errorf("agent = %v, want stopped at %d, 1 tool use and its tokens from the transcript", agent, end)
+		}
+		if reply := row(t, q.store, "requests", "request_id = 'msg_sub_end'"); reply == nil || reply["agent_id"] != "a1" {
+			t.Errorf("reply request = %v, want msg_sub_end of agent a1", reply)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Fatalf("quietCandidates after the rebuild = %v, want none", got)
+		}
+		before := q.snapshot(t)
+		events := count(t, q.store, "events")
+		if again := q.recover(t); again.Sessions != 0 || again.AgentStops != 0 || again.Unfillable != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := q.snapshot(t); !reflect.DeepEqual(before, after) || count(t, q.store, "events") != events {
+			t.Fatalf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+		}
+	})
 }
 
 // TestRecoverQuietRebuildsALostTurnEnd: a session whose turn-end hook was lost
@@ -839,6 +1270,19 @@ func (q quietStore) candidates(t *testing.T) []quietSession {
 	return got
 }
 
+// unfilledTurnEndText is the fault text the turn-end marker carries, as Go
+// formats it: the SQL of turnEndMarker must produce the same bytes.
+func unfilledTurnEndText(promptID, eventID string) string {
+	return fmt.Sprintf("prompt %s UserPromptSubmit %s: %s", promptID, eventID, UnfilledTurnEnd)
+}
+
+// submitPrompt stores a main-chat UserPromptSubmit event.
+func submitPrompt(tx *Tx, eventID, promptID string, at time.Time) error {
+	_, err := tx.InsertEvent(context.Background(), Event{EventID: eventID, Event: "UserPromptSubmit", SessionID: Ptr("sess-1"),
+		PromptID: Ptr(promptID), TS: at.UnixMilli()})
+	return err
+}
+
 func stopTurn(tx *Tx, eventID, promptID string, at time.Time) error {
 	_, err := tx.InsertTurn(context.Background(), Turn{EventID: eventID, Event: EventStop, SessionID: Ptr("sess-1"),
 		PromptID: Ptr(promptID), TS: at.UnixMilli(), LastAssistantMessageBytes: Ptr(int64(42))})
@@ -957,6 +1401,94 @@ func TestRecoverQuietMarksAnUnfillableStopOnce(t *testing.T) {
 	}
 }
 
+// TestRecoverQuietMarksAnUnendedPromptOnce: a latest prompt with no Stop or
+// StopFailure whose quiet main transcript shows no turn end after it is read
+// once: one transcript fault names the prompt and the session stops being a
+// candidate, so a later report never reads the transcript again. A later prompt
+// or any later hook makes it a candidate again.
+func TestRecoverQuietMarksAnUnendedPromptOnce(t *testing.T) {
+	start := time.Now().Add(-2 * time.Hour)
+	// toolu_x, the call running when the session went quiet, has its row: this
+	// test is about the prompt alone (TestRecoverQuietRebuildsAnUnrecordedCall).
+	seed := func(tx *Tx) error {
+		if err := tx.UpsertCall(context.Background(), Call{ToolUseID: "toolu_x", SessionID: Ptr("sess-1"), RequestID: Ptr("msg_tool"),
+			Tool: Ptr("Bash"), BytesReal: Ptr(int64(3)), Source: Ptr(SourceHook)}, Overwrite); err != nil {
+			return err
+		}
+		return submitPrompt(tx, "prompt-ev", "prompt-P", start)
+	}
+	want := unfilledTurnEndText("prompt-P", "prompt-ev")
+	// marked is a store whose prompt recovery has marked, after its first pass.
+	marked := func(t *testing.T, mainLines ...string) quietStore {
+		t.Helper()
+		q := newUnfilledStore(t, 2*time.Hour, start.Add(-time.Minute), mainLines, nil, seed)
+		if got := q.candidates(t); len(got) != 1 {
+			t.Fatalf("quietCandidates = %v, want the session: its latest prompt has no turn end", got)
+		}
+		if summary := q.recover(t); summary.Unfillable != 1 {
+			t.Fatalf("RecoverQuiet = %+v, want 1 unfillable: the unended prompt", summary)
+		}
+		// The fault sits inside the session's own span: at its last hook, not at the
+		// report's marking time.
+		lastHook := row(t, q.store, "sessions", "session_id = 'sess-1'")["last_ts"]
+		fault := row(t, q.store, "faults", "stage = 'transcript'")
+		if fault == nil || fault["session_id"] != "sess-1" || fault["ts"] != lastHook || fault["error"] != want {
+			t.Fatalf("fault = %v, want session sess-1, ts %v (the session's last hook), error %q", fault, lastHook, want)
+		}
+		if got := q.candidates(t); len(got) != 0 {
+			t.Fatalf("quietCandidates after the marker = %v, want none", got)
+		}
+		before := q.snapshot(t)
+		if again := q.recover(t); again.Sessions != 0 || again.Unfillable != 0 || again.TurnEnds != 0 {
+			t.Fatalf("second RecoverQuiet = %+v, want nothing", again)
+		}
+		if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
+			t.Fatalf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+		}
+		if n := count(t, q.store, "faults"); n != 1 {
+			t.Fatalf("faults = %d, want 1: the marker is recorded once", n)
+		}
+		return q
+	}
+	running := []string{promptLine("prompt-P", secretPrompt, start), toolUseLine("msg_tool", "toolu_x", 5, start.Add(time.Second))}
+	t.Run("a tool call and no turn end", func(t *testing.T) {
+		marked(t, running...)
+	})
+	t.Run("a turn end older than the prompt", func(t *testing.T) {
+		// The last message is an earlier turn's answer: RecoverTurnEnd refuses it.
+		q := marked(t, promptLine("prompt-old", secretPrompt, start.Add(-3*time.Minute)), endTurnLine("msg_old", 9, start.Add(-2*time.Minute)))
+		if n := count(t, q.store, "turns"); n != 0 {
+			t.Errorf("turns = %d, want 0: the earlier answer is no turn end of this prompt", n)
+		}
+	})
+	t.Run("a later prompt", func(t *testing.T) {
+		q := marked(t, running...)
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			return submitPrompt(tx, "prompt-ev2", "prompt-Q", start.Add(time.Minute))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := q.candidates(t); len(got) != 1 {
+			t.Errorf("quietCandidates after a later prompt = %v, want the session again", got)
+		}
+	})
+	t.Run("a later hook", func(t *testing.T) {
+		q := marked(t, running...)
+		if err := q.store.Batch(context.Background(), func(tx *Tx) error {
+			return tx.TouchSession(context.Background(), Session{SessionID: "sess-1", TS: q.now.Add(time.Second).UnixMilli()})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got, err := q.store.quietCandidates(context.Background(), q.now.Add(2*time.Hour).UnixMilli())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Errorf("quietCandidates after a later hook = %v, want the session again", got)
+		}
+	})
+}
+
 // TestRecoverQuietMarksNothingForALiveOrUnreadSession: a marker says recovery
 // read every transcript in full. A session still written to is not read, and one
 // whose sub-agent transcript cannot be read is not read in full: neither is
@@ -975,6 +1507,16 @@ func TestRecoverQuietMarksNothingForALiveOrUnreadSession(t *testing.T) {
 		}
 		if got := q.candidates(t); len(got) != 1 {
 			t.Errorf("quietCandidates = %v, want the live session kept", got)
+		}
+	})
+	t.Run("live with an unended prompt", func(t *testing.T) {
+		q := newUnfilledStore(t, 0, start, []string{promptLine("prompt-P", secretPrompt, start)}, nil,
+			func(tx *Tx) error { return submitPrompt(tx, "prompt-ev", "prompt-P", start) })
+		if summary := q.recover(t); summary.Sessions != 0 || summary.Unfillable != 0 {
+			t.Errorf("RecoverQuiet = %+v, want nothing for a live session", summary)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0: a live session's prompt may still end", n)
 		}
 	})
 	t.Run("unreadable sub-agent transcript", func(t *testing.T) {

@@ -45,6 +45,7 @@ type message struct {
 	id, session, agent, model, stopReason string
 	promptID                              string // the latest user line's promptId when the message began
 	ts                                    int64
+	endTS                                 int64 // the line that set a turn-ending stop_reason (set, not tool_use); 0: none
 	usage                                 tokens
 	toolIDs                               map[string]bool
 }
@@ -426,6 +427,9 @@ func (w *world) assistant(t *transcript, l *line, blocks []block, ms int64) erro
 	if m.StopReason != nil && *m.StopReason != "" {
 		msg.stopReason = *m.StopReason
 		t.lastStop = *m.StopReason
+		if msg.stopReason != "tool_use" {
+			msg.endTS = ms
+		}
 		if msg.stopReason == "end_turn" {
 			t.endTurns[m.ID] = true
 		}

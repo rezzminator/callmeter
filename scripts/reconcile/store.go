@@ -38,6 +38,8 @@ type sCall struct {
 	// noCommand: the stored input keeps only command_bytes, the command the
 	// heredoc cutter could not cut safely (docs/design.md § Privacy).
 	noCommand bool
+	// delivered: bytes_delivered is set (PostToolBatch stored the size).
+	delivered bool
 }
 
 type sRequest struct {
@@ -57,8 +59,14 @@ type sAgent struct {
 type sTurn struct {
 	seq             int64
 	ts              int64 // its stop, else its start (unix ms); 0: neither
+	start           int64 // its start (unix ms); 0: none
 	noStart, noStop bool
+	rebuilt         bool // its stop is a SubagentStop recovery rebuilt from the transcript (rebuiltDetail)
 }
+
+// rebuiltDetail is the detail of a turn end recovery rebuilt from a transcript
+// (callmeter.RecoveredDetail; a test pins the two).
+const rebuiltDetail = `{"from_transcript":true}`
 
 type sEvent struct {
 	session, event, agent, source, promptID string
@@ -120,10 +128,10 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				}
 				return nil
 			}},
-		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), bytes_delivered IS NOT NULL AND bytes_real IS NULL AND COALESCE(failed,0) = 0 AND error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0) FROM calls`,
+		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), bytes_delivered IS NOT NULL AND bytes_real IS NULL AND COALESCE(failed,0) = 0 AND error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL FROM calls`,
 			func(r *sql.Rows) error {
 				c := &sCall{}
-				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &c.batchOnly, &c.noCommand); err != nil {
+				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &c.batchOnly, &c.noCommand, &c.delivered); err != nil {
 					return err
 				}
 				d.calls[c.id] = c
@@ -149,11 +157,12 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				d.agents[a.id] = a
 				return nil
 			}},
-		{"agent_turns", `SELECT agent_id, seq, started IS NULL, stopped IS NULL, COALESCE(stopped, started, 0) FROM agent_turns ORDER BY agent_id, seq`,
+		{"agent_turns", `SELECT t.agent_id, t.seq, t.started IS NULL, t.stopped IS NULL, COALESCE(t.stopped, t.started, 0), COALESCE(t.started, 0),
+			COALESCE(e.event = 'SubagentStop' AND e.detail = '` + rebuiltDetail + `', 0) FROM agent_turns t LEFT JOIN events e ON e.event_id = t.stop_event_id ORDER BY t.agent_id, t.seq`,
 			func(r *sql.Rows) error {
 				var id string
 				var t sTurn
-				if err := r.Scan(&id, &t.seq, &t.noStart, &t.noStop, &t.ts); err != nil {
+				if err := r.Scan(&id, &t.seq, &t.noStart, &t.noStop, &t.ts, &t.start, &t.rebuilt); err != nil {
 					return err
 				}
 				d.turns[id] = append(d.turns[id], t)

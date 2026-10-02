@@ -358,8 +358,49 @@ func foldEntry(request *RequestUsage, message *assistantMessage) {
 // usage, with the prompt it answered and the calls it issued.
 type TranscriptRequest struct {
 	RequestUsage
-	PromptID   string   // the promptId of the last user entry before it; "" when none carries one
-	ToolUseIDs []string // its tool_use blocks, in order
+	PromptID   string    // the promptId of the last user entry before it; "" when none carries one
+	ToolUseIDs []string  // its tool_use blocks, in order
+	ToolUses   []ToolUse // the same blocks with their tool and input
+	Cwd        string    // the cwd of its first entry; "" when it carries none
+	// EndTS is the timestamp of its entry that set a turn-ending stop_reason
+	// (set, not tool_use), Unix ms UTC: the turn's end line. 0 while none did.
+	EndTS int64
+}
+
+// ToolUse is one tool_use block of a transcript request: its id, its tool and
+// its input as written, which only SanitizeInput may turn into a stored value.
+type ToolUse struct {
+	ID    string
+	Name  string
+	Input json.RawMessage
+}
+
+// toolUseBlock is a content block read for its tool_use fields.
+type toolUseBlock struct {
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// SubagentMeta reads the agent type and the parent Agent call's tool_use id
+// Claude Code writes beside a sub-agent's transcript
+// (`agent-{agentID}.meta.json`); a missing file is an error wrapping
+// fs.ErrNotExist.
+func SubagentMeta(mainTranscript, agentID string) (agentType, toolUseID string, err error) {
+	path := strings.TrimSuffix(SubagentTranscriptPath(mainTranscript, agentID), ".jsonl") + ".meta.json"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("read sub-agent meta: %w", err)
+	}
+	var meta struct {
+		AgentType string `json:"agentType"`
+		ToolUseID string `json:"toolUseId"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", "", fmt.Errorf("sub-agent meta %s: %w", path, err)
+	}
+	return meta.AgentType, meta.ToolUseID, nil
 }
 
 // ReadRequests reads every model request of the transcript at path, in the
@@ -433,6 +474,7 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 	var entry struct {
 		transcriptEntry
 		PromptID string `json:"promptId"`
+		Cwd      string `json:"cwd"`
 	}
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return fmt.Errorf("malformed entry: %w", err)
@@ -454,7 +496,7 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 	if message.ID == "" || message.Model == syntheticModel {
 		return nil
 	}
-	var blocks []contentBlock
+	var blocks []toolUseBlock
 	if err := json.Unmarshal(message.Content, &blocks); err != nil {
 		return fmt.Errorf("assistant message %q: content is not a block list: %w", message.ID, err)
 	}
@@ -469,16 +511,25 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 		scan.requests = append(scan.requests, TranscriptRequest{
 			RequestUsage: RequestUsage{MessageID: message.ID, TS: at.UnixMilli()},
 			PromptID:     scan.prompt,
+			Cwd:          entry.Cwd,
 		})
 	}
 	request := &scan.requests[i]
 	foldEntry(&request.RequestUsage, &message)
+	if message.StopReason != nil && *message.StopReason != "" && *message.StopReason != toolUse {
+		at, err := entryTime(message.ID, entry.Timestamp)
+		if err != nil {
+			return err
+		}
+		request.EndTS = at.UnixMilli()
+	}
 	if message.Usage != nil {
 		scan.used[message.ID] = true
 	}
 	for _, block := range blocks {
 		if block.Type == toolUse && block.ID != "" && !slices.Contains(request.ToolUseIDs, block.ID) {
 			request.ToolUseIDs = append(request.ToolUseIDs, block.ID)
+			request.ToolUses = append(request.ToolUses, ToolUse{ID: block.ID, Name: block.Name, Input: block.Input})
 		}
 	}
 	scan.final = message.StopReason != nil && *message.StopReason != toolUse
