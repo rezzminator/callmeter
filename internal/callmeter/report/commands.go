@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,6 +16,25 @@ const (
 	BandLow  = 20000
 	BandHigh = 30000 // exclusive: output at or over it is persisted
 )
+
+// UnknownSize is a byte cell whose every contributing call has no delivered
+// size: the size is unknown, never 0 bytes.
+const UnknownSize = "unknown"
+
+// sizeCell is a byte sum, or UnknownSize when none of the calls it covers had
+// a delivered size: a sum of nothing known is unknown, never 0.
+func sizeCell(sum, known, unknown int64) string {
+	if known == 0 && unknown > 0 {
+		return UnknownSize
+	}
+	return itoa(sum)
+}
+
+// unknownSizeNote names the calls a table left out of its byte columns for
+// having no delivered size, in gapNotes' words; gapNotes names their reasons.
+func unknownSizeNote(n int64, calls, columns string) string {
+	return fmt.Sprintf("%d %s have no delivered size: size unknown, not counted in %s", n, calls, columns)
+}
 
 // MaxShapeParts is how many part shapes a call's shape keeps.
 const MaxShapeParts = 3
@@ -134,7 +154,8 @@ func callShape(parts []storedPart) string {
 
 type shapeStat struct {
 	shape     string
-	delivered []int64
+	calls     int64
+	delivered []int64 // the known sizes: a call with none is only counted
 	sum       int64
 	band      int64
 	persisted int64
@@ -158,9 +179,10 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		return nil, err
 	}
 	stats := map[string]*shapeStat{}
+	var unknown int64 // Bash calls with no delivered size
 	where, args := f.where()
 	err = query(ctx, store, "Bash calls",
-		`SELECT c.tool_use_id, COALESCE(c.bytes_delivered, 0), COALESCE(c.bytes_real, c.bytes_delivered, 0),
+		`SELECT c.tool_use_id, c.bytes_delivered, COALESCE(c.bytes_real, c.bytes_delivered),
 		COALESCE(c.persisted_path, ''),
 		(SELECT COUNT(*) FROM calls r WHERE r.tool = 'Read' AND c.persisted_path IS NOT NULL
 			AND r.file_path = c.persisted_path AND r.file_path LIKE '%/tool-results/%'
@@ -168,7 +190,8 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		FROM calls c WHERE c.tool = 'Bash' AND `+where, args,
 		func(r rowSource) error {
 			var id, persisted string
-			var delivered, realBytes, followUps int64
+			var delivered, realBytes *int64
+			var followUps int64
 			if err := r.Scan(&id, &delivered, &realBytes, &persisted, &followUps); err != nil {
 				return err
 			}
@@ -178,9 +201,14 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 				s = &shapeStat{shape: key}
 				stats[key] = s
 			}
-			s.delivered = append(s.delivered, delivered)
-			s.sum += delivered
-			if realBytes >= BandLow && realBytes < BandHigh {
+			s.calls++
+			if delivered == nil {
+				unknown++
+			} else {
+				s.delivered = append(s.delivered, *delivered)
+				s.sum += *delivered
+			}
+			if realBytes != nil && *realBytes >= BandLow && *realBytes < BandHigh {
 				s.band++
 			}
 			if persisted != "" {
@@ -208,9 +236,12 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		Header: []string{"SHAPE", "CALLS", "BYTES", "P50", "P95", "20K-30K", "PERSISTED", "FOLLOW-UP READS"},
 	}
 	for _, s := range list[:min(len(list), f.limit())] {
+		known := int64(len(s.delivered))
 		t.Rows = append(t.Rows, []string{
-			s.shape, itoa(int64(len(s.delivered))), itoa(s.sum), itoa(percentile(s.delivered, 50)),
-			itoa(percentile(s.delivered, 95)), itoa(s.band), itoa(s.persisted), itoa(s.followUps),
+			s.shape, itoa(s.calls), sizeCell(s.sum, known, s.calls-known),
+			sizeCell(percentile(s.delivered, 50), known, s.calls-known),
+			sizeCell(percentile(s.delivered, 95), known, s.calls-known),
+			itoa(s.band), itoa(s.persisted), itoa(s.followUps),
 		})
 	}
 	notes, err := gapNotes(ctx, store, f)
@@ -218,6 +249,9 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		return nil, err
 	}
 	t.Notes = notes
+	if unknown > 0 {
+		t.Notes = append(t.Notes, unknownSizeNote(unknown, "Bash calls", "BYTES, P50 or P95"))
+	}
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
 }

@@ -41,9 +41,9 @@ Claude Code hook ─▶ libexec/callmeter (sh wrapper) ─▶ callmeter binary �
 - Every registered event runs the plugin's wrapper with `hook`. The wrapper finds the `callmeter` binary for this plugin version and `exec`s it with the hook's payload on stdin.
 - On the first `SessionStart` after install, the wrapper downloads the binary for your platform from the GitHub release of this version, checks it against the `SHA256SUMS` committed in the plugin, and caches it under `CALLMETER_HOME`. Every later run uses the cache.
 - The binary writes one short SQLite transaction per event and exits 0 on every path. A hook it could not serve is logged to `missed.log` and counted as a fault on the next run, so a gap shows in the reports instead of a smaller number.
-- Reports read the same store. Each report run first prunes rows older than 30 days, archiving them to `archive.db`.
+- Reports read the same store. Each report run first prunes rows older than 30 days, archiving them to `archive.db`, then settles every session with no hook and no transcript write for an hour from its transcripts: calls left in flight, requests no hook wrote, a turn end whose `Stop` or `StopFailure` hook was lost.
 
-Every hook but `SessionStart` and `SessionEnd` is async: nothing waits for callmeter before a tool runs.
+Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing waits for callmeter before a tool runs.
 
 ## 📒 What it records
 
@@ -51,11 +51,11 @@ Every hook but `SessionStart` and `SessionEnd` is async: nothing waits for callm
 - `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output) and the context size.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
-- `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message.
+- `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.
 - `events`: one row per lifecycle event: session start and end, prompts (their size only), slash-command expansions, instructions loaded, compactions, stop failures, permission requests, notifications, tasks.
 - `sessions`: one row per session: first and last activity, model, how it started and ended, cwd, seat, host, time zone.
 - `command_parts`: every simple command inside a Bash call, with the files it read or wrote, parsed at report time.
-- `faults`: every event that could not be recorded or parsed, by stage.
+- `faults`: every event that could not be recorded and every command part that could not be parsed, by stage; a parse fault keeps the byte count of the parser's message, never its text.
 
 ## 📊 Reports
 
@@ -67,12 +67,12 @@ The same runs from a shell as `callmeter report …` when the binary is on your 
 
 | Topic | Answers |
 | --- | --- |
-| `files` | files by bytes delivered, read count, distinct agents, size on disk, whole against ranged reads, re-reads |
+| `files` | files by bytes delivered, read count, distinct agents, size on disk, whole against ranged reads, re-reads, runs of the file as a script |
 | `writes` | files by write count and total growth |
 | `commands` | command shapes by bytes delivered (sum, p50, p95), outputs just under the 30,000-char limit, persisted outputs |
 | `context` | per agent: start and peak context, mean growth, the requests that grew it most and the calls behind them |
 | `sequences` | call runs that recur across agents, ranked by occurrences × bytes |
-| `faults` | calls not recorded, snippets not parsed, hooks the wrapper missed |
+| `faults` | calls not recorded, snippets not parsed, hooks the wrapper missed, turns refused by an API error |
 | `sessions` | one row per session: model, start and end, calls, agents, cwd, host |
 | `prompts` | one row per prompt: calls, failures, agents, requests, tokens |
 | `effort` | calls and turns per effort level, permission mode and agent type |
@@ -106,7 +106,7 @@ Under `CALLMETER_HOME`: `callmeter.db` (the store), `callmeter.log` (JSON lines)
 
 The store stays on your machine; callmeter sends nothing anywhere. Its only network use is the one-time binary download.
 
-No prompt text, message text or file content is stored: each becomes a `{name}_bytes` count. A tool input keeps its command, description, file paths, search patterns and read range; `content`, `old_string`, `new_string`, an edit's `edits` and an agent's `prompt` are replaced by their byte length. Event details keep only their shape, numbers, booleans and a short list of enum-like keys (`type`, `status`, `source`, `reason`, `model`, `file_path`, …); every other string becomes its byte count. Commit messages, patch lines and command output are never stored.
+No prompt, message or file content is ever stored: each becomes a `{name}_bytes` count. A tool input keeps its command with every heredoc body cut out, an unquoted body keeping only the `$(…)` and backquote substitutions the shell runs (a command that cannot be cut safely keeps only its byte count), file paths, search patterns and read range; `content`, `old_string`, `new_string`, an edit's `edits`, an agent's `prompt` and a `description`, `query` or `target` are replaced by their byte length. Event details keep only their shape, numbers, booleans, a short list of enum-like keys (`type`, `status`, `source`, `model`, `file_path`, …) and the known labels of a stop failure's `error` and a session end's `reason`; every other string becomes its byte count. A failed call keeps only its exit code or an outcome label, and a parse fault only the size of the parser's message. Commit messages, patch lines and command output are never stored. `callmeter redact` rewrites rows already stored under these rules.
 
 ## ❓ FAQ
 
@@ -148,7 +148,7 @@ internal/wrappertest/     tests of the sh wrapper
 internal/…                clock, sqlitedb, runner, testjail, paths, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skill
-scripts/                  build-release.sh, release-check.sh, leak-check.sh
+scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/
 docs/                     design.md, testing.md
 ```
 

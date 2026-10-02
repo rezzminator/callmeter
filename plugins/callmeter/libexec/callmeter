@@ -20,9 +20,15 @@
 # writes it: the cleanup after an install reads its mtime. A stamp that cannot
 # be written never fails the run.
 #
+# The hot path, a cached binary for this version, starts no process before the
+# exec: the root, the version and the stamp come from shell builtins alone. A
+# headless exit kills a running hook within tens of milliseconds, so every
+# process started before the hand-off is a chance to lose the event.
+#
 # Under `hook` this script never fails a call and never writes to stdout: any
 # failure exits 0 and appends one `{unix seconds}<TAB>{hook_event_name or unknown}<TAB>{reason}`
-# line to {CALLMETER_HOME}/missed.log, which the binary counts on its next run.
+# line, followed by `<TAB>{session_id}` when the payload carries one, to
+# {CALLMETER_HOME}/missed.log, which the binary counts on its next run.
 # Under any other subcommand a failure is `callmeter: binary unavailable: {reason}`
 # on stderr and exit 1. There is no `set -e`: every failure goes through fail().
 
@@ -70,35 +76,72 @@ on_signal() {
 trap cleanup EXIT
 trap on_signal HUP INT TERM
 
-# first_json_string KEY: reads JSON on stdin and prints the first string value
-# of "KEY": "...", or nothing. All of stdin is consumed (the writer never gets
-# a broken pipe); values holding an escape are not matched.
-first_json_string() {
-  LC_ALL=C grep -o "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" 2>/dev/null \
-    | { IFS= read -r first; cat >/dev/null; printf '%s' "$first"; } \
-    | sed "s/^\"$1\"[[:space:]]*:[[:space:]]*\"//; s/\"\$//"
+# json_field TEXT KEY sets field to the first string value of "KEY": "..." in
+# TEXT, key and value on one line, or to nothing. Builtins only: no process.
+# A value holding an escape is cut at its first quote; the callers' alphabets
+# refuse its backslash.
+json_field() {
+  field=
+  rest=$1
+  while :; do
+    case $rest in
+      *"\"$2\""*) ;;
+      *) return 0 ;;
+    esac
+    rest=${rest#*"\"$2\""}
+    val=${rest#"${rest%%[![:space:]]*}"}
+    case $val in
+      :*) val=${val#:} ;;
+      *) continue ;;
+    esac
+    val=${val#"${val%%[![:space:]]*}"}
+    case $val in
+      \"*\"*) ;;
+      *) continue ;;
+    esac
+    val=${val#\"}
+    field=${val%%\"*}
+    return 0
+  done
 }
 
-# hook_event prints the hook_event_name of the payload on stdin, or `unknown`
-# when stdin is a terminal, was already read, or carries none.
-hook_event() {
+# payload_fields sets event to the hook_event_name of the payload on stdin, or
+# `unknown`, and session to its session_id, or nothing, when stdin is a
+# terminal, was already read, or carries none. All of stdin is consumed (the
+# writer never gets a broken pipe): it runs only once no binary will read it.
+# One grep reads the payload: a builtin `read` takes a byte per system call
+# from a pipe, seconds for a payload of a few MB.
+payload_fields() {
   event=
+  session=
   if [ -z "$stdin_spent" ] && [ ! -t 0 ]; then
-    event=$(first_json_string hook_event_name)
+    keys=$(LC_ALL=C grep -oE '"(hook_event_name|session_id)"[[:space:]]*:[[:space:]]*"[^"]*"' 2>/dev/null)
+    json_field "$keys" hook_event_name
+    event=$field
+    json_field "$keys" session_id
+    session=$field
   fi
   case $event in
     '' | *[!A-Za-z0-9_]*) event=unknown ;;
   esac
-  printf '%s' "$event"
+  case $session in
+    *[!A-Za-z0-9._-]*) session= ;;
+  esac
 }
 
 log_missed() {
   if [ -z "$home" ]; then
     return 0
   fi
-  event=$(hook_event)
-  mkdir -p "$home" 2>/dev/null || return 0
-  printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log" 2>/dev/null
+  payload_fields
+  if [ ! -d "$home" ]; then
+    mkdir -p "$home" 2>/dev/null || return 0
+  fi
+  if [ -n "$session" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" "$session" >>"$home/missed.log" 2>/dev/null
+  else
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log" 2>/dev/null
+  fi
   return 0
 }
 
@@ -151,17 +194,26 @@ if [ -n "${CALLMETER_BIN-}" ] && [ -f "$CALLMETER_BIN" ] && [ -x "$CALLMETER_BIN
   run_bin "$CALLMETER_BIN" "$@"
 fi
 
-# The plugin root is the directory above this script's own.
+# The plugin root is the directory above this script's own, by parameter
+# expansion: a hook names the script by its path, so no process runs here.
 case $0 in
   */*) script=$0 ;;
   *) script=$(command -v "$0" 2>/dev/null) ;;
 esac
-root=$(cd "$(dirname -- "$script")/.." 2>/dev/null && pwd)
-if [ -z "$root" ]; then
-  fail "plugin root not found"
-fi
+case $script in
+  */*) root=${script%/*}/.. ;;
+  *) fail "plugin root not found" ;;
+esac
 
-version=$(first_json_string version <"$root/.claude-plugin/plugin.json" 2>/dev/null)
+# The version is the manifest's first "version" string, read by builtins.
+version=
+manifest=$root/.claude-plugin/plugin.json
+if [ -f "$manifest" ] && [ -r "$manifest" ]; then
+  while [ -z "$version" ] && { IFS= read -r line || [ -n "$line" ]; }; do
+    json_field "$line" version
+    version=$field
+  done <"$manifest"
+fi
 case $version in
   '' | *[!0-9A-Za-z._+-]*) fail "no plugin version" ;;
 esac

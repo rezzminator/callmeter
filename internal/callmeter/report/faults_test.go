@@ -2,6 +2,8 @@ package report
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +46,33 @@ func TestFaultsCountsByStageAndStatusThenLatest(t *testing.T) {
 	}
 	if len(latest) != 2 || latest[0] != "parse broke" {
 		t.Errorf("latest faults = %v, want 2, newest first", latest)
+	}
+}
+
+// A Python heredoc whose body the store cut parsed fine as shell: its part is
+// counted under its own status, script-body, and adds no parse fault.
+func TestFaultsScriptBodyIsNoParseFault(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	seed(t, store, bash("b1", "s", "", ms(time.Hour), workDir(t), "python3 - <<'EOF'\nEOF\nls", 5))
+	if _, err := EnsureParsed(ctx, store, "", nil); err != nil {
+		t.Fatalf("EnsureParsed: %v", err)
+	}
+	table, err := Faults(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Faults: %v", err)
+	}
+	counts := map[string]string{}
+	for _, row := range table.Rows {
+		if row[0] == "fault" {
+			t.Errorf("fault row %v, want none", row)
+		}
+		counts[row[0]+":"+row[1]] = row[2]
+	}
+	for key, want := range map[string]string{"stage:parse": "0", "parse:script-body": "1", "parse:ok": "1", "parse:unparsed": ""} {
+		if counts[key] != want {
+			t.Errorf("count %s = %q, want %q (rows %v)", key, counts[key], want, table.Rows)
+		}
 	}
 }
 
@@ -193,5 +222,91 @@ func TestFaultsTerminatedStageListedNotUnknown(t *testing.T) {
 	want := []string{"payload=0", "store=0", "transcript=0", "parse=0", "binary=0", "terminated=1"}
 	if strings.Join(stageRows, ",") != strings.Join(want, ",") {
 		t.Errorf("stage rows = %v, want %v", stageRows, want)
+	}
+}
+
+// Transcript lines in the shape Claude Code writes, invented values: a
+// prompt, a model answer, the `<synthetic>` message an API error leaves in
+// place of one, and the bookkeeping entries that follow it.
+const (
+	refusalPrompt  = `{"type":"user","timestamp":"2026-09-23T09:00:00.000Z","message":{"role":"user","content":"invented prompt"}}`
+	refusalAnswer  = `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","message":{"id":"msg-demo-ok","model":"claude-demo","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"invented answer"}],"usage":{"input_tokens":3,"output_tokens":4}}}`
+	refusalTail    = `{"type":"last-prompt","sessionId":"s-demo"}` + "\n" + `{"type":"cost-state","sessionId":"s-demo"}`
+	refusalMessage = "invented refusal text"
+)
+
+func refusalLine(kind string) string {
+	return `{"type":"assistant","timestamp":"2026-09-23T09:00:01.000Z","isApiErrorMessage":true,"error":"` + kind +
+		`","message":{"id":"msg-demo-err","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","content":[{"type":"text","text":"` +
+		refusalMessage + `"}],"usage":{"input_tokens":0,"output_tokens":0}}}`
+}
+
+// A turn refused by the API shows as a refusal with its error kind: from its
+// StopFailure event, or, when the headless exit cancelled that async hook,
+// from the `<synthetic>` message ending its transcript. The message text never
+// reaches the report.
+func TestFaultsListsRefusals(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	dir := t.TempDir()
+	transcript := func(name string, lines ...string) string {
+		path := filepath.Join(dir, name+".jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
+		return path
+	}
+	p := callmeter.Ptr[string]
+	sessions := map[string]string{
+		"s-hook":  transcript("s-hook", refusalPrompt, refusalLine("oauth_org_not_allowed"), refusalTail),
+		"s-lost":  transcript("s-lost", refusalPrompt, refusalLine("rate_limit"), refusalTail),
+		"s-odd":   transcript("s-odd", refusalPrompt, refusalLine("Not A Kind: "+refusalMessage), refusalTail),
+		"s-open":  transcript("s-open", refusalPrompt, refusalAnswer, refusalTail),
+		"s-done":  transcript("s-done", refusalPrompt, refusalLine("rate_limit"), refusalPrompt, refusalAnswer),
+		"s-gone":  filepath.Join(dir, "absent.jsonl"),
+		"s-built": transcript("s-built", refusalPrompt, refusalLine("rate_limit"), refusalTail),
+	}
+	for i, id := range []string{"s-hook", "s-lost", "s-odd", "s-open", "s-done", "s-gone", "s-built"} {
+		at := ms(time.Duration(7-i) * time.Hour)
+		batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
+			return tx.TouchSession(ctx, callmeter.Session{SessionID: id, TS: at, TranscriptPath: p(sessions[id])})
+		})
+		seedEvent(t, store, callmeter.Event{EventID: id + "-up", Event: "UserPromptSubmit", TS: at, SessionID: p(id)})
+		seedEvent(t, store, callmeter.Event{EventID: id + "-end", Event: callmeter.EventSessionEnd, TS: at + 2, SessionID: p(id), Reason: p("other")})
+	}
+	seedEvent(t, store, callmeter.Event{EventID: "s-hook-sf", Event: "StopFailure", TS: ms(7*time.Hour) + 1, SessionID: p("s-hook"), ErrorType: p("oauth_org_not_allowed")})
+	// SessionEnd rebuilt this one from the transcript (RecoverStopFailure): the
+	// row says so, never passing for the hook's own.
+	seedEvent(t, store, callmeter.Event{EventID: "s-built-sf", Event: "StopFailure", TS: ms(time.Hour) + 1, SessionID: p("s-built"), ErrorType: p("rate_limit"), Detail: p(callmeter.RecoveredDetail)})
+	batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
+		_, err := tx.InsertTurn(ctx, callmeter.Turn{EventID: "s-done-stop", Event: "Stop", SessionID: p("s-done"), TS: ms(3*time.Hour) + 1})
+		return err
+	})
+	table, err := Faults(ctx, store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Faults: %v", err)
+	}
+	var refusals []string
+	for _, row := range table.Rows {
+		if row[0] == "refusal" {
+			refusals = append(refusals, strings.Join([]string{row[1], row[2], row[4], row[6]}, "|"))
+		}
+	}
+	want := []string{
+		"rate_limit|1|chat-s-built|StopFailure rebuilt from the transcript",
+		"unknown|1|chat-s-odd|transcript, no StopFailure",
+		"rate_limit|1|chat-s-lost|transcript, no StopFailure",
+		"oauth_org_not_allowed|1|chat-s-hook|StopFailure",
+	}
+	if strings.Join(refusals, "\n") != strings.Join(want, "\n") {
+		t.Errorf("refusal rows =\n%s\nwant\n%s\n(rows %v)", strings.Join(refusals, "\n"), strings.Join(want, "\n"), table.Rows)
+	}
+	notes := strings.Join(table.Notes, "\n")
+	if !strings.Contains(notes, "1 sessions ending on an unanswered prompt could not be checked for an API error") ||
+		!strings.Contains(notes, "absent.jsonl") {
+		t.Errorf("notes = %q, want the unreadable transcript of s-gone named", notes)
+	}
+	if out := render(t, table); strings.Contains(out, refusalMessage) || strings.Contains(out, "invented") {
+		t.Errorf("the report carries transcript text:\n%s", out)
 	}
 }

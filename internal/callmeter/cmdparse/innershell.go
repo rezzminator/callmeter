@@ -8,22 +8,18 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// shellScript finds the -c STRING of bash, sh and zsh: -c alone or inside a
-// flag cluster (-lc, -ec), the string being the first operand after the
-// flags; -o/-O and --rcfile/--init-file take the next word as their value.
-func shellScript(base string, rest []arg) (arg, bool) {
-	if base != "bash" && base != "sh" && base != "zsh" {
-		return arg{}, false
-	}
-	command := false
+// shellArgs scans the flags of bash, sh and zsh: -c alone or inside a flag
+// cluster (-lc, -ec) makes the first operand a command string; -s makes every
+// operand a positional parameter of a script read from stdin; -n reads a
+// script without running it; -o/-O and
+// --rcfile/--init-file take the next word as their value. first is the index
+// of the first operand, len(rest) when there is none.
+func shellArgs(rest []arg) (first int, command, stdin, noexec bool) {
 	for i := 0; i < len(rest); i++ {
 		a := rest[i].text
 		switch {
 		case a == "--" || a == "-":
-			if command && i+1 < len(rest) {
-				return rest[i+1], true
-			}
-			return arg{}, false
+			return i + 1, command, stdin, noexec
 		case a == "--rcfile" || a == "--init-file":
 			i++
 		case strings.HasPrefix(a, "--"):
@@ -31,17 +27,51 @@ func shellScript(base string, rest []arg) (arg, bool) {
 			if a[0] == '-' && strings.ContainsRune(a[1:], 'c') {
 				command = true
 			}
+			if a[0] == '-' && strings.ContainsRune(a[1:], 's') {
+				stdin = true
+			}
+			if a[0] == '-' && strings.ContainsRune(a[1:], 'n') {
+				noexec = true
+			}
 			if strings.ContainsAny(a[1:], "oO") {
 				i++
 			}
 		default:
-			if command {
-				return rest[i], true
-			}
-			return arg{}, false
+			return i, command, stdin, noexec
 		}
 	}
-	return arg{}, false
+	return len(rest), command, stdin, noexec
+}
+
+func isShell(base string) bool {
+	return base == "bash" || base == "sh" || base == "zsh"
+}
+
+// shellScript finds the -c STRING of bash, sh and zsh, the first operand
+// after the flags.
+func shellScript(base string, rest []arg) (arg, bool) {
+	if !isShell(base) {
+		return arg{}, false
+	}
+	first, command, _, _ := shellArgs(rest)
+	if !command || first >= len(rest) {
+		return arg{}, false
+	}
+	return rest[first], true
+}
+
+// shellFile finds the script file bash, sh and zsh run (never under -c, -s
+// or -n):
+// the first operand after the flags, its index in rest.
+func shellFile(base string, rest []arg) (int, bool) {
+	if !isShell(base) {
+		return 0, false
+	}
+	first, command, stdin, noexec := shellArgs(rest)
+	if command || stdin || noexec || first >= len(rest) {
+		return 0, false
+	}
+	return first, true
 }
 
 // innerShell handles `bash -c STRING`. A literal STRING is parsed as shell
@@ -63,7 +93,7 @@ func (p *callParser) innerShell(program string, rest []arg, script arg, lead []F
 		p.emit(Part{Lang: LangSh, Status: StatusUnparsed, Error: fmt.Sprintf("shell -c nested over %d levels", maxShellDepth)})
 		return
 	}
-	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(script.text), "")
+	file, err := parseShell(script.text, filepath.Base(program) == "zsh")
 	if err != nil {
 		p.emit(Part{Lang: LangSh, Status: StatusError, Error: fmt.Sprintf("%s -c: %v", filepath.Base(program), err)})
 		return

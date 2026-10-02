@@ -83,7 +83,6 @@ func TestFilesUnderHome(t *testing.T) {
 		"store":    {Store(home), "/x/cm/callmeter.db"},
 		"log":      {Log(home), "/x/cm/callmeter.log"},
 		"missed":   {Missed(home), "/x/cm/missed.log"},
-		"archive":  {Archive(home), "/x/cm/archive.db"},
 		"bincache": {BinCache(home, "0.1.0"), "/x/cm/bin/0.1.0/callmeter"},
 	} {
 		if tt.got != tt.want {

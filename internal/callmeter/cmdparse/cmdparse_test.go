@@ -70,6 +70,19 @@ func TestShellParseErrorIsOneErrorPart(t *testing.T) {
 	}
 }
 
+// An apostrophe inside a heredoc inside a single-quoted bash -c string closes
+// the quote, leaving the rest of the line as shell words; a `(` there is a
+// syntax error bash -n reports too (`line 3: syntax error near unexpected
+// token '('`), so the parse is one error part at that line, never ok.
+func TestQuoteClosedByApostropheIsBashsError(t *testing.T) {
+	t.Parallel()
+	command := "bash -c '\ncat > /tmp/n <<EOF\n- it's a note (x)\nEOF\n'"
+	parts := parseOne(t, fixture(t), command, nil)
+	if len(parts) != 1 || parts[0].Status != StatusError || !strings.HasPrefix(parts[0].Error, "3:") {
+		t.Fatalf("parts = %+v, want one error part at line 3, as bash -n reports", parts)
+	}
+}
+
 func TestNodeEvalIsUnparsed(t *testing.T) {
 	t.Parallel()
 	cwd := fixture(t, "x.js")
@@ -300,5 +313,53 @@ func TestOversizeCommandIsOneUnparsedPart(t *testing.T) {
 	want := []Part{{Seq: 0, Lang: LangSh, Status: StatusUnparsed, Error: "command over 65536 bytes"}}
 	if !reflect.DeepEqual(over, want) {
 		t.Fatalf("parts = %+v\nwant    %+v", over, want)
+	}
+}
+
+// The Bash tool runs the user's $SHELL, zsh on macOS: a command bash cannot
+// parse is parsed again as zsh, and a zsh parameter expansion leaves its word
+// unknown while the program stays resolved. bash -c still parses as bash only.
+func TestZshOnlyCommandParses(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t, "x.txt", "y.txt")
+	for _, tc := range []struct {
+		name, command string
+		programs      []string
+	}{
+		{"split flag", `for id in ${=IDS}; do grep -c "$id" x.txt; done`, []string{"grep"}},
+		{"param flags over a command substitution", `for f in ${(f)"$(git ls-files)"}; do wc -l "$f"; done`, []string{"git", "wc"}},
+		{"split flag on a known value", `IDS=x.txt; cat ${=IDS}`, []string{"cat"}},
+		{"param flag on a known value", `IDS=x.txt; cat ${(f)IDS}`, []string{"cat"}},
+		{"zsh -c script", `zsh -c 'cat ${=IDS}'`, []string{"zsh", "cat"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parts := parseOne(t, cwd, tc.command, nil)
+			var programs []string
+			for _, p := range parts {
+				if p.Status == StatusError {
+					t.Fatalf("parts = %+v, want no error part", parts)
+				}
+				if p.Program == "cat" && len(p.Files) != 0 {
+					t.Fatalf("cat part = %+v, want no file: its word is a zsh split, unknown", p)
+				}
+				programs = append(programs, p.Program)
+			}
+			if strings.Join(programs, " ") != strings.Join(tc.programs, " ") {
+				t.Fatalf("programs = %q, want %q (parts %+v)", programs, tc.programs, parts)
+			}
+		})
+	}
+	for _, command := range []string{`echo ${=IDS`, `bash -c 'cat ${=IDS}'`} {
+		parts := parseOne(t, cwd, command, nil)
+		var errs int
+		for _, p := range parts {
+			if p.Status == StatusError {
+				errs++
+			}
+		}
+		if errs != 1 {
+			t.Fatalf("%q: parts = %+v, want one error part: invalid as bash, and zsh never runs it", command, parts)
+		}
 	}
 }

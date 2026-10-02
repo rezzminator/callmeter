@@ -32,7 +32,7 @@ const bashTool = "Bash"
 type seqStep struct {
 	shape     string // tool, or "Bash {program}"
 	file      string // "" when the call names no file
-	delivered int64
+	delivered *int64 // nil when the call has no delivered size
 }
 
 // seqOccurrence is where one run occurrence starts.
@@ -43,7 +43,8 @@ type runStat struct {
 	steps  int
 	occurs []seqOccurrence
 	agents map[int]bool
-	bytes  int64
+	bytes  int64 // summed over the known occurrences only
+	known  int64 // occurrences whose every call has a delivered size
 }
 
 // bashStepOf is a Bash call's step: its first non-trivial program's base name
@@ -104,18 +105,21 @@ func Sequences(ctx context.Context, store *callmeter.Store, f Filter, nameOf Nam
 		return nil, err
 	}
 	var agents [][]seqStep
-	var unparsed int64
+	var unparsed, unknown int64
 	lastKey := ""
 	where, args := f.where()
 	err = query(ctx, store, "calls in order",
 		`SELECT c.tool_use_id, COALESCE(c.session_id, ''), COALESCE(c.agent_id, ''), COALESCE(c.tool, ''),
-		COALESCE(c.file_path, ''), COALESCE(c.bytes_delivered, 0)
+		COALESCE(c.file_path, ''), c.bytes_delivered
 		FROM calls c WHERE `+where+` ORDER BY c.session_id, c.agent_id, c.ts, c.tool_use_id`, args,
 		func(r rowSource) error {
 			var id, session, agent, tool, path string
-			var delivered int64
+			var delivered *int64
 			if err := r.Scan(&id, &session, &agent, &tool, &path, &delivered); err != nil {
 				return err
+			}
+			if delivered == nil {
+				unknown++
 			}
 			step := seqStep{shape: tool, file: path, delivered: delivered}
 			if tool == bashTool {
@@ -148,8 +152,12 @@ func Sequences(ctx context.Context, store *callmeter.Store, f Filter, nameOf Nam
 	}
 	for _, s := range listed[:min(len(listed), f.limit())] {
 		occurs := int64(len(s.occurs))
+		mean := UnknownSize
+		if s.known > 0 {
+			mean = itoa(s.bytes / s.known)
+		}
 		t.Rows = append(t.Rows, []string{
-			s.key, itoa(occurs), itoa(int64(len(s.agents))), itoa(s.bytes), itoa(s.bytes / occurs),
+			s.key, itoa(occurs), itoa(int64(len(s.agents))), sizeCell(s.bytes, s.known, occurs-s.known), mean,
 		})
 	}
 	notes, err := gapNotes(ctx, store, f)
@@ -157,6 +165,10 @@ func Sequences(ctx context.Context, store *callmeter.Store, f Filter, nameOf Nam
 		return nil, err
 	}
 	t.Notes = notes
+	if unknown > 0 {
+		t.Notes = append(t.Notes, unknownSizeNote(unknown, "calls",
+			"BYTES or MEAN BYTES; a run occurrence holding one is left out whole"))
+	}
 	if unparsed > 0 {
 		t.Notes = append(
 			t.Notes,
@@ -183,8 +195,20 @@ func recurringRuns(agents [][]seqStep) []*runStat {
 				}
 				s.occurs = append(s.occurs, seqOccurrence{agent: ai, start: start})
 				s.agents[ai] = true
+				// An occurrence with a call of unknown size has an unknown
+				// size: left out whole, never summed as if that call were 0.
+				var bytes int64
+				whole := true
 				for _, step := range window {
-					s.bytes += step.delivered
+					if step.delivered == nil {
+						whole = false
+						break
+					}
+					bytes += *step.delivered
+				}
+				if whole {
+					s.bytes += bytes
+					s.known++
 				}
 			}
 		}

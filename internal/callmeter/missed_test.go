@@ -86,6 +86,32 @@ func TestIngestMissedTerminatedLinesAreTerminatedFaults(t *testing.T) {
 	}
 }
 
+// TestIngestMissedLinesCarryTheirSession: a line's optional fourth field, the
+// hook payload's session_id, becomes the fault's session; a three-field line
+// keeps no session, and a reason holding a tab whose last part is no session
+// id stays whole.
+func TestIngestMissedLinesCarryTheirSession(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	writeMissed(t, path,
+		"1790000001\tStop\tdownload failed\t0b5c4c1e-1111-2222-3333-444455556666\n"+
+			"1790000002\tPostToolUse\tkilled by signal\n"+
+			"1790000003\tSubagentStop\tterminated by SIGTERM\tsess_2.b\n"+
+			"1790000004\tStop\tcannot install /tmp/demo\tdir/callmeter\n")
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 4 {
+		t.Fatalf("IngestMissed = %d, %v; want 4, nil", n, err)
+	}
+	got := keys(t, store.DB(), "SELECT ts || '|' || stage || '|' || COALESCE(session_id, 'NULL') || '|' || error FROM faults ORDER BY ts")
+	want := "1790000001000|binary|0b5c4c1e-1111-2222-3333-444455556666|Stop: download failed," +
+		"1790000002000|binary|NULL|PostToolUse: killed by signal," +
+		"1790000003000|terminated|sess_2.b|SubagentStop: terminated by SIGTERM," +
+		"1790000004000|binary|NULL|Stop: cannot install /tmp/demo\tdir/callmeter"
+	if got != want {
+		t.Errorf("faults = %q\nwant %q", got, want)
+	}
+}
+
 func ingestLeftovers(t *testing.T, path string) []string {
 	t.Helper()
 	left, err := filepath.Glob(path + ".ingest-*")

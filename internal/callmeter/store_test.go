@@ -230,7 +230,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 func TestCreateSchemaWaitsOutAConcurrentWriter(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
-	writerDB, err := sqlitedb.OpenStore(ctx, path)
+	writerDB, err := sqlitedb.OpenStore(ctx, path, BusyTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +239,7 @@ func TestCreateSchemaWaitsOutAConcurrentWriter(t *testing.T) {
 			t.Errorf("close writer: %v", err)
 		}
 	})
-	creatorDB, err := sqlitedb.OpenStore(ctx, path)
+	creatorDB, err := sqlitedb.OpenStore(ctx, path, BusyTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,6 +311,12 @@ func TestOpenDBRetriesABusyOpenUntilTheCreatorIsDone(t *testing.T) {
 			t.Errorf("close creator connection: %v", err)
 		}
 	})
+	// A real creator is OpenDB, with a busy timeout: the retrying open holds a
+	// SHARED lock while it reads, and a creator with none would fail its COMMIT
+	// (which needs EXCLUSIVE) at once.
+	if _, err := creator.ExecContext(ctx, "PRAGMA busy_timeout=5000"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := creator.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
@@ -428,6 +434,38 @@ func TestPruneByAge(t *testing.T) {
 	}
 	if row(t, store, "command_parts", "tool_use_id = ?", "toolu_new") == nil {
 		t.Error("the recent call's command parts were pruned")
+	}
+}
+
+// TestPruneWithNothingExpiredLeavesNoArchiveBesideTheStore: a prune with no
+// row past the cutoff writes no file beside the store; the first row that ages
+// out creates archive.db and is moved into it.
+func TestPruneWithNothingExpiredLeavesNoArchiveBesideTheStore(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	archivePath := filepath.Join(filepath.Dir(store.path), ArchiveFile)
+	if err := store.UpsertCall(ctx, Call{ToolUseID: "toolu_new", TS: Ptr(cutoff.Add(time.Hour).UnixMilli())}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := store.Prune(ctx, cutoff)
+	if err != nil || removed != 0 {
+		t.Fatalf("Prune with nothing expired = %d, %v; want 0, nil", removed, err)
+	}
+	if _, err := os.Stat(archivePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Prune with nothing expired left %s (stat err %v), want no file", archivePath, err)
+	}
+	if err := store.UpsertCall(ctx, Call{ToolUseID: "toolu_old", TS: Ptr(cutoff.Add(-time.Hour).UnixMilli())}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err = store.Prune(ctx, cutoff); err != nil || removed != 1 {
+		t.Fatalf("Prune with one expired call = %d, %v; want 1, nil", removed, err)
+	}
+	if got := keys(t, openArchive(t, store), "SELECT tool_use_id FROM calls"); got != "toolu_old" {
+		t.Errorf("archived calls = %s, want toolu_old", got)
+	}
+	if got := keys(t, store.DB(), "SELECT tool_use_id FROM calls"); got != "toolu_new" {
+		t.Errorf("calls after prune = %s, want toolu_new", got)
 	}
 }
 

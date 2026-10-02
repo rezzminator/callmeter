@@ -106,7 +106,7 @@ func EnsureParsed(
 					SessionID: p.sessionID,
 					ToolUseID: p.call.ID,
 					Stage:     callmeter.StageParse,
-					Error:     fmt.Sprintf("part %d (%s): %s", part.Seq, part.Program, part.Error),
+					Error:     callmeter.ParseFault(part.Seq, part.Program, part.Error),
 				}); err != nil {
 					return summary, fmt.Errorf("callmeter report: record parse fault: %w", err)
 				}

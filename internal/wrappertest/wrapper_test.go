@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -393,16 +394,28 @@ func (r *rig) missed() []string {
 }
 
 // wantMissed asserts missed.log holds exactly one line for event and reason,
-// stamped with unix seconds near now.
+// with no session, stamped with unix seconds near now.
 func (r *rig) wantMissed(event, reason string) {
+	r.t.Helper()
+	r.wantMissedSession(event, reason, "")
+}
+
+// wantMissedSession asserts missed.log holds exactly one line for event,
+// reason and session, stamped with unix seconds near now; an empty session is
+// a line without the session field.
+func (r *rig) wantMissedSession(event, reason, session string) {
 	r.t.Helper()
 	lines := r.missed()
 	if len(lines) != 1 {
 		r.t.Fatalf("missed.log lines = %q, want exactly one", lines)
 	}
+	want := []string{event, reason}
+	if session != "" {
+		want = append(want, session)
+	}
 	fields := strings.Split(lines[0], "\t")
-	if len(fields) != 3 || !regexp.MustCompile(`^[0-9]+$`).MatchString(fields[0]) || fields[1] != event || fields[2] != reason {
-		r.t.Fatalf("missed line = %q, want {unix seconds}\\t%s\\t%s", lines[0], event, reason)
+	if !regexp.MustCompile(`^[0-9]+$`).MatchString(fields[0]) || !slices.Equal(fields[1:], want) {
+		r.t.Fatalf("missed line = %q, want {unix seconds}\\t%s", lines[0], strings.Join(want, "\\t"))
 	}
 	var seconds int64
 	if _, err := fmt.Sscan(fields[0], &seconds); err != nil || time.Now().Unix()-seconds > 30 || seconds-time.Now().Unix() > 30 {
@@ -525,6 +538,26 @@ func TestCacheHitRunsTheCachedBinary(t *testing.T) {
 	assertEqual(t, "stdout", res.stdout, "fake-callmeter args=report faults stdin=from stdin\n")
 	if r.hits.Load() != 0 {
 		t.Fatalf("server hit %d times, want 0", r.hits.Load())
+	}
+}
+
+// cache-hit tools: a cache hit runs no external command, so it starts no
+// process before the binary; with nothing on the PATH it still reads its
+// version, execs the cached binary and leaves no missed line.
+func TestCacheHitRunsNoExternalCommand(t *testing.T) {
+	for _, shell := range []string{"sh", "dash", "bash"} {
+		t.Run(shell, func(t *testing.T) {
+			r := newRig(t, rigOpts{})
+			r.pathEnv = t.TempDir()
+			r.seed(version, "#!/bin/sh\nprintf 'cache-ran %s\\n' \"$*\"\n")
+			res := r.runShell(shell, `{"session_id":"s","hook_event_name":"Stop"}`, nil, "hook")
+			if res.code != 0 || res.stdout != "cache-ran hook\n" {
+				t.Fatalf("exit %d stdout %q stderr %q, want 0 and the cached binary's line", res.code, res.stdout, res.stderr)
+			}
+			if lines := r.missed(); lines != nil {
+				t.Fatalf("missed.log = %q, want none", lines)
+			}
+		})
 	}
 }
 
@@ -902,7 +935,7 @@ func TestHookKilledBeforeTheBinaryIsMissed(t *testing.T) {
 	if err := os.MkdirAll(lock, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	p := r.start("sh", `{"hook_event_name":"SessionEnd","reason":"other"}`, nil, "hook")
+	p := r.start("sh", `{"session_id":"s-killed","hook_event_name":"SessionEnd","reason":"other"}`, nil, "hook")
 	time.Sleep(1500 * time.Millisecond)
 	p.signal(syscall.SIGTERM)
 	res := p.wait()
@@ -910,7 +943,7 @@ func TestHookKilledBeforeTheBinaryIsMissed(t *testing.T) {
 		t.Fatalf("a killed hook must exit 0, got %d", res.code)
 	}
 	assertEqual(t, "stdout", res.stdout, "")
-	r.wantMissed("SessionEnd", "killed by signal")
+	r.wantMissedSession("SessionEnd", "killed by signal", "s-killed")
 }
 
 // kill during download: the signal is handled once curl, waiting on a slow
@@ -1089,19 +1122,27 @@ func TestHomeResolution(t *testing.T) {
 	}
 }
 
-// missed line: the event comes from stdin, `unknown` when there is none.
+// missed line: the event and the session come from stdin, the event `unknown`
+// and the session field left out when there is none.
 func TestMissedLineEvent(t *testing.T) {
+	const uuid = "0b5c4c1e-1111-2222-3333-444455556666"
 	cases := []struct {
-		name, stdin, event string
+		name, stdin, event, session string
 	}{
-		{"compact", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash"}`, "PreToolUse"},
-		{"spaced and multi-line", "{\n  \"session_id\": \"s\",\n  \"hook_event_name\" : \"SessionEnd\"\n}\n", "SessionEnd"},
-		{"escaped decoy inside a prompt first", `{"prompt":"say \"hook_event_name\":\"Fake\" now","hook_event_name":"UserPromptSubmit"}`, "UserPromptSubmit"},
-		{"first of two", `{"hook_event_name":"Stop","nested":{"hook_event_name":"Other"}}`, "Stop"},
-		{"no key", `{"session_id":"s"}`, "unknown"},
-		{"empty stdin", ``, "unknown"},
-		{"not json", "\x00\x01\x02 garbage \xff", "unknown"},
-		{"value outside the event alphabet", `{"hook_event_name":"a\tb"}`, "unknown"},
+		{"compact", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash"}`, "PreToolUse", "s"},
+		{"spaced and multi-line", "{\n  \"session_id\": \"s\",\n  \"hook_event_name\" : \"SessionEnd\"\n}\n", "SessionEnd", "s"},
+		{"escaped decoy inside a prompt first", `{"prompt":"say \"hook_event_name\":\"Fake\" now","hook_event_name":"UserPromptSubmit"}`, "UserPromptSubmit", ""},
+		{"first of two", `{"hook_event_name":"Stop","nested":{"hook_event_name":"Other"}}`, "Stop", ""},
+		{"no key", `{"session_id":"s"}`, "unknown", "s"},
+		{"empty stdin", ``, "unknown", ""},
+		{"not json", "\x00\x01\x02 garbage \xff", "unknown", ""},
+		{"value outside the event alphabet", `{"hook_event_name":"a\tb"}`, "unknown", ""},
+		{"a captured payload's session", `{"session_id":"` + uuid + `","transcript_path":"/tmp/demo-home/t.jsonl","cwd":"/tmp/demo-proj","hook_event_name":"StopFailure"}`, "StopFailure", uuid},
+		{"escaped session decoy inside a prompt first", `{"prompt":"say \"session_id\":\"fake\" now","session_id":"` + uuid + `","hook_event_name":"UserPromptSubmit"}`, "UserPromptSubmit", uuid},
+		{"session first of two", `{"session_id":"outer","tool_input":{"session_id":"inner"},"hook_event_name":"PreToolUse"}`, "PreToolUse", "outer"},
+		{"session outside the id alphabet", `{"session_id":"a b\tc","hook_event_name":"Stop"}`, "Stop", ""},
+		{"session not a string", `{"session_id":42,"hook_event_name":"Stop"}`, "Stop", ""},
+		{"keys after a 1 MB value", `{"tool_response":"` + strings.Repeat("x", 1<<20) + `","session_id":"` + uuid + `","hook_event_name":"PostToolUse"}`, "PostToolUse", uuid},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1110,7 +1151,7 @@ func TestMissedLineEvent(t *testing.T) {
 			if res.code != 0 || res.stdout != "" {
 				t.Fatalf("exit %d stdout %q, want 0 and empty", res.code, res.stdout)
 			}
-			r.wantMissed(tc.event, "download failed")
+			r.wantMissedSession(tc.event, "download failed", tc.session)
 		})
 	}
 }

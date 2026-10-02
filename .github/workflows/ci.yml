@@ -28,7 +28,7 @@ jobs:
         run: claude plugin validate --strict .
       - name: validate the plugin
         run: claude plugin validate --strict plugins/callmeter
-      - name: leak check
+      - name: leak gate
         env:
           LEAK_TERMS_CONTENT: ${{ secrets.LEAK_TERMS }}
         run: |

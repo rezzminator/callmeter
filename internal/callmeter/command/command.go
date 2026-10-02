@@ -97,6 +97,27 @@ func parseFlagsAnywhere(flags *flag.FlagSet, args []string) ([]string, int, bool
 	}
 }
 
+// QuietAfterEnv names the variable that replaces callmeter.QuietAfter for one
+// report run: a Go duration, zero or more. The e2e sets it low to settle a
+// session it has just run; unset, recovery waits QuietAfter.
+const QuietAfterEnv = "CALLMETER_QUIET_AFTER"
+
+// quietAfter is the quiet recovery waits for this run, from QuietAfterEnv;
+// false, after a line on stderr, when the value is not a duration of zero or
+// more.
+func quietAfter(getenv paths.Getenv, stderr io.Writer) (time.Duration, bool) {
+	value := getenv(QuietAfterEnv)
+	if value == "" {
+		return callmeter.QuietAfter, true
+	}
+	quiet, err := time.ParseDuration(value)
+	if err != nil || quiet < 0 {
+		fmt.Fprintf(stderr, "callmeter report: %s=%q is not a duration of zero or more, such as 1ms or 2h\n", QuietAfterEnv, value)
+		return 0, false
+	}
+	return quiet, true
+}
+
 func reportAction(
 	ctx context.Context,
 	args []string,
@@ -121,6 +142,10 @@ func reportAction(
 	filter, code, ok := buildFilter(values, now, stderr)
 	if !ok {
 		return code
+	}
+	quiet, ok := quietAfter(getenv, stderr)
+	if !ok {
+		return 2
 	}
 	home, err := paths.Home(getenv)
 	if err != nil {
@@ -156,6 +181,17 @@ func reportAction(
 	if _, err := report.PruneExpired(ctx, db, now); err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
 		return 1
+	}
+	// Sessions gone quiet are settled from their transcripts before the topic
+	// reads the store: a call a killed session left in flight, a request no
+	// hook swept.
+	recovered, err := db.RecoverQuiet(ctx, now, quiet)
+	if err != nil {
+		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: %v\n", err)
+		return 1
+	}
+	for _, skipped := range recovered.Skipped {
+		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: skipped: %v\n", skipped)
 	}
 	if _, err := report.EnsureParsed(ctx, db, getenv("HOME"), nil); err != nil {
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)

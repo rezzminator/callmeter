@@ -79,7 +79,7 @@ func TestTokensAgentTypeNarrowsAndPendingIsANoteNotARow(t *testing.T) {
 	if table.Rows[0][2] != "2" {
 		t.Errorf("opus requests = %s, want the pending request left out of the count", table.Rows[0][2])
 	}
-	if len(table.Notes) != 1 || table.Notes[0] != "1 requests still pending (context size not yet read from the transcript)" {
+	if len(table.Notes) != 1 || table.Notes[0] != "1 requests still pending (its session has not ended: still live, or killed before its Stop): context size unknown, not counted" {
 		t.Errorf("notes = %q, want the pending note", table.Notes)
 	}
 }

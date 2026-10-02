@@ -1,0 +1,1229 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/rezzminator/callmeter/internal/callmeter"
+)
+
+// The fixture: one invented session with a Bash and an Agent call in one
+// two-block message, a sub-agent making one Read call and a closing text
+// message, and a store holding exactly the rows those transcripts imply.
+
+const (
+	fxSession = "11111111-aaaa-4bbb-8ccc-000000000001"
+	fxAgent   = "a0000000000000001"
+	fxPrompt  = "22222222-aaaa-4bbb-8ccc-000000000002"
+	fxSecret  = "invented-secret-text"
+)
+
+var fxBase = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func fxTS(sec float64) string {
+	return fxBase.Add(time.Duration(sec * float64(time.Second))).Format(time.RFC3339Nano)
+}
+
+func fxMS(sec float64) int64 {
+	return fxBase.Add(time.Duration(sec * float64(time.Second))).UnixMilli()
+}
+
+func jsonLine(t *testing.T, v map[string]any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal fixture line: %v", err)
+	}
+	return string(b)
+}
+
+func assistantLine(t *testing.T, sec float64, msgID string, out int64, stop any, content ...map[string]any) string {
+	return jsonLine(t, map[string]any{
+		"type": "assistant", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli",
+		"message": map[string]any{
+			"id": msgID, "model": "claude-demo", "stop_reason": stop, "content": content,
+			"usage": map[string]any{"input_tokens": 3, "output_tokens": out, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20},
+		},
+	})
+}
+
+func toolUse(id, name string) map[string]any {
+	return map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{"command": fxSecret}}
+}
+
+func toolResult(t *testing.T, sec float64, id string) string {
+	return jsonLine(t, map[string]any{
+		"type": "user", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli",
+		"message": map[string]any{"role": "user", "content": []map[string]any{{"type": "tool_result", "tool_use_id": id, "is_error": false, "content": fxSecret}}},
+	})
+}
+
+func promptLine(t *testing.T, sec float64) string {
+	return jsonLine(t, map[string]any{
+		"type": "user", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli", "promptId": fxPrompt,
+		"message": map[string]any{"role": "user", "content": fxSecret},
+	})
+}
+
+type fixture struct {
+	dir, db, projects, main, allow string
+}
+
+// mainLines and agentLines are the matching transcripts; a case appends to them.
+func mainLines(t *testing.T) []string {
+	return []string{
+		promptLine(t, 1),
+		// One message, two content blocks: the first line carries the streaming
+		// partial usage, the last the final one.
+		assistantLine(t, 2, "msg_A1", 5, nil, toolUse("toolu_A1", "Bash")),
+		assistantLine(t, 2.1, "msg_A1", 50, "tool_use", toolUse("toolu_A2", "Agent")),
+		toolResult(t, 3, "toolu_A1"),
+		toolResult(t, 20, "toolu_A2"),
+		jsonLine(t, map[string]any{"type": "system", "subtype": "turn_duration", "timestamp": fxTS(21), "sessionId": fxSession, "entrypoint": "cli"}),
+	}
+}
+
+func agentLines(t *testing.T) []string {
+	return []string{
+		promptLine(t, 5),
+		assistantLine(t, 6, "msg_B1", 40, "tool_use", toolUse("toolu_B1", "Read")),
+		toolResult(t, 7, "toolu_B1"),
+		assistantLine(t, 8, "msg_B2", 30, "end_turn", map[string]any{"type": "text", "text": fxSecret}),
+	}
+}
+
+func writeLines(t *testing.T, path string, lines []string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func newFixture(t *testing.T, extraMain, extraSQL []string) fixture {
+	t.Helper()
+	dir := t.TempDir()
+	f := fixture{dir: dir, db: filepath.Join(dir, "snap", "callmeter.db"), projects: filepath.Join(dir, "projects"), allow: filepath.Join(dir, "allowlist.txt")}
+	f.main = filepath.Join(f.projects, "-tmp-demo-proj", fxSession+".jsonl")
+	writeLines(t, f.main, append(mainLines(t), extraMain...))
+	sub := filepath.Join(f.projects, "-tmp-demo-proj", fxSession, "subagents")
+	writeLines(t, filepath.Join(sub, "agent-"+fxAgent+".jsonl"), agentLines(t))
+	if err := os.WriteFile(filepath.Join(sub, "agent-"+fxAgent+".meta.json"), []byte(`{"agentType":"demo-agent","toolUseId":"toolu_A2"}`), 0o600); err != nil {
+		t.Fatalf("write meta: %v", err)
+	}
+	if err := os.WriteFile(f.allow, []byte("# empty\n"), 0o600); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+
+	ctx := context.Background()
+	store, err := callmeter.OpenDB(ctx, f.db)
+	if err != nil {
+		t.Fatalf("create fixture store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close fixture store: %v", err)
+		}
+	}()
+	rows := []string{
+		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, model, start_source, transcript_path) VALUES('%s', %d, %d, 'claude-demo', 'startup', '%s')`, fxSession, fxMS(0.5), fxMS(21), f.main),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('e1', 'SessionStart', %d, '%s', 'startup')`, fxMS(0.5), fxSession),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e2', 'UserPromptSubmit', %d, '%s', '%s')`, fxMS(1), fxSession, fxPrompt),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, agent_id, agent_type) VALUES('e3', 'SubagentStart', %d, '%s', '%s', 'demo-agent')`, fxMS(5), fxSession, fxAgent),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, agent_id, agent_type) VALUES('e4', 'SubagentStop', %d, '%s', '%s', 'demo-agent')`, fxMS(9), fxSession, fxAgent),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e5', 'Stop', %d, '%s')`, fxMS(21), fxSession),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('e5end', 'SessionEnd', %d, '%s', 'other')`, fxMS(21), fxSession),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A1', '%s', 'msg_A1', %d, 'Bash', 10, 0)`, fxSession, fxMS(2)),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A2', '%s', 'msg_A1', %d, 'Agent', 10, 0)`, fxSession, fxMS(2.1)),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, request_id, ts, tool, bytes_real, failed) VALUES('toolu_B1', '%s', '%s', 'demo-agent', 'msg_B1', %d, 'Read', 10, 0)`, fxSession, fxAgent, fxMS(6)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A1', '%s', %d, 'claude-demo', 'tool_use', 3, 50, 100, 20, 2, 0)`, fxSession, fxMS(2)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B1', '%s', '%s', %d, 'claude-demo', 'tool_use', 3, 40, 100, 20, 1, 0)`, fxSession, fxAgent, fxMS(6)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B2', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 30, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(8)),
+		fmt.Sprintf(`INSERT INTO agents(agent_id, session_id, agent_type, parent_tool_use_id, started, stopped, tool_uses) VALUES('%s', '%s', 'demo-agent', 'toolu_A2', %d, %d, 1)`, fxAgent, fxSession, fxMS(5), fxMS(9)),
+		fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started, stopped) VALUES('%s', 1, '%s', 'demo-agent', %d, %d)`, fxAgent, fxSession, fxMS(5), fxMS(9)),
+		`INSERT INTO command_parts(tool_use_id, seq, lang, program, parse_status, parser) VALUES('toolu_A1', 1, 'sh', 'echo', 'ok', 1)`,
+	}
+	for _, q := range append(rows, extraSQL...) {
+		if _, err := store.DB().ExecContext(ctx, q); err != nil {
+			t.Fatalf("fixture row %q: %v", q, err)
+		}
+	}
+	return f
+}
+
+func (f fixture) run(t *testing.T, since string) (int, string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	code := run([]string{
+		"--db", f.db, "--since", since, "--until", "2030-01-01T01:00:00Z",
+		"--projects", f.projects, "--allowlist", f.allow, "--scratch", filepath.Join(f.dir, "scratch"),
+	}, &out, &errOut)
+	if code == 2 {
+		t.Fatalf("reconcile could not run: %s", errOut.String())
+	}
+	if strings.Contains(out.String(), fxSecret) {
+		t.Fatalf("output carries transcript content:\n%s", out.String())
+	}
+	return code, out.String()
+}
+
+func TestMatchingFixtureIsClean(t *testing.T) {
+	f := newFixture(t, nil, nil)
+	code, out := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 0 || !strings.Contains(out, "sessions compared 1, transcripts read 2,") || !strings.Contains(out, "mismatches 0 unexplained 0 expected; by class: none") {
+		t.Fatalf("exit %d, want 0 and a clean summary:\n%s", code, out)
+	}
+}
+
+func TestSeededMismatchIsCaught(t *testing.T) {
+	cases := []struct {
+		name, class string
+		extraMain   []string
+		sql         []string
+	}{
+		// calls
+		{name: "call row missing", class: "call-missing", sql: []string{`DELETE FROM calls WHERE tool_use_id='toolu_B1'`}},
+		{name: "sub-agent call attributed to the main chat", class: "call-agent", sql: []string{`UPDATE calls SET agent_id=NULL WHERE tool_use_id='toolu_B1'`}},
+		{name: "sub-agent call with the wrong agent type", class: "call-agent-type", sql: []string{`UPDATE calls SET agent_type='other' WHERE tool_use_id='toolu_B1'`}},
+		{name: "call without a size", class: "call-no-size", sql: []string{`UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_A1'`}},
+		{name: "call row without a ts", class: "call-no-ts", sql: []string{`UPDATE calls SET ts=NULL WHERE tool_use_id='toolu_A1'`}},
+		{name: "store call absent from every transcript", class: "call-extra", sql: []string{fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, ts, tool) VALUES('toolu_Z9', '%s', %d, 'Bash')`, fxSession, fxMS(4))}},
+		// requests and tokens
+		{name: "request row missing", class: "request-missing", sql: []string{`DELETE FROM requests WHERE request_id='msg_A1'`}},
+		{name: "request kept the first block's partial usage", class: "request-tokens", sql: []string{`UPDATE requests SET output_tokens=5 WHERE request_id='msg_A1'`}},
+		{name: "token sums disagree", class: "token-sum", sql: []string{`UPDATE requests SET cache_read_tokens=1 WHERE request_id='msg_B1'`}},
+		{name: "text-only message has no request row", class: "request-untracked", extraMain: textOnlyTurn(t), sql: textOnlyStop()},
+		{name: "request still pending", class: "request-pending", sql: []string{`UPDATE requests SET pending=1 WHERE request_id='msg_B2'`}},
+		// agents and agent_turns
+		{name: "agent row missing", class: "agent-missing", sql: []string{`DELETE FROM agents`}},
+		{name: "agent parent wrong", class: "agent-parent", sql: []string{`UPDATE agents SET parent_tool_use_id='toolu_A1'`}},
+		{name: "extra agent turn", class: "agent-turns", sql: []string{fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, stopped) VALUES('%s', 2, '%s', %d)`, fxAgent, fxSession, fxMS(9.5))}},
+		{name: "agent turn without a start", class: "agent-turn-no-start", sql: []string{`UPDATE agent_turns SET started=NULL`}},
+		// command_parts
+		{name: "Bash part unparsed", class: "parse-unparsed", sql: []string{`UPDATE command_parts SET parse_status='unparsed'`}},
+		{name: "Bash part failed to parse", class: "parse-error", sql: []string{`UPDATE command_parts SET parse_status='error'`}},
+		// lifecycle events
+		{name: "Stop missing", class: "event-stop", sql: []string{`DELETE FROM events WHERE event='Stop'`}},
+		{name: "SessionStart missing", class: "event-no-sessionstart", sql: []string{`DELETE FROM events WHERE event='SessionStart'`}},
+		{name: "UserPromptSubmit missing", class: "event-prompt-missing", sql: []string{`DELETE FROM events WHERE event='UserPromptSubmit'`}},
+		{name: "compaction without events", class: "event-compact", extraMain: []string{jsonLine(t, map[string]any{"type": "system", "subtype": "compact_boundary", "timestamp": fxTS(22), "sessionId": fxSession, "entrypoint": "cli"})}},
+		{name: "API error without StopFailure", class: "event-stopfailure", extraMain: []string{jsonLine(t, map[string]any{"type": "assistant", "timestamp": fxTS(22), "sessionId": fxSession, "isApiErrorMessage": true, "message": map[string]any{"id": "msg_err", "model": "<synthetic>", "content": []map[string]any{}}})}},
+		{name: "slash-led prompt bound for the model without UserPromptSubmit", class: "event-prompt-missing", extraMain: []string{userText(t, 22, fxPrompt2, "/tmp/demo-file "+fxSecret)}},
+		// sessions
+		{name: "session without a model", class: "session-no-model", sql: []string{`UPDATE sessions SET model=NULL`}},
+		// the window edge: a call whose result is in, still without a request row
+		{name: "returned call without a request row", class: "call-no-request", sql: []string{`UPDATE calls SET request_id=NULL WHERE tool_use_id='toolu_A1'`}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, c.extraMain, c.sql)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != 1 || !strings.Contains(out, "MISMATCH "+c.class+" ") {
+				t.Fatalf("exit %d, want 1 and a %s mismatch:\n%s", code, c.class, out)
+			}
+		})
+	}
+}
+
+const (
+	fxPrompt2  = "22222222-aaaa-4bbb-8ccc-000000000003"
+	fxSession2 = "11111111-aaaa-4bbb-8ccc-000000000009"
+)
+
+// userText is a typed user line whose content is a plain string.
+func userText(t *testing.T, sec float64, promptID, text string) string {
+	return jsonLine(t, map[string]any{
+		"type": "user", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli", "promptId": promptID,
+		"message": map[string]any{"role": "user", "content": text},
+	})
+}
+
+// TestRealShapesAreReadRight seeds shapes Claude Code really writes that an
+// earlier reading of the transcripts or the store took for a mismatch.
+func TestRealShapesAreReadRight(t *testing.T) {
+	cases := []struct {
+		name         string
+		extraMain    []string
+		sql          []string
+		want, absent []string // classes that must, and must not, print
+		pending      []string // states not yet due at --until: PENDING, never a mismatch
+		otherMain    []string // a second session's transcript; {sub} in sql names its directory
+	}{
+		{
+			// A Stop hook that blocks the turn's end makes Claude Code fire Stop
+			// again in the same turn with stop_hook_active true: one turn, two Stops.
+			name: "blocked Stop fired again with stop_hook_active",
+			sql: []string{
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e6', 'Stop', %d, '%s')`, fxMS(21.2), fxSession),
+				fmt.Sprintf(`INSERT INTO turns(event_id, event, session_id, ts, stop_hook_active) VALUES('e5', 'Stop', '%s', %d, 0)`, fxSession, fxMS(21)),
+				fmt.Sprintf(`INSERT INTO turns(event_id, event, session_id, ts, stop_hook_active) VALUES('e6', 'Stop', '%s', %d, 1)`, fxSession, fxMS(21.2)),
+			},
+			absent: []string{"event-stop"},
+		},
+		{
+			// A typed /compact is written as a raw line with a promptId; it fires
+			// PreCompact with that promptId, never UserPromptSubmit.
+			name: "typed /compact and local commands are not model prompts",
+			extraMain: []string{
+				userText(t, 22, fxPrompt2, "/compact"),
+				userText(t, 23, "22222222-aaaa-4bbb-8ccc-000000000004", "/compact keep "+fxSecret),
+				userText(t, 24, "22222222-aaaa-4bbb-8ccc-000000000005", "/model"),
+			},
+			sql:    []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id, trigger) VALUES('e7', 'PreCompact', %d, '%s', '%s', 'manual')`, fxMS(22.05), fxSession, fxPrompt2)},
+			absent: []string{"event-prompt-missing"},
+		},
+		{
+			// A call still running at the snapshot: its request row is written at
+			// PostToolBatch, after the call returns.
+			name:      "call still running at the window's end",
+			extraMain: []string{assistantLine(t, 22, "msg_A4", 7, "tool_use", toolUse("toolu_A4", "Read"))},
+			sql:       []string{fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, ts, tool) VALUES('toolu_A4', '%s', %d, 'Read')`, fxSession, fxMS(22))},
+			pending:   []string{"request-in-flight", "call-in-flight"},
+			// its tokens wait with it: no store row can hold them yet
+			absent: []string{"request-missing", "call-no-request", "token-sum"},
+		},
+		{
+			// A text-only reply's request is written by the sweep at its turn's
+			// Stop (SubagentStop, SessionEnd); before any of them it is open.
+			name:      "text-only message whose turn has not ended yet",
+			extraMain: []string{assistantLine(t, 22, "msg_A3", 9, "end_turn", map[string]any{"type": "text", "text": fxSecret})},
+			pending:   []string{"request-untracked-open"},
+			absent:    []string{"request-untracked"},
+		},
+		{
+			// command_parts are written at report time only: a Bash call newer
+			// than every parsed one waits for the next report.
+			name:    "Bash call no report has parsed yet",
+			sql:     []string{`DELETE FROM command_parts`},
+			pending: []string{"parts-pending-report"},
+			absent:  []string{"parts-missing"},
+		},
+		{
+			// A batch whose message id was not yet on disk at PostToolBatch holds
+			// the provisional key until the chat's next batch or Stop fills it; at
+			// the snapshot none has come yet. One batch, reported once.
+			name: "pending request with no later batch or Stop yet",
+			extraMain: []string{
+				assistantLine(t, 22, "msg_A4", 7, "tool_use", toolUse("toolu_A4", "Read")),
+				toolResult(t, 22.5, "toolu_A4"),
+				// the chat's next batch is still running: it fills nothing yet
+				assistantLine(t, 23, "msg_A5", 7, "tool_use", toolUse("toolu_A5", "Read")),
+			},
+			sql: []string{
+				fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, ts, tool) VALUES('toolu_A5', '%s', %d, 'Read')`, fxSession, fxMS(23)),
+				fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A4', '%s', 'pending:toolu_A4', %d, 'Read', 10, 0)`, fxSession, fxMS(22)),
+				fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, calls, pending) VALUES('pending:toolu_A4', '%s', %d, 1, 1)`, fxSession, fxMS(22)),
+			},
+			pending: []string{"request-pending-open"},
+			absent:  []string{"request-missing", "request-pending ", "token-sum"},
+		},
+		{
+			// The store recorded a session whose transcript is gone from disk: that
+			// says nothing about whether it reached the model.
+			name: "recorded session whose transcript is gone",
+			sql: []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, model, start_source, transcript_path) VALUES('%s', %d, 'claude-demo', 'startup', '/nonexistent/demo/%s.jsonl')`, fxSession2, fxMS(1), fxSession2),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e8', 'UserPromptSubmit', %d, '%s', '%s')`, fxMS(1), fxSession2, fxPrompt2),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e9', 'Stop', %d, '%s')`, fxMS(2), fxSession2),
+			},
+			want:   []string{"session-no-transcript"},
+			absent: []string{"session-promptless"},
+		},
+		{
+			// A session whose one turn the API refused (model_not_found, a rate
+			// limit) holds a synthetic API error message and no model message:
+			// it reached the model, and its StopFailure is checked on its own.
+			name: "session whose only turn ended in an API error",
+			sql: []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, start_source, transcript_path) VALUES('%s', %d, 'startup', '{sub}/%s.jsonl')`, fxSession2, fxMS(1), fxSession2),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e8', 'UserPromptSubmit', %d, '%s', '%s')`, fxMS(1), fxSession2, fxPrompt2),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, error_type) VALUES('e9', 'StopFailure', %d, '%s', 'model_not_found')`, fxMS(2), fxSession2),
+			},
+			otherMain: []string{
+				jsonLine(t, map[string]any{"type": "user", "timestamp": fxTS(1), "sessionId": fxSession2, "entrypoint": "sdk-cli", "promptId": fxPrompt2, "message": map[string]any{"role": "user", "content": fxSecret}}),
+				jsonLine(t, map[string]any{"type": "assistant", "timestamp": fxTS(2), "sessionId": fxSession2, "entrypoint": "sdk-cli", "isApiErrorMessage": true, "message": map[string]any{"id": "msg_err2", "model": "<synthetic>", "content": []map[string]any{}}}),
+			},
+			absent: []string{"session-promptless", "event-stopfailure"},
+		},
+		{
+			// A store row of a session first recorded before --since is not
+			// compared: no transcript of it was read.
+			name: "row of a session recorded before the window",
+			sql: []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, model, transcript_path) VALUES('%s', %d, 'claude-demo', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(-3600), fxSession2),
+				fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_C1', '%s', 'msg_C1', %d, 'Read', 10, 0)`, fxSession2, fxMS(3)),
+				fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, calls, pending) VALUES('msg_C1', '%s', %d, 'claude-demo', 'tool_use', 1, 0)`, fxSession2, fxMS(3)),
+			},
+			absent: []string{"call-extra", "request-extra"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sql := make([]string, len(c.sql))
+			for i, q := range c.sql {
+				sql[i] = strings.ReplaceAll(q, "{sub}", dir)
+			}
+			if len(c.otherMain) > 0 {
+				writeLines(t, filepath.Join(dir, fxSession2+".jsonl"), c.otherMain)
+			}
+			f := newFixture(t, c.extraMain, sql)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			for _, class := range c.pending {
+				if !strings.Contains(out, "PENDING "+class+" ") || strings.Contains(out, "MISMATCH "+class+" ") {
+					t.Errorf("%s did not print as PENDING alone:\n%s", class, out)
+				}
+			}
+			if len(c.pending) > 0 && len(c.want) == 0 && code != 0 {
+				t.Errorf("exit %d, want 0: a state not yet due is no mismatch:\n%s", code, out)
+			}
+			for _, class := range c.absent {
+				if strings.Contains(out, " "+class+" ") {
+					t.Errorf("a %s mismatch printed for a real shape:\n%s", class, out)
+				}
+			}
+			for _, class := range c.want {
+				if !strings.Contains(out, "MISMATCH "+class+" ") {
+					t.Errorf("no %s mismatch:\n%s", class, out)
+				}
+			}
+		})
+	}
+}
+
+func TestNoSessionComparedFails(t *testing.T) {
+	f := newFixture(t, nil, nil)
+	code, out := f.run(t, "2030-01-01T00:30:00Z")
+	if code != 1 || !strings.Contains(out, "sessions compared 0,") || !strings.Contains(out, "FAIL: 0 sessions compared") {
+		t.Fatalf("exit %d, want 1 and the 0-sessions failure:\n%s", code, out)
+	}
+}
+
+func TestAllowlistedMismatchPrintsItsReason(t *testing.T) {
+	f := newFixture(t, nil, []string{`UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_A1'`})
+	if err := os.WriteFile(f.allow, []byte("call-no-size | toolu_A1 | invented reason for the test\n"), 0o600); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+	code, out := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 0 || !strings.Contains(out, "EXPECTED call-no-size session="+fxSession+" ids=toolu_A1") || !strings.Contains(out, "expected: invented reason for the test") {
+		t.Fatalf("exit %d, want 0 and the expected line:\n%s", code, out)
+	}
+}
+
+func TestLiveStoreRefused(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("home: %v", err)
+	}
+	live := filepath.Join(home, ".local", "state", "callmeter")
+	if err := os.MkdirAll(live, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var out, errOut bytes.Buffer
+	code := run([]string{"--db", filepath.Join(live, "callmeter.db"), "--since", "2030-01-01T00:00:00Z"}, &out, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "live store") {
+		t.Fatalf("exit %d, want 2 and a live-store refusal: %s", code, errOut.String())
+	}
+}
+
+// TestWildcardIsRefused: an allowlist entry explains named rows, never a whole
+// class, so `*` is refused for every class.
+func TestWildcardIsRefused(t *testing.T) {
+	for _, class := range []string{"call-no-ts", "call-no-size", "request-tokens"} {
+		f := newFixture(t, nil, []string{`UPDATE calls SET ts=NULL WHERE tool_use_id='toolu_A1'`})
+		if err := os.WriteFile(f.allow, []byte(class+" | * | invented reason for the test\n"), 0o600); err != nil {
+			t.Fatalf("write allowlist: %v", err)
+		}
+		var out, errOut bytes.Buffer
+		code := run([]string{
+			"--db", f.db, "--since", "2030-01-01T00:00:00Z", "--until", "2030-01-01T01:00:00Z",
+			"--projects", f.projects, "--allowlist", f.allow,
+		}, &out, &errOut)
+		if code != 2 || !strings.Contains(errOut.String(), class+": `*` is refused") {
+			t.Fatalf("exit %d, want 2 and a refusal naming %s: %s%s", code, class, errOut.String(), out.String())
+		}
+	}
+}
+
+// TestNoTSCallIsExplainedByIDAlone: a call row with no ts is a capture gap per
+// call; a `ts<` scope cannot reach it, only its id.
+func TestNoTSCallIsExplainedByIDAlone(t *testing.T) {
+	f := newFixture(t, nil, []string{`UPDATE calls SET ts=NULL WHERE tool_use_id='toolu_A1'`})
+	if err := os.WriteFile(f.allow, []byte("call-no-ts | ts<2031-01-01T00:00:00Z | invented reason for the test\n"), 0o600); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH call-no-ts ") {
+		t.Fatalf("exit %d: a ts scope explained a row without a ts:\n%s", code, out)
+	}
+	if err := os.WriteFile(f.allow, []byte("call-no-ts | toolu_A1 | invented reason for the test\n"), 0o600); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+	code, got := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 0 || !strings.Contains(got, "EXPECTED call-no-ts session="+fxSession+" ids=toolu_A1") {
+		t.Fatalf("exit %d, want 0 and the expected call-no-ts line:\n%s", code, got)
+	}
+}
+
+// TestBatchOnlyCallIsItsOwnClass: a tool a function-hooks plugin answers in
+// its own tool.call hook (mcp__sub-agent-compact__compact) fires no PreToolUse,
+// PostToolUse or PostToolUseFailure; only PostToolBatch names it, so its row
+// has a delivered size and nothing else. That is one class, call-batch-only,
+// never call-no-size or call-no-ts, and the allowlist explains it per tool.
+func TestBatchOnlyCallIsItsOwnClass(t *testing.T) {
+	batchOnly := `UPDATE calls SET failed=NULL, bytes_real=NULL, bytes_delivered=95 WHERE tool_use_id='toolu_A1'`
+	for _, c := range []struct {
+		name string
+		sql  []string
+	}{
+		{name: "batch set the ts", sql: []string{batchOnly}},
+		{name: "a legacy row without a ts", sql: []string{batchOnly, `UPDATE calls SET ts=NULL WHERE tool_use_id='toolu_A1'`}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != 1 || !strings.Contains(out, "MISMATCH call-batch-only session="+fxSession+" ids=toolu_A1,tool=Bash") {
+				t.Fatalf("exit %d, want 1 and a call-batch-only mismatch naming its tool:\n%s", code, out)
+			}
+			for _, class := range []string{"call-no-size", "call-no-ts"} {
+				if strings.Contains(out, " "+class+" ") {
+					t.Errorf("a batch-only call also reads as %s:\n%s", class, out)
+				}
+			}
+		})
+	}
+	t.Run("explained per tool, the tool name exact", func(t *testing.T) {
+		f := newFixture(t, nil, []string{batchOnly})
+		if err := os.WriteFile(f.allow, []byte("call-batch-only | tool=Bas | a prefix of the tool name\n"), 0o600); err != nil {
+			t.Fatalf("write allowlist: %v", err)
+		}
+		if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || strings.Contains(out, "EXPECTED call-batch-only") {
+			t.Fatalf("exit %d: a tool-name prefix explained the call:\n%s", code, out)
+		}
+		if err := os.WriteFile(f.allow, []byte("call-batch-only | tool=Bash | invented reason for the test\n"), 0o600); err != nil {
+			t.Fatalf("write allowlist: %v", err)
+		}
+		code, out := f.run(t, "2030-01-01T00:00:00Z")
+		if code != 0 || !strings.Contains(out, "EXPECTED call-batch-only session="+fxSession+" ids=toolu_A1,tool=Bash") || !strings.Contains(out, "expected: invented reason for the test") {
+			t.Fatalf("exit %d, want 0 and the expected line:\n%s", code, out)
+		}
+	})
+}
+
+// TestTSScopeExplainsOnlyOlderRows: `ts<{time}` explains a mismatch whose row is
+// older than the time, and nothing at or after it. Each per-row class carries
+// its row's time: a call's, a request's, an untracked message's, an agent
+// turn's, and token-sum the latest request behind it.
+func TestTSScopeExplainsOnlyOlderRows(t *testing.T) {
+	cases := []struct {
+		name, class string
+		extraMain   []string
+		sql         []string
+		rowSec      float64
+	}{
+		{name: "call", class: "call-no-size", sql: []string{`UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_A1'`}, rowSec: 2},
+		{name: "request", class: "request-tokens", sql: []string{`UPDATE requests SET output_tokens=5 WHERE request_id='msg_B1'`}, rowSec: 6},
+		{name: "token sum", class: "token-sum", sql: []string{`UPDATE requests SET output_tokens=5 WHERE request_id='msg_B1'`}, rowSec: 6},
+		{name: "untracked message", class: "request-untracked", extraMain: textOnlyTurn(t), sql: textOnlyStop(), rowSec: 22},
+		{name: "agent turn", class: "agent-turn-no-start", sql: []string{`UPDATE agent_turns SET started=NULL`}, rowSec: 9},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				bound    float64
+				explains bool
+			}{{c.rowSec + 0.5, true}, {c.rowSec, false}} {
+				f := newFixture(t, c.extraMain, c.sql)
+				entry := fmt.Sprintf("%s | ts<%s | invented reason for the test\n", c.class, fxTS(tc.bound))
+				if err := os.WriteFile(f.allow, []byte(entry), 0o600); err != nil {
+					t.Fatalf("write allowlist: %v", err)
+				}
+				_, out := f.run(t, "2030-01-01T00:00:00Z")
+				if got := strings.Contains(out, "EXPECTED "+c.class+" "); got != tc.explains {
+					t.Errorf("bound %s: explained %t, want %t:\n%s", fxTS(tc.bound), got, tc.explains, out)
+				}
+				if !tc.explains && !strings.Contains(out, "MISMATCH "+c.class+" ") {
+					t.Errorf("bound %s: no %s mismatch:\n%s", fxTS(tc.bound), c.class, out)
+				}
+			}
+		})
+	}
+}
+
+// textOnlyTurn is a second turn ending in a text-only reply (msg_A3 at 22 s);
+// textOnlyStop is its Stop, so the reply's request row is due.
+func textOnlyTurn(t *testing.T) []string {
+	return []string{
+		assistantLine(t, 22, "msg_A3", 9, "end_turn", map[string]any{"type": "text", "text": fxSecret}),
+		jsonLine(t, map[string]any{"type": "system", "subtype": "turn_duration", "timestamp": fxTS(23), "sessionId": fxSession, "entrypoint": "cli"}),
+	}
+}
+
+// textOnlyStop ends the text-only turn; a later row moves the snapshot past
+// hookLag, so the turn's sweep is due.
+func textOnlyStop() []string {
+	return []string{
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e7', 'Stop', %d, '%s')`, fxMS(23), fxSession),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e-later', 'Notification', %d, '%s')`, fxMS(60), fxSession),
+	}
+}
+
+// TestSweptBatchOnlyCallStaysBatchOnly: the Stop and SessionEnd sweep
+// (resolveUnfinished) fills a batch-only call's failed=0 from its transcript
+// result, never its real size; the row is still the batch's alone.
+func TestSweptBatchOnlyCallStaysBatchOnly(t *testing.T) {
+	f := newFixture(t, nil, []string{`UPDATE calls SET failed=0, bytes_real=NULL, bytes_delivered=95 WHERE tool_use_id='toolu_A1'`})
+	code, out := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 1 || !strings.Contains(out, "MISMATCH call-batch-only session="+fxSession+" ids=toolu_A1,tool=Bash") || strings.Contains(out, " call-no-size ") {
+		t.Fatalf("exit %d, want a call-batch-only mismatch and no call-no-size:\n%s", code, out)
+	}
+}
+
+// TestKilledStopFailureHookMatchesItsRow: the wrapper's `StopFailure: killed by
+// signal` (no session) is expected only beside a StopFailure row of a session
+// whose SessionEnd follows the kill, one row per fault.
+func TestKilledStopFailureHookMatchesItsRow(t *testing.T) {
+	apiError := jsonLine(t, map[string]any{"type": "assistant", "timestamp": fxTS(22), "sessionId": fxSession, "isApiErrorMessage": true, "message": map[string]any{"id": "msg_err", "model": "<synthetic>", "content": []map[string]any{}}})
+	stopFailure := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, error_type, detail) VALUES('e8', 'StopFailure', %d, '%s', 'model_not_found', '{"from_transcript":true}')`, fxMS(22), fxSession)
+	sessionEnd := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('e9', 'SessionEnd', %d, '%s', 'other')`, fxMS(22.6), fxSession)
+	fault := func(sec float64, text string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', '%s')`, fxMS(sec), text)
+	}
+	for _, c := range []struct {
+		name, want string
+		extraMain  []string
+		sql        []string
+	}{
+		{name: "beside its row and its session's end", want: "EXPECTED fault-binary", extraMain: []string{apiError}, sql: []string{stopFailure, sessionEnd, fault(22, "StopFailure: killed by signal")}},
+		{name: "no StopFailure row near it", want: "MISMATCH fault-binary", sql: []string{sessionEnd, fault(22, "StopFailure: killed by signal")}},
+		{name: "two kills, one row", want: "MISMATCH fault-binary", extraMain: []string{apiError}, sql: []string{stopFailure, sessionEnd, fault(22, "StopFailure: killed by signal"), fault(22.001, "StopFailure: killed by signal")}},
+		{name: "another event's kill", want: "MISMATCH fault-binary", extraMain: []string{apiError}, sql: []string{stopFailure, sessionEnd, fault(22, "Stop: killed by signal")}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, c.extraMain, c.sql)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if !strings.Contains(out, c.want+" ") {
+				t.Fatalf("want %s:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
+// TestPromptlessLaunchHasNoTranscript: a `claude -p` given no prompt fires
+// SessionStart and SessionEnd, exits 1 and never writes its transcript.
+func TestPromptlessLaunchHasNoTranscript(t *testing.T) {
+	launch := []string{
+		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason, transcript_path) VALUES('%s', %d, %d, 'startup', 'other', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(30), fxMS(31), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('p1', 'SessionStart', %d, '%s', 'startup')`, fxMS(30), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('p2', 'SessionEnd', %d, '%s', 'other')`, fxMS(31), fxSession2),
+	}
+	f := newFixture(t, nil, launch)
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "EXPECTED session-no-prompt session="+fxSession2) {
+		t.Fatalf("exit %d, want 0 and an expected session-no-prompt:\n%s", code, out)
+	}
+	prompted := append(launch, fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('p3', 'UserPromptSubmit', %d, '%s')`, fxMS(30.5), fxSession2))
+	f = newFixture(t, nil, prompted)
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH session-no-transcript session="+fxSession2) {
+		t.Fatalf("exit %d, want 1: a prompted session without a transcript stays a mismatch:\n%s", code, out)
+	}
+}
+
+// TestPythonScriptParts: a script-body part (python3 - <<EOF, parser 6 on) is
+// expected by design; a python part a parser before 6 marked unparsed is
+// expected under its own class, since that parser did not tell a cut heredoc
+// body from unresolved code; from parser 6 on an unparsed python part is a
+// -c or here-string holding an unresolved expansion, expected under its own
+// class. A shell part unparsed stays a mismatch (TestSeededMismatchIsCaught).
+func TestPythonScriptParts(t *testing.T) {
+	for _, tc := range []struct {
+		name, sql, want string
+		code            int
+		absent          []string
+	}{
+		{"script-body at parser 6", `UPDATE command_parts SET parse_status='script-body', lang='python', program='python3', parser=6`,
+			"EXPECTED parse-script-body session=" + fxSession + " ids=toolu_A1", 0, []string{"parse-unparsed", "MISMATCH parse-script-body", "parts-stale"}},
+		{"unparsed python before parser 6", `UPDATE command_parts SET parse_status='unparsed', lang='python', program='python3', parser=5`,
+			"EXPECTED parse-python-unparsed-pre6 session=" + fxSession + " ids=toolu_A1", 0, []string{"MISMATCH", "parse-script-body"}},
+		{"unparsed python at parser 6", `UPDATE command_parts SET parse_status='unparsed', lang='python', program='python3', parser=6`,
+			"EXPECTED parse-python-code-unresolved session=" + fxSession + " ids=toolu_A1", 0, []string{"MISMATCH", "parse-unparsed", "parse-script-body", "parse-python-unparsed-pre6"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, nil, []string{tc.sql})
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != tc.code || !strings.Contains(out, tc.want) {
+				t.Fatalf("exit %d, want %d and %q:\n%s", code, tc.code, tc.want, out)
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(out, a) {
+					t.Fatalf("output holds %q:\n%s", a, out)
+				}
+			}
+		})
+	}
+}
+
+// TestSessionNoEndHook: a session whose latest run has no SessionEnd is the
+// class session-no-end-hook, EXPECTED only when the store carries end_reason
+// never and the transcript holds no SessionEnd hook entry; a run quiet less
+// than an hour is PENDING, and never by wildcard. One whose store carries
+// end_reason lost (its SessionEnd hook ran and was killed) is the EXPECTED
+// class session-end-killed, with or without the transcript's hook entry; one
+// still NULL whose transcript ran the end hook stays a MISMATCH.
+func TestSessionNoEndHook(t *testing.T) {
+	endHook := jsonLine(t, map[string]any{
+		"type": "attachment", "timestamp": fxTS(22), "sessionId": fxSession, "entrypoint": "cli",
+		"attachment": map[string]any{"type": "hook_success", "hookEvent": "SessionEnd"},
+	})
+	noEnd := `DELETE FROM events WHERE event='SessionEnd'`
+	never := `UPDATE sessions SET end_reason='never'`
+	lost := `UPDATE sessions SET end_reason='lost'`
+	unmarked := `UPDATE sessions SET end_reason=NULL`
+	// a row of another session an hour and more after this one's last row
+	later := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('z1', 'SessionStart', %d, '%s')`, fxMS(21+3700), fxSession2)
+	resumed := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('z2', 'SessionStart', %d, '%s', 'resume')`, fxMS(22), fxSession)
+	for _, tc := range []struct {
+		name      string
+		extraMain []string
+		sql       []string
+		code      int
+		want      []string
+		absent    []string
+	}{
+		{"never marked, no end hook in the transcript", nil, []string{noEnd, never}, 0,
+			[]string{"EXPECTED session-no-end-hook session=" + fxSession + " end_reason=never: expected: " + reasonNoEndHook}, []string{"MISMATCH", "PENDING"}},
+		{"never marked, but the transcript ran the end hook", []string{endHook}, []string{noEnd, never}, 1,
+			[]string{"MISMATCH session-no-end-hook session=" + fxSession + " transcript_end_hook=true end_reason=never"}, []string{"EXPECTED session-no-end-hook"}},
+		{"lost, the transcript ran the end hook", []string{endHook}, []string{noEnd, lost}, 0,
+			[]string{"EXPECTED session-end-killed session=" + fxSession + " transcript_end_hook=true end_reason=lost: expected: " + reasonEndKilled},
+			[]string{"MISMATCH", "PENDING", "session-no-end-hook"}},
+		{"lost, no end hook in the transcript", nil, []string{noEnd, lost}, 0,
+			[]string{"EXPECTED session-end-killed session=" + fxSession + " transcript_end_hook=false end_reason=lost"},
+			[]string{"MISMATCH", "PENDING", "session-no-end-hook"}},
+		{"unmarked, but the transcript ran the end hook", []string{endHook}, []string{noEnd, unmarked}, 1,
+			[]string{"MISMATCH session-no-end-hook session=" + fxSession + " transcript_end_hook=true end_reason=-"},
+			[]string{"EXPECTED session-no-end-hook", "session-end-killed"}},
+		{"unmarked, quiet less than an hour", nil, []string{noEnd}, 0,
+			[]string{"PENDING session-no-end-hook-live session=" + fxSession + " end_reason=-"}, []string{"MISMATCH", "EXPECTED session-no-end-hook"}},
+		{"unmarked, quiet past an hour", nil, []string{noEnd, later}, 1,
+			[]string{"MISMATCH session-no-end-hook session=" + fxSession + " end_reason=- quiet past QuietAfter and unmarked"}, []string{"EXPECTED session-no-end-hook", "PENDING session-no-end-hook-live"}},
+		{"ended after its latest start", nil, nil, 0,
+			nil, []string{"session-no-end-hook"}},
+		{"resumed after an end, never marked", nil, []string{resumed, never}, 0,
+			[]string{"EXPECTED session-no-end-hook session=" + fxSession + " end_reason=never"}, []string{"MISMATCH"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.extraMain, tc.sql)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d:\n%s", code, tc.code, out)
+			}
+			for _, w := range tc.want {
+				if strings.Count(out, w) != 1 {
+					t.Fatalf("want exactly one %q:\n%s", w, out)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(out, a) {
+					t.Fatalf("output holds %q:\n%s", a, out)
+				}
+			}
+		})
+	}
+}
+
+// TestHookLagIsPending: a transcript entry within hookLag of the store's
+// latest row may still have its async hook in flight: PENDING, not a mismatch.
+func TestHookLagIsPending(t *testing.T) {
+	missing := `DELETE FROM requests WHERE request_id='msg_B1'`
+	f := newFixture(t, nil, []string{missing, fmt.Sprintf(`UPDATE events SET ts=%d WHERE event IN ('Stop', 'SessionEnd')`, fxMS(12))})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "PENDING request-missing-lag ") || strings.Contains(out, "MISMATCH") {
+		t.Fatalf("exit %d, want 0 and a request-missing-lag PENDING:\n%s", code, out)
+	}
+	f = newFixture(t, nil, []string{missing})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH request-missing ") {
+		t.Fatalf("exit %d, want 1: a row older than hookLag stays a mismatch:\n%s", code, out)
+	}
+}
+
+// TestRedactedCommandHasNoParts: a Bash call whose stored input keeps only the
+// command's size (the command itself was not stored) can never be parsed.
+func TestRedactedCommandHasNoParts(t *testing.T) {
+	f := newFixture(t, nil, []string{`UPDATE calls SET input='{"command_bytes":12,"description_bytes":3}' WHERE tool_use_id='toolu_A1'`, `UPDATE command_parts SET tool_use_id='toolu_B1'`})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "EXPECTED parts-command-not-stored session="+fxSession+" ids=toolu_A1") {
+		t.Fatalf("exit %d, want 0 and an expected parts-command-not-stored:\n%s", code, out)
+	}
+	f = newFixture(t, nil, []string{`UPDATE command_parts SET tool_use_id='toolu_B1'`})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH parts-missing ") {
+		t.Fatalf("exit %d, want 1: a stored command without parts stays parts-missing:\n%s", code, out)
+	}
+}
+
+// TestKilledUnknownHookIsVouchedByItsNeighbours: the wrapper's `unknown: killed
+// by signal` names neither its event nor its session. It is expected only when
+// every session with a store row within ±1 s of its second was compared (in the
+// window, or over its whole history when it began before --since) and holds no
+// unexplained mismatch, so a lost event would surface on that session instead;
+// with no such session it stays a mismatch.
+func TestKilledUnknownHookIsVouchedByItsNeighbours(t *testing.T) {
+	const fxOrphan = "11111111-aaaa-4bbb-8ccc-00000000000f" // event rows, no sessions row
+	fault := func(sec float64) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', 'unknown: killed by signal')`, fxMS(sec))
+	}
+	// fxSession's Stop at 21 lies within ±1 s of a kill in second 22.
+	dropPrompt := `DELETE FROM events WHERE event_id = 'e2'`
+	launch := []string{
+		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason, transcript_path) VALUES('%s', %d, %d, 'startup', 'other', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(30), fxMS(31), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('p1', 'SessionStart', %d, '%s', 'startup')`, fxMS(30), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('p2', 'SessionEnd', %d, '%s', 'other')`, fxMS(31), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('n1', 'Notification', %d, '%s')`, fxMS(30.5), fxSession),
+		fault(30),
+	}
+	for _, c := range []struct {
+		name, since, allow, want string
+		sql                      []string
+	}{
+		{name: "every neighbour reconciles", want: "EXPECTED fault-binary session=- event=unknown", sql: []string{fault(22)}},
+		{name: "a neighbour has an unexplained mismatch", want: "MISMATCH fault-binary session=- event=unknown sessions_near=1 unvouched=" + fxSession + ":unexplained", sql: []string{dropPrompt, fault(22)}},
+		{name: "its neighbour's mismatch is allowlisted", allow: "event-prompt-missing | 22222222 | seeded\n", want: "EXPECTED fault-binary session=- event=unknown", sql: []string{dropPrompt, fault(22)}},
+		{name: "no session beside it", want: "MISMATCH fault-binary session=- event=unknown sessions_near=0", sql: []string{fault(40)}},
+		{name: "every neighbour compared", want: "EXPECTED fault-binary session=- event=unknown", sql: launch},
+		// The window limits which rows are judged, not which evidence is read:
+		// a neighbour first recorded before --since vouches by its whole history.
+		{name: "a neighbour before the window reconciles", since: "2030-01-01T00:00:25Z", want: "EXPECTED fault-binary session=- event=unknown", sql: launch},
+		{name: "a neighbour before the window has an unexplained mismatch", since: "2030-01-01T00:00:25Z", want: "MISMATCH fault-binary session=- event=unknown sessions_near=2 unvouched=" + fxSession + ":unexplained", sql: append([]string{dropPrompt}, launch...)},
+		{name: "a neighbour with no session row", want: "MISMATCH fault-binary session=- event=unknown sessions_near=2 unvouched=" + fxOrphan + ":not-compared", sql: []string{fault(22), fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('g1', 'Notification', %d, '%s')`, fxMS(22.5), fxOrphan)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			if c.allow != "" {
+				if err := os.WriteFile(f.allow, []byte(c.allow), 0o600); err != nil {
+					t.Fatalf("write allowlist: %v", err)
+				}
+			}
+			since := c.since
+			if since == "" {
+				since = "2030-01-01T00:00:00Z"
+			}
+			_, out := f.run(t, since)
+			if !strings.Contains(out, c.want+" ") {
+				t.Fatalf("want %q:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
+// TestTerminatedStopNeedsItsTurnsStop: the binary's `Stop: terminated by
+// SIGTERM` (no session) is a headless exit cancelling the async Stop hook. It is
+// expected only beside a session ending right after it whose cancelled turn has
+// a Stop row (hook, or rebuilt from the transcript), one per fault, while no
+// other session ending there leaves its turn open.
+func TestTerminatedStopNeedsItsTurnsStop(t *testing.T) {
+	fault := fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'terminated', 'Stop: terminated by SIGTERM')`, fxMS(22))
+	sessionEnd := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('e9', 'SessionEnd', %d, '%s', 'other')`, fxMS(22.6), fxSession)
+	rebuilt := `UPDATE events SET detail = '{"from_transcript":true}' WHERE event_id = 'e5'`
+	dropStop := `DELETE FROM events WHERE event_id = 'e5'`
+	laterPrompt := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e10', 'UserPromptSubmit', %d, '%s', 'later-prompt')`, fxMS(21.5), fxSession)
+	other := func(closing string) []string {
+		rows := []string{
+			fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('o1', 'UserPromptSubmit', %d, '%s')`, fxMS(20), fxSession2),
+			fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('o2', 'SessionEnd', %d, '%s', 'other')`, fxMS(22.8), fxSession2),
+		}
+		if closing != "" {
+			rows = append(rows, fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('o3', '%s', %d, '%s')`, closing, fxMS(21.5), fxSession2))
+		}
+		return rows
+	}
+	expected := "EXPECTED fault-terminated session=" + fxSession + " event=Stop"
+	for _, c := range []struct {
+		name, want string
+		sql        []string
+	}{
+		{name: "its turn has a Stop rebuilt from the transcript", want: expected, sql: []string{rebuilt, sessionEnd, fault}},
+		{name: "its turn has a hook Stop", want: expected, sql: []string{sessionEnd, fault}},
+		{name: "its turn has no Stop", want: "MISMATCH fault-terminated session=- event=Stop sessions_ending=1 open_turn=" + fxSession, sql: []string{dropStop, sessionEnd, fault}},
+		{name: "the Stop closes an earlier turn", want: "MISMATCH fault-terminated session=- event=Stop sessions_ending=1 open_turn=" + fxSession, sql: []string{laterPrompt, sessionEnd, fault}},
+		{name: "no session ends after it", want: "MISMATCH fault-terminated session=- event=Stop", sql: []string{fault}},
+		{name: "two faults, one Stop", want: "MISMATCH fault-terminated session=- event=Stop", sql: []string{sessionEnd, fault, fault}},
+		{name: "another ending session's turn is open", want: "MISMATCH fault-terminated session=- event=Stop sessions_ending=2 open_turn=" + fxSession2, sql: append([]string{sessionEnd, fault}, other("")...)},
+		{name: "another ending session's turn closed in a StopFailure", want: expected, sql: append([]string{sessionEnd, fault}, other("StopFailure")...)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if !strings.Contains(out, c.want+" ") {
+				t.Fatalf("want %q:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
+// TestTerminatedStopNamingItsSession: a `Stop: terminated by …` fault naming
+// its session (`store busy`, or a signal after the payload was read) pairs with
+// that session's turn alone, no SessionEnd needed: expected when a Stop row
+// closes the turn, a mismatch naming the session when the turn is open, already
+// paired, or the session is absent from the store. A sessionless fault beside
+// it keeps its own window pairing.
+func TestTerminatedStopNamingItsSession(t *testing.T) {
+	named := func(session string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id) VALUES(%d, 'terminated', 'Stop: terminated by store busy', '%s')`, fxMS(22), session)
+	}
+	sessionless := fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'terminated', 'Stop: terminated by SIGTERM')`, fxMS(22))
+	sessionEnd := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('e9', 'SessionEnd', %d, '%s', 'other')`, fxMS(22.6), fxSession)
+	rebuilt := `UPDATE events SET detail = '{"from_transcript":true}' WHERE event_id = 'e5'`
+	dropStop := `DELETE FROM events WHERE event_id = 'e5'`
+	other := []string{
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('o1', 'UserPromptSubmit', %d, '%s')`, fxMS(20), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('o3', 'Stop', %d, '%s')`, fxMS(21.5), fxSession2),
+	}
+	const absent = "11111111-aaaa-4bbb-8ccc-0000000000ff"
+	expected := "EXPECTED fault-terminated session=" + fxSession + " event=Stop"
+	for _, c := range []struct {
+		name string
+		want []string
+		sql  []string
+	}{
+		{name: "its session's turn has a hook Stop", want: []string{expected + " at=2030-01-01T00:00:22Z: expected: " + reasonTerminatedStopNamed}, sql: []string{named(fxSession)}},
+		{name: "its session's turn has a Stop rebuilt from the transcript", want: []string{expected}, sql: []string{rebuilt, named(fxSession)}},
+		{name: "its session is absent from the store", want: []string{"MISMATCH fault-terminated session=" + absent + " event=Stop session_in_store=false"}, sql: []string{named(absent)}},
+		{name: "its session's turn has no Stop", want: []string{"MISMATCH fault-terminated session=" + fxSession + " event=Stop open_turn=" + fxSession}, sql: []string{dropStop, named(fxSession)}},
+		{name: "two faults, one Stop", want: []string{expected, "MISMATCH fault-terminated session=" + fxSession + " event=Stop unpaired_stop=0"}, sql: []string{named(fxSession), named(fxSession)}},
+		{name: "a sessionless fault beside it", want: []string{expected, "EXPECTED fault-terminated session=" + fxSession2 + " event=Stop"}, sql: append([]string{sessionEnd, sessionless, named(fxSession2)}, other...)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			for _, w := range c.want {
+				if !strings.Contains(out, w) {
+					t.Fatalf("want %q:\n%s", w, out)
+				}
+			}
+			if strings.Contains(out, "MISMATCH fault-terminated session=- ") {
+				t.Fatalf("a sessionless verdict for a named fault:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestLostHookFaultNamingItsSession: a SessionEnd fault naming its session (the
+// binary's `terminated by …`, or the wrapper's `binary` line) is expected only
+// when the session's latest run carries end_reason lost, the fault within that
+// run; a StopFailure one only when a StopFailure row closes the session's turn.
+// Every other one stays a mismatch naming its session.
+func TestLostHookFaultNamingItsSession(t *testing.T) {
+	fault := func(stage, err string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id) VALUES(%d, '%s', '%s', '%s')`, fxMS(22), stage, err, fxSession)
+	}
+	endTerminated := fault("terminated", "SessionEnd: terminated by store busy")
+	endKilled := fault("binary", "SessionEnd: killed by signal")
+	failTerminated := fault("terminated", "StopFailure: terminated by store busy")
+	lost := `UPDATE sessions SET end_reason='lost'`
+	unmarked := `UPDATE sessions SET end_reason=NULL`
+	resumed := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('z2', 'SessionStart', %d, '%s', 'resume')`, fxMS(23), fxSession)
+	stopFailure := `UPDATE events SET event='StopFailure' WHERE event_id='e5'`
+	at := " at=2030-01-01T00:00:22Z"
+	for _, c := range []struct {
+		name         string
+		sql          []string
+		want, absent string
+	}{
+		{"terminated SessionEnd, end_reason lost", []string{lost, endTerminated},
+			"EXPECTED fault-terminated session=" + fxSession + " event=SessionEnd end_reason=lost" + at + ": expected: " + reasonEndKilled, "MISMATCH fault-"},
+		{"wrapper SessionEnd, end_reason lost", []string{lost, endKilled},
+			"EXPECTED fault-binary session=" + fxSession + " event=SessionEnd end_reason=lost" + at, "MISMATCH fault-"},
+		{"terminated SessionEnd, end_reason NULL", []string{unmarked, endTerminated},
+			"MISMATCH fault-terminated session=" + fxSession + at, "EXPECTED fault-"},
+		{"terminated SessionEnd before the lost run's start", []string{lost, resumed, endTerminated},
+			"MISMATCH fault-terminated session=" + fxSession + at, "EXPECTED fault-"},
+		{"terminated StopFailure, its turn has a StopFailure row", []string{stopFailure, failTerminated},
+			"EXPECTED fault-terminated session=" + fxSession + " event=StopFailure" + at, "MISMATCH fault-"},
+		{"terminated StopFailure, its turn has none", []string{failTerminated},
+			"MISMATCH fault-terminated session=" + fxSession + " event=StopFailure unpaired_stopfailure=0" + at, "EXPECTED fault-"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, c.sql)
+			_, out := f.run(t, "2030-01-01T00:00:00Z")
+			if !strings.Contains(out, c.want) || strings.Contains(out, c.absent) {
+				t.Fatalf("want %q, never %q:\n%s", c.want, c.absent, out)
+			}
+		})
+	}
+}
+
+// TestAllowlistNamesLinesMatchingNothing: the summary names every allowlist
+// line no mismatch matched, so a dead line shows.
+func TestAllowlistNamesLinesMatchingNothing(t *testing.T) {
+	f := newFixture(t, nil, []string{`DELETE FROM events WHERE event_id = 'e2'`})
+	allow := "# a comment\nevent-prompt-missing | 22222222 | seeded\ncall-extra | toolu_none | matches nothing\n"
+	if err := os.WriteFile(f.allow, []byte(allow), 0o600); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+	if _, out := f.run(t, "2030-01-01T00:00:00Z"); !strings.Contains(out, "reconcile: allowlist lines matching no mismatch: 3\n") {
+		t.Fatalf("want line 3 named as matching nothing:\n%s", out)
+	}
+	f = newFixture(t, nil, nil)
+	if _, out := f.run(t, "2030-01-01T00:00:00Z"); !strings.Contains(out, "reconcile: allowlist lines matching no mismatch: none\n") {
+		t.Fatalf("want none:\n%s", out)
+	}
+}
+
+func agentFile(f fixture) string {
+	return filepath.Join(f.projects, "-tmp-demo-proj", fxSession, "subagents", "agent-"+fxAgent+".jsonl")
+}
+
+func errorResult(t *testing.T, sec float64, id string) string {
+	return jsonLine(t, map[string]any{
+		"type": "user", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli",
+		"message": map[string]any{"role": "user", "content": []map[string]any{{"type": "tool_result", "tool_use_id": id, "is_error": true, "content": fxSecret}}},
+	})
+}
+
+// TestStoppedSubAgentCall: TaskStop cut a sub-agent's call; Claude Code wrote
+// its error result itself and no PostToolUse, PostToolBatch or SubagentStop
+// fired, so its request, its size and the agent's tool count never land.
+func TestStoppedSubAgentCall(t *testing.T) {
+	taskStop := map[string]any{"type": "tool_use", "id": "toolu_A3", "name": "TaskStop", "input": map[string]any{"task_id": fxAgent}}
+	mainStop := []string{assistantLine(t, 10, "msg_A3", 5, "tool_use", taskStop), toolResult(t, 10.5, "toolu_A3")}
+	rows := []string{
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A3', '%s', 'msg_A3', %d, 'TaskStop', 10, 0)`, fxSession, fxMS(10)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A3', '%s', %d, 'claude-demo', 'tool_use', 3, 5, 100, 20, 1, 0)`, fxSession, fxMS(10)),
+		fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started) VALUES('%s', 2, '%s', 'demo-agent', %d)`, fxAgent, fxSession, fxMS(9.5)),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, ts, tool) VALUES('toolu_B3', '%s', '%s', 'demo-agent', %d, 'Bash')`, fxSession, fxAgent, fxMS(9.7)),
+	}
+	for _, tc := range []struct {
+		name   string
+		result float64
+		code   int
+		want   []string
+		absent []string
+	}{
+		{"error result written at the stop", 10.03, 0,
+			[]string{"EXPECTED call-no-request session=" + fxSession + " ids=toolu_B3", "EXPECTED call-no-size session=" + fxSession + " ids=toolu_B3",
+				"EXPECTED request-missing session=" + fxSession + " ids=msg_B3", "EXPECTED agent-tool-uses session=" + fxSession + " ids=" + fxAgent + " transcript=2 store=1"},
+			[]string{"MISMATCH", "token-sum"}},
+		{"error result long after the stop", 18, 1,
+			[]string{"MISMATCH call-no-request session=" + fxSession + " ids=toolu_B3", "MISMATCH request-missing session=" + fxSession + " ids=msg_B3", "MISMATCH agent-tool-uses"},
+			[]string{"EXPECTED call-no-request"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, mainStop, rows)
+			writeLines(t, agentFile(f), append(agentLines(t), promptLine(t, 9.5), assistantLine(t, 9.7, "msg_B3", 7, "tool_use", toolUse("toolu_B3", "Bash")), errorResult(t, tc.result, "toolu_B3")))
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d:\n%s", code, tc.code, out)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Fatalf("want %q:\n%s", w, out)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(out, a) {
+					t.Fatalf("output holds %q:\n%s", a, out)
+				}
+			}
+		})
+	}
+}
+
+// TestPeerMessageIsAPrompt: a message a sub-agent sends the chat is written
+// isMeta with origin.kind "peer", and fires UserPromptSubmit; a plain isMeta
+// line fires none.
+func TestPeerMessageIsAPrompt(t *testing.T) {
+	const peerPrompt = "33333333-aaaa-4bbb-8ccc-000000000003"
+	row := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, prompt_id) VALUES('e9', 'UserPromptSubmit', %d, '%s', '%s')`, fxMS(15), fxSession, peerPrompt)
+	metaLine := func(origin map[string]any) string {
+		v := map[string]any{"type": "user", "timestamp": fxTS(15), "sessionId": fxSession, "entrypoint": "cli", "promptId": peerPrompt, "isMeta": true,
+			"message": map[string]any{"role": "user", "content": fxSecret}}
+		if origin != nil {
+			v["origin"] = origin
+		}
+		return jsonLine(t, v)
+	}
+	f := newFixture(t, []string{metaLine(map[string]any{"kind": "peer", "from": fxAgent})}, []string{row})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || strings.Contains(out, "event-prompt-extra") {
+		t.Fatalf("a peer message's UserPromptSubmit is no extra prompt (exit %d):\n%s", code, out)
+	}
+	f = newFixture(t, []string{metaLine(nil)}, []string{row})
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH event-prompt-extra session="+fxSession+" ids="+peerPrompt) {
+		t.Fatalf("a plain isMeta line is no prompt (exit %d):\n%s", code, out)
+	}
+}
+
+// TestTurnEndingWithNullStopReason: a sub-agent turn whose final message keeps
+// a null stop_reason still counts as a turn; it never inherits the end_turn of
+// the message before it.
+func TestTurnEndingWithNullStopReason(t *testing.T) {
+	f := newFixture(t, nil, []string{
+		fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started, stopped) VALUES('%s', 2, '%s', 'demo-agent', %d, %d)`, fxAgent, fxSession, fxMS(9.5), fxMS(9.8)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 7, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(9.7)),
+	})
+	writeLines(t, agentFile(f), append(agentLines(t), promptLine(t, 9.5), assistantLine(t, 9.6, "msg_B3", 7, nil, map[string]any{"type": "thinking", "thinking": fxSecret}), assistantLine(t, 9.7, "msg_B3", 7, nil, map[string]any{"type": "text", "text": fxSecret})))
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || strings.Contains(out, "agent-turns") {
+		t.Fatalf("two turns on both sides (exit %d):\n%s", code, out)
+	}
+}
+
+// TestScratchStoreRecordsUnrecordedSession: a session that ran with
+// CALLMETER_HOME in a scratch store is unrecorded here and recorded there.
+func TestScratchStoreRecordsUnrecordedSession(t *testing.T) {
+	const scratchSession = "44444444-aaaa-4bbb-8ccc-000000000004"
+	f := newFixture(t, nil, nil)
+	writeLines(t, filepath.Join(f.projects, "-tmp-demo-proj", scratchSession+".jsonl"), []string{promptLine(t, 30), assistantLine(t, 31, "msg_S1", 5, "end_turn", map[string]any{"type": "text", "text": fxSecret})})
+	code, out := f.run(t, "2020-01-01T00:00:00Z")
+	if code != 1 || !strings.Contains(out, "MISMATCH session-unrecorded session="+scratchSession) {
+		t.Fatalf("no scratch store: want the unexplained row (exit %d):\n%s", code, out)
+	}
+	ctx := context.Background()
+	path := filepath.Join(f.dir, "scratch", "run1", "home", "callmeter.db")
+	store, err := callmeter.OpenDB(ctx, path)
+	if err != nil {
+		t.Fatalf("create scratch store: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts) VALUES('%s', %d)`, scratchSession, fxMS(30))); err != nil {
+		t.Fatalf("scratch row: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close scratch store: %v", err)
+	}
+	code, out = f.run(t, "2020-01-01T00:00:00Z")
+	want := "EXPECTED session-unrecorded session=" + scratchSession + " assistant_lines=1 tool_uses=0 subagents=0 scratch_store=" + path + ": expected: " + reasonScratchStore
+	if code != 0 || !strings.Contains(out, want) || !strings.Contains(out, "reconcile: scratch stores under "+filepath.Join(f.dir, "scratch")+": 1 read, unreadable: none\n") {
+		t.Fatalf("want %q and one store read (exit %d):\n%s", want, code, out)
+	}
+}
+
+// TestQuietSessionWithAFreshTranscriptIsLive: recovery leaves a session whose
+// transcript was written within the hour, so it is not yet due here either.
+func TestQuietSessionWithAFreshTranscriptIsLive(t *testing.T) {
+	later := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('z1', 'SessionStart', %d, '%s')`, fxMS(21+3700), fxSession2)
+	f := newFixture(t, nil, []string{`DELETE FROM events WHERE event='SessionEnd'`, later})
+	stale := fxBase.Add(21 * time.Second)
+	if err := os.Chtimes(f.main, stale, stale); err != nil {
+		t.Fatalf("age transcript: %v", err)
+	}
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH session-no-end-hook session="+fxSession) {
+		t.Fatalf("quiet transcript: want the unexplained row (exit %d):\n%s", code, out)
+	}
+	fresh := fxBase.Add((21 + 3650) * time.Second)
+	if err := os.Chtimes(f.main, fresh, fresh); err != nil {
+		t.Fatalf("touch transcript: %v", err)
+	}
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "PENDING session-no-end-hook-live session="+fxSession+" end_reason=- transcript_written=2030-01-01T01:01:11Z") {
+		t.Fatalf("fresh transcript: want PENDING live (exit %d):\n%s", code, out)
+	}
+}
+
+// TestOpenAgentTurnCountIsPending: an agent's tool count is written at
+// SubagentStop, so one still in its turn is not yet due; once its session has
+// ended the gap is a mismatch.
+func TestOpenAgentTurnCountIsPending(t *testing.T) {
+	rows := []string{
+		fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started) VALUES('%s', 2, '%s', 'demo-agent', %d)`, fxAgent, fxSession, fxMS(9.5)),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, request_id, ts, tool, bytes_real, failed) VALUES('toolu_B3', '%s', '%s', 'demo-agent', 'msg_B3', %d, 'Read', 10, 0)`, fxSession, fxAgent, fxMS(9.7)),
+		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'tool_use', 3, 7, 100, 20, 1, 0)`, fxSession, fxAgent, fxMS(9.7)),
+	}
+	for _, tc := range []struct {
+		name string
+		sql  []string
+		code int
+		want string
+	}{
+		{"session running", append([]string{`DELETE FROM events WHERE event='SessionEnd'`}, rows...), 0, "PENDING agent-tool-uses-open session=" + fxSession + " ids=" + fxAgent + " transcript=2 store=1"},
+		{"session ended", rows, 1, "MISMATCH agent-tool-uses session=" + fxSession + " ids=" + fxAgent + " transcript=2 store=1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, nil, tc.sql)
+			writeLines(t, agentFile(f), append(agentLines(t), promptLine(t, 9.5), assistantLine(t, 9.7, "msg_B3", 7, "tool_use", toolUse("toolu_B3", "Read")), toolResult(t, 9.8, "toolu_B3")))
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != tc.code || !strings.Contains(out, tc.want) {
+				t.Fatalf("exit %d, want %d and %q:\n%s", code, tc.code, tc.want, out)
+			}
+		})
+	}
+}
+
+// TestUnfillableMarkerIsExplainedByItsOwnParse: report-time recovery records a
+// transcript fault for an agent turn or a Stop it read the transcripts in full
+// for and could not fill. The fault is expected only when this check's own
+// parse of the session's transcripts holds nothing that fills the turn at or
+// after the session's first row; otherwise it stays a mismatch.
+func TestUnfillableMarkerIsExplainedByItsOwnParse(t *testing.T) {
+	agentFault := func(stopped float64, tail string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, session_id, stage, error) VALUES(%d, '%s', 'transcript', 'agent %s turn stopped %d: %s')`,
+			fxMS(stopped), fxSession, fxAgent, fxMS(stopped), strings.ReplaceAll(tail, "'", "''"))
+	}
+	stopFault := func(tail string) string {
+		return fmt.Sprintf(`INSERT INTO faults(ts, session_id, stage, error) VALUES(%d, '%s', 'transcript', 'prompt %s Stop e5: %s')`,
+			fxMS(21), fxSession, fxPrompt, strings.ReplaceAll(tail, "'", "''"))
+	}
+	// A second agent turn, spanning (9, 9.8], and the reply msg_B3 at reply: in
+	// that span (9.2) or in the first turn's (8.5).
+	agentTurn := func(reply float64) (extraSQL []string, lines []string) {
+		extraSQL = []string{
+			fmt.Sprintf(`INSERT INTO agent_turns(agent_id, seq, session_id, agent_type, started, stopped) VALUES('%s', 2, '%s', 'demo-agent', %d, %d)`, fxAgent, fxSession, fxMS(9.1), fxMS(9.8)),
+			fmt.Sprintf(`INSERT INTO requests(request_id, session_id, agent_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_B3', '%s', '%s', %d, 'claude-demo', 'end_turn', 3, 7, 100, 20, 0, 0)`, fxSession, fxAgent, fxMS(reply)),
+		}
+		lines = append(agentLines(t), promptLine(t, 9.05), assistantLine(t, reply, "msg_B3", 7, "end_turn", map[string]any{"type": "text", "text": fxSecret}))
+		return extraSQL, lines
+	}
+	stopReply := []string{assistantLine(t, 21.5, "msg_A2", 9, "end_turn", map[string]any{"type": "text", "text": fxSecret})}
+	stopReplyRow := fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A2', '%s', %d, 'claude-demo', 'end_turn', 3, 9, 100, 20, 0, 0)`, fxSession, fxMS(21.5))
+	expectedAgent := "EXPECTED fault-transcript-unfillable session=" + fxSession + " agent=" + fxAgent + " "
+	expectedStop := "EXPECTED fault-transcript-unfillable session=" + fxSession + " prompt=" + fxPrompt + " "
+	unexplained := "MISMATCH fault-transcript session=" + fxSession + " "
+	for _, c := range []struct {
+		name      string
+		reply     float64 // the agent's second reply, 0: no agent turn
+		extraMain []string
+		sql       []string
+		fault     string
+		want      string
+		code      int
+	}{
+		{name: "agent: no request in the span", reply: 8.5, fault: agentFault(9.8, unfilledAgentTurn), want: expectedAgent, code: 0},
+		{name: "agent: the transcript holds a request in the span", reply: 9.2, fault: agentFault(9.8, unfilledAgentTurn), want: unexplained, code: 1},
+		{name: "agent: a stop the store holds no turn for", reply: 8.5, fault: agentFault(9.9, unfilledAgentTurn), want: unexplained, code: 1},
+		{name: "stop: no final request of the prompt", fault: stopFault(unfilledStopReply), want: expectedStop, code: 0},
+		{name: "stop: the transcript holds a final request of the prompt", extraMain: stopReply, sql: []string{stopReplyRow}, fault: stopFault(unfilledStopReply), want: unexplained, code: 1},
+		{name: "another text is no marker", fault: stopFault("something else"), want: unexplained, code: 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sql := append(slices.Clone(c.sql), c.fault)
+			var lines []string
+			if c.reply != 0 {
+				var turn []string
+				turn, lines = agentTurn(c.reply)
+				sql = append(sql, turn...)
+			}
+			f := newFixture(t, c.extraMain, sql)
+			if lines != nil {
+				writeLines(t, agentFile(f), lines)
+			}
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != c.code || !strings.Contains(out, c.want) {
+				t.Fatalf("exit %d, want %d and %q:\n%s", code, c.code, c.want, out)
+			}
+			if c.code == 0 && !strings.Contains(out, reasonUnfillable) {
+				t.Fatalf("want the reason line %q:\n%s", reasonUnfillable, out)
+			}
+		})
+	}
+}
+
+// TestUnfillableTailsAreTheStores: reconcile reuses nothing of
+// internal/callmeter, so its copy of the two fault tails is pinned to the one
+// RecoverQuiet writes.
+func TestUnfillableTailsAreTheStores(t *testing.T) {
+	if unfilledAgentTurn != callmeter.UnfilledAgentTurn || unfilledStopReply != callmeter.UnfilledStopReply {
+		t.Fatalf("tails = %q, %q; want %q, %q", unfilledAgentTurn, unfilledStopReply, callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply)
+	}
+}

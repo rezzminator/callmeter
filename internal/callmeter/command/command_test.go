@@ -72,6 +72,9 @@ func (fixture lab) seedRead(t *testing.T, id, session, file, seat string) {
 		ToolUseID: id, SessionID: callmeter.Ptr(session), AgentID: callmeter.Ptr(""),
 		TS: callmeter.Ptr(time.Now().UnixMilli()), Tool: callmeter.Ptr("Read"),
 		Cwd: callmeter.Ptr(filepath.Dir(file)), FilePath: callmeter.Ptr(file),
+		// failed=0 is what PostToolUse sets on a Read that ran; with it NULL the row
+		// reads as PostToolBatch-only and the report names it in a note.
+		Failed:         callmeter.Ptr(false),
 		BytesDelivered: callmeter.Ptr(int64(1234)), Source: callmeter.Ptr(callmeter.SourceHook),
 		SeatDir: callmeter.Ptr(seat),
 	}
@@ -482,5 +485,154 @@ func TestCallmeterCLIReportMissedLogFailureIsAStderrLineAndExit1(t *testing.T) {
 	code, stdout, stderr := fixture.run("report", "files")
 	if code != 1 || stdout != "" || !strings.Contains(stderr, "callmeter: ingest missed.log: ") {
 		t.Fatalf("report with an unreadable missed.log = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}
+
+// seedQuiet records a session whose hooks stopped after one PreToolUse two
+// hours ago, with a transcript holding lines, last written two hours ago too.
+func (fixture lab) seedQuiet(t *testing.T, session, toolUseID, transcript string, lines ...string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcript, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	quiet := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(transcript, quiet, quiet); err != nil {
+		t.Fatal(err)
+	}
+	store, err := callmeter.OpenDB(ctx, fixture.storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	err = store.Batch(ctx, func(tx *callmeter.Tx) error {
+		if err := tx.TouchSession(ctx, callmeter.Session{
+			SessionID: session, TS: quiet.Add(-time.Minute).UnixMilli(), TranscriptPath: callmeter.Ptr(transcript),
+		}); err != nil {
+			return err
+		}
+		return tx.UpsertCall(ctx, callmeter.Call{
+			ToolUseID: toolUseID, SessionID: callmeter.Ptr(session), TS: callmeter.Ptr(quiet.UnixMilli()),
+			Tool: callmeter.Ptr("Bash"), Source: callmeter.Ptr(callmeter.SourceHook),
+		}, callmeter.Overwrite)
+	})
+	if err != nil {
+		t.Fatalf("seed quiet session: %v", err)
+	}
+}
+
+// callRow reads the delivered size and request of one call from the store.
+func (fixture lab) callRow(t *testing.T, toolUseID string) (delivered, request *string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := callmeter.OpenDB(ctx, fixture.storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT CAST(bytes_delivered AS TEXT), request_id FROM calls WHERE tool_use_id = ?", toolUseID).Scan(&delivered, &request); err != nil {
+		t.Fatalf("read call %s: %v", toolUseID, err)
+	}
+	return delivered, request
+}
+
+// TestCallmeterCLIReportSettlesAQuietSessionFromItsTranscript: a session whose
+// hooks stopped an hour or more ago with a call in flight is settled by the
+// report that reads the store, before the topic runs.
+func TestCallmeterCLIReportSettlesAQuietSessionFromItsTranscript(t *testing.T) {
+	fixture := newLab(t)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-quiet.jsonl")
+	at := time.Now().Add(-2 * time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	fixture.seedQuiet(t, "sess-quiet", "toolu_quiet", transcript,
+		`{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_quiet","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_quiet","name":"Bash","input":{"command":"wc -l notes.md","description":"Count lines"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":10789,"cache_read_input_tokens":13689,"output_tokens":276}},"requestId":"req_demo_1","timestamp":"`+at+`","cwd":"/tmp/demo-proj","sessionId":"sess-quiet"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_quiet","type":"tool_result","content":"1\tnotes\n"}]},"timestamp":"`+at+`","cwd":"/tmp/demo-proj","sessionId":"sess-quiet"}`,
+	)
+	if delivered, _ := fixture.callRow(t, "toolu_quiet"); delivered != nil {
+		t.Fatalf("seeded call bytes_delivered = %q, want NULL before the report", *delivered)
+	}
+	code, stdout, stderr := fixture.run("report", "sessions")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report sessions = %d, want 0 and a quiet stderr\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	delivered, request := fixture.callRow(t, "toolu_quiet")
+	if delivered == nil || *delivered != "8" || request == nil || *request != "msg_quiet" {
+		t.Errorf("settled call = bytes_delivered %v request_id %v, want 8 and msg_quiet", delivered, request)
+	}
+}
+
+// TestCallmeterCLIReportNamesAnUnreadableQuietTranscriptAndGoesOn: a transcript
+// recovery cannot read is one stderr line naming the session and the path; the
+// report still runs.
+func TestCallmeterCLIReportNamesAnUnreadableQuietTranscriptAndGoesOn(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-bad.jsonl")
+	fixture.seedQuiet(t, "sess-bad", "toolu_bad", transcript, `{"type":"user","message":{"content":[{"type":"tool_result" toolu_bad`)
+	code, stdout, stderr := fixture.run("report", "files")
+	want := "callmeter: recover quiet sessions: skipped: session sess-bad: " + transcript
+	if code != 0 || !strings.Contains(stderr, want) || !strings.Contains(stdout, "/work/one.md") {
+		t.Fatalf("report files = %d, want 0, the skip line %q and the table\nstdout:\n%s\nstderr:\n%s", code, want, stdout, stderr)
+	}
+}
+
+// TestCallmeterCLIReportQuietAfterFromTheEnvironment: CALLMETER_QUIET_AFTER, a
+// Go duration, replaces QuietAfter for one report run (the e2e's seam): a
+// session quiet for two hours is left alone under 3h; a value that is not a
+// non-negative duration is a usage error naming it, and the store is not read.
+func TestCallmeterCLIReportQuietAfterFromTheEnvironment(t *testing.T) {
+	transcriptLines := func(at string) []string {
+		return []string{
+			`{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","id":"msg_quiet","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_quiet","name":"Bash","input":{"command":"wc -l notes.md","description":"Count lines"}}],"usage":{"input_tokens":10,"cache_creation_input_tokens":10789,"cache_read_input_tokens":13689,"output_tokens":276}},"requestId":"req_demo_1","timestamp":"` + at + `","cwd":"/tmp/demo-proj","sessionId":"sess-quiet"}`,
+			`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_quiet","type":"tool_result","content":"1\tnotes\n"}]},"timestamp":"` + at + `","cwd":"/tmp/demo-proj","sessionId":"sess-quiet"}`,
+		}
+	}
+	at := time.Now().Add(-2 * time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	withQuiet := func(fixture lab, value string) lab {
+		base := fixture.getenv
+		fixture.getenv = func(key string) string {
+			if key == "CALLMETER_QUIET_AFTER" {
+				return value
+			}
+			return base(key)
+		}
+		return fixture
+	}
+	t.Run("longer than the quiet", func(t *testing.T) {
+		fixture := newLab(t)
+		transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-quiet.jsonl")
+		fixture.seedQuiet(t, "sess-quiet", "toolu_quiet", transcript, transcriptLines(at)...)
+		code, stdout, stderr := withQuiet(fixture, "3h").run("report", "sessions")
+		if code != 0 || stderr != "" {
+			t.Fatalf("report sessions = %d, want 0 and a quiet stderr\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+		}
+		if delivered, _ := fixture.callRow(t, "toolu_quiet"); delivered != nil {
+			t.Errorf("call bytes_delivered = %q, want NULL: two hours quiet is not 3h", *delivered)
+		}
+	})
+	for _, value := range []string{"soon", "-1m"} {
+		t.Run("invalid "+value, func(t *testing.T) {
+			fixture := newLab(t)
+			transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-quiet.jsonl")
+			fixture.seedQuiet(t, "sess-quiet", "toolu_quiet", transcript, transcriptLines(at)...)
+			code, stdout, stderr := withQuiet(fixture, value).run("report", "sessions")
+			if code != 2 || stdout != "" || !strings.Contains(stderr, "CALLMETER_QUIET_AFTER") || !strings.Contains(stderr, value) {
+				t.Fatalf("report sessions with CALLMETER_QUIET_AFTER=%s = %d, want 2 and a stderr naming it\nstdout:\n%s\nstderr:\n%s", value, code, stdout, stderr)
+			}
+			if delivered, _ := fixture.callRow(t, "toolu_quiet"); delivered != nil {
+				t.Errorf("call bytes_delivered = %q, want NULL: a usage error reads nothing", *delivered)
+			}
+		})
 	}
 }

@@ -2,7 +2,8 @@
 // tool call a Claude chat or sub-agent makes, the model request that grouped
 // it and the sub-agent that made it (docs/design.md § The store), plus the
 // input sanitizer and the transcript readers the hook entry and the reports
-// share. Every row comes from a hook event.
+// share. Every row comes from a hook event, or from the transcript of a
+// session gone quiet (RecoverQuiet).
 package callmeter
 
 import (
@@ -24,11 +25,16 @@ import (
 // PRAGMA user_version.
 const SchemaVersion = 1
 
-// BusyTimeout is how long a statement waits on a concurrent async writer.
+// BusyTimeout is how long a statement waits on a concurrent writer when the
+// caller sets no tighter bound (OpenDBWaiting).
 const BusyTimeout = 5 * time.Second
 
-// SourceHook is the source every write sets: the hook wrote the row.
+// SourceHook is the source a hook's write sets: the hook wrote the row.
 const SourceHook = "hook"
+
+// SourceTranscript is the source of a row the quiet-session recovery wrote
+// from a transcript, no hook (RecoverQuiet).
+const SourceTranscript = "transcript"
 
 // Fault stages: where a failure to record or parse happened. StageBinary and
 // StageTerminated rows come only from ingesting missed.log (IngestMissed):
@@ -234,19 +240,26 @@ type Store struct {
 	path string
 }
 
-// OpenDB opens (creating it and its directory) the store at path: WAL,
-// BusyTimeout, foreign keys off, schema SchemaVersion. A store written by a
-// newer schema is refused, never opened and misread.
+// OpenDB opens the store at path with the default wait (OpenDBWaiting).
+func OpenDB(ctx context.Context, path string) (*Store, error) {
+	return OpenDBWaiting(ctx, path, BusyTimeout)
+}
+
+// OpenDBWaiting opens (creating it and its directory) the store at path: WAL,
+// a busy timeout of wait, foreign keys off, schema SchemaVersion. A store
+// written by a newer schema is refused, never opened and misread.
 //
 // A store another process is creating at this instant answers SQLITE_BUSY at
 // once — its switch to WAL takes no busy wait — so a busy open is retried
-// until BusyTimeout has passed: the first async hooks of a session all race
-// to create the store, and the loser must not lose its record.
-func OpenDB(ctx context.Context, path string) (*Store, error) {
-	deadline := clock.Real.Now().Add(BusyTimeout)
+// until wait has passed: the first async hooks of a session all race to create
+// the store, and the loser must not lose its record. wait is also the wait of
+// every later statement on the store, since the driver does not stop a busy
+// wait on a ctx deadline.
+func OpenDBWaiting(ctx context.Context, path string, wait time.Duration) (*Store, error) {
+	deadline := clock.Real.Now().Add(wait)
 	for {
-		store, err := openAndPrepare(ctx, path)
-		if err == nil || !isBusySQLite(err) || clock.Real.Now().After(deadline) {
+		store, err := openAndPrepare(ctx, path, wait)
+		if err == nil || !IsBusy(err) || clock.Real.Now().After(deadline) {
 			return store, err
 		}
 		select {
@@ -263,14 +276,14 @@ const openRetryDelay = 20 * time.Millisecond
 // sqliteBusy is SQLite's primary result code SQLITE_BUSY.
 const sqliteBusy = 5
 
-// isBusySQLite reports whether err is SQLite answering SQLITE_BUSY.
-func isBusySQLite(err error) bool {
+// IsBusy reports whether err is SQLite answering SQLITE_BUSY.
+func IsBusy(err error) bool {
 	var sqliteError *modernsqlite.Error
 	return errors.As(err, &sqliteError) && sqliteError.Code()&0xff == sqliteBusy
 }
 
-func openAndPrepare(ctx context.Context, path string) (*Store, error) {
-	db, err := sqlitedb.OpenStore(ctx, path)
+func openAndPrepare(ctx context.Context, path string, wait time.Duration) (*Store, error) {
+	db, err := sqlitedb.OpenStore(ctx, path, wait)
 	if err != nil {
 		return nil, fmt.Errorf("open callmeter store: %w", err)
 	}
@@ -281,9 +294,6 @@ func openAndPrepare(ctx context.Context, path string) (*Store, error) {
 }
 
 func prepare(ctx context.Context, db *sql.DB, path string) error {
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", BusyTimeout.Milliseconds())); err != nil {
-		return fmt.Errorf("callmeter store %s: set busy_timeout: %w", path, err)
-	}
 	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("callmeter store %s: disable foreign keys: %w", path, err)
 	}
@@ -520,8 +530,18 @@ var pruneAfterArchive func() error
 // included, so a row is never deleted without its archive copy. A stop between
 // the phases leaves rows in both files, which the next prune deletes from the
 // store and does not copy again.
+//
+// A store with no row to archive is left alone and archive.db is never
+// attached, so a prune with nothing to do creates no file beside the store.
 func (s *Store) Prune(ctx context.Context, before time.Time) (removed int64, err error) {
 	cutoff := before.UnixMilli()
+	pending, err := s.anyToArchive(ctx, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if !pending {
+		return 0, nil
+	}
 	archivePath := filepath.Join(filepath.Dir(s.path), ArchiveFile)
 	// ATTACH belongs to one connection and cannot run inside a transaction.
 	conn, err := s.db.Conn(ctx)
@@ -580,6 +600,25 @@ func (s *Store) pruneTransaction(ctx context.Context, conn *sql.Conn, phase stri
 		return rollback(fmt.Errorf("callmeter store %s: commit prune %s: %w", s.path, phase, err))
 	}
 	return nil
+}
+
+// anyToArchive reports whether any pruneTables entry holds a row phase 1 would
+// copy. Every expired row is one of them, so false means the prune has nothing
+// to archive and nothing to delete.
+func (s *Store) anyToArchive(ctx context.Context, cutoff int64) (bool, error) {
+	for _, table := range pruneTables {
+		predicate := table.archivePredicate()
+		var found bool
+		if err := s.db.QueryRowContext(ctx, fmt.Sprintf(
+			"SELECT EXISTS (SELECT 1 FROM %s WHERE %s)", table.name, predicate,
+		), predicateArgs(predicate, cutoff)...).Scan(&found); err != nil {
+			return false, fmt.Errorf("callmeter store %s: look for %s rows to prune: %w", s.path, table.name, err)
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // archiveExpired is phase 1 of Prune, inside its transaction: it creates the

@@ -25,8 +25,9 @@ const unparsedLimit = 200
 // IngestMissed turns the wrapper's missed.log into `binary` faults, and the
 // lines the binary wrote itself (a reason opening TerminatedReason) into
 // `terminated` faults, and returns how many it wrote. Each line is
-// `{unix seconds}\t{event}\t{reason}` and becomes a fault stamped seconds × 1000
-// whose error is `{event}: {reason}`;
+// `{unix seconds}\t{event}\t{reason}`, optionally followed by
+// `\t{session_id}`, and becomes a fault stamped seconds × 1000 whose error is
+// `{event}: {reason}` and whose session is that session_id;
 // a line that does not parse becomes a fault `unparsed missed.log line: …` of
 // its first 200 bytes, never a dropped line.
 //
@@ -204,13 +205,20 @@ func parseMissed(data []byte, now int64) []Fault {
 }
 
 // TerminatedReason opens the reason of a missed.log line the binary wrote itself
-// when a signal ended its run before it recorded: `terminated by SIGTERM`.
-// parseMissedLine turns such a line into a StageTerminated fault; every other
-// line stays StageBinary.
+// when a signal or its store-wait bound ended its run before it recorded:
+// `terminated by SIGTERM`. parseMissedLine turns such a line into a
+// StageTerminated fault; every other line stays StageBinary.
 const TerminatedReason = "terminated by "
 
-// parseMissedLine reads `{unix seconds}\t{event}\t{reason}`; false when the
-// line has not that shape.
+// TerminatedByStoreBusy is the reason of the binary's own line when its store
+// wait hit its event's bound before it recorded: the store stayed locked, and
+// the hook gave up inside its timeout instead of being killed by it.
+const TerminatedByStoreBusy = TerminatedReason + "store busy"
+
+// parseMissedLine reads `{unix seconds}\t{event}\t{reason}[\t{session_id}]`;
+// false when the line has not that shape. The session is the reason's last tab
+// field only when it is a session id (MissedSessionID), so a line written
+// before the field existed, its reason holding a tab, keeps its reason whole.
 func parseMissedLine(line string) (Fault, bool) {
 	fields := strings.SplitN(line, "\t", 3)
 	if len(fields) != 3 {
@@ -220,9 +228,30 @@ func parseMissedLine(line string) (Fault, bool) {
 	if err != nil {
 		return Fault{}, false
 	}
+	reason, session := fields[2], ""
+	if cut := strings.LastIndexByte(reason, '\t'); cut >= 0 && MissedSessionID(reason[cut+1:]) {
+		reason, session = reason[:cut], reason[cut+1:]
+	}
 	stage := StageBinary
-	if strings.HasPrefix(fields[2], TerminatedReason) {
+	if strings.HasPrefix(reason, TerminatedReason) {
 		stage = StageTerminated // the binary's own line: a signal cut its run short
 	}
-	return Fault{TS: seconds * 1000, Stage: stage, Error: fields[1] + ": " + fields[2]}, true
+	return Fault{TS: seconds * 1000, SessionID: session, Stage: stage, Error: fields[1] + ": " + reason}, true
+}
+
+// MissedSessionID reports whether s can be the session_id field of a
+// missed.log line: non-empty, only ASCII letters, digits, `.`, `_` and `-`,
+// the alphabet the wrapper and the hook binary write (a Claude Code session
+// id is a UUID).
+func MissedSessionID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }

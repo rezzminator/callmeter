@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -22,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/clock"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
@@ -368,6 +371,7 @@ func newSessionID(t *testing.T) string {
 type session struct {
 	id     string
 	stream []byte
+	debug  string // Claude Code's debug log of the process
 }
 
 // claude runs one headless session: haiku, project and local settings only,
@@ -384,7 +388,10 @@ func (r *liveRun) claude(t *testing.T, label, plugin, prompt, resume string, env
 		id = newSessionID(t)
 		args = append(args, "--session-id", id)
 	}
-	args = append(args, "--output-format", "stream-json", "--verbose", prompt)
+	// Claude Code's own debug log, kept beside the stream: whether a hook was
+	// dispatched, timed out or was killed shows only there.
+	debugPath := filepath.Join(r.root, label+".debug.txt")
+	args = append(args, "--debug-file", debugPath, "--output-format", "stream-json", "--verbose", prompt)
 	full := childEnv(append([]string{"CALLMETER_HOME=" + r.home, "CLAUDE_CODE_SUBAGENT_MODEL=haiku"}, append(gitEnv, env...)...)...)
 	res := execute(t, label, sessionTimeout, args, r.project, full, false)
 	streamPath := filepath.Join(r.root, label+".stream.jsonl")
@@ -394,18 +401,41 @@ func (r *liveRun) claude(t *testing.T, label, plugin, prompt, resume string, env
 	if err := os.WriteFile(filepath.Join(r.root, label+".stderr.txt"), res.Stderr, 0o600); err != nil {
 		t.Fatalf("%s: keep stderr: %v", label, err)
 	}
-	t.Logf("%s: session %s, exit %d, stream %s", label, id, res.ExitCode, streamPath)
+	t.Logf("%s: session %s, exit %d, stream %s, debug log %s", label, id, res.ExitCode, streamPath, debugPath)
 	if res.ExitCode != 0 {
 		t.Fatalf("%s: claude exited %d\nstderr: %s", label, res.ExitCode, tail(res.Stderr))
 	}
-	return session{id: id, stream: res.Stdout}
+	return session{id: id, stream: res.Stdout, debug: debugPath}
 }
 
 // callmeter runs the built binary against this run's store.
 func (r *liveRun) callmeter(t *testing.T, bin string, args ...string) runner.RunResult {
 	t.Helper()
+	return r.callmeterEnv(t, bin, nil, args...)
+}
+
+// callmeterEnv is callmeter with extra environment entries for the one run.
+func (r *liveRun) callmeterEnv(t *testing.T, bin string, env []string, args ...string) runner.RunResult {
+	t.Helper()
 	return execute(t, "callmeter "+strings.Join(args, " "), time.Minute, append([]string{bin}, args...), r.project,
-		childEnv("CALLMETER_HOME="+r.home), false)
+		childEnv(append([]string{"CALLMETER_HOME=" + r.home}, env...)...), false)
+}
+
+// sessionEndHookLine matches the line Claude Code writes when it runs this
+// plugin's SessionEnd hook, e.g.
+// "[DEBUG] SessionEnd:other [${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook] completed with status 0".
+// A built-in hook module's own SessionEnd line names no callmeter hook.
+var sessionEndHookLine = regexp.MustCompile(`SessionEnd:\S* \[[^\]]*callmeter hook\]`)
+
+// sessionEndRan reports whether Claude Code's debug log at path shows the
+// callmeter SessionEnd hook ran. A log that cannot be read is an error, never
+// false.
+func sessionEndRan(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, fmt.Errorf("read the debug log: %w", err)
+	}
+	return sessionEndHookLine.Match(data), nil
 }
 
 // openStore opens the run's store for reading; the handle closes with t.
@@ -661,7 +691,8 @@ type toolUse struct {
 type transcript struct {
 	path    string
 	uses    []toolUse
-	partial bool // the last line was cut off mid-write and skipped
+	results map[string]bool // tool_use_id of every tool_result block
+	partial bool            // the last line was cut off mid-write and skipped
 }
 
 type block struct {
@@ -682,7 +713,7 @@ func readTranscript(t *testing.T, path string) transcript {
 	if err != nil {
 		t.Fatalf("read transcript: %v", err)
 	}
-	out := transcript{path: path}
+	out := transcript{path: path, results: map[string]bool{}}
 	errored := map[string]bool{}
 	lines := bytes.Split(data, []byte("\n"))
 	for i, line := range lines {
@@ -716,8 +747,11 @@ func readTranscript(t *testing.T, path string) transcript {
 				}
 				_ = json.Unmarshal(b.Input, &input) // only a Bash input has a command
 				out.uses = append(out.uses, toolUse{ID: b.ID, Name: b.Name, MessageID: entry.Message.ID, Command: input.Command})
-			case entry.Type == "user" && b.Type == "tool_result" && b.IsError:
-				errored[b.ToolUseID] = true
+			case entry.Type == "user" && b.Type == "tool_result":
+				out.results[b.ToolUseID] = true
+				if b.IsError {
+					errored[b.ToolUseID] = true
+				}
 			}
 		}
 	}
@@ -1022,6 +1056,62 @@ func storeWithoutCalls(t *testing.T, home string, ids map[string]bool) []byte {
 	return readAll(t, scrubbedPath)
 }
 
+// assertReportRecoversSession runs `report sessions` with the quiet threshold
+// forced low over a session whose SessionEnd never ran, then requires the
+// recovery's outcome: end_reason never, a settled main-chat turn, and every
+// call whose result is in a transcript settled.
+func assertReportRecoversSession(t *testing.T, r *liveRun, bin string, db *sql.DB, id string, main transcript, subs map[string]transcript) {
+	t.Helper()
+	res := r.callmeterEnv(t, bin, []string{"CALLMETER_QUIET_AFTER=1ms"}, "report", "sessions")
+	if res.ExitCode != 0 {
+		t.Fatalf("report sessions with CALLMETER_QUIET_AFTER=1ms: exit %d\nstderr: %s", res.ExitCode, tail(res.Stderr))
+	}
+	wantCell(t, db, "sessions", "end_reason", "session_id", id, "end_reason "+callmeter.EndReasonNever+" written by report recovery",
+		func(got string) bool { return got == callmeter.EndReasonNever })
+
+	const mainChat = "(agent_id IS NULL OR agent_id = '')"
+	settled := wantSome(t, db, "events", `event IN ('Stop', 'StopFailure') AND `+mainChat+` AND session_id = ?
+		AND ts >= (SELECT MAX(ts) FROM events WHERE event = 'UserPromptSubmit' AND `+mainChat+` AND session_id = ?)`, id, id)
+	if !settled {
+		t.Logf("recovery: main-chat events of session %s\n%s", id, rowsText(t, db,
+			"SELECT event, ts, agent_id FROM events WHERE "+mainChat+" AND session_id = ? ORDER BY ts", id))
+	}
+
+	rows, err := db.QueryContext(context.Background(),
+		"SELECT tool_use_id, COALESCE(tool, '') FROM calls WHERE session_id = ? AND bytes_real IS NULL AND bytes_delivered IS NULL", id)
+	if err != nil {
+		t.Fatalf("read the unsettled calls of session %s: %v", id, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close unsettled calls: %v", err)
+		}
+	}()
+	answered := map[string]bool{}
+	for _, tr := range append([]transcript{main}, slices.Collect(maps.Values(subs))...) {
+		for use := range tr.results {
+			answered[use] = true
+		}
+	}
+	var unsettled []string
+	for rows.Next() {
+		var useID, tool string
+		if err := rows.Scan(&useID, &tool); err != nil {
+			t.Fatalf("scan an unsettled call of session %s: %v", id, err)
+		}
+		if answered[useID] {
+			unsettled = append(unsettled, tool+" "+useID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the unsettled calls of session %s: %v", id, err)
+	}
+	if len(unsettled) > 0 {
+		t.Errorf("calls: %d calls of session %s with bytes_real and bytes_delivered both NULL although a transcript holds their tool_result, want 0: %s",
+			len(unsettled), id, strings.Join(unsettled, ", "))
+	}
+}
+
 func TestLiveSessionFillsEveryTable(t *testing.T) {
 	requireE2E(t)
 	bin := builtBinary(t)
@@ -1040,7 +1130,7 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 
 	t.Run("lifecycle", func(t *testing.T) {
 		db := openStore(t, r.home)
-		for _, want := range []string{"SessionStart", "UserPromptSubmit", "InstructionsLoaded", "SessionEnd"} {
+		for _, want := range []string{"SessionStart", "UserPromptSubmit", "InstructionsLoaded"} {
 			wantSome(t, db, "events", "event = ? AND session_id = ?", want, first.id)
 		}
 		wantSome(t, db, "events", "event = 'SessionStart' AND source = 'startup' AND session_id = ?", first.id)
@@ -1049,16 +1139,41 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 			t.FailNow()
 		}
 		equals := func(v string) func(string) bool { return func(got string) bool { return got == v } }
-		for _, check := range []struct {
+		type cellCheck struct {
 			column, want string
 			ok           func(string) bool
-		}{
+		}
+		checks := []cellCheck{
 			{"engine", `"claude"`, equals("claude")},
 			{"host", "a non-empty value", isSet},
 			{"start_source", `"startup"`, equals("startup")},
-			{"end_reason", "a non-empty value", isSet},
 			{"model", "a non-empty value", isSet},
-		} {
+		}
+		// A headless claude -p can exit before it dispatches the SessionEnd hook:
+		// its debug log says which run this was, and each outcome has its own
+		// assertions.
+		ended, err := sessionEndRan(first.debug)
+		if err != nil {
+			t.Fatalf("run1: decide whether the SessionEnd hook ran from the debug log %s: %v", first.debug, err)
+		}
+		if ended {
+			t.Logf("lifecycle: run1's debug log %s shows the SessionEnd hook ran: requiring its event row, or end_reason lost with a fault row", first.debug)
+			switch {
+			case count(t, db, "SELECT COUNT(*) FROM events WHERE event = 'SessionEnd' AND session_id = ?", first.id) > 0:
+			case cell(t, db, "sessions", "end_reason", "session_id", first.id) == callmeter.EndReasonLost &&
+				count(t, db, "SELECT COUNT(*) FROM faults WHERE session_id = ?", first.id) > 0:
+				t.Logf("lifecycle: the SessionEnd hook ran but the binary recorded it as lost: end_reason %q with a faults row for session %s", callmeter.EndReasonLost, first.id)
+			default:
+				t.Errorf("lifecycle: the SessionEnd hook ran but session %s has no SessionEnd events row, and is not end_reason %q with a faults row: end_reason = %q, faults rows = %d",
+					first.id, callmeter.EndReasonLost, cell(t, db, "sessions", "end_reason", "session_id", first.id),
+					count(t, db, "SELECT COUNT(*) FROM faults WHERE session_id = ?", first.id))
+			}
+			checks = append(checks, cellCheck{"end_reason", "a non-empty value", isSet})
+		} else {
+			t.Logf("lifecycle: run1's debug log %s shows no SessionEnd hook: requiring report recovery to settle run1", first.debug)
+			assertReportRecoversSession(t, r, bin, db, first.id, main, subs)
+		}
+		for _, check := range checks {
 			wantCell(t, db, "sessions", check.column, "session_id", first.id, check.want, check.ok)
 		}
 	})
@@ -1412,6 +1527,30 @@ func TestLogTailRendersTheLastLinesAbsenceAndErrors(t *testing.T) {
 	// A directory is readable as a path and unreadable as a file.
 	if got := logTail(dir, logTailLines); !strings.HasPrefix(got, dir+": unreadable: ") {
 		t.Errorf("tail of an unreadable path: %q", got)
+	}
+}
+
+func TestSessionEndRanReadsTheDebugLog(t *testing.T) {
+	dir := t.TempDir()
+	ran := filepath.Join(dir, "run2.debug.txt")
+	writeFile(t, ran, "2026-10-02T02:26:06.100Z [DEBUG] Hook Stop (Stop) completed\n"+
+		"2026-10-02T02:26:06.159Z [DEBUG] SessionEnd:other [${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook] completed with status 0\n")
+	got, err := sessionEndRan(ran)
+	if err != nil || !got {
+		t.Errorf("a log with the callmeter SessionEnd hook line: got %v, error %v, want true", got, err)
+	}
+	none := filepath.Join(dir, "run1.debug.txt")
+	writeFile(t, none, "2026-10-02T02:20:01.000Z [DEBUG] Hook Stop (Stop) cancelled:\n"+
+		"2026-10-02T02:20:01.010Z [DEBUG] [uds-messaging] Shutting down\n"+
+		"2026-10-02T02:20:01.020Z [DEBUG] hooks module cc-plugin-sec-default@builtin classic.SessionEnd settled in 21.1ms\n"+
+		"2026-10-02T02:20:01.030Z [DEBUG] InstructionsLoaded:session_start [${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook] completed with status 0\n")
+	got, err = sessionEndRan(none)
+	if err != nil || got {
+		t.Errorf("a log without the callmeter SessionEnd hook line: got %v, error %v, want false", got, err)
+	}
+	missing := filepath.Join(dir, "absent.debug.txt")
+	if got, err := sessionEndRan(missing); err == nil || got {
+		t.Errorf("a missing log: got %v, error %v, want an error and false", got, err)
 	}
 }
 

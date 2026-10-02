@@ -224,7 +224,7 @@
             "args": [
               "hook"
             ],
-            "async": true
+            "timeout": 2
           }
         ]
       }

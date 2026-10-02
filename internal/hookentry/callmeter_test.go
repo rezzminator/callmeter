@@ -273,8 +273,8 @@ func TestCallmeterCapturedPayloads(t *testing.T) {
 	subBatch := func(id, response string) string {
 		return fmt.Sprintf(
 			`{"session_id":%q,"transcript_path":%q,"cwd":%q,"agent_id":%q,"agent_type":"general-purpose",`+
-				`"hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Read","tool_input":{},"tool_use_id":%q,"tool_response":%s}]}`,
-			cmSessionA, lab.transcript(cmSessionA), lab.proj, cmSubagent, id, response)
+				`"hook_event_name":"PostToolBatch","tool_calls":[{"tool_name":"Read","tool_input":{"file_path":%q},"tool_use_id":%q,"tool_response":%s}]}`,
+			cmSessionA, lab.transcript(cmSessionA), lab.proj, cmSubagent, filepath.Join(lab.proj, "fixture.go"), id, response)
 	}
 	lab.feed(scripted[:7]...)
 	lab.feed(subBatch("toolu_01V8dv8UQGCZREurDdztPdMd", `[{"type":"text","text":"abc"},{"type":"text","text":"defg"}]`))
@@ -310,8 +310,8 @@ func TestCallmeterCapturedPayloads(t *testing.T) {
 	)
 	failure := lab.call("toolu_0159VRFgcqEF4RCnEtEF1gjm")
 	expect(t, "failed Bash", failure,
-		map[string]any{"tool": "Bash", "failed": 1, "bytes_real": len(failure["error"]), "duration_ms": 11})
-	if !strings.HasPrefix(failure["error"], "Exit code 1\ncat: does-not-exist.txt") {
+		map[string]any{"tool": "Bash", "failed": 1, "bytes_real": len("Exit code 1\ncat: does-not-exist.txt: No such file or directory"), "duration_ms": 11})
+	if failure["error"] != "Exit code 1" {
 		t.Errorf("failed Bash error = %q", failure["error"])
 	}
 	expect(t, "sub-agent Read", lab.call("toolu_01V8dv8UQGCZREurDdztPdMd"), map[string]any{
@@ -400,7 +400,7 @@ func TestCallmeterCapturedPayloads(t *testing.T) {
 	)
 
 	if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
-		t.Errorf("faults = %d, want 0 for the captured run", n)
+		t.Errorf("faults = %d, want 0 for the captured run: %s", n, lab.faultsText())
 	}
 	if n := lab.count("SELECT count(*) FROM requests WHERE pending = 1"); n != 0 {
 		t.Errorf("pending requests = %d, want 0 after every Stop", n)
@@ -899,6 +899,102 @@ func TestCallmeterResumedAgentKeepsItsFirstStartAndLatestTotals(t *testing.T) {
 	})
 }
 
+// wakePrompt is the user entry Claude Code writes when it wakes an agent
+// whose turn ended (a task notification), carrying the main chat's prompt id,
+// which its SubagentStop carries too (live: both the same id).
+func wakePrompt(promptID string) string {
+	return `{"type":"user","uuid":"s-u3","isMeta":true,"promptId":"` + promptID + `","timestamp":"2026-09-23T01:50:00.000Z",` +
+		`"message":{"role":"user","content":"invented wake-up text"}}` + "\n"
+}
+
+// wakeReply is the woken agent's whole turn: one text reply, no tool call.
+const wakeReply = `{"type":"assistant","uuid":"s-a7","timestamp":"2026-09-23T01:50:05.000Z","message":{"id":"msg_demo_S7","model":"claude-sonnet-4-5",` +
+	`"content":[{"type":"text","text":"invented reply text"}],"stop_reason":"end_turn",` +
+	`"usage":{"input_tokens":2,"cache_read_input_tokens":7600,"cache_creation_input_tokens":20,"output_tokens":60}}}` + "\n"
+
+// TestCallmeterSubagentStopWaitsForAWokenTurnsTextReply: an agent woken after
+// its turn ended (live: an orchestrator woken by a task notification) answered
+// with one text reply, and its SubagentStop fired 43 ms after that reply was
+// stamped, before its line was flushed. The previous turn's end_turn was then
+// the last assistant entry on disk, read as the turn's tail, so the hook did
+// not wait and the reply was never recorded. A prompt after the last assistant
+// entry means the turn's answer is still to come: the hook waits for it, and
+// stops as soon as it is on disk.
+func TestCallmeterSubagentStopWaitsForAWokenTurnsTextReply(t *testing.T) {
+	lab := newCallmeterLab(t)
+	scripted := lab.payloads("scripted.jsonl")
+	agentTranscript, _ := payloadField(t, scripted[8], "agent_transcript_path").(string)
+	lab.feed(scripted[5], asyncAgentResult(t, scripted[9]), scripted[8])
+	full, err := os.ReadFile(agentTranscript)
+	if err != nil {
+		t.Fatalf("read agent transcript: %v", err)
+	}
+	promptID, _ := payloadField(t, scripted[8], "prompt_id").(string)
+	if promptID == "" {
+		t.Fatal("the captured SubagentStop carries no prompt_id")
+	}
+	woken := append(append([]byte{}, full...), wakePrompt(promptID)...)
+	lab.write(agentTranscript, woken)
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		time.Sleep(150 * time.Millisecond)
+		if err := os.WriteFile(agentTranscript, append(woken, wakeReply...), 0o644); err != nil {
+			t.Errorf("flush the woken turn's reply: %v", err)
+		}
+	}()
+	lab.clock.Advance(20 * time.Minute)
+	began := time.Now()
+	lab.feed(scripted[8])
+	took := time.Since(began)
+	<-flushed
+	expect(t, "woken turn's reply", lab.row("SELECT * FROM requests WHERE request_id = 'msg_demo_S7'"), map[string]any{
+		"agent_id": cmSubagent, "output_tokens": 60, "stop_reason": "end_turn", "calls": 0, "pending": 0,
+	})
+	expect(t, "woken agent", lab.row("SELECT * FROM agents WHERE agent_id = ?", cmSubagent), map[string]any{
+		"total_tokens": 18107 + (2 + 7600 + 20 + 60), "tool_uses": 2,
+	})
+	if took >= agentSettle {
+		t.Errorf("SubagentStop took %v, want under agentSettle %v: it stops once the reply is on disk", took, agentSettle)
+	}
+}
+
+// TestCallmeterStopWaitsForASecondTurnsTextReply: the main chat's Stop, like
+// SubagentStop, fires before the turn's last line is flushed. A second turn
+// answered by one text reply had the first turn's end_turn as the last
+// assistant entry on disk, read as the tail, so the sweep did not wait and the
+// reply was never recorded. The prompt after it means the answer is to come.
+func TestCallmeterStopWaitsForASecondTurnsTextReply(t *testing.T) {
+	lab := newCallmeterLab(t)
+	main := lab.transcript(cmSessionA)
+	const before = 1790125140000 // 2026-09-23T00:59:00Z, before the transcript's entries
+	first := `{"type":"user","promptId":"prompt-turn-1","message":{"role":"user","content":"invented"}}` + "\n" +
+		sweepEntry("msg_turnone0001", "01", `"end_turn"`, 5, `{"type":"text","text":"invented"}`)
+	lab.write(main, []byte(first))
+	lab.feedAt(before, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-turn-1"}))
+	turns := first + `{"type":"user","promptId":"prompt-turn-2","message":{"role":"user","content":"invented"}}` + "\n"
+	lab.write(main, []byte(turns))
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		time.Sleep(150 * time.Millisecond)
+		if err := os.WriteFile(main, []byte(turns+
+			sweepEntry("msg_turntwo0001", "05", `"end_turn"`, 44, `{"type":"text","text":"invented"}`)), 0o644); err != nil {
+			t.Errorf("flush the second turn's reply: %v", err)
+		}
+	}()
+	began := time.Now()
+	lab.feedAt(before+60000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-turn-2"}))
+	took := time.Since(began)
+	<-flushed
+	expect(t, "second turn's reply", lab.row("SELECT * FROM requests WHERE request_id = 'msg_turntwo0001'"), map[string]any{
+		"output_tokens": 44, "stop_reason": "end_turn", "prompt_id": "prompt-turn-2", "agent_id": "<nil>", "pending": 0,
+	})
+	if took >= agentSettle {
+		t.Errorf("Stop took %v, want under agentSettle %v: it stops once the reply is on disk", took, agentSettle)
+	}
+}
+
 // A PostToolBatch carries no top-level tool_use_id: a store it cannot open
 // still names every call whose record is lost.
 func TestCallmeterStoreUnopenableNamesBatchCalls(t *testing.T) {
@@ -1061,6 +1157,64 @@ func TestCallmeterBatchResolvesEarlierPending(t *testing.T) {
 		t.Errorf("pending requests after the next batch = %d, want 0", n)
 	}
 	expect(t, "early call", lab.call("toolu_early"), map[string]any{"request_id": "msg_early"})
+}
+
+// TestCallmeterSessionEdgeResolvesAnAbandonedAgentsPending: a sub-agent whose
+// last batch missed the disk and that never fires SubagentStop (killed, or
+// outlived a headless run) kept that request pending forever: the main chat's
+// Stop resolved only the main chat's own (live e2e: 1 pending, its message on
+// disk 1 s before the Stop). The main chat's Stop and SessionEnd now resolve
+// every agent's; an agent whose transcript is missing stays pending with the
+// one transcript fault of its batch, never a second.
+func TestCallmeterSessionEdgeResolvesAnAbandonedAgentsPending(t *testing.T) {
+	for _, edge := range []string{eventStop, callmeter.EventSessionEnd} {
+		t.Run(edge, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			transcript := lab.transcript(cmSessionA)
+			agent := callmeter.SubagentTranscriptPath(transcript, "aabandoned000001")
+			if err := os.MkdirAll(filepath.Dir(agent), 0o755); err != nil {
+				t.Fatalf("create subagents dir: %v", err)
+			}
+			batch := func(agentID, id string) string {
+				encoded, err := json.Marshal(map[string]any{
+					"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": transcript,
+					"agent_id": agentID, "agent_type": "general-purpose",
+					"tool_calls": []map[string]any{{"tool_use_id": id, "tool_response": "ok"}},
+				})
+				if err != nil {
+					t.Fatalf("encode batch: %v", err)
+				}
+				return string(encoded)
+			}
+			lab.write(agent, []byte(""))
+			lab.feed(batch("aabandoned000001", "toolu_abandoned1"))
+			lab.feed(batch("amissing00000001", "toolu_missing001"))
+			if n := lab.count("SELECT count(*) FROM requests WHERE pending = 1"); n != 2 {
+				t.Fatalf("pending requests after the batches = %d, want 2", n)
+			}
+			lab.write(agent, []byte(`{"type":"assistant","timestamp":"2026-09-23T01:00:00.000Z","message":{"id":"msg_abandoned",`+
+				`"content":[{"type":"tool_use","id":"toolu_abandoned1"}],"usage":{"input_tokens":5,`+
+				`"cache_read_input_tokens":7,"cache_creation_input_tokens":0,"output_tokens":1}}}`+"\n"))
+			encoded, err := json.Marshal(map[string]any{
+				"session_id": cmSessionA, "hook_event_name": edge, "transcript_path": transcript, "reason": "other",
+			})
+			if err != nil {
+				t.Fatalf("encode %s: %v", edge, err)
+			}
+			lab.feed(string(encoded))
+			expect(t, "abandoned agent's call", lab.call("toolu_abandoned1"), map[string]any{"request_id": "msg_abandoned"})
+			if n := lab.count("SELECT count(*) FROM requests WHERE request_id = 'msg_abandoned' AND pending = 0 AND context_tokens = 12"); n != 1 {
+				t.Errorf("resolved request rows = %d, want 1 with context_tokens 12", n)
+			}
+			if n := lab.count("SELECT count(*) FROM requests WHERE pending = 1 AND agent_id = 'amissing00000001'"); n != 1 {
+				t.Errorf("pending requests of the agent without a transcript = %d, want 1", n)
+			}
+			if n := lab.count("SELECT count(*) FROM faults WHERE stage = ? AND error LIKE '%amissing00000001%'",
+				callmeter.StageTranscript); n != 1 {
+				t.Errorf("transcript faults naming the agent without a transcript = %d, want 1", n)
+			}
+		})
+	}
 }
 
 // TestCallmeterBatchUntypedAgentWithoutTranscriptIsNotRecorded:
@@ -1734,5 +1888,726 @@ func TestCallmeterRedeliveredBatchCountsItsCallsOnce(t *testing.T) {
 				t.Errorf("requests rows = %d, want 1", n)
 			}
 		})
+	}
+}
+
+// TestCallmeterPreToolUseOfUntypedAgentWithoutTranscriptIsNotRecorded: live,
+// Claude Code's own internal agents (no agent_type, no transcript on disk)
+// fire PreToolUse for a Bash call and nothing after it — no PostToolUse, and
+// their PostToolBatch is not metered — so a start row would wait forever for
+// a size it can never get (7 such rows in the live store). Their PreToolUse
+// writes no call, as their batch and stop write nothing; a typed agent's start
+// is still recorded.
+func TestCallmeterPreToolUseOfUntypedAgentWithoutTranscriptIsNotRecorded(t *testing.T) {
+	lab := newCallmeterLab(t)
+	start := func(agentID, agentType, id string) string {
+		m := map[string]any{
+			"session_id": cmSessionA, "hook_event_name": "PreToolUse", "cwd": cmDemoProj,
+			"transcript_path": lab.transcript(cmSessionA), "agent_id": agentID,
+			"tool_name": "Bash", "tool_use_id": id,
+			"tool_input": map[string]any{"command": "ls", "description": "list"},
+		}
+		if agentType != "" {
+			m["agent_type"] = agentType
+		}
+		encoded, err := json.Marshal(m)
+		if err != nil {
+			t.Fatalf("encode PreToolUse: %v", err)
+		}
+		return string(encoded)
+	}
+	lab.feed(
+		start("ainternal0000001", "", "toolu_untypedstart1"),
+		start("atyped0000000001", "general-purpose", "toolu_typedstart1"),
+	)
+	if n := lab.count("SELECT count(*) FROM calls WHERE tool_use_id = 'toolu_untypedstart1'"); n != 0 {
+		t.Errorf("calls for the untyped agent's PreToolUse = %d, want 0", n)
+	}
+	if n := lab.count("SELECT count(*) FROM calls WHERE tool_use_id = 'toolu_typedstart1'"); n != 1 {
+		t.Errorf("calls for the typed agent's PreToolUse = %d, want 1", n)
+	}
+	if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+		t.Errorf("faults = %d, want 0", n)
+	}
+}
+
+// TestCallmeterBatchMarksDeniedAndRejectedCalls: live (claude -p with a
+// PreToolUse deny hook and an ungranted Write), a denied call fires neither
+// PostToolUse nor PostToolUseFailure; its PostToolBatch alone carries the
+// harness's text. The batch marks it failed with its outcome label — never
+// the hook's or the prompt's own words — and an ordinary result stays unmarked.
+func TestCallmeterBatchMarksDeniedAndRejectedCalls(t *testing.T) {
+	lab := newCallmeterLab(t)
+	responses := []struct{ id, text, outcome string }{
+		{"toolu_hookdeny01", "PreToolUse:Bash hook error: invented reason", callmeter.OutcomeDeniedByHook},
+		{"toolu_permdeny01", "Claude requested permissions to write to /tmp/demo-proj/out.txt, but you haven't granted it yet.",
+			callmeter.OutcomeDeniedByPermission},
+		{"toolu_rejected01", "The user doesn't want to proceed with this tool use. The tool use was rejected.",
+			callmeter.OutcomeRejectedByUser},
+		{"toolu_ordinary01", "PreToolUse is a hook event", ""},
+	}
+	var calls []map[string]any
+	for _, r := range responses {
+		calls = append(calls, map[string]any{"tool_use_id": r.id, "tool_name": "Bash", "tool_response": r.text})
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"session_id": cmSessionA, "hook_event_name": "PostToolBatch",
+		"transcript_path": lab.transcript(cmSessionA), "tool_calls": calls,
+	})
+	if err != nil {
+		t.Fatalf("encode batch: %v", err)
+	}
+	lab.feed(string(encoded))
+	for _, r := range responses {
+		want := map[string]any{"bytes_delivered": len(r.text), "bytes_real": len(r.text), "failed": 1, "error": r.outcome}
+		if r.outcome == "" {
+			want["bytes_real"], want["failed"], want["error"] = "<nil>", "<nil>", "<nil>"
+		}
+		expect(t, r.id, lab.call(r.id), want)
+	}
+}
+
+// TestCallmeterBatchFillsInputAndFileOfAWriteNoHookSaw: only Bash has a
+// PreToolUse hook, so a Write the harness refused before it ran has its batch
+// entry alone, and that entry's tool_input is the only place its input and
+// file_path can come from. The input is stored sanitized (the content text is
+// nowhere in the store); a Write whose PostToolUse landed first keeps the
+// input and file_path that hook stored, whatever the batch's entry says.
+func TestCallmeterBatchFillsInputAndFileOfAWriteNoHookSaw(t *testing.T) {
+	const content = "invented-write-content-words"
+	const refusal = "Claude requested permissions to write to %s, but you haven't granted it yet."
+	batch := func(t *testing.T, lab *callmeterLab, id, path string) string {
+		t.Helper()
+		encoded, err := json.Marshal(map[string]any{
+			"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": lab.transcript(cmSessionA),
+			"tool_calls": []map[string]any{{
+				"tool_use_id": id, "tool_name": "Write",
+				"tool_input":    map[string]any{"file_path": path, "content": content},
+				"tool_response": fmt.Sprintf(refusal, path),
+			}},
+		})
+		if err != nil {
+			t.Fatalf("encode batch: %v", err)
+		}
+		return string(encoded)
+	}
+	t.Run("batch alone", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		path := filepath.Join(lab.proj, "refused.txt")
+		lab.feed(batch(t, lab, "toolu_refusedwr1", path))
+		row := lab.call("toolu_refusedwr1")
+		expect(t, "call", row, map[string]any{"file_path": path, "failed": 1, "error": callmeter.OutcomeDeniedByPermission})
+		if row["input"] == "<nil>" || row["input"] == "" {
+			t.Errorf("input = %q, want the batch's sanitized tool_input", row["input"])
+		}
+		if strings.Contains(lab.storeText(), content) {
+			t.Errorf("the store holds the Write's content text")
+		}
+	})
+	t.Run("earlier hook's columns stay", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		const id = "toolu_keptwrite01"
+		first := filepath.Join(lab.proj, "first.txt")
+		lab.feed(toolPayload(t, "PostToolUse", id, "Write",
+			map[string]any{"file_path": first, "content": "other-invented-words"}, map[string]any{"tool_response": map[string]any{}}))
+		before := lab.call(id)
+		if before["file_path"] != first || before["input"] == "<nil>" {
+			t.Fatalf("PostToolUse stored file_path %q, input %q, want %q and an input", before["file_path"], before["input"], first)
+		}
+		lab.feed(batch(t, lab, id, filepath.Join(lab.proj, "second.txt")))
+		after := lab.call(id)
+		for _, column := range []string{"input", "file_path"} {
+			if after[column] != before[column] {
+				t.Errorf("%s = %q after the batch, want the hook's %q", column, after[column], before[column])
+			}
+		}
+		if after["bytes_delivered"] == "<nil>" {
+			t.Errorf("bytes_delivered = %q, want the batch's size", after["bytes_delivered"])
+		}
+	})
+}
+
+// TestCallmeterBatchLabelsRefusalBesideItsStart: live (reconcile over the
+// 2026-10-01 store, 10 calls), a call a PreToolUse hook blocked or permission
+// denied fired no PostToolUse or PostToolUseFailure, and the store kept only
+// its batch's delivered size. A Bash call had callmeter's own PreToolUse row
+// first (its matcher is Bash), in a sub-agent too; an Edit or a Write had
+// none. Its batch still marks it failed with its outcome label, whichever of
+// PreToolUse and PostToolBatch lands first and when the batch lands twice, and
+// the hook's own words reach no column.
+func TestCallmeterBatchLabelsRefusalBesideItsStart(t *testing.T) {
+	const reason = "invented-hook-reason-words"
+	cases := []struct {
+		name, tool, agent, response, outcome string
+		started                              bool
+	}{
+		{"main Bash", "Bash", "", "PreToolUse:Bash hook error: " + reason, callmeter.OutcomeDeniedByHook, true},
+		{"sub-agent Bash", "Bash", "agitter000000002", "PreToolUse:Bash hook error: " + reason, callmeter.OutcomeDeniedByHook, true},
+		{"Edit", "Edit", "", "PreToolUse:Edit hook error: " + reason, callmeter.OutcomeDeniedByHook, false},
+		{"Write", "Write", "", "Claude requested permissions to write to /tmp/demo-proj/out.txt, but you haven't granted it yet.",
+			callmeter.OutcomeDeniedByPermission, false},
+	}
+	for _, c := range cases {
+		orders := [][]string{{"batch"}, {"batch", "batch"}}
+		if c.started {
+			orders = [][]string{{"start", "batch"}, {"batch", "start"}, {"start", "batch", "batch"}}
+		}
+		for _, order := range orders {
+			t.Run(c.name+"/"+strings.Join(order, "-"), func(t *testing.T) {
+				lab := newCallmeterLab(t)
+				const id = "toolu_refusedcall1"
+				fields := func(event string) map[string]any {
+					f := map[string]any{"session_id": cmSessionA, "hook_event_name": event, "cwd": cmDemoProj,
+						"transcript_path": lab.transcript(cmSessionA)}
+					if c.agent != "" {
+						f["agent_id"], f["agent_type"] = c.agent, "gitter"
+					}
+					return f
+				}
+				if c.agent != "" {
+					path := callmeter.SubagentTranscriptPath(lab.transcript(cmSessionA), c.agent)
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatalf("create subagents dir: %v", err)
+					}
+					lab.write(path, nil)
+				}
+				start := fields("PreToolUse")
+				start["tool_name"], start["tool_use_id"] = c.tool, id
+				start["tool_input"] = map[string]any{"command": "git status", "description": "status"}
+				batch := fields("PostToolBatch")
+				batch["tool_calls"] = []map[string]any{{"tool_use_id": id, "tool_name": c.tool, "tool_response": c.response}}
+				payloads := map[string]map[string]any{"start": start, "batch": batch}
+				for _, step := range order {
+					encoded, err := json.Marshal(payloads[step])
+					if err != nil {
+						t.Fatalf("encode %s: %v", step, err)
+					}
+					lab.feed(string(encoded))
+				}
+				row := lab.call(id)
+				expect(t, c.name, row, map[string]any{
+					"tool": c.tool, "bytes_delivered": len(c.response), "bytes_real": len(c.response),
+					"failed": 1, "error": c.outcome,
+				})
+				if row["ts"] == "<nil>" {
+					t.Errorf("%s.ts is NULL, want the earliest hook's", c.name)
+				}
+				if strings.Contains(lab.storeText(), reason) {
+					t.Errorf("the store holds the hook's reason %q, which must stay out of it", reason)
+				}
+			})
+		}
+	}
+}
+
+// TestCallmeterSessionEdgeSettlesUnfinishedCalls: live, a sub-agent's Bash
+// call the user interrupted fired PreToolUse and nothing else — no
+// PostToolUseFailure, no PostToolBatch, no SubagentStop — while its transcript
+// holds the tool_result the model received; and a call Claude Code refused
+// before any PostToolUse kept only its batch's delivered size. The chat's next
+// Stop, or its SessionEnd when the user quits without another prompt, fills
+// each from that result: the size, failed and the outcome label, and a
+// refusal's real size, its text being the whole output. A call with no result
+// yet stays unknown.
+func TestCallmeterSessionEdgeSettlesUnfinishedCalls(t *testing.T) {
+	for _, edge := range []string{eventStop, callmeter.EventSessionEnd} {
+		t.Run(edge, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			const agent = "agitter000000001"
+			start := func(id string) string {
+				encoded, err := json.Marshal(map[string]any{
+					"session_id": cmSessionA, "hook_event_name": "PreToolUse", "cwd": cmDemoProj,
+					"transcript_path": lab.transcript(cmSessionA), "agent_id": agent, "agent_type": "gitter",
+					"tool_name": "Bash", "tool_use_id": id,
+					"tool_input": map[string]any{"command": "git push", "description": "push"},
+				})
+				if err != nil {
+					t.Fatalf("encode PreToolUse: %v", err)
+				}
+				return string(encoded)
+			}
+			const rejected = "The user doesn't want to proceed with this tool use. The tool use was rejected."
+			lines := []map[string]any{
+				{"type": "assistant", "timestamp": "2026-09-23T01:00:00.000Z", "message": map[string]any{"id": "msg_invented01", "content": []map[string]any{
+					{"type": "tool_use", "id": "toolu_interrupted1", "name": "Bash", "input": map[string]any{"command": "git push"}},
+				}}},
+				{"type": "user", "message": map[string]any{"content": []map[string]any{
+					{"type": "tool_result", "tool_use_id": "toolu_interrupted1", "content": rejected, "is_error": true},
+				}}},
+				{"type": "user", "message": map[string]any{"content": []map[string]any{
+					{"type": "text", "text": "[Request interrupted by user for tool use]"},
+				}}},
+			}
+			var transcript []byte
+			for _, line := range lines {
+				encoded, err := json.Marshal(line)
+				if err != nil {
+					t.Fatalf("encode transcript line: %v", err)
+				}
+				transcript = append(append(transcript, encoded...), '\n')
+			}
+			path := callmeter.SubagentTranscriptPath(lab.transcript(cmSessionA), agent)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("create subagents dir: %v", err)
+			}
+			lab.write(path, transcript)
+			const denied = "PreToolUse:Bash hook error: invented reason"
+			main := lab.transcript(cmSessionA)
+			lab.write(main, []byte(sweepEntry("msg_invented02", "01", `"tool_use"`, 5,
+				`{"type":"tool_use","id":"toolu_refusedold1","name":"Bash","input":{"command":"git status"}}`)+
+				`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_refusedold1","content":"`+
+				denied+`","is_error":true}]}}`+"\n"+
+				sweepEntry("msg_invented03", "02", `"end_turn"`, 3, `{"type":"text","text":"ok"}`)))
+			// The batch's text, not the harness's opening: no label, no real size.
+			batch, err := json.Marshal(map[string]any{
+				"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": main,
+				"tool_calls": []map[string]any{{"tool_use_id": "toolu_refusedold1", "tool_name": "Bash", "tool_response": "Error: " + denied}},
+			})
+			if err != nil {
+				t.Fatalf("encode PostToolBatch: %v", err)
+			}
+			ending := map[string]any{"session_id": cmSessionA, "hook_event_name": edge, "transcript_path": main}
+			if edge == callmeter.EventSessionEnd {
+				ending["reason"] = "other"
+			}
+			end, err := json.Marshal(ending)
+			if err != nil {
+				t.Fatalf("encode %s: %v", edge, err)
+			}
+			lab.feed(start("toolu_interrupted1"), start("toolu_stillrunning1"), string(batch), string(end))
+			expect(t, "interrupted call", lab.call("toolu_interrupted1"), map[string]any{
+				"bytes_delivered": len(rejected), "bytes_real": len(rejected), "failed": 1, "error": callmeter.OutcomeRejectedByUser,
+			})
+			expect(t, "refused call", lab.call("toolu_refusedold1"), map[string]any{
+				"bytes_real": len(denied), "failed": 1, "error": callmeter.OutcomeDeniedByHook,
+			})
+			expect(t, "running call", lab.call("toolu_stillrunning1"), map[string]any{
+				"bytes_delivered": "<nil>", "bytes_real": "<nil>", "failed": "<nil>", "error": "<nil>",
+			})
+			// At SessionEnd the call still running has no result and will get none:
+			// that is a fault naming it; at Stop it may be a background call.
+			wantFaults := 0
+			if edge == callmeter.EventSessionEnd {
+				wantFaults = 1
+				if n := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = 'toolu_stillrunning1' AND stage = ?", callmeter.StageTranscript); n != 1 {
+					t.Errorf("faults naming the call with no result = %d, want 1", n)
+				}
+			}
+			if n := lab.count("SELECT count(*) FROM faults"); n != wantFaults {
+				t.Errorf("faults = %d, want %d: %s", n, wantFaults, lab.faultsText())
+			}
+		})
+	}
+}
+
+// sweepEntry is one transcript entry of message id as Claude Code writes it:
+// one content block per entry, the usage as it stood when the block was
+// written, stop null on every entry but the last.
+func sweepEntry(id, second, stop string, output int, block string) string {
+	return fmt.Sprintf(`{"type":"assistant","timestamp":"2026-09-23T01:00:%s.000Z","message":{"id":"%s","model":"claude-opus-4-1",`+
+		`"stop_reason":%s,"content":[%s],"usage":{"input_tokens":3,"cache_read_input_tokens":40,"cache_creation_input_tokens":5,`+
+		`"output_tokens":%d}}}`+"\n", second, id, stop, block, output)
+}
+
+// TestCallmeterSessionEdgeSweepsEveryRequest: the main chat's Stop and
+// SessionEnd write every request its transcripts hold at its final usage. A
+// row its batch stored from a message's first entry (output 8, no stop
+// reason: the batch read before the rest of the message was on disk) is
+// corrected to the final entry's; the turn's closing reply, which has no tool
+// call and so no batch, gets a row with 0 calls, its prompt and its tokens,
+// never its text; and an interrupted sub-agent's call, whose batch never ran,
+// is pointed at its request. A reply from before the session's first recorded
+// run (callmeter enabled mid-session) is not back-filled.
+func TestCallmeterSessionEdgeSweepsEveryRequest(t *testing.T) {
+	for _, edge := range []string{eventStop, callmeter.EventSessionEnd} {
+		t.Run(edge, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			main := lab.transcript(cmSessionA)
+			const agent = "asweep0000000001"
+			encode := func(fields map[string]any) string {
+				fields["session_id"], fields["transcript_path"] = cmSessionA, main
+				encoded, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatalf("encode payload: %v", err)
+				}
+				return string(encoded)
+			}
+			const secret = "invented closing reply text"
+			prompt := sweepEntry("msg_sweep_old", "00", `"end_turn"`, 31, `{"type":"text","text":"invented"}`) +
+				`{"type":"user","promptId":"prompt-sweep-1","message":{"role":"user","content":"invented"}}` + "\n"
+			prompt = strings.Replace(prompt, "01:00:00.000Z", "00:59:00.000Z", 1)
+			first := sweepEntry("msg_sweep_calls", "01", "null", 8, `{"type":"tool_use","id":"toolu_sweep_a","name":"Bash","input":{}}`)
+			lab.write(main, []byte(prompt+first))
+			lab.feedAt(1790125199000, batchPayload(t, main, "toolu_sweep_a"))
+			expect(t, "batch-time request", lab.row("SELECT output_tokens, stop_reason FROM requests WHERE request_id = 'msg_sweep_calls'"),
+				map[string]any{"output_tokens": 8, "stop_reason": "<nil>"})
+			lab.write(main, []byte(prompt+first+
+				sweepEntry("msg_sweep_calls", "02", `"tool_use"`, 643, `{"type":"tool_use","id":"toolu_sweep_b","name":"Bash","input":{}}`)+
+				`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_sweep_a","content":"ok"}]}}`+"\n"+
+				sweepEntry("msg_sweep_reply", "05", "null", 9, `{"type":"thinking","thinking":"invented"}`)+
+				sweepEntry("msg_sweep_reply", "06", `"end_turn"`, 212, `{"type":"text","text":"`+secret+`"}`)))
+			agentPath := callmeter.SubagentTranscriptPath(main, agent)
+			if err := os.MkdirAll(filepath.Dir(agentPath), 0o755); err != nil {
+				t.Fatalf("create subagents dir: %v", err)
+			}
+			lab.write(agentPath, []byte(
+				sweepEntry("msg_sweep_agent", "03", `"tool_use"`, 77, `{"type":"tool_use","id":"toolu_sweep_cut","name":"Bash","input":{}}`)))
+			lab.clock = clock.NewFake(time.UnixMilli(1790125300000))
+			lab.feed(
+				encode(map[string]any{"hook_event_name": "SubagentStart", "agent_id": agent, "agent_type": "gitter"}),
+				encode(map[string]any{
+					"hook_event_name": "PreToolUse", "cwd": cmDemoProj, "agent_id": agent, "agent_type": "gitter",
+					"tool_name": "Bash", "tool_use_id": "toolu_sweep_cut", "tool_input": map[string]any{"command": "git push"},
+				}),
+				encode(map[string]any{"hook_event_name": edge, "reason": "other"}),
+			)
+			expect(t, "corrected request", lab.row(
+				"SELECT output_tokens, stop_reason, context_tokens, calls, ts FROM requests WHERE request_id = 'msg_sweep_calls'"),
+				map[string]any{"output_tokens": 643, "stop_reason": "tool_use", "context_tokens": 48, "calls": 1, "ts": 1790125201000})
+			expect(t, "closing reply", lab.row(
+				"SELECT output_tokens, stop_reason, calls, prompt_id, agent_id, session_id, pending, ts FROM requests WHERE request_id = 'msg_sweep_reply'"),
+				map[string]any{
+					"output_tokens": 212, "stop_reason": "end_turn", "calls": 0, "prompt_id": "prompt-sweep-1",
+					"agent_id": "<nil>", "session_id": cmSessionA, "pending": 0, "ts": 1790125205000,
+				})
+			expect(t, "interrupted agent's request", lab.row(
+				"SELECT output_tokens, agent_id, calls FROM requests WHERE request_id = 'msg_sweep_agent'"),
+				map[string]any{"output_tokens": 77, "agent_id": agent, "calls": 1})
+			expect(t, "interrupted agent's call", lab.call("toolu_sweep_cut"), map[string]any{"request_id": "msg_sweep_agent"})
+			if n := lab.count("SELECT count(*) FROM requests WHERE request_id = 'msg_sweep_old'"); n != 0 {
+				t.Errorf("rows of the reply before the session's first run = %d, want 0", n)
+			}
+			if strings.Contains(lab.storeText(), secret) {
+				t.Errorf("the store holds the reply's text")
+			}
+			// The interrupted sub-agent's call has no result on disk: at SessionEnd,
+			// the hooks' last chance to find one, that is said as a fault naming it.
+			wantFaults := 0
+			if edge == callmeter.EventSessionEnd {
+				wantFaults = 1
+				if n := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = 'toolu_sweep_cut' AND stage = ?", callmeter.StageTranscript); n != 1 {
+					t.Errorf("faults naming the call with no result = %d, want 1", n)
+				}
+			}
+			if n := lab.count("SELECT count(*) FROM faults"); n != wantFaults {
+				t.Errorf("faults = %d, want %d: %s", n, wantFaults, lab.faultsText())
+			}
+		})
+	}
+}
+
+// TestCallmeterSessionEndReadsASettledAgentLast: a sub-agent whose
+// SubagentStop came after its last start had its transcript swept by that
+// stop. SessionEnd reads it again only after every agent no stop settled, and
+// only while its budget lasts, so a read of it the budget cuts off is no skip;
+// with time left it is read, for a stop cut off before its sweep committed.
+func TestCallmeterSessionEndReadsASettledAgentLast(t *testing.T) {
+	for _, budget := range []time.Duration{0, sessionEndBudget} {
+		t.Run(budget.String(), func(t *testing.T) {
+			saved := sessionEndBudget
+			sessionEndBudget = budget
+			t.Cleanup(func() { sessionEndBudget = saved })
+			lab := newCallmeterLab(t)
+			main := lab.transcript(cmSessionA)
+			lab.write(main, []byte(sweepEntry("msg_mainreply01", "01", `"end_turn"`, 5, `{"type":"text","text":"ok"}`)))
+			const settled, running = "asettled00000001", "arunning00000001"
+			for _, agent := range []string{settled, running} {
+				path := callmeter.SubagentTranscriptPath(main, agent)
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatalf("create subagents dir: %v", err)
+				}
+				lab.write(path, []byte(sweepEntry("msg_"+agent, "01", `"end_turn"`, 5, `{"type":"text","text":"done"}`)))
+			}
+			path := callmeter.SubagentTranscriptPath(main, settled)
+			edge := func(event string) string {
+				return hookPayload(t, event, map[string]any{
+					"agent_id": settled, "agent_type": "gitter", "transcript_path": main, "agent_transcript_path": path,
+				})
+			}
+			const before = 1790125140000 // 2026-09-23T00:59:00Z, before the transcripts' entries
+			lab.feedAt(before, edge(callmeter.EventSubagentStart))
+			lab.feedAt(before+1000, edge(callmeter.EventSubagentStop))
+			lab.write(path, []byte(sweepEntry("msg_"+settled, "01", `"end_turn"`, 5, `{"type":"text","text":"done"}`)+
+				sweepEntry("msg_agentlate01", "02", `"end_turn"`, 7, `{"type":"text","text":"later"}`)))
+			lab.feedAt(before+2000, hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main}))
+			if budget == 0 {
+				// The main transcript and every agent on disk but the settled
+				// one are skipped reads; the settled one is not counted.
+				files, err := filepath.Glob(filepath.Join(filepath.Dir(path), "agent-*.jsonl"))
+				if err != nil {
+					t.Fatalf("list sub-agent transcripts: %v", err)
+				}
+				// ... and the main transcript's turn-end read (recoverTurnEnd).
+				want := fmt.Sprintf(": %d transcript reads skipped", len(files)+1)
+				if n := lab.count("SELECT count(*) FROM faults WHERE instr(error, ?) > 0", want); n != 1 {
+					t.Errorf("faults naming %q = %d, want 1: %v", want, n, lab.row("SELECT stage, error FROM faults"))
+				}
+				return
+			}
+			for _, id := range []string{"msg_mainreply01", "msg_" + running, "msg_agentlate01"} {
+				if n := lab.count("SELECT count(*) FROM requests WHERE request_id = ?", id); n != 1 {
+					t.Errorf("request %s stored %d times, want 1", id, n)
+				}
+			}
+			if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+				t.Errorf("faults = %d, want 0: %v", n, lab.row("SELECT stage, error FROM faults"))
+			}
+		})
+	}
+}
+
+// TestCallmeterSessionEndStopsReadingAtItsBudget: SessionEnd commits its event
+// first, then reads transcripts only within sessionEndBudget; a read the budget
+// cuts off is a transcript fault naming the count, never silence. Serial: it
+// sets the package's budget.
+func TestCallmeterSessionEndStopsReadingAtItsBudget(t *testing.T) {
+	saved := sessionEndBudget
+	sessionEndBudget = 0
+	t.Cleanup(func() { sessionEndBudget = saved })
+	lab := newCallmeterLab(t)
+	main := lab.transcript(cmSessionA)
+	lab.write(main, []byte(sweepEntry("msg_budget00001", "01", `"end_turn"`, 5, `{"type":"text","text":"bye"}`)))
+	lab.feed(hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main}))
+	expect(t, "event", lab.event(callmeter.EventSessionEnd), map[string]any{"reason": "other"})
+	if n := lab.count("SELECT count(*) FROM requests"); n != 0 {
+		t.Errorf("requests = %d, want 0: the budget was spent before any read", n)
+	}
+	if n := lab.count("SELECT count(*) FROM faults WHERE stage = ? AND error LIKE '%budget%'", callmeter.StageTranscript); n != 1 {
+		t.Errorf("budget faults = %d, want 1", n)
+	}
+}
+
+// toolResultLine is a transcript's user entry holding one tool_result.
+func toolResultLine(id, text string) string {
+	return `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"` + id +
+		`","content":"` + text + `","is_error":true}]}}` + "\n"
+}
+
+// TestCallmeterSessionEndWaitsForAnInFlightCallsResult: live, a headless
+// session's SessionEnd read the transcript 10 ms after it started, before
+// Claude Code had flushed the killed Bash call's `Exit code 137` result 50-100
+// ms later, and settled nothing, silently. SessionEnd now re-reads while the
+// transcript grows, for at most unfinishedSettle: a result that lands settles
+// the call; one that never does is a transcript fault naming the call, its
+// outcome columns left NULL, and the run ends inside sessionEndBudget.
+func TestCallmeterSessionEndWaitsForAnInFlightCallsResult(t *testing.T) {
+	const id = "toolu_inflight001"
+	setup := func(t *testing.T) (*callmeterLab, string) {
+		lab := newCallmeterLab(t)
+		main := lab.transcript(cmSessionA)
+		lab.write(main, []byte(sweepEntry("msg_inflight001", "01", `"tool_use"`, 5,
+			`{"type":"tool_use","id":"`+id+`","name":"Bash","input":{"command":"sleep 99"}}`)+
+			sweepEntry("msg_inflight002", "02", `"end_turn"`, 3, `{"type":"text","text":"ok"}`)))
+		lab.feed(toolPayload(t, "PreToolUse", id, "Bash", map[string]any{"command": "sleep 99"}, map[string]any{"cwd": lab.proj}))
+		return lab, main
+	}
+	end := func(t *testing.T, main string) string {
+		return hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main})
+	}
+	t.Run("result lands after SessionEnd starts", func(t *testing.T) {
+		lab, main := setup(t)
+		appended := make(chan error, 1)
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			file, err := os.OpenFile(main, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				appended <- err
+				return
+			}
+			_, err = file.WriteString(toolResultLine(id, "Exit code 137"))
+			appended <- errors.Join(err, file.Close())
+		}()
+		lab.feed(end(t, main))
+		if err := <-appended; err != nil {
+			t.Fatalf("append the tool_result: %v", err)
+		}
+		expect(t, "call", lab.call(id), map[string]any{"failed": 1, "bytes_delivered": len("Exit code 137"), "error": "Exit code 137"})
+		if n := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = ?", id); n != 0 {
+			t.Errorf("faults naming the call = %d, want 0: its result was found", n)
+		}
+	})
+	t.Run("result never lands", func(t *testing.T) {
+		lab, main := setup(t)
+		began := time.Now()
+		lab.feed(end(t, main))
+		took := time.Since(began)
+		if took < unfinishedSettle || took >= sessionEndBudget {
+			t.Errorf("SessionEnd took %v, want from unfinishedSettle %v to under sessionEndBudget %v", took, unfinishedSettle, sessionEndBudget)
+		}
+		expect(t, "call", lab.call(id), map[string]any{"failed": "<nil>", "bytes_delivered": "<nil>", "error": "<nil>"})
+		fault := lab.row("SELECT * FROM faults WHERE tool_use_id = ?", id)
+		expect(t, "fault", fault, map[string]any{"stage": callmeter.StageTranscript})
+		if !strings.Contains(fault["error"], "no tool_result") || !strings.Contains(fault["error"], "left in flight") {
+			t.Errorf("fault error = %q, want it to say the call has no tool_result and was left in flight", fault["error"])
+		}
+	})
+	t.Run("Stop leaves a running call alone", func(t *testing.T) {
+		lab, main := setup(t)
+		began := time.Now()
+		lab.feed(hookPayload(t, eventStop, map[string]any{"transcript_path": main}))
+		if took := time.Since(began); took >= unfinishedSettle {
+			t.Errorf("Stop took %v, want no wait: a background call may still be running", took)
+		}
+		if n := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = ?", id); n != 0 {
+			t.Errorf("faults naming the call = %d, want 0 at Stop", n)
+		}
+	})
+}
+
+// TestCallmeterCallTSIsTheEarliestHook: a call's ts is the earliest hook that
+// saw it, in every landing order of its PreToolUse, PostToolUse and batch; a
+// call Claude Code refused before any PreToolUse (here a tool name it does not
+// know) has its batch alone, and carries the batch's ts.
+func TestCallmeterCallTSIsTheEarliestHook(t *testing.T) {
+	const id = "toolu_tsorder01"
+	echo := map[string]any{"command": "echo hi"}
+	type delivery struct {
+		at      int64
+		payload func(*testing.T, *callmeterLab) string
+	}
+	pre := delivery{3000, func(t *testing.T, _ *callmeterLab) string {
+		return toolPayload(t, "PreToolUse", id, "Bash", echo, nil)
+	}}
+	post := delivery{4000, func(t *testing.T, _ *callmeterLab) string {
+		return toolPayload(t, "PostToolUse", id, "Bash", echo, nil)
+	}}
+	batch := delivery{5000, func(t *testing.T, lab *callmeterLab) string {
+		return batchPayload(t, lab.transcript(cmSessionA), id)
+	}}
+	for name, order := range map[string][]delivery{
+		"pre post batch": {pre, post, batch}, "pre batch post": {pre, batch, post},
+		"post pre batch": {post, pre, batch}, "post batch pre": {post, batch, pre},
+		"batch pre post": {batch, pre, post}, "batch post pre": {batch, post, pre},
+	} {
+		t.Run(name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			for _, d := range order {
+				lab.feedAt(d.at, d.payload(t, lab))
+			}
+			expect(t, "call", lab.call(id), map[string]any{"ts": 3000})
+		})
+	}
+	t.Run("refused before any PreToolUse", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		const refused = "toolu_tsrefused1"
+		encoded, err := json.Marshal(map[string]any{
+			"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": lab.transcript(cmSessionA),
+			"tool_calls": []map[string]any{{
+				"tool_use_id": refused, "tool_name": "bash",
+				"tool_response": "<tool_use_error>Error: No such tool available: bash</tool_use_error>",
+			}},
+		})
+		if err != nil {
+			t.Fatalf("encode PostToolBatch: %v", err)
+		}
+		lab.feedAt(5000, string(encoded))
+		expect(t, "refused call", lab.call(refused), map[string]any{"ts": 5000, "tool": "bash"})
+	})
+	// A call stored before every hook set a ts gets the Stop's, the settle
+	// reading its result; the earlier ts of a call that has one stands.
+	t.Run("stored without a ts, settled at the Stop", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		const legacy, started = "toolu_tslegacy01", "toolu_tsstarted01"
+		lab.feedAt(3000, toolPayload(t, "PreToolUse", started, "Bash", echo, nil))
+		if err := lab.db().UpsertCall(context.Background(), callmeter.Call{
+			ToolUseID: legacy, SessionID: callmeter.Ptr(cmSessionA), Tool: callmeter.Ptr("bash"),
+			Source: callmeter.Ptr(callmeter.SourceHook),
+		}, callmeter.Overwrite); err != nil {
+			t.Fatalf("seed a call without a ts: %v", err)
+		}
+		main := lab.transcript(cmSessionA)
+		var transcript string
+		for _, id := range []string{legacy, started} {
+			transcript += sweepEntry("msg_"+id, "01", `"tool_use"`, 5,
+				`{"type":"tool_use","id":"`+id+`","name":"Bash","input":{"command":"echo hi"}}`) +
+				`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"` + id +
+				`","content":"<tool_use_error>Error: No such tool available: bash</tool_use_error>","is_error":true}]}}` + "\n"
+		}
+		lab.write(main, []byte(transcript))
+		stop, err := json.Marshal(map[string]any{"session_id": cmSessionA, "hook_event_name": eventStop, "transcript_path": main})
+		if err != nil {
+			t.Fatalf("encode Stop: %v", err)
+		}
+		lab.feedAt(9000, string(stop))
+		expect(t, "legacy call", lab.call(legacy), map[string]any{"ts": 9000, "failed": 1})
+		expect(t, "started call", lab.call(started), map[string]any{"ts": 3000, "failed": 1})
+	})
+}
+
+// faultsText lists the faults rows as "stage tool_use_id error", for a failure message.
+func (lab *callmeterLab) faultsText() string {
+	lab.t.Helper()
+	rows, err := lab.db().DB().QueryContext(lab.ctx, "SELECT stage, COALESCE(tool_use_id, ''), error FROM faults ORDER BY ts, rowid")
+	if err != nil {
+		lab.t.Fatalf("read faults: %v", err)
+	}
+	var out []string
+	for rows.Next() {
+		var stage, id, text string
+		if err := rows.Scan(&stage, &id, &text); err != nil {
+			lab.t.Fatalf("scan a fault: %v", err)
+		}
+		out = append(out, fmt.Sprintf("[%s %s %s]", stage, id, text))
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		lab.t.Fatalf("read faults: %v", err)
+	}
+	return strings.Join(out, " ")
+}
+
+// TestHookTimeoutsAgreeWithHooksJSON pins hookTimeouts to the plugin's
+// hooks.json: a sync hook's timeout is the table's, an async hook has none (and
+// no table row), and every event's store wait ends, twice over with the reserve,
+// inside the timeout Claude Code gives it.
+func TestHookTimeoutsAgreeWithHooksJSON(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "plugins", "callmeter", "hooks", "hooks.json"))
+	if err != nil {
+		t.Fatalf("read hooks.json: %v", err)
+	}
+	var config struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Timeout *float64 `json:"timeout"`
+				Async   bool     `json:"async"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatalf("decode hooks.json: %v", err)
+	}
+	if len(config.Hooks) == 0 {
+		t.Fatal("hooks.json registers no event")
+	}
+	for event := range hookTimeouts {
+		if _, ok := config.Hooks[event]; !ok {
+			t.Errorf("hookTimeouts names %s, which hooks.json does not register", event)
+		}
+	}
+	for event, entries := range config.Hooks {
+		for _, entry := range entries {
+			for _, hook := range entry.Hooks {
+				timeout := asyncHookTimeout
+				if hook.Timeout != nil {
+					timeout = time.Duration(*hook.Timeout * float64(time.Second))
+					if hook.Async {
+						t.Errorf("%s: a hook with a timeout must be sync", event)
+					}
+					if hookTimeouts[event] != timeout {
+						t.Errorf("hookTimeouts[%s] = %v, hooks.json says %v", event, hookTimeouts[event], timeout)
+					}
+				} else {
+					if !hook.Async {
+						t.Errorf("%s: a hook with no timeout must be async", event)
+					}
+					if _, ok := hookTimeouts[event]; ok {
+						t.Errorf("hookTimeouts holds %s, which hooks.json runs async with no timeout", event)
+					}
+				}
+				if got := 2*storeWait(event) + storeWaitReserve; got > timeout {
+					t.Errorf("%s: two store waits of %v plus the %v reserve = %v, over its %v timeout",
+						event, storeWait(event), storeWaitReserve, got, timeout)
+				}
+			}
+		}
 	}
 }

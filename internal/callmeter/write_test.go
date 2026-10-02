@@ -83,7 +83,8 @@ func TestFillEmptyNeverOverwrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := row(t, store, "calls", "tool_use_id = ?", "toolu_1")
-	want := map[string]any{"ts": int64(1000), "tool": "Bash", "source": SourceHook, "bytes_delivered": int64(42)}
+	// ts alone keeps the earlier of the two in every mode (TestCallTSKeepsTheEarliest).
+	want := map[string]any{"ts": int64(999), "tool": "Bash", "source": SourceHook, "bytes_delivered": int64(42)}
 	for name, value := range want {
 		if got[name] != value {
 			t.Errorf("%s = %v, want %v", name, got[name], value)
@@ -548,5 +549,33 @@ func TestKeepMinAndKeepMaxAreOrderIndependent(t *testing.T) {
 	got := row(t, store, "agents", "agent_id = ?", "b")
 	if got["started"] != int64(4) || got["stopped"] != int64(8) {
 		t.Errorf("a NULL stored side must lose: started, stopped = %v, %v; want 4, 8", got["started"], got["stopped"])
+	}
+}
+
+// TestCallTSKeepsTheEarliest: a call's ts is the earliest hook that saw it,
+// whatever the upsert's mode and the landing order: a PostToolUse or a batch
+// landing after its PreToolUse never moves ts later, an earlier one landing
+// last still wins, and an upsert providing no ts leaves it.
+func TestCallTSKeepsTheEarliest(t *testing.T) {
+	ctx := context.Background()
+	early := Call{ToolUseID: "toolu_1", TS: Ptr(int64(1000))}
+	late := Call{ToolUseID: "toolu_1", TS: Ptr(int64(2000))}
+	none := Call{ToolUseID: "toolu_1", Tool: Ptr("Bash")}
+	for _, mode := range []Mode{Overwrite, FillEmpty} {
+		for name, calls := range map[string][]Call{
+			"early then late": {early, late, none},
+			"late then early": {late, early, none},
+			"none first":      {none, late, early},
+		} {
+			store := openTestStore(t)
+			for _, c := range calls {
+				if err := store.UpsertCall(ctx, c, mode); err != nil {
+					t.Fatalf("mode %d, %s: UpsertCall: %v", mode, name, err)
+				}
+			}
+			if got := row(t, store, "calls", "tool_use_id = ?", "toolu_1")["ts"]; got != int64(1000) {
+				t.Errorf("mode %d, %s: ts = %v, want 1000", mode, name, got)
+			}
+		}
 	}
 }

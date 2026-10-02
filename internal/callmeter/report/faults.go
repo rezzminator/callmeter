@@ -2,7 +2,9 @@ package report
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
@@ -15,8 +17,9 @@ var stages = []string{
 }
 
 // Faults counts faults by stage and command parts by parse status, then lists
-// the latest Limit faults. Faults narrow by window and session only: a call
-// that failed to record has no calls row to carry the other filters.
+// the latest Limit faults, then the latest Limit refusals (refusalsOf). Faults
+// and refusals narrow by window and session only: a call that failed to
+// record has no calls row to carry the other filters.
 func Faults(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
@@ -48,7 +51,11 @@ func Faults(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 		Scan(&calls); err != nil {
 		return nil, fmt.Errorf("callmeter report: count calls in window: %w", err)
 	}
-	if total == 0 && calls == 0 {
+	refusals, unchecked, err := refusalsOf(ctx, store, f)
+	if err != nil {
+		return nil, err
+	}
+	if total == 0 && calls == 0 && len(refusals) == 0 && unchecked == nil {
 		return t, nil
 	}
 	for _, stage := range stages {
@@ -108,11 +115,134 @@ func Faults(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 			"fault", row.stage, "1", time.UnixMilli(row.ts).UTC().Format("2006-01-02 15:04:05"), chat, row.call, row.message,
 		})
 	}
+	for _, r := range refusals {
+		t.Rows = append(t.Rows, []string{
+			"refusal", r.kind, "1", time.UnixMilli(r.ts).UTC().Format("2006-01-02 15:04:05"), n.of(r.session), "", r.source,
+		})
+	}
 	notes, err := gapNotes(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
 	t.Notes = notes
+	if unchecked != nil {
+		t.Notes = append(t.Notes, fmt.Sprintf(
+			"%d sessions ending on an unanswered prompt could not be checked for an API error: %v", unchecked.count, unchecked.first))
+	}
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
+}
+
+// Where a refusal row's kind was read.
+const (
+	refusalFromHook       = "StopFailure"
+	refusalFromTranscript = "transcript, no StopFailure"
+	// refusalRebuilt is a StopFailure row rebuilt from the transcript
+	// (callmeter.RecoveredDetail), at SessionEnd or at report time, its hook
+	// lost.
+	refusalRebuilt = "StopFailure rebuilt from the transcript"
+)
+
+// refusal is one turn the API refused: its error kind, never its message.
+type refusal struct {
+	ts                    int64
+	session, kind, source string
+}
+
+// uncheckedRefusals counts the sessions whose transcript could not be read
+// to tell a refusal from a turn still open.
+type uncheckedRefusals struct {
+	count int
+	first error
+}
+
+// refusalsOf lists the turns the API refused, latest first, at most Limit:
+// each StopFailure event in the window (one rebuilt from the transcript, at
+// SessionEnd or at report time, says so), and each session active in the
+// window whose latest main-chat prompt got neither a Stop nor a StopFailure
+// and whose transcript ends on the `<synthetic>` API-error message, because a
+// headless exit cancels the async StopFailure hook before it records. A
+// transcript that cannot be read is counted in unchecked, never read as no
+// refusal.
+func refusalsOf(ctx context.Context, store *callmeter.Store, f Filter) ([]refusal, *uncheckedRefusals, error) {
+	var found []refusal
+	eventWhere, eventArgs := faultFilter(f, "e")
+	err := query(ctx, store, "stop failures",
+		`SELECT COALESCE(e.ts, 0), COALESCE(e.session_id, ''), COALESCE(e.error_type, ''),
+		COALESCE(e.detail, '') = ?
+		FROM events e WHERE e.event = 'StopFailure' AND `+eventWhere, append([]any{callmeter.RecoveredDetail}, eventArgs...),
+		func(r rowSource) error {
+			var row refusal
+			var rebuilt bool
+			if err := r.Scan(&row.ts, &row.session, &row.kind, &rebuilt); err != nil {
+				return err
+			}
+			row.kind, row.source = callmeter.APIErrorKind(row.kind), refusalFromHook
+			if rebuilt {
+				row.source = refusalRebuilt
+			}
+			found = append(found, row)
+			return nil
+		})
+	if err != nil {
+		return nil, nil, err
+	}
+	conds, args := "1=1", []any{}
+	if !f.Since.IsZero() {
+		conds += " AND s.last_ts >= ?"
+		args = append(args, f.Since.UnixMilli())
+	}
+	if f.Session != "" {
+		conds += " AND s.session_id = ?"
+		args = append(args, f.Session)
+	}
+	type openTurn struct {
+		ts                  int64
+		session, transcript string
+	}
+	var open []openTurn
+	err = query(ctx, store, "sessions ending on an unanswered prompt",
+		`SELECT s.session_id, COALESCE(s.last_ts, 0), COALESCE(s.transcript_path, '') FROM sessions s
+		JOIN (SELECT session_id, MAX(ts) AS asked FROM events
+			WHERE event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' GROUP BY session_id) u
+			ON u.session_id = s.session_id
+		WHERE `+conds+`
+		AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.session_id AND t.event = 'Stop'
+			AND COALESCE(t.agent_id, '') = '' AND t.ts >= u.asked)
+		AND NOT EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.session_id AND e.event = 'StopFailure'
+			AND e.ts >= u.asked)`, args,
+		func(r rowSource) error {
+			var row openTurn
+			if err := r.Scan(&row.session, &row.ts, &row.transcript); err != nil {
+				return err
+			}
+			open = append(open, row)
+			return nil
+		})
+	if err != nil {
+		return nil, nil, err
+	}
+	// The store holds one connection: transcripts are read after the scan closes.
+	var unchecked *uncheckedRefusals
+	for _, turn := range open {
+		kind, err := "", errors.New("no transcript path recorded for session "+turn.session)
+		if turn.transcript != "" {
+			kind, err = callmeter.TranscriptAPIError(turn.transcript)
+		}
+		if err != nil {
+			if unchecked == nil {
+				unchecked = &uncheckedRefusals{first: err}
+			}
+			unchecked.count++
+			continue
+		}
+		if kind != "" {
+			found = append(found, refusal{ts: turn.ts, session: turn.session, kind: kind, source: refusalFromTranscript})
+		}
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].ts > found[j].ts })
+	if len(found) > f.limit() {
+		found = found[:f.limit()]
+	}
+	return found, unchecked, nil
 }

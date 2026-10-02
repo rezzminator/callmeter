@@ -19,6 +19,7 @@ import (
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
+	"github.com/rezzminator/callmeter/internal/sqlitedb"
 )
 
 // buildCallmeter builds ./cmd/callmeter to binary.
@@ -53,7 +54,11 @@ func TestProcessConcurrentHooks(t *testing.T) {
 	lab.storePath = paths.Store(callmeterHome)
 	registered := registeredEvents(t)
 	var payloads []string
-	wantEvents, wantTurns := 0, 0
+	// The concurrent run fires every payload at once, so the same bytes the
+	// in-order replay feeds seconds apart (an agent woken twice) may land within
+	// RedeliveryWindow and be one occurrence: the counts lie between the in-order
+	// replay's distinct payload hashes and its rows.
+	wantEvents, wantTurns, minEvents, minTurns := 0, 0, 0, 0
 	ids := map[string]bool{}
 	for _, session := range []string{"S1", "S2"} {
 		// The two homes hold different session files: one home holds both.
@@ -69,6 +74,8 @@ func TestProcessConcurrentHooks(t *testing.T) {
 		inOrder.feedInOrder()
 		wantEvents += inOrder.lab.count("SELECT COUNT(*) FROM events")
 		wantTurns += inOrder.lab.count("SELECT COUNT(*) FROM turns")
+		minEvents += inOrder.lab.count("SELECT COUNT(DISTINCT substr(event_id, 1, 64)) FROM events")
+		minTurns += inOrder.lab.count("SELECT COUNT(DISTINCT substr(event_id, 1, 64)) FROM turns")
 		for id := range inOrder.calls() {
 			ids[id] = true
 		}
@@ -108,11 +115,106 @@ func TestProcessConcurrentHooks(t *testing.T) {
 			t.Errorf("call %s: %d rows, want 1", id, n)
 		}
 	}
-	if n := lab.count("SELECT COUNT(*) FROM events"); n != wantEvents {
-		t.Errorf("events holds %d rows, want the in-order replay's %d", n, wantEvents)
+	if n := lab.hookRows("events"); n < minEvents || n > wantEvents {
+		t.Errorf("events holds %d hook rows, want from the in-order replay's %d distinct payloads (same bytes within "+
+			"RedeliveryWindow are one occurrence) to its %d rows:\n%s", n, minEvents, wantEvents, lab.turnEndRows())
 	}
-	if n := lab.count("SELECT COUNT(*) FROM turns"); n != wantTurns {
-		t.Errorf("turns holds %d rows, want the in-order replay's %d", n, wantTurns)
+	if n := lab.hookRows("turns"); n < minTurns || n > wantTurns {
+		t.Errorf("turns holds %d hook rows, want from the in-order replay's %d distinct payloads (same bytes within "+
+			"RedeliveryWindow are one occurrence) to its %d rows:\n%s", n, minTurns, wantTurns, lab.turnEndRows())
+	}
+	if n := lab.strayRebuiltEnds(); n != 0 {
+		t.Errorf("%d turn ends rebuilt from a transcript that no SessionEnd running before its session's prompt "+
+			"explains:\n%s", n, lab.turnEndRows())
+	}
+}
+
+// rebuiltEnds lists the event ids of the turn ends rebuilt from a transcript
+// (callmeter.RecoveredDetail, bound to ?1) rather than written by a hook.
+const rebuiltEnds = "SELECT event_id FROM events WHERE detail = ?1"
+
+// hookRows counts the rows of table, events or turns, that a hook wrote: a
+// turn end rebuilt from a transcript is left out, its events row and its turns
+// row.
+func (lab *callmeterLab) hookRows(table string) int {
+	lab.t.Helper()
+	return lab.count("SELECT COUNT(*) FROM "+table+" WHERE event_id NOT IN ("+rebuiltEnds+")", callmeter.RecoveredDetail)
+}
+
+// strayRebuiltEnds counts the turn ends rebuilt from a transcript that the
+// concurrent run does not explain. The run stamps every hook with the real
+// clock while the gym transcripts keep their capture time, so a SessionEnd
+// committing before its session's prompt and Stop rebuilds a Stop with no
+// prompt_id, dated before the prompt that lands next; the Stop hook's drop
+// then rightly takes it for an earlier turn's answer and keeps it. Every other
+// rebuilt row (one naming a prompt, a StopFailure, one dated at or after its
+// session's first prompt, one in a session with no prompt) is stray.
+func (lab *callmeterLab) strayRebuiltEnds() int {
+	lab.t.Helper()
+	return lab.count(`SELECT COUNT(*) FROM events e WHERE e.detail = ?1 AND NOT EXISTS (
+		SELECT 1 FROM turns t WHERE t.event_id = e.event_id AND t.event = 'Stop' AND t.prompt_id IS NULL
+			AND t.ts < (SELECT COALESCE(MIN(p.ts), 0) FROM events p WHERE p.session_id = t.session_id
+				AND p.event = 'UserPromptSubmit' AND COALESCE(p.agent_id, '') = ''))`, callmeter.RecoveredDetail)
+}
+
+// turnEndRows is the store's turns rows and its prompt, turn-end and
+// SessionEnd events rows, for a failure message.
+func (lab *callmeterLab) turnEndRows() string {
+	lab.t.Helper()
+	dump := lab.dump()
+	var ends []string
+	for _, row := range dump["events"] {
+		if strings.Contains(row, "UserPromptSubmit") || strings.Contains(row, "Stop") || strings.Contains(row, "SessionEnd") {
+			ends = append(ends, row)
+		}
+	}
+	return "turns:\n" + strings.Join(dump["turns"], "\n") + "\nprompt, turn-end and SessionEnd events:\n" + strings.Join(ends, "\n")
+}
+
+// TestProcessConcurrentCountsLeaveOutATurnEndRebuiltBeforeItsPrompt forces the
+// interleaving TestProcessConcurrentHooks meets under load: S1's SessionEnd
+// commits first, on a clock past the capture-time transcript, then its prompt
+// and its Stop. The rebuilt Stop stays beside the hook's; the counts the
+// concurrent run is held to leave it out, and explain it.
+func TestProcessConcurrentCountsLeaveOutATurnEndRebuiltBeforeItsPrompt(t *testing.T) {
+	r := newReplay(t, "gym/S1")
+	first := func(event string) string {
+		t.Helper()
+		found := r.matching(event, nil)
+		if len(found) == 0 {
+			t.Fatalf("gym/S1 holds no %s payload", event)
+		}
+		return r.payloads[found[0]]
+	}
+	stop := first("Stop")
+	transcript, _ := payloadField(t, stop, "transcript_path").(string)
+	end, err := callmeter.TranscriptTurnEnd(transcript)
+	if err != nil || end.Event != callmeter.EventStop || end.TS == 0 {
+		t.Fatalf("TranscriptTurnEnd(%s) = %+v, %v; want a dated Stop", transcript, end, err)
+	}
+	after := end.TS + time.Minute.Milliseconds()
+	r.lab.feedAt(after, first("SessionEnd"))
+	r.lab.feedAt(after+20, first("UserPromptSubmit"))
+	r.lab.feedAt(after+20, stop)
+	if n := r.lab.count("SELECT COUNT(*) FROM turns WHERE event_id IN ("+rebuiltEnds+")", callmeter.RecoveredDetail); n != 1 {
+		t.Fatalf("the forced order left %d rebuilt turn ends, want 1: the interleaving did not happen\n%s", n, r.lab.turnEndRows())
+	}
+	if n := r.lab.hookRows("turns"); n != 1 {
+		t.Errorf("turns holds %d hook rows, want 1, the Stop hook's:\n%s", n, r.lab.turnEndRows())
+	}
+	if n := r.lab.hookRows("events"); n != 3 {
+		t.Errorf("events holds %d hook rows, want 3: SessionEnd, UserPromptSubmit, Stop\n%s", n, r.lab.turnEndRows())
+	}
+	if n := r.lab.strayRebuiltEnds(); n != 0 {
+		t.Errorf("%d stray rebuilt turn ends, want 0:\n%s", n, r.lab.turnEndRows())
+	}
+	// A rebuilt row naming a prompt is no timing artifact: it must read as stray.
+	if _, err := r.lab.db().DB().ExecContext(r.lab.ctx, "UPDATE turns SET prompt_id = 'p' WHERE event_id IN ("+rebuiltEnds+")",
+		callmeter.RecoveredDetail); err != nil {
+		t.Fatalf("name a prompt on the rebuilt turn: %v", err)
+	}
+	if n := r.lab.strayRebuiltEnds(); n != 1 {
+		t.Errorf("a rebuilt turn naming a prompt: %d stray, want 1", n)
 	}
 }
 
@@ -121,8 +223,9 @@ func TestProcessConcurrentHooks(t *testing.T) {
 // of a SubagentStop whose transcript lacks its final message.
 const signalDelay = 700 * time.Millisecond
 
-// missedLine is one line the binary appends to missed.log under a signal.
-var missedLine = regexp.MustCompile(`^(\d+)\t(\S+)\tterminated by (SIG[A-Z]+)\n$`)
+// missedLine is one line the binary appends to missed.log under a signal, its
+// session field present when the payload decoded with a session id.
+var missedLine = regexp.MustCompile(`^(\d+)\t(\S+)\tterminated by (SIG[A-Z]+)(?:\t([A-Za-z0-9._-]+))?\n$`)
 
 // signalScene is one hermetic run of the built binary: its own CALLMETER_HOME,
 // seat and the gym/S2 session's transcripts.
@@ -277,9 +380,10 @@ func (scene *signalScene) missedLines(t *testing.T) string {
 	return string(data)
 }
 
-// wantTerminatedLine checks that missed.log holds exactly one line of event
-// and signal, stamped within the run's own seconds.
-func (scene *signalScene) wantTerminatedLine(t *testing.T, proc *hookProcess, event, signal string) {
+// wantTerminatedLine checks that missed.log holds exactly one line of event,
+// signal and session ("" = no session field), stamped within the run's own
+// seconds.
+func (scene *signalScene) wantTerminatedLine(t *testing.T, proc *hookProcess, event, signal, session string) {
 	t.Helper()
 	got := scene.missedLines(t)
 	match := missedLine.FindStringSubmatch(got)
@@ -290,8 +394,8 @@ func (scene *signalScene) wantTerminatedLine(t *testing.T, proc *hookProcess, ev
 	if err != nil || secs < proc.started.Unix() || secs > time.Now().Unix() {
 		t.Errorf("missed.log stamp = %q, want Unix seconds of this run (%d..%d)", match[1], proc.started.Unix(), time.Now().Unix())
 	}
-	if match[2] != event || match[3] != signal {
-		t.Errorf("missed.log line = %q, want event %s signal %s", got, event, signal)
+	if match[2] != event || match[3] != signal || match[4] != session {
+		t.Errorf("missed.log line = %q, want event %s signal %s session %q", got, event, signal, session)
 	}
 }
 
@@ -341,11 +445,16 @@ func TestProcessSignalledHook(t *testing.T) {
 	} {
 		t.Run("killed before recording by "+name, func(t *testing.T) {
 			scene := newSignalScene(t, binary)
-			proc := scene.start(t, scene.unfinishedStop(t))
+			payload := scene.unfinishedStop(t)
+			session, _ := payloadField(t, payload, "session_id").(string)
+			if session == "" {
+				t.Fatal("the SubagentStop payload carries no session_id")
+			}
+			proc := scene.start(t, payload)
 			time.Sleep(signalDelay)
 			proc.signal(t, sig)
 			wantQuietExit(t, proc)
-			scene.wantTerminatedLine(t, proc, "SubagentStop", name)
+			scene.wantTerminatedLine(t, proc, "SubagentStop", name, session)
 			if n := scene.lab.count("SELECT COUNT(*) FROM events"); n != 0 {
 				t.Errorf("events holds %d rows, want none for the killed run", n)
 			}
@@ -374,7 +483,7 @@ func TestProcessSignalledHook(t *testing.T) {
 		time.Sleep(signalDelay)
 		proc.signal(t, syscall.SIGTERM)
 		wantQuietExit(t, proc)
-		scene.wantTerminatedLine(t, proc, "unknown", "SIGTERM")
+		scene.wantTerminatedLine(t, proc, "unknown", "SIGTERM", "")
 	})
 
 	t.Run("killed during the commit, which commits", func(t *testing.T) {
@@ -528,24 +637,29 @@ func TestTerminationAfterRecordingWritesNoLine(t *testing.T) {
 
 // TestTerminationBeforeRecordingWritesTheLine: a run with nothing accounted
 // for leaves one line naming its event, `unknown` when the payload never
-// decoded or its name would break the line; the home is created when absent.
+// decoded or its name would break the line, followed by the payload's session
+// id as a fourth field, the wrapper's layout, so a killed SessionEnd names its
+// session; a session id outside the field's alphabet is left out, never
+// written to break the line. The home is created when absent.
 func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
-	for name, run := range map[string]struct{ event, want string }{
-		"decoded":                 {"Stop", "Stop"},
-		"not decoded":             {"", "unknown"},
-		"a name with a tab":       {"Pre\tToolUse", "unknown"},
-		"a name with a line feed": {"Pre\nToolUse", "unknown"},
+	for name, run := range map[string]struct{ event, session, want string }{
+		"decoded":                       {"Stop", "", "\tStop\tterminated by SIGINT\n"},
+		"a SessionEnd with its session": {"SessionEnd", "sess_1.b-2", "\tSessionEnd\tterminated by SIGINT\tsess_1.b-2\n"},
+		"a session with a tab":          {"SessionEnd", "sess\t1", "\tSessionEnd\tterminated by SIGINT\n"},
+		"not decoded":                   {"", "", "\tunknown\tterminated by SIGINT\n"},
+		"a name with a tab":             {"Pre\tToolUse", "sess-1", "\tunknown\tterminated by SIGINT\tsess-1\n"},
+		"a name with a line feed":       {"Pre\nToolUse", "", "\tunknown\tterminated by SIGINT\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scene := newSignalScene(t, "")
 			state := &terminationState{}
-			state.setEvent(run.event)
+			state.setPayload(run.event, run.session)
 			var stderr bytes.Buffer
 			if code := await(t, scene.lab.terminate(state, syscall.SIGINT, &stderr)); code != 0 {
 				t.Errorf("handler exit code = %d, want 0", code)
 			}
-			if got := scene.missedLines(t); !missedLine.MatchString(got) || !strings.Contains(got, "\t"+run.want+"\tterminated by SIGINT\n") {
-				t.Errorf("missed.log = %q, want one line of event %s", got, run.want)
+			if got := scene.missedLines(t); !missedLine.MatchString(got) || !strings.HasSuffix(got, run.want) {
+				t.Errorf("missed.log = %q, want one line ending %q", got, run.want)
 			}
 			info, err := os.Stat(scene.home)
 			if err != nil || info.Mode().Perm() != 0o755 {
@@ -573,7 +687,8 @@ func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
 		if code := await(t, lab.terminate(state, syscall.SIGHUP, &stderr)); code != 0 {
 			t.Errorf("handler exit code = %d, want 0", code)
 		}
-		if got := scene.missedLines(t); !strings.Contains(got, "\tPreToolUse\tterminated by SIGHUP\n") {
+		session, _ := payloadField(t, scene.payload(t, "PreToolUse"), "session_id").(string)
+		if got := scene.missedLines(t); session == "" || !strings.Contains(got, "\tPreToolUse\tterminated by SIGHUP\t"+session+"\n") {
 			t.Errorf("missed.log = %q, want the line: a store nobody could write accounts for nothing", got)
 		}
 	})
@@ -647,6 +762,96 @@ func TestTerminationWaitsOutAnInFlightCommit(t *testing.T) {
 				t.Errorf("after a failed batch: %d calls, %d store faults; want 0 and 1", calls, faults)
 			case !failing && (calls != 1 || faults != 0):
 				t.Errorf("after a committed batch: %d calls, %d store faults; want 1 and 0", calls, faults)
+			}
+		})
+	}
+}
+
+// holdStoreExclusive takes the whole store through a second connection in
+// exclusive locking mode: the lock stays after the commit until the connection
+// closes, and every other connection, even one that only opens, answers
+// SQLITE_BUSY. The scene's own store handle stays unopened until the release.
+func (scene *signalScene) holdStoreExclusive(t *testing.T) (release func()) {
+	t.Helper()
+	database, err := sqlitedb.OpenReadWrite(paths.Store(scene.home), time.Second)
+	if err != nil {
+		t.Fatalf("open the store to hold it: %v", err)
+	}
+	conn, err := database.Conn(scene.lab.ctx)
+	if err != nil {
+		t.Fatalf("take a connection: %v", err)
+	}
+	for _, statement := range []string{
+		"PRAGMA locking_mode=EXCLUSIVE", "BEGIN EXCLUSIVE", "CREATE TABLE IF NOT EXISTS held_by_test (x TEXT)", "COMMIT",
+	} {
+		if _, err := conn.ExecContext(scene.lab.ctx, statement); err != nil {
+			t.Fatalf("hold the store exclusively (%s): %v", statement, err)
+		}
+	}
+	return func() {
+		if err := errors.Join(conn.Close(), database.Close()); err != nil {
+			t.Errorf("release the exclusive store: %v", err)
+		}
+	}
+}
+
+// TestProcessStoreBusySessionEndLeavesAMissedLine drives the built binary's
+// SessionEnd against a store that stays locked: the hook gives up inside its
+// event's timeout with one missed.log line carrying the event and session, exit
+// 0 and a silent stdout, and report-time recovery then marks that session's end
+// `lost`.
+func TestProcessStoreBusySessionEndLeavesAMissedLine(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "callmeter")
+	buildCallmeter(ctx, t, binary)
+
+	holds := map[string]func(*signalScene, *testing.T) func(){
+		"exclusive":  (*signalScene).holdStoreExclusive,
+		"write lock": (*signalScene).holdStore,
+	}
+	for name, hold := range holds {
+		t.Run(name, func(t *testing.T) {
+			scene := newSignalScene(t, binary)
+			start, end := scene.payload(t, "SessionStart"), scene.payload(t, "SessionEnd")
+			session, _ := payloadField(t, end, "session_id").(string)
+			if session == "" || payloadField(t, start, "session_id") != session {
+				t.Fatalf("the SessionStart and SessionEnd payloads must share a session_id; SessionEnd has %q", session)
+			}
+			wantQuietExit(t, scene.start(t, start)) // the sessions row exists before the store is held
+			release := hold(scene, t)
+			released := false
+			defer func() {
+				if !released {
+					release()
+				}
+			}()
+
+			proc := scene.start(t, end)
+			wantQuietExit(t, proc)
+			took := time.Since(proc.started)
+			if took >= hookTimeouts[callmeter.EventSessionEnd] {
+				t.Errorf("SessionEnd took %v against a held store, want under its %v hook timeout", took, hookTimeouts[callmeter.EventSessionEnd])
+			}
+			want := regexp.MustCompile(`^\d+\tSessionEnd\tterminated by store busy\t` + regexp.QuoteMeta(session) + `\n$`)
+			if got := scene.missedLines(t); !want.MatchString(got) {
+				t.Errorf("missed.log = %q, want one line matching %s", got, want)
+			}
+
+			release()
+			released = true
+			if n := scene.lab.count("SELECT COUNT(*) FROM events WHERE event = ?1", callmeter.EventSessionEnd); n != 0 {
+				t.Errorf("events holds %d SessionEnd rows, want none for the run that gave up", n)
+			}
+			store := scene.lab.db()
+			if _, err := store.IngestMissed(ctx, paths.Missed(scene.home)); err != nil {
+				t.Fatalf("ingest missed.log: %v", err)
+			}
+			if _, err := store.RecoverQuiet(ctx, time.Now().Add(time.Hour), 0); err != nil {
+				t.Fatalf("recover quiet sessions: %v", err)
+			}
+			if got := scene.lab.row("SELECT end_reason FROM sessions WHERE session_id = ?1", session)["end_reason"]; got != callmeter.EndReasonLost {
+				t.Errorf("sessions.end_reason = %q, want %q", got, callmeter.EndReasonLost)
 			}
 		})
 	}
