@@ -192,13 +192,18 @@ func TestCallmeterCLINamesAChatFromItsTranscript(t *testing.T) {
 func TestCallmeterCLIUnreadableTranscriptShowsAQuestionMarkAndOneNote(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	if err := os.MkdirAll(filepath.Join(fixture.seat, "projects", "-work", "sess-1.jsonl"), 0o700); err != nil {
+	unreadable := filepath.Join(fixture.seat, "projects", "-work", "sess-1.jsonl")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, stderr := fixture.run("report", "files", "--session", "sess-1")
 	title, _, _ := strings.Cut(stdout, "\n")
+	stderrLines := strings.Split(strings.TrimSpace(stderr), "\n")
 	if code != 0 || !strings.Contains(title, "session=sess-1 (?)") ||
-		strings.Count(stdout, "note: chat names could not be read: session sess-1: ") != 1 {
+		strings.Count(stdout, "note: chat names could not be read for 1 sessions (first: unreadable)") != 1 ||
+		strings.Contains(stdout, unreadable) || len(stderrLines) != 1 ||
+		!strings.HasPrefix(stderrLines[0], "callmeter: chat name: session sess-1: ") ||
+		!strings.Contains(stderrLines[0], unreadable) {
 		t.Fatalf("report files --session = %d, want a ? chat and one note\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }

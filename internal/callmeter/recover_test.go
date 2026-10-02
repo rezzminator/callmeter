@@ -285,7 +285,12 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 	if summary := q.recover(t); summary.Calls != 2 {
 		t.Fatalf("RecoverQuiet = %+v, want 2 calls settled before the scan means anything", summary)
 	}
-	tables, err := q.store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	assertNoTranscriptText(t, q.store)
+}
+
+func assertNoTranscriptText(t *testing.T, store *Store) {
+	t.Helper()
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +306,7 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, table := range names {
-		rows, err := q.store.DB().Query("SELECT * FROM " + table)
+		rows, err := store.DB().Query("SELECT * FROM " + table)
 		if err != nil {
 			t.Fatalf("scan %s: %v", table, err)
 		}
@@ -325,7 +330,7 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 				}
 				for _, secret := range []string{secretResult, secretMessage, secretPrompt} {
 					if strings.Contains(text, secret) {
-						t.Errorf("%s.%s holds transcript text %q", table, columns[i], secret)
+						t.Errorf("%s.%s holds transcript text", table, columns[i])
 					}
 				}
 			}
@@ -718,13 +723,312 @@ func TestRecoverQuietSizesAnEarlierRebuiltCall(t *testing.T) {
 	})
 }
 
+func TestRecoverQuietFillsAgentMetaWithoutWaiting(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		meta       string
+		directory  bool
+		parent     any
+		agentType  any
+		transcript *string
+		moved      bool
+		wantParent any
+		wantType   any
+		wantCount  int
+	}{
+		{name: "live session", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
+		{name: "meta absent"},
+		{name: "meta directory", directory: true},
+		{name: "meta bad JSON", meta: `{`},
+		{name: "meta empty", meta: `{}`},
+		{name: "parent kept type filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, parent: "toolu_kept", wantParent: "toolu_kept", wantType: "Explore", wantCount: 1},
+		{name: "type kept parent filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, agentType: "general-purpose", wantParent: "toolu_meta", wantType: "general-purpose", wantCount: 1},
+		{name: "transcript NULL", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("NULL")},
+		{name: "transcript empty", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("")},
+		{name: "moved transcript", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, moved: true, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			q := newQuietStore(t, time.Minute, 0)
+			ctx := context.Background()
+			meta := strings.TrimSuffix(q.sub, ".jsonl") + ".meta.json"
+			if test.directory {
+				if err := os.Mkdir(meta, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if test.meta != "" {
+				// Claude Code's gym S2 meta shape: agentType and toolUseId.
+				if err := os.WriteFile(meta, []byte(test.meta), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := q.store.Batch(ctx, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id, parent_tool_use_id, agent_type) VALUES('a1', 'sess-1', ?1, ?2)`, test.parent, test.agentType); err != nil {
+					return err
+				}
+				if test.transcript != nil {
+					var path any = *test.transcript
+					if *test.transcript == "NULL" {
+						path = nil
+					}
+					_, err := tx.tx.ExecContext(ctx, `UPDATE sessions SET transcript_path = ?1, seat_dir = ?2 WHERE session_id = 'sess-1'`, path, filepath.Dir(filepath.Dir(filepath.Dir(q.main))))
+					return err
+				}
+				if test.moved {
+					_, err := tx.tx.ExecContext(ctx, `UPDATE sessions SET transcript_path = ?1, seat_dir = ?2 WHERE session_id = 'sess-1'`, filepath.Join(t.TempDir(), "missing", "sess-1.jsonl"), filepath.Dir(filepath.Dir(filepath.Dir(q.main))))
+					return err
+				}
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO sessions(session_id, transcript_path) VALUES('sess-no-path', '')`); err != nil {
+					return err
+				}
+				_, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id) VALUES('a2', 'sess-no-path')`)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first := q.recover(t)
+			if first.Parents != test.wantCount || first.Sessions != 0 {
+				t.Errorf("RecoverQuiet Parents = %d, Sessions = %d; want %d, 0", first.Parents, first.Sessions, test.wantCount)
+			}
+			agent := row(t, q.store, "agents", "agent_id = 'a1'")
+			if agent["parent_tool_use_id"] != test.wantParent || agent["agent_type"] != test.wantType {
+				t.Errorf("agent parent = %v, type = %v; want %v, %v", agent["parent_tool_use_id"], agent["agent_type"], test.wantParent, test.wantType)
+			}
+			if n := count(t, q.store, "faults"); n != 0 {
+				t.Errorf("faults = %d, want 0", n)
+			}
+			if test.transcript == nil && !test.moved {
+				unread := row(t, q.store, "agents", "agent_id = 'a2'")
+				if unread["parent_tool_use_id"] != nil || unread["agent_type"] != nil {
+					t.Errorf("transcript-less agent parent = %v, type = %v; want NULL, NULL", unread["parent_tool_use_id"], unread["agent_type"])
+				}
+			}
+			if again := q.recover(t); again.Parents != 0 || again.Sessions != 0 {
+				t.Errorf("second RecoverQuiet Parents = %d, Sessions = %d; want 0, 0", again.Parents, again.Sessions)
+			}
+		})
+	}
+}
+
+func TestRecoverQuietAgentMetaStoreErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "scan", sql: `INSERT INTO agents(agent_id, session_id) VALUES(NULL, 'sess-1')`, want: "scan an agent missing meta"},
+		{name: "upsert", sql: `CREATE TRIGGER refuse_agent_meta BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'test meta fill failure'); END`, want: "test meta fill failure"},
+		{name: "query", sql: `DROP TABLE agents`, want: "list agents missing meta"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			q := newQuietStore(t, time.Minute, 0)
+			ctx := context.Background()
+			if _, err := q.store.DB().ExecContext(ctx, `INSERT INTO agents(agent_id, session_id) VALUES('a1', 'sess-1')`); err != nil {
+				t.Fatal(err)
+			}
+			// Claude Code's gym S2 meta shape: agentType and toolUseId.
+			if err := os.WriteFile(strings.TrimSuffix(q.sub, ".jsonl")+".meta.json", []byte(`{"agentType":"Explore","toolUseId":"toolu_meta"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := q.store.DB().ExecContext(ctx, test.sql); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("RecoverQuiet error = %v, want %s", err, test.want)
+			}
+			if summary.Parents != 0 || summary.Sessions != 0 || len(summary.Skipped) != 0 {
+				t.Errorf("RecoverQuiet Parents = %d, Sessions = %d, Skipped = %d; want 0, 0, 0", summary.Parents, summary.Sessions, len(summary.Skipped))
+			}
+			if test.name == "upsert" {
+				agent := row(t, q.store, "agents", "agent_id = 'a1'")
+				if agent["parent_tool_use_id"] != nil || agent["agent_type"] != nil {
+					t.Errorf("failed fill parent = %v, type = %v; want NULL, NULL", agent["parent_tool_use_id"], agent["agent_type"])
+				}
+			}
+		})
+	}
+}
+
+// taskNoticeLine copies gym S2 main-transcript lines 38 (attachment.type,
+// attachment.origin.kind, attachment.prompt) and 50 (origin.kind,
+// message.content): both have a top-level timestamp and string notice body.
+func taskNoticeLine(kind, agentID, status string, at time.Time) string {
+	body := "<task-notification><task-id>" + agentID + "</task-id><status>" + status +
+		"</status><summary>" + secretPrompt + "</summary><result>" + secretResult +
+		"</result><usage><total_tokens>999999</total_tokens><tool_uses>999</tool_uses></usage></task-notification>"
+	if kind == "attachment" {
+		return fmt.Sprintf(`{"type":"attachment","timestamp":%q,"attachment":{"type":"queued_command","origin":{"kind":"task-notification"},"prompt":%q,"usage":{"totalTokens":999999,"toolUses":999}}}`, stamp(at), body)
+	}
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"origin":{"kind":"task-notification"},"message":{"role":"user","content":%q}}`, stamp(at), body)
+}
+
+func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
+	start := time.Now().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	notice := start.Add(20 * time.Second)
+	for _, test := range []struct {
+		name, kind, agent, status                                 string
+		offset                                                    time.Duration
+		woken, several, ended, live, noID, noStatus, noTranscript bool
+	}{
+		{name: "attachment notice", kind: "attachment"},
+		{name: "user-entry notice", kind: "user"},
+		{name: "failed status", status: "failed"},
+		{name: "killed status", status: "killed"},
+		{name: "woken agent", woken: true},
+		{name: "several notices after the start", several: true},
+		{name: "notice exactly at the start", offset: -20 * time.Second},
+		{name: "notice before the start only", offset: -time.Second * 21},
+		{name: "another agent", agent: "a2"},
+		{name: "without task-id", noID: true},
+		{name: "without status", noStatus: true},
+		{name: "transcript turn end exists", ended: true, offset: -18 * time.Second},
+		{name: "notice usage differs"},
+		{name: "privacy"},
+		{name: "live session", live: true},
+		// A background agent failing before it wrote its transcript still gets
+		// a notice: no totals to read, so the turn is marked once, as before.
+		{name: "no agent transcript", noTranscript: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kind, agent, status := test.kind, test.agent, test.status
+			if kind == "" {
+				kind = "attachment"
+			}
+			if agent == "" {
+				agent = "a1"
+			}
+			if status == "" {
+				status = "completed"
+			}
+			noticeAt := notice.Add(test.offset)
+			line := taskNoticeLine(kind, agent, status, noticeAt)
+			if test.noID {
+				line = strings.Replace(line, "<task-id>a1</task-id>", "", 1)
+			}
+			if test.noStatus {
+				line = strings.Replace(line, "<status>completed</status>", "", 1)
+			}
+			mainLines := []string{line}
+			if test.woken {
+				mainLines = append(mainLines, taskNoticeLine(kind, "a1", status, start.Add(-time.Second)))
+			}
+			if test.several {
+				// Deliberately out of time order: choose the earliest, not first.
+				mainLines = append([]string{taskNoticeLine(kind, "a1", status, noticeAt.Add(time.Second))}, mainLines...)
+			}
+			subLines := []string{toolUseLine("msg_sub", "toolu_sub", 31, start.Add(time.Second)),
+				quietResultLine("toolu_sub", secretResult, true, start.Add(1500*time.Millisecond)),
+				strings.Replace(textLine("msg_sub", secretMessage, 77, start.Add(2*time.Second)), `"role":"assistant",`, `"role":"assistant","stop_reason":null,`, 1)}
+			if test.offset == -20*time.Second {
+				for i := range subLines {
+					for _, offset := range []time.Duration{time.Second, 1500 * time.Millisecond, 2 * time.Second} {
+						subLines[i] = strings.ReplaceAll(subLines[i], stamp(start.Add(offset)), stamp(start))
+					}
+				}
+			}
+			if test.woken {
+				subLines = append([]string{endTurnLine("msg_old", 3, start.Add(-2*time.Second))}, subLines...)
+			}
+			wantEnd := noticeAt.UnixMilli()
+			if test.ended {
+				wantEnd = start.Add(3 * time.Second).UnixMilli()
+				subLines = append(subLines, endTurnLine("msg_sub", 77, start.Add(3*time.Second)))
+			}
+			ctx := context.Background()
+			q := newUnfilledStore(t, 2*time.Hour, start.Add(-time.Minute), mainLines, subLines, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id, started) VALUES('a1', 'sess-1', ?)`, start.UnixMilli()); err != nil {
+					return err
+				}
+				events := []Event{{EventID: "agent-start", Event: EventSubagentStart, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.UnixMilli()}}
+				if test.woken {
+					events = append(events,
+						Event{EventID: "old-start", Event: EventSubagentStart, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.Add(-3 * time.Second).UnixMilli()},
+						Event{EventID: "old-stop", Event: EventSubagentStop, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.Add(-2 * time.Second).UnixMilli()})
+				}
+				for _, event := range events {
+					if _, err := tx.InsertEvent(ctx, event); err != nil {
+						return err
+					}
+				}
+				return tx.RebuildAgentTurns(ctx, "a1")
+			})
+			if test.live {
+				if err := q.store.Batch(ctx, func(tx *Tx) error {
+					return tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: q.now.Add(-time.Minute).UnixMilli()})
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.noTranscript {
+				if err := os.Remove(q.sub); err != nil {
+					t.Fatal(err)
+				}
+			}
+			summary := q.recover(t)
+			unfilled := test.offset < -20*time.Second || test.agent == "a2" || test.noID || test.noStatus || test.noTranscript
+			if len(summary.Skipped) != 0 {
+				t.Fatalf("RecoverQuiet skipped %v, want nothing skipped", summary.Skipped)
+			}
+			if test.live || unfilled {
+				wantFaults := 0
+				if unfilled {
+					wantFaults = 1
+				}
+				if summary.AgentStops != 0 || summary.Unfillable != wantFaults || count(t, q.store, "faults") != wantFaults {
+					t.Fatalf("RecoverQuiet = %+v, want no stops and %d unfillable faults", summary, wantFaults)
+				}
+				if turn := row(t, q.store, "agent_turns", "agent_id = 'a1' AND stopped IS NULL"); turn == nil {
+					t.Fatal("open turn was closed")
+				}
+				if unfilled {
+					if fault := row(t, q.store, "faults", "stage = 'transcript'"); fault["error"] != "agent a1 turn 1 open: "+UnfilledAgentStop {
+						t.Fatal("unfilled stop fault text changed")
+					}
+					if again := q.recover(t); again.Unfillable != 0 || count(t, q.store, "faults") != 1 {
+						t.Fatal("unfillable turn was marked again")
+					}
+				}
+				return
+			}
+			if summary.AgentStops != 1 || summary.Unfillable != 0 || count(t, q.store, "faults") != 0 {
+				t.Fatalf("RecoverQuiet = %+v, want 1 stop and no faults", summary)
+			}
+			stop := row(t, q.store, "events", "event = 'SubagentStop' AND detail = ?", RecoveredDetail)
+			if stop == nil || stop["ts"] != wantEnd || stop["detail"] != RecoveredDetail {
+				t.Fatalf("stop = %v, want recovered stop at %d", stop, wantEnd)
+			}
+			seq := 1
+			if test.woken {
+				seq = 2
+			}
+			turn := row(t, q.store, "agent_turns", "agent_id = 'a1' AND seq = ?", seq)
+			if turn["stopped"] != wantEnd || turn["stop_event_id"] != stop["event_id"] {
+				t.Fatal("agent turn did not close at the recovered stop")
+			}
+			if test.woken && row(t, q.store, "agent_turns", "agent_id = 'a1' AND seq = 1")["stopped"] != start.Add(-2*time.Second).UnixMilli() {
+				t.Fatal("earlier turn changed")
+			}
+			totals, err := ReadAgentTotals(q.sub, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			agentRow := row(t, q.store, "agents", "agent_id = 'a1'")
+			if agentRow["total_tokens"] != totals.TotalTokens || agentRow["tool_uses"] != totals.ToolUses {
+				t.Fatal("agent totals differ from its own transcript")
+			}
+			assertNoTranscriptText(t, q.store)
+			if again := q.recover(t); again.AgentStops != 0 || again.Unfillable != 0 {
+				t.Fatal("recovery repeated the stop")
+			}
+		})
+	}
+}
+
 // TestRecoverQuietMarksAnOpenAgentTurnOnce: a sub-agent's latest turn with no
-// SubagentStop whose quiet transcript shows no turn end after its start (the
-// agent was killed mid-turn) is marked once by one transcript fault, and the
-// agent row takes its parent Agent call and type from the meta file beside its
-// transcript. Any later hook reopens the turn; a transcript showing the turn's
-// end is no open turn to mark: its SubagentStop was lost, and recovery rebuilds
-// it at that end line's own ts, once.
+// SubagentStop, transcript turn end or qualifying task notice is marked once
+// by one transcript fault. Its parent Agent call and type come from the meta
+// file. A later hook reopens the turn; a transcript turn end rebuilds its
+// missing SubagentStop at that end line's own ts, once.
 func TestRecoverQuietMarksAnOpenAgentTurnOnce(t *testing.T) {
 	want := "agent a1 turn 1 open: " + UnfilledAgentStop
 	open := func(t *testing.T, subLines ...string) quietStore {

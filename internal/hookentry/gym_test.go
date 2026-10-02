@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
@@ -289,9 +290,8 @@ func TestReplayCwdPersistence(t *testing.T) {
 	}
 }
 
-// TestReplayAgents: S2's background agent B ran two turns, its foreground
-// agent A spawned a nested agent whose stop lands after A's, and the harness's
-// task-notification prompts are marked.
+// TestReplayAgentTotalsWaitForTheStop: totals wait for SubagentStop hooks;
+// quiet recovery rebuilds missing stops from turn ends or task notifications.
 func TestReplayAgentTotalsWaitForTheStop(t *testing.T) {
 	full := newReplay(t, "gym/S2")
 	full.feedInOrder()
@@ -335,20 +335,24 @@ func TestReplayAgentTotalsWaitForTheStop(t *testing.T) {
 		expect(t, "recovered agent "+id, r.lab.row("SELECT * FROM agents WHERE agent_id = ?", id),
 			map[string]any{"total_tokens": want["total_tokens"], "tool_uses": want["tool_uses"]})
 	}
-	for _, id := range []string{"a17591d0a08cc3b13", "a88a0d95598144e27"} {
+	for _, id := range []string{"a17591d0a08cc3b13", "a88a0d95598144e27", "a8a1da5926e2e3168"} {
 		if !recovered[id] {
 			t.Errorf("agent %s: no recovered SubagentStop", id)
 		}
 	}
-	// S2's nested background agent ends with a NULL stop_reason, so its
-	// transcript cannot supply the missing SubagentStop's whole-agent totals.
+	// S2's nested background agent has no turn end; its attachment notice
+	// supplies the stop time, while its own transcript supplies the totals.
 	const nested = "a8a1da5926e2e3168"
-	expect(t, "unfillable agent "+nested, r.lab.row("SELECT * FROM agents WHERE agent_id = ?", nested),
-		map[string]any{"total_tokens": nil, "tool_uses": nil})
-	open := r.lab.row("SELECT seq FROM agent_turns WHERE agent_id = ? AND stopped IS NULL", nested)
-	fault := fmt.Sprintf("agent %s turn %s open: %s", nested, open["seq"], callmeter.UnfilledAgentStop)
-	if n := r.lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error = ?", callmeter.StageTranscript, fault); n != 1 {
-		t.Errorf("agent %s: %d transcript faults %q, want 1", nested, n, fault)
+	notice, err := time.Parse(time.RFC3339Nano, "2026-10-01T00:52:21.292Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, "notice stop "+nested,
+		r.lab.row("SELECT ts FROM events WHERE event = ? AND agent_id = ? AND detail = ?", callmeter.EventSubagentStop, nested, callmeter.RecoveredDetail),
+		map[string]any{"ts": notice.UnixMilli()})
+	if n := r.lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE ? AND error LIKE ?", callmeter.StageTranscript,
+		"agent "+nested+" turn % open: %", "%"+callmeter.UnfilledAgentStop); n != 0 {
+		t.Errorf("agent %s: %d unfilled stop faults, want 0", nested, n)
 	}
 }
 

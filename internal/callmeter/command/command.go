@@ -181,7 +181,7 @@ func reportAction(
 			}
 		}
 	}()
-	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv}
+	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
 	if _, err := db.IngestMissed(ctx, paths.Missed(home)); err != nil {
 		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
 		return 1

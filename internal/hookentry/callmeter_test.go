@@ -893,6 +893,105 @@ func TestCallmeterSubagentStopFillsTotals(t *testing.T) {
 	})
 }
 
+func TestCallmeterSubagentMetaFillsParentAndType(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		meta       string
+		directory  bool
+		stopped    bool
+		result     bool
+		noPath     bool
+		writeFail  bool
+		wantType   any
+		wantParent any
+	}{
+		{name: "start fills parent", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, wantParent: "toolu_meta", wantType: "general-purpose"},
+		{name: "stop fills both", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, stopped: true, wantParent: "toolu_meta", wantType: "Explore"},
+		{name: "start keeps hook parent", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, result: true, wantType: "general-purpose"},
+		{name: "stop keeps hook parent", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, result: true, stopped: true, wantType: "general-purpose"},
+		{name: "start no meta", wantType: "general-purpose"},
+		{name: "stop no meta", stopped: true},
+		{name: "start directory", directory: true, wantType: "general-purpose"},
+		{name: "stop directory", directory: true, stopped: true},
+		{name: "start bad JSON", meta: `{`, wantType: "general-purpose"},
+		{name: "stop bad JSON", meta: `{`, stopped: true},
+		{name: "start empty meta", meta: `{}`, wantType: "general-purpose"},
+		{name: "stop empty meta", meta: `{}`, stopped: true},
+		{name: "start no transcript path", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, noPath: true, wantType: "general-purpose"},
+		{name: "stop no transcript path", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, noPath: true, stopped: true},
+		{name: "start meta write fails", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, writeFail: true},
+		{name: "stop meta write fails", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, writeFail: true, stopped: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			scripted := lab.payloads("scripted.jsonl")
+			meta := strings.TrimSuffix(callmeter.SubagentTranscriptPath(lab.transcript(cmSessionA), cmSubagent), ".jsonl") + ".meta.json"
+			if test.directory {
+				if err := os.Mkdir(meta, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if test.meta != "" {
+				// Claude Code's gym S2 meta shape: agentType and toolUseId.
+				lab.write(meta, []byte(test.meta))
+			}
+			payload := scripted[5]
+			if test.stopped {
+				// Copy the captured SubagentStop, omitting its agent_type.
+				fields := decoded(t, scripted[8])
+				delete(fields, "agent_type")
+				encoded, err := json.Marshal(fields)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload = string(encoded)
+			}
+			if test.noPath {
+				payload = withFields(t, payload, map[string]any{"transcript_path": ""})
+				// A read with an empty main path would find this decoy meta.
+				if err := os.Mkdir(filepath.Join(lab.root, "subagents"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				lab.write(filepath.Join(lab.root, "subagents", "agent-"+cmSubagent+".meta.json"), []byte(test.meta))
+				t.Chdir(lab.root)
+			}
+			wantParent := test.wantParent
+			if test.result {
+				lab.feed(scripted[9])
+				wantParent = payloadField(t, scripted[9], "tool_use_id")
+			}
+			if test.writeFail {
+				if _, err := lab.db().DB().ExecContext(lab.ctx, `CREATE TRIGGER refuse_agent_meta BEFORE UPDATE ON agents WHEN NEW.parent_tool_use_id = 'toolu_meta' BEGIN SELECT RAISE(ABORT, 'test meta fill failure'); END`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lab.feed(payload)
+			if test.writeFail {
+				if n := lab.count("SELECT count(*) FROM agents"); n != 0 {
+					t.Errorf("agents after failed write = %d, want 0", n)
+				}
+				if n := lab.count("SELECT count(*) FROM faults WHERE stage = ?", callmeter.StageStore); n != 1 {
+					t.Errorf("store faults = %d, want 1", n)
+				}
+				assertLogged(t, lab.logPath, callmeter.StageStore)
+				return
+			}
+			expect(t, "agent", lab.row("SELECT * FROM agents WHERE agent_id = ?", cmSubagent), map[string]any{
+				"parent_tool_use_id": wantParent, "agent_type": test.wantType,
+			})
+			if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+				t.Errorf("faults = %d, want 0", n)
+			}
+			if data, err := os.ReadFile(lab.logPath); err == nil {
+				if len(data) != 0 {
+					t.Errorf("log bytes = %d, want 0", len(data))
+				}
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // TestCallmeterSubagentStopWaitsForTheFinalMessage: Claude Code fires
 // SubagentStop 20-50 ms after the agent's final message is stamped but before
 // that line is flushed to its transcript (live: 31 of 33 agents summed without
@@ -1138,11 +1237,85 @@ func TestCallmeterStoreUnopenableNamesBatchCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read missed.log: %v", err)
 	}
-	want := regexp.MustCompile(`^\d+\tPostToolBatch\tstore unavailable: \w+\t` + cmSessionB + `\n$`)
+	want := regexp.MustCompile(`^\d+\tPostToolBatch\tstore unavailable: \w+` + regexp.QuoteMeta(fmt.Sprintf(" (pid %d)", os.Getpid())) + `\t` + cmSessionB + `\n$`)
 	if !want.Match(missed) {
 		t.Error("missed.log does not hold exactly one classified line for the batch")
 	}
 	assertLogged(t, lab.logPath, callmeter.StageStore)
+}
+
+func TestCallmeterStoreCloseFailureNamesBatchCalls(t *testing.T) {
+	lab := newCallmeterLab(t)
+	previous := closeStore
+	closeStore = func(store *callmeter.Store) error {
+		return errors.Join(store.Close(), errors.New("close failed"))
+	}
+	t.Cleanup(func() { closeStore = previous })
+	var stderr bytes.Buffer
+	batch := lab.payloads("probe5.jsonl")[3]
+	if code := runCallmeter(lab.ctx, strings.NewReader(batch), &stderr,
+		lab.files(), lab.clock, callmeterSeat{}, mapEnv(nil)); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	ids := []string{cmBatchLead, "toolu_014w33S7y4Hmv2iQj3NzzEWV", "toolu_01LV57SCFxiU1LaMWZm3ixg6"}
+	logged, err := os.ReadFile(lab.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, output := range map[string]string{"stderr": stderr.String(), "log": string(logged)} {
+		var failures []string
+		for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+			if strings.Contains(line, "close failed") {
+				failures = append(failures, line)
+			}
+		}
+		if len(failures) != len(ids) {
+			t.Errorf("%s has %d close failures, want %d", name, len(failures), len(ids))
+		}
+		for _, id := range ids {
+			n := 0
+			for _, line := range failures {
+				if !strings.Contains(line, id) {
+					continue
+				}
+				n++
+				for _, other := range ids {
+					if other != id && strings.Contains(line, other) {
+						t.Errorf("%s close failure for %s also names %s", name, id, other)
+					}
+				}
+				if name == "stderr" {
+					want := fmt.Sprintf("callmeter: store: session %q call %q: close failed", cmSessionB, id)
+					if line != want {
+						t.Errorf("stderr close failure for %s differs from its complete line", id)
+					}
+				} else {
+					var record map[string]string
+					if err := json.Unmarshal([]byte(line), &record); err != nil {
+						t.Fatal(err)
+					}
+					if record["step"] != callmeter.StageStore || record["session"] != cmSessionB ||
+						record["target"] != id || record["err"] != "close failed" {
+						t.Errorf("log close failure does not name session and call %s exactly", id)
+					}
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s has %d close failures for %s, want 1", name, n, id)
+			}
+		}
+	}
+	missed, err := os.ReadFile(lab.missed)
+	if !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
+		t.Errorf("accounted batch left %d missed bytes (%v)", len(missed), err)
+	}
+	if n := lab.count("SELECT COUNT(*) FROM calls"); n != 3 {
+		t.Errorf("committed calls = %d, want 3", n)
+	}
+	for id, delivered := range map[string]int{ids[0]: 17, ids[1]: 19, ids[2]: 17} {
+		expect(t, "committed batch call "+id, lab.call(id),
+			map[string]any{"session_id": cmSessionB, "bytes_delivered": delivered})
+	}
 }
 
 // TestCallmeterBashCwdIsTheDirectoryBeforeTheCommand: PostToolUse's cwd
@@ -2888,7 +3061,7 @@ func TestCallmeterStoreUnavailableLeavesAMissedLine(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read missed.log: %v", err)
 			}
-			reason := callmeter.StoreUnavailableReason + c.class
+			reason := fmt.Sprintf("%s%s (pid %d)", callmeter.StoreUnavailableReason, c.class, os.Getpid())
 			want := regexp.MustCompile(`^\d+\t` + c.event + `\t` + regexp.QuoteMeta(reason) + `\t` + cmSessionA + `\n$`)
 			if !want.Match(missed) {
 				t.Fatalf("missed.log = %q, want one line matching %s", missed, want)
@@ -2989,5 +3162,33 @@ func TestCallmeterNoRealOutputToolsStoreNullBytesReal(t *testing.T) {
 				t.Fatal("malformed response must have one payload fault")
 			}
 		})
+	}
+}
+
+// TestAppendMissedNamesItsWriter copies AppendMissed's tab-separated timestamp,
+// event, reason and optional session fields; only the reason gains the pid.
+func TestAppendMissedNamesItsWriter(t *testing.T) {
+	for _, session := range []string{"", "sess_1.b-2"} {
+		for _, reason := range []string{callmeter.TerminatedReason + "SIGTERM", callmeter.TerminatedByStoreBusy, callmeter.StoreUnavailableReason + callmeter.StoreClassOpen, callmeter.PanicReason} {
+			t.Run(session+"/"+reason, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "state", "missed.log")
+				now := time.Unix(1790000001, 0)
+				if err := AppendMissed(path, "SessionEnd", session, reason, now); err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := fmt.Sprintf("%d\tSessionEnd\t%s (pid %d)", now.Unix(), reason, os.Getpid())
+				if session != "" {
+					want += "\t" + session
+				}
+				want += "\n"
+				if string(got) != want {
+					t.Errorf("missed line = %q, want %q", got, want)
+				}
+			})
+		}
 	}
 }

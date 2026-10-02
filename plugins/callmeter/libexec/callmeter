@@ -142,7 +142,8 @@ payload_fields() {
   esac
 }
 
-# log_missed REASON appends the missed line for this hook. A line that cannot
+# log_missed REASON appends the missed line with reason `{reason} (pid $$)`
+# for this hook. A line that cannot
 # be appended (no home, a home that cannot be made, a missed.log that cannot be
 # opened or written) goes to stderr instead as
 # `callmeter: missed: {event} {reason}`, followed by ` {session}` when the
@@ -152,9 +153,9 @@ log_missed() {
   if [ -n "$home" ]; then
     if [ -d "$home" ] || mkdir -p "$home" 2>/dev/null; then
       if [ -n "$session" ]; then
-        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
+        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
       else
-        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log"; } 2>/dev/null && return 0
+        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" >>"$home/missed.log"; } 2>/dev/null && return 0
       fi
     fi
   fi

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -163,11 +164,67 @@ func TestNameOfErrorRendersQuestionMarkAndNote(t *testing.T) {
 		t.Errorf("fault row = %v, want chat column ?", faultRow)
 	}
 	out := render(t, table)
-	if !strings.Contains(out, "note: chat names could not be read: session s1: transcript unreadable") {
+	if !strings.Contains(out, "note: chat names could not be read for 1 sessions (first: unreadable)") ||
+		strings.Contains(out, "transcript unreadable") {
 		t.Errorf("report lacks the chat-name note:\n%s", out)
 	}
 	if !strings.Contains(out, "note: 1 calls not recorded") {
 		t.Errorf("report lacks the unrecorded-calls note:\n%s", out)
+	}
+}
+
+func TestNamesNoteCountsSessionsWithASafeLabel(t *testing.T) {
+	cases := []struct {
+		name     string
+		fn       NameOf
+		sessions []string
+		want     string
+	}{
+		{
+			name: "distinct failing sessions and first failure",
+			fn: func(session string) (string, error) {
+				if session == "b" {
+					return "", fmt.Errorf("lookup: %w", fs.ErrPermission)
+				}
+				return "", errNames
+			},
+			sessions: []string{"a", "b", "a"},
+			want:     "chat names could not be read for 2 sessions (first: unreadable)",
+		},
+		{
+			name:     "permission denied",
+			fn:       func(string) (string, error) { return "", fmt.Errorf("lookup: %w", fs.ErrPermission) },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: permission denied)",
+		},
+		{
+			name:     "not found",
+			fn:       func(string) (string, error) { return "", fmt.Errorf("lookup: %w", fs.ErrNotExist) },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: not found)",
+		},
+		{
+			name:     "other error",
+			fn:       func(string) (string, error) { return "", errNames },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: unreadable)",
+		},
+		{
+			name:     "no name source",
+			sessions: []string{"a", "b", "a"},
+			want:     "chat names could not be read for 2 sessions (first: unreadable)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			names := newNames(tc.fn)
+			for _, session := range tc.sessions {
+				names.of(session)
+			}
+			if got := names.notes(); len(got) != 1 || got[0] != tc.want {
+				t.Errorf("notes = %q, want [%q]", got, tc.want)
+			}
+		})
 	}
 }
 

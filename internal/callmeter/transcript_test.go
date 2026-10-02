@@ -10,7 +10,51 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestReadTaskNoticesReadsOnlyIdAndStatus(t *testing.T) {
+	at := time.Date(2026, 10, 1, 0, 52, 21, 292000000, time.UTC)
+	attachment := taskNoticeLine("attachment", "a1", "completed", at)
+	user := taskNoticeLine("user", "a1", "failed", at.Add(time.Second))
+	lines := []string{
+		attachment, user, taskNoticeLine("user", "a2", "killed", at.Add(2*time.Second)),
+		// Synthetic queue-operation shape from gym S2: content is not a notice.
+		`{"type":"queue-operation","content":"<task-notification><task-id>queued</task-id><status>completed</status></task-notification>","timestamp":"2026-10-01T00:52:21.292Z"}`,
+		`{"type":"attachment","task-notification": broken`,
+		`not JSON and no notice marker`,
+		strings.Replace(user, "<task-id>a1</task-id>", "", 1),
+		strings.Replace(user, "<task-id>a1</task-id>", "<task-id></task-id>", 1),
+		strings.Replace(user, "</task-id>", "", 1),
+		strings.Replace(user, "<status>failed</status>", "", 1),
+		strings.Replace(user, "<status>failed</status>", "<status></status>", 1),
+		strings.Replace(user, "</status>", "", 1),
+		strings.Replace(user, stamp(at.Add(time.Second)), "invalid", 1),
+		strings.Replace(user, `"kind":"task-notification"`, `"kind":"peer"`, 1),
+		strings.Replace(attachment, `"type":"queued_command"`, `"type":"other"`, 1),
+		strings.Replace(attachment, `"kind":"task-notification"`, `"kind":"peer"`, 1),
+		// File order is kept, including a final line without a newline.
+		taskNoticeLine("attachment", "a1", "killed", at.Add(-time.Second)),
+	}
+	path := filepath.Join(t.TempDir(), "notices.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadTaskNotices(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]int64{"a1": {at.UnixMilli(), at.Add(time.Second).UnixMilli(), at.Add(-time.Second).UnixMilli()}, "a2": {at.Add(2 * time.Second).UnixMilli()}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadTaskNotices = %v, want %v", got, want)
+	}
+	if _, err := ReadTaskNotices(filepath.Join(t.TempDir(), "missing.jsonl")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing transcript error = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := ReadTaskNotices(t.TempDir()); err == nil {
+		t.Fatal("reading a directory succeeded")
+	}
+}
 
 func TestFindRequests(t *testing.T) {
 	path := filepath.Join("testdata", "transcript.jsonl")

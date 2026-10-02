@@ -59,7 +59,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	since := fs.String("since", "", "RFC 3339 time: compare sessions first recorded at or after it, and transcript entries from it on (default: the snapshot's earliest session, all history)")
 	until := fs.String("until", "", "RFC 3339 time: ignore transcript entries after it (default: the snapshot's latest row)")
 	projects := fs.String("projects", "", "comma-separated Claude Code projects dirs (default: ~/.claude/projects,~/.cc/2/projects,~/.cc/3/projects)")
-	scratch := fs.String("scratch", "/tmp/callmeter", "a directory searched for scratch stores (every callmeter.db under it, read-only): a disk session one of them records is the expected session-unrecorded; empty: none")
+	scratch := fs.String("scratch", "/tmp/callmeter", "a directory searched for scratch stores (every callmeter.db under it, read-only): a disk session one records by a sessions row or a fault naming it is the expected session-unrecorded; empty: none")
 	allow := fs.String("allowlist", filepath.Join("scripts", "reconcile", "allowlist.txt"), "the allowlist file")
 	if err := fs.Parse(args); err != nil {
 		return 2

@@ -258,7 +258,7 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			rep.add("fault-"+f.stage, f.session, f.ts, lost[i].detail)
 		case lostEnd(st, f):
 			rep.expect("fault-"+f.stage, f.session, f.ts, reasonEndKilled, "event=SessionEnd end_reason=lost")
-		case f.stage == "binary" && f.session == "" && f.err == killedUnknown:
+		case f.stage == "binary" && f.session == "" && withoutPid(f.err) == killedUnknown:
 			unknown = append(unknown, f)
 		case f.stage == "transcript" && unfillable(st, w, f) != "":
 			rep.expect("fault-transcript-unfillable", f.session, f.ts, reasonUnfillable, unfillable(st, w, f))
@@ -289,6 +289,7 @@ var lostHookReason = map[string]string{
 
 const (
 	reasonRanNothing             = "the session started and ran nothing: only idle lifecycle events, no calls, requests, agents or turns, and no fault or lost event that could hide work (internal/callmeter/report/sessions.go ranNothing)"
+	reasonKilledBeforeReply      = "the session was killed before the model's first reply: the store holds only its SessionStart, UserPromptSubmit and SessionEnd events, and its transcript holds a prompt and no assistant line (a launch killed or cleared mid-request)"
 	reasonUnfillable             = "report-time recovery read every transcript of the session in full and an agent turn, a Stop, a prompt's turn end, an open call or a sub-agent's open turn still had nothing to fill it, and it recorded that once; this check's own parse of the transcripts confirms they hold none at or after the session's first row (callmeter.RecoverQuiet)"
 	reasonKilledStopFailure      = "Claude Code killed the StopFailure hook at a headless exit; the StopFailure row of the session ending right after it (hook or rebuilt from its transcript at SessionEnd) stands for it"
 	reasonTerminatedFailureNamed = "the StopFailure hook of the session the fault names ended before it recorded (store busy, or a signal); that session's turn has a StopFailure row (hook or rebuilt from its transcript) no other fault paired"
@@ -504,7 +505,8 @@ func markedOpen(st *storeData, w *world, agent string, seq int64) bool {
 }
 
 // killedStopFailure is the wrapper's missed.log reason for a StopFailure hook
-// killed before its binary ran: no session_id, the ts in whole seconds.
+// killed before its binary ran: an optional trailing pid, no session_id, the ts
+// in whole seconds.
 const killedStopFailure = "StopFailure: killed by signal"
 
 // matchKilledStopFailures pairs each killedStopFailure fault, oldest first,
@@ -531,7 +533,7 @@ func matchKilledStopFailures(st *storeData) map[int]bool {
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
 	var faults []int
 	for i, f := range st.faults {
-		if f.stage == "binary" && f.session == "" && f.err == killedStopFailure {
+		if f.stage == "binary" && f.session == "" && withoutPid(f.err) == killedStopFailure {
 			faults = append(faults, i)
 		}
 	}
@@ -554,6 +556,20 @@ func matchKilledStopFailures(st *storeData) map[int]bool {
 	return matched
 }
 
+// withoutPid drops one trailing missed.log pid suffix, preserving every other reason.
+func withoutPid(text string) string {
+	start := strings.LastIndex(text, " (pid ")
+	if start < 0 || !strings.HasSuffix(text, ")") || start+6 >= len(text)-1 {
+		return text
+	}
+	for _, digit := range text[start+6 : len(text)-1] {
+		if digit < '0' || digit > '9' {
+			return text
+		}
+	}
+	return text[:start]
+}
+
 // terminatedEvent recognises the binary's stored forms of a lost hook.
 func terminatedEvent(f sFault) (event string, ok bool) {
 	if f.stage != callmeter.StageTerminated {
@@ -561,7 +577,8 @@ func terminatedEvent(f sFault) (event string, ok bool) {
 	}
 	event, reason, found := strings.Cut(f.err, ": ")
 	return event, found && (strings.HasPrefix(reason, callmeter.TerminatedReason) ||
-		strings.HasPrefix(reason, callmeter.StoreUnavailableReason) || reason == callmeter.PanicReason)
+		strings.HasPrefix(reason, callmeter.StoreUnavailableReason) || reason == callmeter.PanicReason ||
+		strings.HasPrefix(reason, callmeter.PanicReason+" ("))
 }
 
 // lostEnd reports whether f is a SessionEnd fault (the binary's `terminated`
@@ -921,7 +938,7 @@ func matchLostHooks(st *storeData, w *world) map[int]hookVerdict {
 
 // killedUnknown is the wrapper's missed.log reason for a hook killed before it
 // read hook_event_name: neither the event nor the session is known, the ts in
-// whole seconds.
+// whole seconds, with an optional trailing pid.
 const killedUnknown = "unknown: killed by signal"
 
 // voucher is what the sessions beside a killedUnknown fault can say for it:
@@ -998,6 +1015,22 @@ func nonEmpty(ids ...string) []string {
 		}
 	}
 	return out
+}
+
+func promptOnly(id string, st storeData) bool {
+	found := false
+	for _, e := range st.events {
+		if e.session != id {
+			continue
+		}
+		found = true
+		switch e.event {
+		case callmeter.EventSessionStart, "UserPromptSubmit", callmeter.EventSessionEnd:
+		default:
+			return false
+		}
+	}
+	return found
 }
 
 // ranNothing mirrors the unexported SQL rule in internal/callmeter/report/sessions.go.
@@ -1085,6 +1118,8 @@ func compareSessions(rep *report, st *storeData, w *world, compared []*sSession,
 		if t.assistants == 0 && subLines == 0 && t.apiErrors == 0 {
 			if workFor[s.id] {
 				rep.add("session-no-transcript", s.id, 0, fmt.Sprintf("window_lines=%d", t.windowLines))
+			} else if promptOnly(s.id, *st) && len(t.prompts) > 0 {
+				rep.expect("session-promptless", s.id, 0, reasonKilledBeforeReply, promptlessDetail(s, st))
 			} else {
 				rep.add("session-promptless", s.id, 0, promptlessDetail(s, st))
 			}
@@ -1390,10 +1425,19 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 			rep.add("agent-type", t.session, 0, fmt.Sprintf("transcript=%s store=%s", t.meta.AgentType, orDash(a.agentType)), id)
 		}
 		if t.meta.ToolUseID != "" && a.parent != t.meta.ToolUseID {
-			rep.add("agent-parent", t.session, 0, fmt.Sprintf("transcript=%s store=%s", t.meta.ToolUseID, orDash(a.parent)), id)
+			detail := fmt.Sprintf("transcript=%s store=%s", t.meta.ToolUseID, orDash(a.parent))
+			s := st.sessions[t.session]
+			if a.parent == "" && s != nil && (s.lastTS > st.latest-quietAfterMS || w.writes[t.session] > st.latest-quietAfterMS) {
+				// The parent lands with the Agent PostToolUse or the meta fill.
+				rep.edge("agent-parent-open", t.session, 0, detail, id)
+			} else {
+				rep.add("agent-parent", t.session, 0, detail, id)
+			}
 		}
-		if a.toolUses >= 0 && a.toolUses != int64(len(t.toolUses)) {
-			detail := fmt.Sprintf("transcript=%d store=%d", len(t.toolUses), a.toolUses)
+		// Mirrors ReadAgentTotals, which counts the whole agent transcript.
+		toolUses := int64(len(t.toolUses) + len(t.preToolUses))
+		if a.toolUses >= 0 && a.toolUses != toolUses {
+			detail := fmt.Sprintf("transcript=%d store=%d", toolUses, a.toolUses)
 			// The count is written at SubagentStop: a stopped agent's open last
 			// turn never gets one, so its stopped calls are the whole gap.
 			var cut int64
@@ -1402,11 +1446,11 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 					cut++
 				}
 			}
-			if turns := st.turns[id]; cut > 0 && int64(len(t.toolUses))-a.toolUses == cut && len(turns) > 0 && lastTurn(turns).noStop {
+			if turns := st.turns[id]; cut > 0 && toolUses-a.toolUses == cut && len(turns) > 0 && lastTurn(turns).noStop {
 				rep.expect("agent-tool-uses", t.session, 0, reasonStoppedAgent, detail, id)
-			} else if turns := st.turns[id]; len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && lastTurn(turns).noStop && markedOpen(st, w, id, lastTurn(turns).seq) {
+			} else if turns := st.turns[id]; len(turns) > 0 && a.toolUses < toolUses && lastTurn(turns).noStop && markedOpen(st, w, id, lastTurn(turns).seq) {
 				rep.expect("agent-tool-uses", t.session, 0, reasonAgentNeverStopped, detail, id)
-			} else if len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && turnOpen(st, t.session, lastTurn(turns)) && t.lastTS > st.latest-quietAfterMS {
+			} else if len(turns) > 0 && a.toolUses < toolUses && turnOpen(st, t.session, lastTurn(turns)) && t.lastTS > st.latest-quietAfterMS {
 				// Not due: the count lands at the SubagentStop of the turn
 				// still running, as recovery waits an hour for a quiet one.
 				rep.edge("agent-tool-uses-open", t.session, 0, detail, id)
@@ -1414,8 +1458,9 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 				rep.add("agent-tool-uses", t.session, 0, detail, id)
 			}
 		}
-		// Every turn ends in an end_turn message; a last turn cut short ends in none.
-		implied := len(t.endTurns)
+		// SubagentStop also ends a null-stop turn a later prompt woke again;
+		// a last turn cut short ends in none.
+		implied := len(t.endTurns) + len(t.nullEnds)
 		if t.assistants > 0 && t.lastStop != "end_turn" {
 			implied++
 		}
@@ -1804,8 +1849,14 @@ func lastTurn(turns []sTurn) sTurn {
 // shownEnd reports whether this check's own parse of the agent's transcript
 // holds the turn end a SubagentStop rebuilt by recovery is dated at: a message
 // of the agent whose turn-ending stop_reason (set, not tool_use) was written at
-// the stop's ts, at or after the turn's start.
+// the stop's ts, at or after the turn's start. Recovery also ends a background
+// agent's turn at its task-notification in the main transcript (agentStopsToMark).
 func shownEnd(w *world, agent, session string, turn sTurn) bool {
+	for _, ts := range w.notices[agent] {
+		if ts == turn.ts && ts >= turn.start {
+			return true
+		}
+	}
 	for _, msg := range w.messages {
 		if msg.agent == agent && msg.session == session && msg.endTS != 0 && msg.endTS == turn.ts && msg.endTS >= turn.start {
 			return true

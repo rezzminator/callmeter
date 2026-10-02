@@ -308,9 +308,9 @@ func loadScratch(ctx context.Context, root, snapshot string) (map[string]string,
 	return sessions, read, unreadable, nil
 }
 
-// scratchSessions lists a scratch store's session ids without writing to it:
-// read-only beside its -wal, else immutable (no WAL to miss, and no -shm to
-// create).
+// scratchSessions lists sessions recorded by a sessions row or a fault naming
+// them, without writing to the scratch store: read-only beside its -wal, else
+// immutable (no WAL to miss, and no -shm to create).
 func scratchSessions(ctx context.Context, path string) (ids []string, err error) {
 	query := "mode=ro&immutable=1"
 	if _, statErr := os.Stat(path + "-wal"); statErr == nil {
@@ -325,7 +325,7 @@ func scratchSessions(ctx context.Context, path string) (ids []string, err error)
 			err = fmt.Errorf("close: %w", cerr)
 		}
 	}()
-	err = queryEach(ctx, db, `SELECT session_id FROM sessions`, func(r *sql.Rows) error {
+	err = queryEach(ctx, db, `SELECT session_id FROM sessions UNION SELECT session_id FROM faults WHERE session_id IS NOT NULL AND session_id <> ''`, func(r *sql.Rows) error {
 		var id string
 		if err := r.Scan(&id); err != nil {
 			return err

@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -43,7 +45,12 @@ const hookProcesses = 64
 // payload its own `callmeter hook` process, up to hookProcesses at once on one
 // CALLMETER_HOME: every process exits 0 with nothing on stdout, the store
 // never faults, and it holds what the in-order replay of the same payloads
-// holds.
+// holds. A run whose hook timeout keeps its store wait under BusyTimeout
+// (storeWait: SessionEnd's 2 s gives 800 ms) can meet a queue that long on a
+// loaded host and gives up as designed: its `terminated by store busy` line
+// (ingested by a later run, or still in missed.log) stands in for its event
+// row, and a busy store fault of a later batch of such a run whose event
+// committed is its own. Every other run waits BusyTimeout and lands.
 func TestProcessConcurrentHooks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -109,22 +116,53 @@ func TestProcessConcurrentHooks(t *testing.T) {
 				i, failures[i], result.ExitCode, result.Stdout, result.Stderr)
 		}
 	}
-	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'store'"); n != 0 {
+	var shortWait []any
+	for event := range registered {
+		if storeWait(event) < callmeter.BusyTimeout {
+			shortWait = append(shortWait, event)
+		}
+	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(shortWait)), ",")
+	if n := lab.count(`SELECT COUNT(*) FROM faults f WHERE f.stage = 'store' AND NOT (f.error LIKE '%SQLITE_BUSY%'
+		AND EXISTS (SELECT 1 FROM events e WHERE e.session_id = f.session_id AND e.ts = f.ts AND e.event IN (`+marks+`)))`,
+		shortWait...); n != 0 {
 		t.Errorf("%d store faults under %d concurrent processes:\n%s",
 			n, hookProcesses, strings.Join(lab.dump()["faults"], "\n"))
+	}
+	missed, err := os.ReadFile(paths.Missed(callmeterHome))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read missed.log: %v", err)
+	}
+	gaveUp, gaveUpTurns := 0, 0
+	for _, event := range shortWait {
+		n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'terminated' AND error LIKE ?",
+			fmt.Sprint(event)+": "+callmeter.TerminatedByStoreBusy+"%")
+		for _, line := range strings.Split(string(missed), "\n") {
+			if fields := strings.Split(line, "\t"); len(fields) >= 3 && fields[1] == event &&
+				strings.HasPrefix(fields[2], callmeter.TerminatedByStoreBusy) {
+				n++
+			}
+		}
+		gaveUp += n
+		if event == callmeter.EventStopFailure {
+			gaveUpTurns += n
+		}
 	}
 	for id := range ids {
 		if n := lab.count("SELECT COUNT(*) FROM calls WHERE tool_use_id = ?", id); n != 1 {
 			t.Errorf("call %s: %d rows, want 1", id, n)
 		}
 	}
-	if n := lab.hookRows("events"); n < minEvents || n > wantEvents {
+	t.Logf("short-wait runs given up busy: %d", gaveUp)
+	if n := lab.hookRows("events"); n < minEvents-gaveUp || n > wantEvents {
 		t.Errorf("events holds %d hook rows, want from the in-order replay's %d distinct payloads (same bytes within "+
-			"RedeliveryWindow are one occurrence) to its %d rows:\n%s", n, minEvents, wantEvents, lab.turnEndRows())
+			"RedeliveryWindow are one occurrence) less %d short-wait runs given up busy, to its %d rows:\n%s\nmissed.log:\n%s",
+			n, minEvents, gaveUp, wantEvents, lab.turnEndRows(), missed)
 	}
-	if n := lab.hookRows("turns"); n < minTurns || n > wantTurns {
+	if n := lab.hookRows("turns"); n < minTurns-gaveUpTurns || n > wantTurns {
 		t.Errorf("turns holds %d hook rows, want from the in-order replay's %d distinct payloads (same bytes within "+
-			"RedeliveryWindow are one occurrence) to its %d rows:\n%s", n, minTurns, wantTurns, lab.turnEndRows())
+			"RedeliveryWindow are one occurrence) less %d given up busy, to its %d rows:\n%s",
+			n, minTurns, gaveUpTurns, wantTurns, lab.turnEndRows())
 	}
 	if n := lab.strayRebuiltEnds(); n != 0 {
 		t.Errorf("%d turn ends rebuilt from a transcript that no SessionEnd running before its session's prompt "+
@@ -228,7 +266,7 @@ const signalDelay = 700 * time.Millisecond
 
 // missedLine is one line the binary appends to missed.log under a signal, its
 // session field present when the payload decoded with a session id.
-var missedLine = regexp.MustCompile(`^(\d+)\t(\S+)\tterminated by (SIG[A-Z]+)(?:\t([A-Za-z0-9._-]+))?\n$`)
+var missedLine = regexp.MustCompile(`^(\d+)\t(\S+)\tterminated by (SIG[A-Z]+) \(pid ([1-9][0-9]*)\)(?:\t([A-Za-z0-9._-]+))?\n$`)
 
 // signalScene is one hermetic run of the built binary: its own CALLMETER_HOME,
 // seat and the gym/S2 session's transcripts.
@@ -397,8 +435,8 @@ func (scene *signalScene) wantTerminatedLine(t *testing.T, proc *hookProcess, ev
 	if err != nil || secs < proc.started.Unix() || secs > time.Now().Unix() {
 		t.Errorf("missed.log stamp = %q, want Unix seconds of this run (%d..%d)", match[1], proc.started.Unix(), time.Now().Unix())
 	}
-	if match[2] != event || match[3] != signal || match[4] != session {
-		t.Errorf("missed.log line = %q, want event %s signal %s session %q", got, event, signal, session)
+	if match[2] != event || match[3] != signal || match[4] != strconv.Itoa(proc.cmd.Process.Pid) || match[5] != session {
+		t.Errorf("missed.log line = %q, want event %s signal %s pid %d session %q", got, event, signal, proc.cmd.Process.Pid, session)
 	}
 }
 
@@ -530,11 +568,15 @@ func TestProcessSignalledHook(t *testing.T) {
 // terminate starts the signal handler for sig as the binary does, in its own
 // goroutine, and returns the channel its exit code arrives on.
 func (lab *callmeterLab) terminate(state *terminationState, sig os.Signal, stderr io.Writer) <-chan int {
+	codes := make(chan int, 1)
+	lab.terminateWithExit(state, sig, stderr, func(code int) { codes <- code })
+	return codes
+}
+
+func (lab *callmeterLab) terminateWithExit(state *terminationState, sig os.Signal, stderr io.Writer, exit func(int)) {
 	signals := make(chan os.Signal, 1)
 	signals <- sig
-	codes := make(chan int, 1)
-	go terminateOnSignal(signals, nil, state, lab.missed, lab.logPath, stderr, func(code int) { codes <- code })
-	return codes
+	go terminateOnSignal(signals, nil, state, lab.missed, lab.logPath, stderr, exit)
 }
 
 // await returns the handler's exit code, failing when it does not exit.
@@ -603,13 +645,14 @@ func TestTerminationAfterRecordingWritesNoLine(t *testing.T) {
 // session; a session id outside the field's alphabet is left out, never
 // written to break the line. The home is created when absent.
 func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
+	pid := fmt.Sprintf(" (pid %d)", os.Getpid())
 	for name, run := range map[string]struct{ event, session, want string }{
-		"decoded":                       {"Stop", "", "\tStop\tterminated by SIGINT\n"},
-		"a SessionEnd with its session": {"SessionEnd", "sess_1.b-2", "\tSessionEnd\tterminated by SIGINT\tsess_1.b-2\n"},
-		"a session with a tab":          {"SessionEnd", "sess\t1", "\tSessionEnd\tterminated by SIGINT\n"},
-		"not decoded":                   {"", "", "\tunknown\tterminated by SIGINT\n"},
-		"a name with a tab":             {"Pre\tToolUse", "sess-1", "\tunknown\tterminated by SIGINT\tsess-1\n"},
-		"a name with a line feed":       {"Pre\nToolUse", "", "\tunknown\tterminated by SIGINT\n"},
+		"decoded":                       {"Stop", "", "\tStop\tterminated by SIGINT" + pid + "\n"},
+		"a SessionEnd with its session": {"SessionEnd", "sess_1.b-2", "\tSessionEnd\tterminated by SIGINT" + pid + "\tsess_1.b-2\n"},
+		"a session with a tab":          {"SessionEnd", "sess\t1", "\tSessionEnd\tterminated by SIGINT" + pid + "\n"},
+		"not decoded":                   {"", "", "\tunknown\tterminated by SIGINT" + pid + "\n"},
+		"a name with a tab":             {"Pre\tToolUse", "sess-1", "\tunknown\tterminated by SIGINT" + pid + "\tsess-1\n"},
+		"a name with a line feed":       {"Pre\nToolUse", "", "\tunknown\tterminated by SIGINT" + pid + "\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			scene := newSignalScene(t, "")
@@ -649,12 +692,121 @@ func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
 			t.Errorf("handler exit code = %d, want 0", code)
 		}
 		session, _ := payloadField(t, scene.payload(t, "PreToolUse"), "session_id").(string)
-		want := regexp.MustCompile(`^\d+\tPreToolUse\t` + regexp.QuoteMeta(callmeter.StoreUnavailableReason+callmeter.StoreClassOpen) +
+		want := regexp.MustCompile(`^\d+\tPreToolUse\t` + regexp.QuoteMeta(fmt.Sprintf("%s%s (pid %d)", callmeter.StoreUnavailableReason, callmeter.StoreClassOpen, os.Getpid())) +
 			`\t` + regexp.QuoteMeta(session) + `\n$`)
 		if got := scene.missedLines(t); session == "" || !want.MatchString(got) {
 			t.Errorf("missed.log = %q, want the run's own line matching %s and none from the signal: that line accounts for the event", got, want)
 		}
 	})
+}
+
+type panicSignal struct{}
+
+func (panicSignal) Signal()        {}
+func (panicSignal) String() string { panic("boom") }
+
+func TestSignalHandlerPanicKeepsTheAccountedRule(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		sig         os.Signal
+		accounted   bool
+		panicAtExit bool
+		unwritable  bool
+		undecoded   bool
+		wantReason  string
+	}{
+		{name: "before its line", sig: panicSignal{}, wantReason: callmeter.PanicReason},
+		{name: "before payload decoded", sig: panicSignal{}, undecoded: true, wantReason: callmeter.PanicReason},
+		{name: "unwritable missed log", sig: panicSignal{}, unwritable: true},
+		{name: "after its line", sig: syscall.SIGTERM, panicAtExit: true, wantReason: callmeter.TerminatedReason + "SIGTERM"},
+		{name: "accounted", sig: syscall.SIGTERM, accounted: true, panicAtExit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			state := &terminationState{accounted: tc.accounted}
+			event, session := "SessionEnd", cmSessionB
+			if tc.undecoded {
+				event, session = "unknown", ""
+			} else {
+				state.setPayload(event, session)
+			}
+			if tc.unwritable {
+				if err := os.MkdirAll(lab.missed, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var stderr bytes.Buffer
+			codes := make(chan int, 1)
+			calls := 0
+			lab.terminateWithExit(state, tc.sig, &stderr, func(code int) {
+				if state.mu.TryLock() {
+					state.mu.Unlock()
+					t.Error("termination lock released before exit")
+				}
+				calls++
+				if tc.panicAtExit && calls == 1 {
+					panic("boom")
+				}
+				codes <- code
+			})
+			if code := await(t, codes); code != 0 {
+				t.Errorf("handler exit code = %d, want 0", code)
+			}
+			missed, err := os.ReadFile(lab.missed)
+			if tc.wantReason != "" {
+				line := fmt.Sprintf("\t%s\t%s (pid %d)", event, tc.wantReason, os.Getpid())
+				if session != "" {
+					line += "\t" + session
+				}
+				want := regexp.MustCompile(`^\d+` + regexp.QuoteMeta(line+"\n") + `$`)
+				if err != nil || !want.Match(missed) {
+					t.Errorf("missed.log has %d bytes (%v), want exactly one line for %s", len(missed), err, tc.wantReason)
+				}
+			} else if tc.unwritable {
+				if err == nil {
+					t.Error("missed.log directory unexpectedly readable as a file")
+				}
+			} else if !errors.Is(err, os.ErrNotExist) && (err != nil || len(missed) != 0) {
+				t.Errorf("accounted panic left %d bytes in missed.log (%v)", len(missed), err)
+			}
+			prefix := fmt.Sprintf("callmeter: terminated: session %q call %q: ", session, "")
+			wantFailures := 1
+			if tc.unwritable {
+				wantFailures++
+				if !strings.Contains(stderr.String(), prefix+"open "+lab.missed+":") {
+					t.Error("stderr does not name the missed append failure")
+				}
+			}
+			if strings.Count(stderr.String(), prefix) != wantFailures ||
+				!strings.Contains(stderr.String(), prefix+"signal handler panicked: boom\ngoroutine ") {
+				t.Error("stderr does not hold the expected terminated failures and panic stack")
+			}
+			logged, err := os.ReadFile(lab.logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+			if len(lines) != wantFailures {
+				t.Fatalf("log has %d lines, want %d", len(lines), wantFailures)
+			}
+			for i, line := range lines {
+				var record map[string]string
+				if err := json.Unmarshal([]byte(line), &record); err != nil {
+					t.Fatal(err)
+				}
+				if record["step"] != callmeter.StageTerminated || record["session"] != session || record["target"] != "" {
+					t.Error("log failure does not name the terminated stage and session")
+				}
+				if i == len(lines)-1 {
+					if !strings.HasPrefix(record["err"], "signal handler panicked: boom\ngoroutine ") {
+						t.Error("log panic lacks the value and stack")
+					}
+				} else if !strings.HasPrefix(record["err"], "open "+lab.missed+":") {
+					t.Error("log does not name the missed append failure")
+				}
+			}
+		})
+	}
 }
 
 // waitHeld waits until the run sits inside a write holding the state's lock,
@@ -808,7 +960,7 @@ func TestProcessStoreBusySessionEndLeavesAMissedLine(t *testing.T) {
 			if took >= hookTimeouts[callmeter.EventSessionEnd] {
 				t.Errorf("SessionEnd took %v against a held store, want under its %v hook timeout", took, hookTimeouts[callmeter.EventSessionEnd])
 			}
-			want := regexp.MustCompile(`^\d+\tSessionEnd\tterminated by store busy\t` + regexp.QuoteMeta(session) + `\n$`)
+			want := regexp.MustCompile(`^\d+\tSessionEnd\t` + regexp.QuoteMeta(fmt.Sprintf("terminated by store busy (pid %d)", proc.cmd.Process.Pid)) + `\t` + regexp.QuoteMeta(session) + `\n$`)
 			if got := scene.missedLines(t); !want.MatchString(got) {
 				t.Errorf("missed.log = %q, want one line matching %s", got, want)
 			}

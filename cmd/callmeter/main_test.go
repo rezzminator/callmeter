@@ -157,9 +157,9 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			payload: func(c cli) string {
 				return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
 			},
-			line: "\tPostToolUse\tpanic\tb2c7b094-91c1-4b76-8621-258b240b695a\n",
+			line: fmt.Sprintf("\tPostToolUse\tpanic (pid %d)\tb2c7b094-91c1-4b76-8621-258b240b695a\n", os.Getpid()),
 		},
-		{name: "no event", payload: func(cli) string { return "{}" }, line: "\tunknown\tpanic\n"},
+		{name: "no event", payload: func(cli) string { return "{}" }, line: fmt.Sprintf("\tunknown\tpanic (pid %d)\n", os.Getpid())},
 		{name: "accounted", payload: func(c cli) string {
 			return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
 		}, accounted: true},
@@ -218,6 +218,63 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			code, stdout, stderr = c.run("", "report", "files")
 			if code != 0 || !strings.Contains(stdout, "1 events unrecorded: hook terminated before recording") {
 				t.Errorf("report files = %d, want the panic counted as an unrecorded event\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestReportPanicExitsOne(t *testing.T) {
+	previous := report
+	report = func(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
+		if strings.Join(args, " ") != "report files" {
+			t.Error("report did not receive the dispatched arguments")
+		}
+		panic("boom")
+	}
+	t.Cleanup(func() { report = previous })
+	for _, noHome := range []bool{false, true} {
+		name := "with home"
+		if noHome {
+			name = "no home"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := newCLI(t)
+			getenv := func(name string) string {
+				if !noHome && name == paths.EnvHome {
+					return c.state
+				}
+				return ""
+			}
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"report", "files"}, strings.NewReader(""), &stdout, &stderr, getenv)
+			if code != 1 || stdout.Len() != 0 {
+				t.Errorf("report panic exit = %d, stdout bytes = %d; want 1 and 0", code, stdout.Len())
+			}
+			if !strings.HasPrefix(stderr.String(), "callmeter: report panicked: boom\ngoroutine ") ||
+				strings.Count(stderr.String(), "callmeter: report: session \"\" call \"\": report panicked: boom\ngoroutine ") != 1 {
+				t.Error("stderr lacks the report panic prefix, stack or single report failure")
+			}
+			logged, err := os.ReadFile(paths.Log(c.state))
+			if noHome {
+				if !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("no-home panic created a log or returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("report panic log has %d lines, want 1", len(lines))
+			}
+			var record map[string]string
+			if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+				t.Fatal(err)
+			}
+			if record["step"] != "report" || record["session"] != "" || record["target"] != "" ||
+				!strings.HasPrefix(record["err"], "report panicked: boom\ngoroutine ") {
+				t.Error("report panic log lacks the stage, panic value or stack")
 			}
 		})
 	}

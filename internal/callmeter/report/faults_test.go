@@ -142,8 +142,18 @@ func TestFaultsNameOfErrorSurfacesAsNote(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Faults: %v", err)
 	}
-	if len(table.Notes) == 0 {
-		t.Errorf("notes = none, want the NameOf error noted")
+	wantNote := "chat names could not be read for 1 sessions (first: unreadable)"
+	foundNote := false
+	for _, note := range table.Notes {
+		if note == wantNote {
+			foundNote = true
+		}
+		if strings.Contains(note, "transcript unreadable") {
+			t.Errorf("notes contain the lookup error: %q", note)
+		}
+	}
+	if !foundNote {
+		t.Errorf("notes = %q, want the path-free note %q", table.Notes, wantNote)
 	}
 	for _, row := range table.Rows {
 		if row[0] == "fault" && row[4] != "?" {

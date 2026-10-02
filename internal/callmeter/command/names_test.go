@@ -1,6 +1,7 @@
 package command
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"os"
@@ -139,6 +140,33 @@ func TestTranscriptNamesUnreadableTranscriptReturnsItsError(t *testing.T) {
 	name, err := fixture.names.nameOf("sess-bad")
 	if name != "" || err == nil || !strings.Contains(err.Error(), "read transcript "+unreadable) {
 		t.Fatalf("nameOf = %q, %v; want blank and the read error naming %s", name, err, unreadable)
+	}
+}
+
+func TestTranscriptNamesTellsStderrOncePerSession(t *testing.T) {
+	fixture := newNamesLab(t)
+	unreadable := filepath.Join(fixture.seat, "projects", "-work", "sess-bad.jsonl")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	fixture.names.stderr = &stderr
+	var firstErr string
+	for i := 0; i < 2; i++ {
+		_, err := fixture.names.nameOf("sess-bad")
+		if err == nil {
+			t.Fatal("nameOf returned no error for the unreadable transcript")
+		}
+		if i == 0 {
+			firstErr = err.Error()
+		} else if err.Error() != firstErr {
+			t.Errorf("second nameOf error = %q, want %q", err, firstErr)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "callmeter: chat name: session sess-bad: ") ||
+		!strings.Contains(lines[0], unreadable) {
+		t.Errorf("stderr = %q, want one session error line naming the transcript", stderr.String())
 	}
 }
 
