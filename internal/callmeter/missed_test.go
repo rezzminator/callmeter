@@ -527,3 +527,81 @@ func TestIngestMissedKeepsTwinLostEventsOfLaterIngests(t *testing.T) {
 		t.Errorf("faults from missed.log = %d, want 2: a second lost event was read as a re-ingest", n)
 	}
 }
+
+// TestParseMissedLineWriterPid copies AppendMissed's timestamp, event, reason
+// and optional session fields, including old writers' reasons without a pid.
+func TestParseMissedLineWriterPid(t *testing.T) {
+	for _, tc := range []struct{ reason, stage string }{
+		{"panic (pid 7)", StageTerminated},
+		{"panic", StageTerminated},
+		{"panic later", StageBinary},
+		{"terminated by SIGTERM (pid 7)", StageTerminated},
+		{"store unavailable: open (pid 7)", StageTerminated},
+		{"terminated by SIGTERM", StageTerminated},
+		{"store unavailable: open", StageTerminated},
+		{"download failed", StageBinary},
+	} {
+		for _, session := range []string{"", "sess-1"} {
+			t.Run(tc.reason+"/"+session, func(t *testing.T) {
+				line := "1790000001\tSessionEnd\t" + tc.reason
+				if session != "" {
+					line += "\t" + session
+				}
+				got, ok := parseMissedLine(line)
+				if !ok || got.TS != 1790000001000 || got.SessionID != session || got.Stage != tc.stage || got.Error != "SessionEnd: "+tc.reason {
+					t.Errorf("parseMissedLine = %+v, %v; want timestamp 1790000001000, session %q, stage %s, error %q", got, ok, session, tc.stage, "SessionEnd: "+tc.reason)
+				}
+			})
+		}
+	}
+}
+
+// TestIngestMissedKeepsATwinOfAPreClaimFd copies AppendMissed's timestamp,
+// event, reason with writer pid and session fields. An fd opened before the
+// claim appends after its read; a second pid is a twin, the same pid a replay.
+func TestIngestMissedKeepsATwinOfAPreClaimFd(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pid  string
+		want int
+	}{
+		{"another writer", "8", 2},
+		{"identical replay", "7", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			path := missedPath(store)
+			writeMissed(t, path, "1790000001\tPostToolUse\tterminated by SIGTERM (pid 7)\tsess-1\n")
+			late, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = late.Close() })
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+				t.Fatalf("first IngestMissed = %d, %v; want 1, nil", n, err)
+			}
+			if _, err := late.WriteString("1790000001\tPostToolUse\tterminated by SIGTERM (pid " + tc.pid + ")\tsess-1\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := late.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+				t.Fatalf("IngestMissed within grace = %d, %v; want 0, nil", n, err)
+			}
+			if done := backdateDone(t, path, DoneGrace+time.Second); len(done) != 1 {
+				t.Fatalf("done claims = %v, want one", done)
+			}
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != tc.want-1 {
+				t.Errorf("IngestMissed past grace = %d, %v; want %d, nil", n, err, tc.want-1)
+			}
+			if n := missedRows(t, store); n != tc.want {
+				t.Errorf("fault rows = %d, want %d", n, tc.want)
+			}
+			if done := backdateDone(t, path, 0); len(done) != 0 {
+				t.Errorf("done claims after grace = %v, want none", done)
+			}
+		})
+	}
+}

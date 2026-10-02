@@ -311,8 +311,10 @@ func fromNull(n sql.NullString) *string {
 // RecoverAgentStop writes stop as the SubagentStop its hook would have, rebuilt
 // from the agent's transcript (RecoveredDetail) because the hook's event was
 // lost, and reports whether a row went in: an events row and a turns row under
-// one id, dated at the transcript entry that ended the turn and never before
-// the turn's start, the turns columns only a hook carries NULL; the agent's
+// one id, dated at the agent transcript's entry that ended the turn or, when
+// there is none, at the earliest qualifying main-transcript task notice
+// (agentStopsToMark), never before the turn's start, the turns columns only a
+// hook carries NULL; the agent's
 // turns rebuilt from its events, so the turn closes at it; the agent's stopped
 // kept at the latest, its session, type and prompt filled, and, as the hook
 // does at the agent's latest stop, its total_tokens and tool_uses from the

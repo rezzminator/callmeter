@@ -69,9 +69,10 @@ type RecoverSummary struct {
 	// for and could not fill.
 	Unfillable int
 	// Rebuilt counts the call rows written from a transcript tool_use no hook
-	// recorded (RebuiltCall); Parents the agent rows given their parent Agent
-	// call or type from the sub-agent's meta file.
+	// recorded (RebuiltCall).
 	Rebuilt int
+	// Parents counts agent rows given their parent Agent call or type from
+	// the sub-agent's meta file, in every session, quiet or not.
 	Parents int
 	// Skipped holds the per-session transcript errors, each a *SkippedRead
 	// naming the session and the path; the rest of the pass went on. One
@@ -427,6 +428,8 @@ type requestWrite struct {
 // quiet (file mtimes). A hook that never ran again, a session killed with its
 // calls in flight, a sub-agent outliving its chat, leaves them otherwise
 // unknown for good.
+// A light pass first fills missing agent parents and types from their meta
+// files in every session, quiet or not, without reading the transcripts.
 //
 // What it writes is what a SessionEnd sweep reads, by the same code
 // (CallTranscripts, SettledCall, ApplyUsage, ResolvePendingFrom): pending
@@ -468,14 +471,18 @@ type requestWrite struct {
 // marked the same way (MarkCallsUnfillable): it stays out of the candidates
 // until any later hook (callUnmarked). An agent's latest turn with no stop
 // whose transcript, read in full, shows its end gets the SubagentStop its hook
-// lost, rebuilt at that end (agentStopsToMark, RecoverAgentStop); one whose
-// transcript shows none is marked (MarkAgentStopsUnfillable). A live session, or one with a transcript
+// lost, rebuilt at that end (agentStopsToMark, RecoverAgentStop), or at its
+// main-transcript task notice when no turn end exists. A turn with neither
+// is marked (MarkAgentStopsUnfillable). A live session, or one with a transcript
 // that could not be read in full, is never marked.
 //
 // The store holds one connection, so the candidates are read and closed before
 // any transcript is read, and each session's reads precede its one write.
 func (s *Store) RecoverQuiet(ctx context.Context, now time.Time, quiet time.Duration) (RecoverSummary, error) {
 	var summary RecoverSummary
+	if err := s.fillAgentMeta(ctx, &summary); err != nil {
+		return summary, err
+	}
 	cutoff := now.Add(-quiet)
 	candidates, err := s.quietCandidates(ctx, cutoff.UnixMilli())
 	if err != nil {
@@ -696,6 +703,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	built := map[string]requestWrite{} // every request read, by message id, so a rebuilt call's request is written
 	var uses []rebuildUse              // every tool_use within the session and retention window
 	ends := map[string][]int64{}       // agent id -> the ts of the turn-end entry of each of its requests that ends a turn
+	var notices map[string][]int64     // agent id -> main-transcript task-notification times
 	metas := map[string]subagentMeta{} // agent id -> its meta file
 	// complete: every transcript of the session was read in full, so what no
 	// request of theirs fills stays unfilled for good (MarkUnfillable).
@@ -720,6 +728,13 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 				complete = false
 				skip(file, err)
 				continue
+			}
+			if i == 0 {
+				notices, err = ReadTaskNotices(file)
+				if err != nil {
+					skip(file, err)
+					complete = false
+				}
 			}
 			for _, read := range requests {
 				if agentID != "" && read.StopReason != "" && read.StopReason != toolUse {
@@ -813,7 +828,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		if parents, err = s.agentParents(ctx, session.id, metas); err != nil {
 			return err
 		}
-		if markTurns, settleStops, err = s.agentStopsToMark(ctx, session.id, session.transcript, ends, skip); err != nil {
+		if markTurns, settleStops, err = s.agentStopsToMark(ctx, session.id, session.transcript, ends, notices, skip); err != nil {
 			return err
 		}
 	}
@@ -1114,6 +1129,60 @@ func RebuiltCall(sessionID, agentID, agentType string, request TranscriptRequest
 	}
 }
 
+// fillAgentMeta fills existing agents from their meta files without waiting
+// for their sessions to go quiet.
+func (s *Store) fillAgentMeta(ctx context.Context, summary *RecoverSummary) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.agent_id, s.session_id, s.transcript_path, s.seat_dir
+		FROM agents a JOIN sessions s ON s.session_id = a.session_id
+		WHERE (a.parent_tool_use_id IS NULL OR a.agent_type IS NULL)
+		AND s.transcript_path IS NOT NULL AND s.transcript_path <> ''
+		ORDER BY a.agent_id`)
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: list agents missing meta: %w", s.path, err)
+	}
+	var candidates []struct {
+		id, sessionID, transcript string
+		seat                      sql.NullString
+	}
+	for rows.Next() {
+		var candidate struct {
+			id, sessionID, transcript string
+			seat                      sql.NullString
+		}
+		if err := rows.Scan(&candidate.id, &candidate.sessionID, &candidate.transcript, &candidate.seat); err != nil {
+			return errors.Join(fmt.Errorf("callmeter store %s: scan an agent missing meta: %w", s.path, err), rows.Close())
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("callmeter store %s: read agents missing meta: %w", s.path, err)
+	}
+	var fills []Agent
+	for _, candidate := range candidates {
+		transcript := ResolveTranscript(candidate.transcript, candidate.seat.String, candidate.sessionID)
+		agentType, parent, err := SubagentMeta(transcript, candidate.id)
+		if err != nil || (parent == "" && agentType == "") {
+			continue
+		}
+		fills = append(fills, Agent{AgentID: candidate.id, ParentToolUseID: presentString(parent), AgentType: presentString(agentType)})
+	}
+	if len(fills) == 0 {
+		return nil
+	}
+	if err := s.Batch(ctx, func(tx *Tx) error {
+		for _, fill := range fills {
+			if err := tx.UpsertAgent(ctx, fill, FillEmpty); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	summary.Parents += len(fills)
+	return nil
+}
+
 // agentParents is the fill of each agent row of the session that has no parent
 // Agent call or no type, from its meta file (metas), the way the Agent call's
 // own PostToolUse would have set them.
@@ -1140,12 +1209,14 @@ func (s *Store) agentParents(ctx context.Context, sessionID string, metas map[st
 
 // agentStopsToMark splits the open latest agent turns (unmarkedOpenAgentTurns)
 // by what the agent's transcript, read in full, holds at or after the turn's
-// start (ends): no turn end, and the turn is to mark (an agent with no
-// transcript holds none); a turn end, and the turn is to settle at the earliest
-// such end (AgentStop, RecoverAgentStop), with the totals of the same
-// transcript (ReadAgentTotals). A transcript whose totals cannot be read is a
+// start (ends): a turn end settles the turn at the earliest such end. With no
+// turn end, the earliest main-transcript task notice at or after the start
+// settles it instead; neither means mark, and so does a notice for an agent
+// with no transcript. Both stops (AgentStop,
+// RecoverAgentStop) use only the agent's own transcript totals
+// (ReadAgentTotals). A transcript whose totals cannot be read is a
 // Skipped entry, and its turn is neither.
-func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript string, ends map[string][]int64, skip func(string, error)) (mark []openAgentTurn, settle []AgentStop, err error) {
+func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript string, ends, notices map[string][]int64, skip func(string, error)) (mark []openAgentTurn, settle []AgentStop, err error) {
 	turns, err := s.unmarkedOpenAgentTurns(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -1158,11 +1229,23 @@ func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript stri
 			}
 		}
 		if !found {
+			for _, ts := range notices[turn.agentID] {
+				if ts >= turn.started && (!found || ts < end) {
+					end, found = ts, true
+				}
+			}
+		}
+		if !found {
 			mark = append(mark, turn)
 			continue
 		}
 		path := SubagentTranscriptPath(transcript, turn.agentID)
 		totals, err := ReadAgentTotals(path, "")
+		if errors.Is(err, fs.ErrNotExist) {
+			// A notice for an agent that wrote no transcript: no totals, as with none.
+			mark = append(mark, turn)
+			continue
+		}
 		if err != nil {
 			skip(path, err)
 			continue

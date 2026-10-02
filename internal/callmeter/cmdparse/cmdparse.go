@@ -73,8 +73,8 @@ const errCodeUnresolved = "code holds an unresolved expansion"
 // shell parser; a literal -c string nested deeper than maxShellDepth is one
 // unparsed part in place of its parse; the globs of one call share
 // maxGlobLookups directory reads and stats, maxGlobEntries directory entries
-// read and maxGlobTime from their first lookup, past any of which a glob
-// stays as written.
+// read, past either of which a glob stays as written. Glob reads and file
+// stats share maxGlobTime spent parsing since their first IO.
 const (
 	maxCommandBytes = 65536
 	maxShellDepth   = 8
@@ -143,6 +143,7 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 	}
 	out := make(map[string][]Part, len(calls))
 	parsers := make(map[string]*callParser, len(calls))
+	pausedAt := make(map[string]time.Time, len(calls))
 	var snippets []Snippet
 	for _, call := range calls {
 		if _, dup := out[call.ID]; dup {
@@ -152,6 +153,7 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 			return nil, fmt.Errorf("cmdparse: call %q: cwd %q is not absolute", call.ID, call.Cwd)
 		}
 		p := parseCall(call)
+		pausedAt[call.ID] = time.Now()
 		parsers[call.ID] = p
 		out[call.ID] = p.parts
 		snippets = append(snippets, p.snippets...)
@@ -169,6 +171,11 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 	}
 	for _, call := range calls {
 		p := parsers[call.ID]
+		// Time spent on other calls or Python analysis is outside this call's
+		// IO budget. A deadline already spent in the shell phase stays spent.
+		if !p.globDeadline.IsZero() && p.globDeadline.After(pausedAt[call.ID]) {
+			p.globDeadline = p.globDeadline.Add(time.Since(pausedAt[call.ID]))
+		}
 		for snipID, pp := range p.pyParts {
 			part := &p.parts[pp.idx]
 			if err != nil {
@@ -227,8 +234,9 @@ type callParser struct {
 	// shellDepth counts the literal -c strings the walk is inside, up to
 	// maxShellDepth; globLookups the directory reads and stats the call's
 	// globs have spent, up to maxGlobLookups; globEntries the directory
-	// entries they read, up to maxGlobEntries; globDeadline maxGlobTime past
-	// their first lookup (zero before it).
+	// entries they read, up to maxGlobEntries. globDeadline bounds the call's
+	// glob reads and file stats together, maxGlobTime past their first IO
+	// (zero before it), paused while the call is not being parsed.
 	shellDepth   int
 	globLookups  int
 	globEntries  int

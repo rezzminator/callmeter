@@ -1148,6 +1148,14 @@ func seedPruneLoad(t *testing.T, store *Store, cutoff time.Time) {
 	}
 }
 
+// TestPruneNeverHoldsTheWriteLockLong pins design.md's "a hook waits on one
+// chunk at a time, within its own busy bound": a probe sampling BEGIN IMMEDIATE
+// every 2 ms sees the delete phase's lock released between its chunks, many
+// busy streaks rather than one per table or one for the phase, and no streak
+// reaching BusyTimeout. A chunk's hold is wall time that a loaded host
+// stretches (seen past 250 ms with every CPU busy), so the release is judged by
+// the streak count, which load does not shrink: the read selecting the next
+// chunk runs between the commits.
 func TestPruneNeverHoldsTheWriteLockLong(t *testing.T) {
 	store := openTestStore(t)
 	cutoff := time.Now()
@@ -1159,9 +1167,9 @@ func TestPruneNeverHoldsTheWriteLockLong(t *testing.T) {
 	defer probe.Close()
 	ready, stop := make(chan struct{}), make(chan struct{})
 	type observation struct {
-		longest    time.Duration
-		busy, free int
-		err        error
+		longest             time.Duration
+		busy, free, streaks int
+		err                 error
 	}
 	done := make(chan observation, 1)
 	go func() {
@@ -1184,6 +1192,7 @@ func TestPruneNeverHoldsTheWriteLockLong(t *testing.T) {
 					result.err = err
 				}
 				if !busySince.IsZero() {
+					result.streaks++
 					if elapsed := now.Sub(busySince); elapsed > result.longest {
 						result.longest = elapsed
 					}
@@ -1218,15 +1227,21 @@ func TestPruneNeverHoldsTheWriteLockLong(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("non-busy probe error: %v", result.err)
 	}
-	t.Logf("prune elapsed %v; longest busy streak %v; busy probes %d, free probes %d", took, result.longest, result.busy, result.free)
+	t.Logf("prune elapsed %v; longest busy streak %v; busy streaks %d; busy probes %d, free probes %d",
+		took, result.longest, result.streaks, result.busy, result.free)
 	if removed != 50000 {
 		t.Errorf("removed %d, want 50000", removed)
 	}
 	if result.busy == 0 {
 		t.Error("probe never observed the prune's write lock")
 	}
-	if result.longest >= 200*time.Millisecond {
-		t.Errorf("longest busy streak %v, want under 200ms", result.longest)
+	// 50,000 rows in 5 tables delete in 25 chunks of pruneChunk: one lock per
+	// table would show 5 streaks, one for the phase 1.
+	if result.streaks < 10 {
+		t.Errorf("%d busy streaks, want at least 10 of the 25 delete chunks: the write lock is held across chunks", result.streaks)
+	}
+	if result.longest >= BusyTimeout {
+		t.Errorf("longest busy streak %v, want under BusyTimeout %v", result.longest, BusyTimeout)
 	}
 }
 

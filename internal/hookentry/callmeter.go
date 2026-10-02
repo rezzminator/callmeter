@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -136,6 +137,9 @@ type AccountedPanic struct{ Value any }
 
 // afterEventCommit is a test seam, nil in production.
 var afterEventCommit func()
+
+// closeStore closes the run's store; a variable so a test can make the close fail.
+var closeStore = func(s *callmeter.Store) error { return s.Close() }
 
 // Callmeter is the hook entry: it records each hook event into the callmeter
 // store under $CALLMETER_HOME. It exits 0 on every path and writes nothing to
@@ -285,6 +289,8 @@ func (hold termHold) release() {
 // the log, never a non-zero exit. done ends the wait without a signal. The
 // line's reason is `terminated by {SIGNAL}`; a run whose store stays locked
 // leaves `terminated by store busy` itself (giveUpBusy).
+// A handler panic logs its stack and exits 0 with the lock held; it appends
+// one panic line only when neither the run nor this handler accounted for it.
 func terminateOnSignal(
 	signals <-chan os.Signal,
 	done <-chan struct{},
@@ -293,6 +299,22 @@ func terminateOnSignal(
 	stderr io.Writer,
 	exit func(int),
 ) {
+	wrote := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			stack := debug.Stack()
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if !state.accounted && !wrote {
+				if err := AppendMissed(missed, state.event, state.session, callmeter.PanicReason, clock.Real.Now()); err != nil {
+					applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "", err)
+				}
+			}
+			applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "",
+				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack))
+			exit(0)
+		}
+	}()
 	var sig os.Signal
 	select {
 	case sig = <-signals:
@@ -305,13 +327,16 @@ func terminateOnSignal(
 		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
 			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
+		} else {
+			wrote = true
 		}
 	}
 	exit(0)
 }
 
 // AppendMissed appends the binary's own missed.log line,
-// `{unix seconds}\t{event}\t{reason}` (reason opens callmeter.TerminatedReason
+// `{unix seconds}\t{event}\t{reason} (pid N)` with this process's pid
+// (reason opens callmeter.TerminatedReason
 // or callmeter.StoreUnavailableReason, or is callmeter.PanicReason), to the
 // missed.log at path, followed by `\t{session_id}` when session is one
 // (callmeter.MissedSessionID), the wrapper's own layout, so recovery ties a
@@ -326,7 +351,7 @@ func AppendMissed(path, event, session, reason string, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
-	line := fmt.Sprintf("%d\t%s\t%s", now.Unix(), missedEvent(event), reason)
+	line := fmt.Sprintf("%d\t%s\t%s (pid %d)", now.Unix(), missedEvent(event), reason, os.Getpid())
 	if callmeter.MissedSessionID(session) {
 		line += "\t" + session
 	}
@@ -404,7 +429,7 @@ func runCallmeter(
 	}
 	run.store = store
 	defer func() {
-		if err := store.Close(); err != nil {
+		if err := closeStore(store); err != nil {
 			run.store = nil // closed: the fault is said, never written
 			for _, id := range run.payload.callIDs() {
 				run.fault(callmeter.StageStore, id, err)
@@ -996,12 +1021,22 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 		ConfigDir: run.seat.configDir,
 		SeatDir:   run.seat.dir,
 	}
+	meta := callmeter.Agent{AgentID: p.AgentID}
+	readMeta := func() {
+		if p.TranscriptPath != "" {
+			if agentType, parent, err := callmeter.SubagentMeta(p.TranscriptPath, p.AgentID); err == nil {
+				meta.ParentToolUseID = presentString(parent)
+				meta.AgentType = presentString(agentType)
+			}
+		}
+	}
 	if !stopped {
 		// An agent woken for another turn starts again: started keeps the
 		// earliest start, whatever order the starts land in, and the prompt
 		// follows that start.
 		start := callmeter.Agent{AgentID: p.AgentID, Started: callmeter.Ptr(run.now)}
 		prompt := callmeter.Agent{AgentID: p.AgentID, PromptID: presentString(p.PromptID)}
+		readMeta()
 		run.agentTurns = true
 		run.write("", func(tx *callmeter.Tx) error {
 			if err := tx.UpsertAgent(run.ctx, agent, callmeter.Overwrite); err != nil {
@@ -1020,6 +1055,11 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 			if err := tx.UpsertAgent(run.ctx, start, callmeter.KeepMin); err != nil {
 				return err
 			}
+			if meta.ParentToolUseID != nil || meta.AgentType != nil {
+				if err := tx.UpsertAgent(run.ctx, meta, callmeter.FillEmpty); err != nil {
+					return err
+				}
+			}
 			return tx.UpsertAgent(run.ctx, prompt, promptMode)
 		})
 		return
@@ -1036,6 +1076,7 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 	if callmeter.UntypedAgentMissingTranscript(p.AgentID, p.AgentType, transcript) {
 		return
 	}
+	readMeta()
 	agent.TranscriptPath = callmeter.Ptr(transcript)
 	stop := callmeter.Agent{AgentID: p.AgentID, Stopped: callmeter.Ptr(run.now)}
 	prompt := callmeter.Agent{AgentID: p.AgentID, PromptID: presentString(p.PromptID)}
@@ -1071,6 +1112,11 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 		}
 		if err := tx.UpsertAgent(run.ctx, prompt, callmeter.FillEmpty); err != nil {
 			return err
+		}
+		if meta.ParentToolUseID != nil || meta.AgentType != nil {
+			if err := tx.UpsertAgent(run.ctx, meta, callmeter.FillEmpty); err != nil {
+				return err
+			}
 		}
 		if totals == nil || !latest {
 			return nil // no totals read, or an earlier stop than the one stored

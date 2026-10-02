@@ -3,12 +3,15 @@ package cmdparse
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -380,15 +383,14 @@ func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched boo
 	return out, false
 }
 
-// globBoundError stops a glob once the call's globs have spent one of the
-// glob bounds; its text names the bound.
+// globBoundError names a spent glob bound or the shared file IO deadline.
 type globBoundError string
 
 func (e globBoundError) Error() string { return string(e) }
 
 // globLookups, globEntries and globTime are the call's glob bounds:
 // maxGlobLookups directory stats and reads, maxGlobEntries directory entries
-// read, and maxGlobTime of wall clock from the call's first glob lookup.
+// read, and maxGlobTime spent parsing since the call's first file IO.
 func errGlobLookups() error {
 	return globBoundError(fmt.Sprintf("%d directory lookups", maxGlobLookups))
 }
@@ -397,13 +399,23 @@ func errGlobEntries() error {
 }
 func errGlobTime() error { return globBoundError(fmt.Sprintf("%v", maxGlobTime)) }
 
-// globReadDir and globLstat are the glob walk's only filesystem calls; a
-// test replaces them to make a lookup block. globReadDir reports whether dir
-// is a directory and, when it is, its names (nil when unreadable).
+// globReadDir, globLstat and lookupStat are the parse's filesystem calls a
+// test replaces to make IO block. globReadDir reports whether dir is a
+// directory and, when it is, its names (nil when unreadable).
 var (
 	globReadDir = readDirNames
 	globLstat   = func(path string) bool { _, err := os.Lstat(path); return err == nil }
+	lookupStat  = os.Stat
 )
+
+var ioPanicOut io.Writer = os.Stderr
+
+type ioPanic struct {
+	value any
+	stack []byte
+}
+
+func (p ioPanic) String() string { return fmt.Sprintf("%v\n%s", p.value, p.stack) }
 
 func readDirNames(dir string) (names []string, isDir bool) {
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
@@ -497,17 +509,20 @@ func (p *callParser) globDir(dir, pattern string, matches []string) ([]string, e
 	return matches, nil
 }
 
-// globIO spends lookups of the call's maxGlobLookups and runs io off the
-// parse's goroutine, waiting for it no later than the call's glob deadline:
-// a stat the kernel holds (a privacy prompt, an automount) then costs the
-// parse maxGlobTime, and the abandoned io finishes on its own. Nothing io
-// sets is read after the deadline.
+// globIO spends lookups of the call's maxGlobLookups before waiting for IO.
 func (p *callParser) globIO(lookups int, io func()) error {
 	if p.globLookups+lookups > maxGlobLookups {
 		p.globLookups = maxGlobLookups
 		return errGlobLookups()
 	}
 	p.globLookups += lookups
+	return p.ioWithin(io)
+}
+
+// ioWithin waits off-goroutine IO no later than the call's shared deadline.
+// Nothing IO sets is read after abandonment. A panic travels to the waiting
+// parser, or to stderr when the parser has already left.
+func (p *callParser) ioWithin(io func()) error {
 	if p.globDeadline.IsZero() {
 		p.globDeadline = time.Now().Add(maxGlobTime)
 	}
@@ -516,18 +531,46 @@ func (p *callParser) globIO(lookups int, io func()) error {
 		return errGlobTime()
 	}
 	done := make(chan struct{})
+	var mu sync.Mutex
+	waiting := true
+	var carried *ioPanic
 	go func() {
-		defer close(done)
+		defer func() {
+			var caught *ioPanic
+			if value := recover(); value != nil {
+				caught = &ioPanic{value: value, stack: debug.Stack()}
+			}
+			mu.Lock()
+			if waiting {
+				carried = caught
+				close(done)
+				mu.Unlock()
+				return
+			}
+			mu.Unlock()
+			if caught != nil {
+				fmt.Fprintf(ioPanicOut, "callmeter: a parse file read panicked after its deadline: %v\n%s", caught.value, caught.stack)
+			}
+		}()
 		io()
 	}()
 	timer := time.NewTimer(left)
 	defer timer.Stop()
+	var waitErr error
 	select {
 	case <-done:
-		return nil
 	case <-timer.C:
-		return errGlobTime()
+		waitErr = errGlobTime()
 	}
+	mu.Lock()
+	waiting = false
+	caught := carried
+	mu.Unlock()
+	// Both channels may be ready: do not lose a panic already handed over.
+	if caught != nil {
+		panic(*caught)
+	}
+	return waitErr
 }
 
 // file reports whether a resolved argument is an existing regular file.
@@ -560,7 +603,16 @@ func (p *callParser) lookup(val string, missingOK bool) (path string, exists, ok
 		path = filepath.Join(p.dir, path)
 	}
 	path = filepath.Clean(path)
-	info, err := os.Stat(path)
+	statPath := path // Named returns may change path while abandoned IO runs.
+	var info fs.FileInfo
+	var err error
+	if ioErr := p.ioWithin(func() { info, err = lookupStat(statPath) }); ioErr != nil {
+		var bound globBoundError
+		if errors.As(ioErr, &bound) {
+			p.notes = append(p.notes, fmt.Sprintf("stat %s over %s, left unattributed", val, bound))
+		}
+		return "", false, false
+	}
 	switch {
 	case err == nil:
 		return path, true, info.Mode().IsRegular()

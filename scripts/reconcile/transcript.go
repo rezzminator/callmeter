@@ -71,6 +71,7 @@ type transcript struct {
 	assistants           int // non-synthetic assistant lines
 	toolUses             map[string]bool
 	endTurns             map[string]bool // message ids that ended with end_turn
+	nullEnds             map[string]bool // message ids whose null stop_reason a later prompt closed
 	entrypoints          map[string]bool
 	lastStop             string // the latest message's stop_reason, "" while it has none
 	lastMsg              string // the latest message's id
@@ -86,6 +87,7 @@ type transcript struct {
 // world is everything the transcripts say, inside the window.
 type world struct {
 	since, until int64
+	notices      map[string][]int64 // agent id -> ts of each task-notification naming it, main transcripts only
 	taskStops    map[string][]int64 // agent id -> each TaskStop naming it (unix ms)
 	writes       map[string]int64   // session -> its newest transcript file's mtime (unix ms)
 	uses         map[string]*use
@@ -104,7 +106,7 @@ func newWorld(since, until int64) *world {
 		uses: map[string]*use{}, results: map[string]result{}, messages: map[string]*message{},
 		mains: map[string]*transcript{}, agents: map[string]*transcript{}, subagents: map[string][]*transcript{},
 		read: map[string]bool{}, from: map[string]int64{},
-		taskStops: map[string][]int64{}, writes: map[string]int64{},
+		notices: map[string][]int64{}, taskStops: map[string][]int64{}, writes: map[string]int64{},
 	}
 }
 
@@ -203,6 +205,7 @@ type line struct {
 	Timestamp     string `json:"timestamp"`
 	PromptID      string `json:"promptId"`
 	IsMeta        bool   `json:"isMeta"`
+	TurnOrigin    string `json:"turnOrigin"`
 	IsCompactSumm bool   `json:"isCompactSummary"`
 	IsAPIError    bool   `json:"isApiErrorMessage"`
 	Entrypoint    string `json:"entrypoint"`
@@ -212,6 +215,10 @@ type line struct {
 	Attachment *struct {
 		Type      string `json:"type"`
 		HookEvent string `json:"hookEvent"`
+		Origin    *struct {
+			Kind string `json:"kind"`
+		} `json:"origin"`
+		Prompt string `json:"prompt"`
 	} `json:"attachment"`
 	Message *struct {
 		ID         string          `json:"id"`
@@ -258,7 +265,7 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	w.writes[session] = max(w.writes[session], info.ModTime().UnixMilli())
 	t := &transcript{
 		path: real, session: session, agent: agent,
-		prompts: map[string]bool{}, toolUses: map[string]bool{}, endTurns: map[string]bool{},
+		prompts: map[string]bool{}, toolUses: map[string]bool{}, endTurns: map[string]bool{}, nullEnds: map[string]bool{},
 		entrypoints: map[string]bool{}, preToolUses: map[string]bool{},
 	}
 	lower := w.lower(session)
@@ -332,13 +339,23 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 				return nil, fmt.Errorf("transcript %s line %d: %w", real, n, err)
 			}
 		case "user":
-			if (l.IsMeta && !peerMessage(&l)) || l.IsCompactSumm || l.Message == nil {
+			if t.agent == "" {
+				w.notice(&l, ms)
+			}
+			if (l.IsMeta && !peerMessage(&l) && !scheduledPrompt(&l)) || l.IsCompactSumm || l.Message == nil {
 				continue
 			}
 			if l.PromptID != "" && isPrompt(l.Message.Content, blocks) {
 				t.prompts[l.PromptID] = true
+				// The hook's SubagentStop ends the turn whatever the stop_reason.
+				if t.lastMsg != "" && t.lastStop == "" {
+					t.nullEnds[t.lastMsg] = true
+				}
 			}
 		case "attachment":
+			if t.agent == "" {
+				w.notice(&l, ms)
+			}
 			if l.Attachment != nil && l.Attachment.Type == "queued_command" {
 				t.queued++
 			}
@@ -357,12 +374,60 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	return t, nil
 }
 
+// notice collects only the agent id and timestamp of a main-transcript notice.
+func (w *world) notice(l *line, ms int64) {
+	var body string
+	switch l.Type {
+	case "user":
+		if l.Origin == nil || l.Origin.Kind != "task-notification" || l.Message == nil {
+			return
+		}
+		if err := json.Unmarshal(l.Message.Content, &body); err != nil {
+			return
+		}
+	case "attachment":
+		a := l.Attachment
+		if a == nil || a.Type != "queued_command" || a.Origin == nil || a.Origin.Kind != "task-notification" {
+			return
+		}
+		body = a.Prompt
+	}
+	if agent, ok := noticeAgent(body); ok {
+		w.notices[agent] = append(w.notices[agent], ms)
+	}
+}
+
+// noticeAgent reads only the task id and the presence of a non-empty status.
+func noticeAgent(body string) (agentID string, ok bool) {
+	_, task, found := strings.Cut(body, "<task-id>")
+	if !found {
+		return "", false
+	}
+	agentID, _, found = strings.Cut(task, "</task-id>")
+	if !found || agentID == "" {
+		return "", false
+	}
+	_, status, found := strings.Cut(body, "<status>")
+	if !found {
+		return "", false
+	}
+	status, _, found = strings.Cut(status, "</status>")
+	if !found || status == "" {
+		return "", false
+	}
+	return agentID, true
+}
+
 // peerMessage reports whether a user line is a message another agent sent the
 // chat (SendMessage to the main chat): Claude Code writes it isMeta, with
 // origin.kind "peer" and a promptId, and fires UserPromptSubmit for it, so it
-// is a model-bound prompt like a typed one. Every other isMeta line (a
+// is a model-bound prompt like a typed one. A plain isMeta line (a
 // system-reminder, a local-command caveat) fires none.
 func peerMessage(l *line) bool { return l.Origin != nil && l.Origin.Kind == "peer" }
+
+// scheduledPrompt reports whether a scheduled task's prompt is written isMeta
+// with turnOrigin "scheduled" and fires UserPromptSubmit.
+func scheduledPrompt(l *line) bool { return l.TurnOrigin == "scheduled" }
 
 // localCommand marks the lines of a local slash command (`/model`, `/effort`):
 // they carry a promptId but never reach the model, so no UserPromptSubmit.

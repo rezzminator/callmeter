@@ -8,8 +8,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -307,11 +309,12 @@ func intCell(n *int64) string {
 	return itoa(*n)
 }
 
-// names caches chat names; the first lookup error becomes one note line.
+// names caches chat names; lookup failures become a count and safe label note.
 type names struct {
-	fn    NameOf
-	cache map[string]string
-	err   error
+	fn             NameOf
+	cache          map[string]string
+	err            error
+	failedSessions int
 }
 
 func newNames(fn NameOf) *names { return &names{fn: fn, cache: map[string]string{}} }
@@ -325,10 +328,12 @@ func (n *names) of(session string) string {
 	}
 	name := "?"
 	if n.fn == nil {
+		n.failedSessions++
 		if n.err == nil {
 			n.err = fmt.Errorf("no chat-name source was given")
 		}
 	} else if got, err := n.fn(session); err != nil {
+		n.failedSessions++
 		if n.err == nil {
 			n.err = fmt.Errorf("session %s: %w", session, err)
 		}
@@ -343,7 +348,14 @@ func (n *names) notes() []string {
 	if n.err == nil {
 		return nil
 	}
-	return []string{"chat names could not be read: " + n.err.Error()}
+	label := "unreadable"
+	switch {
+	case errors.Is(n.err, fs.ErrPermission):
+		label = "permission denied"
+	case errors.Is(n.err, fs.ErrNotExist):
+		label = "not found"
+	}
+	return []string{fmt.Sprintf("chat names could not be read for %d sessions (first: %s)", n.failedSessions, label)}
 }
 
 // row scanning without naming database/sql: the store's rows satisfy this.

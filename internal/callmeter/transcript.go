@@ -417,6 +417,68 @@ func ReadRequests(path string) (requests []TranscriptRequest, final bool, err er
 	return ReadTurnRequests(path, "")
 }
 
+// ReadTaskNotices reads only task-id and non-empty status tags of task
+// notifications; nothing of the body is kept. Times are in file order.
+func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read task notices: %w", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close task notices %s: %w", path, closeErr))
+		}
+	}()
+	notices = map[string][]int64{}
+	reader := bufio.NewReaderSize(file, 1<<16)
+	for {
+		raw, readErr := reader.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, fmt.Errorf("read task notices %s: %w", path, readErr)
+		}
+		if bytes.Contains(raw, []byte("task-notification")) {
+			var entry struct {
+				Type      string `json:"type"`
+				Timestamp string `json:"timestamp"`
+				Origin    struct {
+					Kind string `json:"kind"`
+				} `json:"origin"`
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+				Attachment struct {
+					Type   string `json:"type"`
+					Origin struct {
+						Kind string `json:"kind"`
+					} `json:"origin"`
+					Prompt string `json:"prompt"`
+				} `json:"attachment"`
+			}
+			if json.Unmarshal(raw, &entry) == nil {
+				body := ""
+				switch {
+				case entry.Type == "user" && entry.Origin.Kind == "task-notification":
+					body = entry.Message.Content
+				case entry.Type == "attachment" && entry.Attachment.Type == "queued_command" && entry.Attachment.Origin.Kind == "task-notification":
+					body = entry.Attachment.Prompt
+				}
+				_, task, hasTask := strings.Cut(body, "<task-id>")
+				agentID, _, taskClosed := strings.Cut(task, "</task-id>")
+				_, status, hasStatus := strings.Cut(body, "<status>")
+				status, _, statusClosed := strings.Cut(status, "</status>")
+				at, timeErr := time.Parse(time.RFC3339Nano, entry.Timestamp)
+				if hasTask && taskClosed && agentID != "" && hasStatus && statusClosed && status != "" && timeErr == nil {
+					notices[agentID] = append(notices[agentID], at.UnixMilli())
+				}
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+	}
+	return notices, nil
+}
+
 // ReadTurnRequests is ReadRequests for the turn of promptID: final also needs
 // no user entry carrying promptID after that last assistant entry. Such an
 // entry (the turn's prompt, a tool_result, or the prompt that woke an agent

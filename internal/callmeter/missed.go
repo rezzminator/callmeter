@@ -37,9 +37,11 @@ const unparsedLimit = 200
 
 // IngestMissed turns the wrapper's missed.log into `binary` faults, and the
 // lines the binary wrote itself (a reason opening TerminatedReason or
-// StoreUnavailableReason) into `terminated` faults, and returns how many it wrote. Each line is
+// StoreUnavailableReason, or PanicReason) into `terminated` faults, and
+// returns how many it wrote. Each line is
 // `{unix seconds}\t{event}\t{reason}`, optionally followed by
-// `\t{session_id}`, and becomes a fault stamped seconds × 1000 whose error is
+// `\t{session_id}`; the writer's pid sits at the reason's end as ` (pid N)`.
+// It becomes a fault stamped seconds × 1000 whose error is
 // `{event}: {reason}` and whose session is that session_id;
 // a line that does not parse becomes a fault `unparsed missed.log line: …` of
 // its first 200 bytes stamped at its file's last write, never a dropped line.
@@ -491,7 +493,8 @@ const (
 )
 
 // parseMissedLine reads `{unix seconds}\t{event}\t{reason}[\t{session_id}]`;
-// false when the line has not that shape. The session is the reason's last tab
+// the writer's pid sits at the reason's end. False when the line has not that
+// shape. The session is the reason's last tab
 // field only when it is a session id (MissedSessionID), so a line written
 // before the field existed, its reason holding a tab, keeps its reason whole.
 func parseMissedLine(line string) (Fault, bool) {
@@ -509,7 +512,7 @@ func parseMissedLine(line string) (Fault, bool) {
 	}
 	stage := StageBinary
 	if strings.HasPrefix(reason, TerminatedReason) || strings.HasPrefix(reason, StoreUnavailableReason) ||
-		reason == PanicReason {
+		reason == PanicReason || strings.HasPrefix(reason, PanicReason+" (") {
 		stage = StageTerminated // the binary's own line: a signal, a busy or an unavailable store, or a panic cut its run short
 	}
 	return Fault{TS: seconds * 1000, SessionID: session, Stage: stage, Error: fields[1] + ": " + reason}, true

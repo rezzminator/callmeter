@@ -89,7 +89,7 @@ session-promptless | 489dee09 | /clear landing session: the user exited at the e
 
 # Claude Code sends a sub-agent's compaction hooks without agent_id, and its
 # transcript_path is the main transcript (live probe 76a01ba7).
-event-compact-subagent | 92cb932e c222fd5d e00f5098 | Claude Code sends a sub-agent's PreCompact/PostCompact/SessionStart(compact) without agent_id and with the main transcript_path, so no store row can name the sub-agent
+event-compact-subagent | 92cb932e c222fd5d e00f5098 ae3d8096 | Claude Code sends a sub-agent's PreCompact/PostCompact/SessionStart(compact) without agent_id and with the main transcript_path, so no store row can name the sub-agent
 # PROVISIONAL (the dedupe part): the running sibling call-residuals may change
 # how byte-identical payloads collapse; recheck these after it lands.
 event-compact | ca215ad9 e00f5098 f0d28042 | sub-agent compactions fire the main session's hooks (some write no boundary); a cancelled /compact (ca215ad9 15:35:43) fires PreCompact only; byte-identical payloads collapse into one row (docs/design.md:201; provisional)
