@@ -620,6 +620,66 @@ func TestKilledStopFailureHookMatchesItsRow(t *testing.T) {
 
 // TestPromptlessLaunchHasNoTranscript: a `claude -p` given no prompt fires
 // SessionStart and SessionEnd, exits 1 and never writes its transcript.
+func TestReconcileSessionThatRanNothingIsExpected(t *testing.T) {
+	const reason = "the session started and ran nothing: only idle lifecycle events, no calls, requests, agents or turns, and no fault or lost event that could hide work (internal/callmeter/report/sessions.go ranNothing)"
+	for _, c := range []struct {
+		name, source string
+		sql          []string
+		mismatch     bool
+	}{
+		{name: "SessionStart InstructionsLoaded SessionEnd", source: "startup"},
+		{name: "resume", source: "resume"},
+		{name: "clear", source: "clear"},
+		{name: "fork", source: "fork"},
+		{name: "Notification", source: "startup", sql: []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('notice', 'Notification', %d, '%s')`, fxMS(30.5), fxSession2)}},
+		{name: "model already selected", source: "startup", sql: []string{fmt.Sprintf(`UPDATE sessions SET model='claude-demo' WHERE session_id='%s'`, fxSession2)}},
+		{name: "UserPromptSubmit", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('prompt', 'UserPromptSubmit', %d, '%s')`, fxMS(30.5), fxSession2)}},
+		{name: "calls", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, ts) VALUES('idle-call', '%s', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "requests", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts) VALUES('idle-request', '%s', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "agents", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO agents(agent_id, session_id, started) VALUES('idle-agent', '%s', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "turns with event", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO turns(event_id, event, session_id, ts) VALUES('idle-load', 'InstructionsLoaded', '%s', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "turns without event", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO turns(event_id, event, session_id, ts) VALUES('idle-turn', 'Stop', '%s', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "agent turns without event", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO turns(event_id, event, session_id, agent_id, ts) VALUES('idle-turn', 'SubagentStop', '%s', 'idle-agent', %d)`, fxSession2, fxMS(30.5))}},
+		{name: "named fault", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id) VALUES(%d, 'transcript', 'open', '%s')`, fxMS(29), fxSession2)}},
+		{name: "sessionless binary at start", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', 'unknown: killed by signal')`, fxMS(30))}},
+		{name: "sessionless binary after start", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', 'unknown: killed by signal')`, fxMS(32))}},
+		{name: "sessionless terminated at start", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'terminated', 'Stop: panic')`, fxMS(30))}},
+		{name: "sessionless terminated after start", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'terminated', 'Stop: panic')`, fxMS(32))}},
+		{name: "sessionless fault between starts", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('resumed', 'SessionStart', %d, '%s')`, fxMS(30.8), fxSession2), fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', 'unknown: killed by signal')`, fxMS(30.5))}},
+		{name: "sessionless binary before start", source: "startup", sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'binary', 'unknown: killed by signal')`, fxMS(29))}},
+		{name: "sessionless other stage", source: "startup", sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error) VALUES(%d, 'transcript', 'open')`, fxMS(32))}},
+		{name: "another session's fault", source: "startup", sql: []string{fmt.Sprintf(`INSERT INTO faults(ts, stage, error, session_id) VALUES(%d, 'terminated', 'Stop: panic', '%s')`, fxMS(32), fxSession)}},
+		{name: "no SessionStart", source: "startup", mismatch: true, sql: []string{`DELETE FROM events WHERE event_id='idle-start'`}},
+		{name: "agent work event", source: "startup", mismatch: true, sql: []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, agent_id) VALUES('agent-work', 'PreToolUse', %d, '%s', 'idle-agent')`, fxMS(30.5), fxSession2)}},
+		{name: "agent idle event", source: "startup", sql: []string{fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, agent_id) VALUES('agent-idle', 'Notification', %d, '%s', 'idle-agent')`, fxMS(30.5), fxSession2)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			launch := []string{
+				fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason) VALUES('%s', %d, %d, '%s', 'other')`, fxSession2, fxMS(30), fxMS(31), c.source),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('idle-start', 'SessionStart', %d, '%s', '%s')`, fxMS(30), fxSession2, c.source),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('idle-load', 'InstructionsLoaded', %d, '%s')`, fxMS(30.5), fxSession2),
+				fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('idle-end', 'SessionEnd', %d, '%s')`, fxMS(31), fxSession2),
+			}
+			f := newFixture(t, nil, append(launch, c.sql...))
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			want := "EXPECTED session-ran-nothing session=" + fxSession2
+			if c.mismatch {
+				want = "MISMATCH session-no-transcript session=" + fxSession2
+				if code != 1 {
+					t.Errorf("exit %d, want 1", code)
+				}
+			} else {
+				if !strings.Contains(out, ": expected: "+reason+"\n") {
+					t.Errorf("missing ran-nothing reason:\n%s", out)
+				}
+			}
+			if !strings.Contains(out, want) {
+				t.Fatalf("want %q:\n%s", want, out)
+			}
+		})
+	}
+}
+
 func TestPromptlessLaunchHasNoTranscript(t *testing.T) {
 	launch := []string{
 		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason, transcript_path) VALUES('%s', %d, %d, 'startup', 'other', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(30), fxMS(31), fxSession2),
@@ -627,8 +687,8 @@ func TestPromptlessLaunchHasNoTranscript(t *testing.T) {
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('p2', 'SessionEnd', %d, '%s', 'other')`, fxMS(31), fxSession2),
 	}
 	f := newFixture(t, nil, launch)
-	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "EXPECTED session-no-prompt session="+fxSession2) {
-		t.Fatalf("exit %d, want 0 and an expected session-no-prompt:\n%s", code, out)
+	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 0 || !strings.Contains(out, "EXPECTED session-ran-nothing session="+fxSession2) {
+		t.Fatalf("exit %d, want 0 and an expected session-ran-nothing:\n%s", code, out)
 	}
 	prompted := append(launch, fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('p3', 'UserPromptSubmit', %d, '%s')`, fxMS(30.5), fxSession2))
 	f = newFixture(t, nil, prompted)
@@ -780,9 +840,11 @@ func TestKilledUnknownHookIsVouchedByItsNeighbours(t *testing.T) {
 	}
 	// fxSession's Stop at 21 lies within ±1 s of a kill in second 22.
 	dropPrompt := `DELETE FROM events WHERE event_id = 'e2'`
+	// The idle neighbour starts after the lost event: a loss from its start
+	// on would leave its lack of work unknown under the product's rule.
 	launch := []string{
-		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason, transcript_path) VALUES('%s', %d, %d, 'startup', 'other', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(30), fxMS(31), fxSession2),
-		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('p1', 'SessionStart', %d, '%s', 'startup')`, fxMS(30), fxSession2),
+		fmt.Sprintf(`INSERT INTO sessions(session_id, first_ts, last_ts, start_source, end_reason, transcript_path) VALUES('%s', %d, %d, 'startup', 'other', '/nonexistent/%s.jsonl')`, fxSession2, fxMS(30.5), fxMS(31), fxSession2),
+		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('p1', 'SessionStart', %d, '%s', 'startup')`, fxMS(30.5), fxSession2),
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('p2', 'SessionEnd', %d, '%s', 'other')`, fxMS(31), fxSession2),
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('n1', 'Notification', %d, '%s')`, fxMS(30.5), fxSession),
 		fault(30),
@@ -843,7 +905,7 @@ func TestTerminatedStopNeedsItsTurnsStop(t *testing.T) {
 		return rows
 	}
 	expected := "EXPECTED fault-terminated session=" + fxSession + " event=Stop"
-	for _, c := range []struct {
+	cases := []struct {
 		name, want string
 		sql        []string
 	}{
@@ -855,14 +917,21 @@ func TestTerminatedStopNeedsItsTurnsStop(t *testing.T) {
 		{name: "two faults, one Stop", want: "MISMATCH fault-terminated session=- event=Stop", sql: []string{sessionEnd, fault, fault}},
 		{name: "another ending session's turn is open", want: "MISMATCH fault-terminated session=- event=Stop sessions_ending=2 open_turn=" + fxSession2, sql: append([]string{sessionEnd, fault}, other("")...)},
 		{name: "another ending session's turn closed in a StopFailure", want: expected, sql: append([]string{sessionEnd, fault}, other("StopFailure")...)},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			f := newFixture(t, nil, c.sql)
-			_, out := f.run(t, "2030-01-01T00:00:00Z")
-			if !strings.Contains(out, c.want+" ") {
-				t.Fatalf("want %q:\n%s", c.want, out)
-			}
-		})
+	}
+	for _, reason := range []string{"terminated by SIGTERM", "store unavailable: full", "panic"} {
+		for _, c := range cases {
+			t.Run(c.name+"/"+reason, func(t *testing.T) {
+				sql := make([]string, len(c.sql))
+				for i, q := range c.sql {
+					sql[i] = strings.ReplaceAll(q, "Stop: terminated by SIGTERM", "Stop: "+reason)
+				}
+				f := newFixture(t, nil, sql)
+				_, out := f.run(t, "2030-01-01T00:00:00Z")
+				if !strings.Contains(out, c.want+" ") {
+					t.Fatalf("want %q:\n%s", c.want, out)
+				}
+			})
+		}
 	}
 }
 
@@ -930,7 +999,7 @@ func TestLostHookFaultNamingItsSession(t *testing.T) {
 	resumed := fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, source) VALUES('z2', 'SessionStart', %d, '%s', 'resume')`, fxMS(23), fxSession)
 	stopFailure := `UPDATE events SET event='StopFailure' WHERE event_id='e5'`
 	at := " at=2030-01-01T00:00:22Z"
-	for _, c := range []struct {
+	cases := []struct {
 		name         string
 		sql          []string
 		want, absent string
@@ -947,7 +1016,41 @@ func TestLostHookFaultNamingItsSession(t *testing.T) {
 			"EXPECTED fault-terminated session=" + fxSession + " event=StopFailure" + at, "MISMATCH fault-"},
 		{"terminated StopFailure, its turn has none", []string{failTerminated},
 			"MISMATCH fault-terminated session=" + fxSession + " event=StopFailure unpaired_stopfailure=0" + at, "EXPECTED fault-"},
-	} {
+		{"SessionEnd invalid terminated reason", []string{lost, fault("terminated", "SessionEnd: panic later")},
+			"MISMATCH fault-terminated session=" + fxSession + at, "EXPECTED fault-"},
+		{"StopFailure invalid terminated reason", []string{stopFailure, fault("terminated", "StopFailure: panic later")},
+			"MISMATCH fault-terminated session=" + fxSession + at, "EXPECTED fault-"},
+	}
+	for _, event := range []string{"StopFailure", "SessionEnd"} {
+		for _, reason := range []string{"terminated by store busy", "store unavailable: full", "panic"} {
+			for _, paired := range []bool{true, false} {
+				sql := []string{fault("terminated", event+": "+reason)}
+				want := "MISMATCH fault-terminated session=" + fxSession
+				absent := "EXPECTED fault-terminated"
+				if paired {
+					absent = "MISMATCH fault-terminated"
+					if event == "SessionEnd" {
+						sql = append(sql, lost)
+						want = "EXPECTED fault-terminated session=" + fxSession + " event=SessionEnd end_reason=lost" + at + ": expected: " + reasonEndKilled
+					} else {
+						sql = append(sql, stopFailure)
+						want = "EXPECTED fault-terminated session=" + fxSession + " event=StopFailure" + at + ": expected: " + reasonTerminatedFailureNamed
+					}
+				} else if event == "SessionEnd" {
+					sql = append(sql, unmarked)
+					want += at
+				} else {
+					want += " event=StopFailure unpaired_stopfailure=0" + at
+				}
+				cases = append(cases, struct {
+					name         string
+					sql          []string
+					want, absent string
+				}{fmt.Sprintf("%s %s paired=%t", event, reason, paired), sql, want, absent})
+			}
+		}
+	}
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t, nil, c.sql)
 			_, out := f.run(t, "2030-01-01T00:00:00Z")
@@ -981,7 +1084,7 @@ func TestLostHookPairsWithItsRow(t *testing.T) {
 	openTurn := `UPDATE agent_turns SET stopped=NULL`
 	at := " at=2030-01-01T00:00:22Z"
 	id := " session=" + fxSession
-	for _, c := range []struct {
+	cases := []struct {
 		name string
 		sql  []string
 		want string
@@ -999,6 +1102,12 @@ func TestLostHookPairsWithItsRow(t *testing.T) {
 
 		{"PostToolUse, every call settled", []string{fault("terminated", "PostToolUse: terminated by store busy", 22)},
 			"EXPECTED fault-terminated" + id + " event=PostToolUse" + at + ": expected: " + reasonLostPostToolUse},
+		{"PostToolUse, a landed Agent without a real size", []string{`UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_A2'`, fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"EXPECTED fault-terminated" + id + " event=PostToolUse" + at},
+		{"PostToolUseFailure wrapper line, a landed Agent without a real size", []string{`UPDATE calls SET bytes_real=NULL WHERE tool_use_id='toolu_A2'`, fault("binary", "PostToolUseFailure: killed by signal", 22)},
+			"EXPECTED fault-binary" + id + " event=PostToolUseFailure" + at},
+		{"PostToolUse, an Agent without a landed outcome", []string{`UPDATE calls SET failed=NULL, bytes_real=NULL WHERE tool_use_id='toolu_A2'`, fault("terminated", "PostToolUse: terminated by store busy", 22)},
+			"MISMATCH fault-terminated" + id + " event=PostToolUse unsettled_call=toolu_A2"},
 		{"PostToolUseFailure wrapper line, every call settled", []string{fault("binary", "PostToolUseFailure: killed by signal", 22)},
 			"EXPECTED fault-binary" + id + " event=PostToolUseFailure"},
 		{"PostToolUse, a call has no size", []string{unsized, fault("terminated", "PostToolUse: terminated by store busy", 22)},
@@ -1036,12 +1145,81 @@ func TestLostHookPairsWithItsRow(t *testing.T) {
 			"MISMATCH fault-binary" + id + " event=Stop open_turn=" + fxSession},
 		{"wrapper StopFailure, its turn has none", []string{fault("binary", "StopFailure: killed by signal", 22)},
 			"MISMATCH fault-binary" + id + " event=StopFailure unpaired_stopfailure=0"},
-	} {
+		{"PreToolUse invalid terminated reason", []string{fault("terminated", "PreToolUse: panic later", 22)},
+			"MISMATCH fault-terminated" + id + at},
+	}
+	for _, event := range []string{"Stop", "SubagentStop", "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"} {
+		for _, reason := range []string{"terminated by store busy", "store unavailable: full", "panic"} {
+			for _, paired := range []bool{true, false} {
+				sec := float64(22)
+				var sql []string
+				if event == "SubagentStop" {
+					sec = 10
+				}
+				if event == "PostToolBatch" {
+					sql = append(sql, delivered)
+				}
+				want := "EXPECTED fault-terminated" + id + " event=" + event
+				why := lostHookReason[event]
+				if event == "Stop" {
+					why = reasonTerminatedStopNamed
+				}
+				if !paired {
+					want = "MISMATCH fault-terminated" + id + " event=" + event
+					if event == "Stop" {
+						sql = append(sql, dropStop)
+						want += " open_turn=" + fxSession
+					} else if event == "SubagentStop" {
+						sec = 100
+						want += " unpaired_subagentstop=0"
+					} else {
+						sec = 100
+						want += " unpaired_call=0"
+					}
+				}
+				want += " at=" + fxTS(sec)
+				if paired {
+					want += ": expected: " + why
+				}
+				sql = append(sql, fault("terminated", event+": "+reason, sec))
+				cases = append(cases, struct {
+					name string
+					sql  []string
+					want string
+				}{fmt.Sprintf("%s %s paired=%t", event, reason, paired), sql, want})
+			}
+		}
+	}
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t, nil, c.sql)
 			_, out := f.run(t, "2030-01-01T00:00:00Z")
 			if !strings.Contains(out, c.want) {
 				t.Fatalf("want %q:\n%s", c.want, out)
+			}
+		})
+	}
+}
+
+func TestTerminatedEvent(t *testing.T) {
+	for _, c := range []struct {
+		name, stage, err, event string
+		ok                      bool
+	}{
+		{"signal", "terminated", "Stop: terminated by SIGTERM", "Stop", true},
+		{"store unavailable", "terminated", "Stop: store unavailable: full", "Stop", true},
+		{"panic", "terminated", "Stop: panic", "Stop", true},
+		{"wrapper stage", "binary", "Stop: panic", "", false},
+		{"other stage", "transcript", "Stop: panic", "", false},
+		{"no delimiter", "terminated", "panic", "panic", false},
+		{"panic suffix", "terminated", "Stop: panic later", "Stop", false},
+		{"incomplete store reason", "terminated", "Stop: store unavailable", "Stop", false},
+		{"incomplete termination reason", "terminated", "Stop: terminated by", "Stop", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			event, ok := terminatedEvent(sFault{stage: c.stage, err: c.err})
+			if event != c.event || ok != c.ok {
+				t.Fatalf("terminatedEvent = (%q, %t), want (%q, %t)", event, ok, c.event, c.ok)
 			}
 		})
 	}
@@ -1473,5 +1651,32 @@ func TestUnfillableTailsAreTheStores(t *testing.T) {
 		unfilledCall != callmeter.UnfilledCall || unfilledAgentStop != callmeter.UnfilledAgentStop {
 		t.Fatalf("tails = %q, %q, %q, %q, %q; want %q, %q, %q, %q, %q", unfilledAgentTurn, unfilledStopReply, unfilledTurnEnd, unfilledCall, unfilledAgentStop,
 			callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply, callmeter.UnfilledTurnEnd, callmeter.UnfilledCall, callmeter.UnfilledAgentStop)
+	}
+}
+
+func TestReconcileLandedCallWithoutARealSize(t *testing.T) {
+	for _, c := range []struct {
+		name, update, want string
+		code               int
+	}{
+		{name: "landed without delivered", update: "bytes_real=NULL"},
+		{name: "landed with delivered", update: "bytes_real=NULL, bytes_delivered=10"},
+		{name: "batch only", update: "failed=NULL, bytes_real=NULL, bytes_delivered=95", code: 1, want: "MISMATCH call-batch-only session=" + fxSession + " ids=toolu_A2,tool=Agent"},
+		{name: "unlanded", update: "failed=NULL, bytes_real=NULL", code: 1, want: "MISMATCH call-no-size session=" + fxSession + " ids=toolu_A2"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, []string{"UPDATE calls SET " + c.update + " WHERE tool_use_id='toolu_A2'"})
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != c.code {
+				t.Errorf("exit=%d, want %d; %s", code, c.code, out)
+			}
+			if c.want != "" {
+				if !strings.Contains(out, c.want) {
+					t.Errorf("missing %q: %s", c.want, out)
+				}
+			} else if strings.Contains(out, "call-no-size") || strings.Contains(out, "call-batch-only") {
+				t.Errorf("landed call misclassified: %s", out)
+			}
+		})
 	}
 }

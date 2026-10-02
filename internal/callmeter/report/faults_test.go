@@ -310,3 +310,78 @@ func TestFaultsListsRefusals(t *testing.T) {
 		t.Errorf("the report carries transcript text:\n%s", out)
 	}
 }
+
+func TestFaultsReadsAMovedTranscript(t *testing.T) {
+	for _, viaSeat := range []bool{false, true} {
+		name := "stored root"
+		if viaSeat {
+			name = "seat root"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openStore(t)
+			seat := t.TempDir()
+			projects := filepath.Join(seat, "projects")
+			path := filepath.Join(projects, "-tmp-moved-proj", "s-moved.jsonl")
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(strings.Join([]string{refusalPrompt, refusalLine("rate_limit"), refusalTail}, "\n")+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			dead := filepath.Join(projects, "-tmp-old-proj", "s-moved.jsonl")
+			if viaSeat {
+				dead = filepath.Join(t.TempDir(), "gone", "s-moved.jsonl")
+			}
+			batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
+				return tx.TouchSession(ctx, callmeter.Session{SessionID: "s-moved", TS: ms(time.Hour), TranscriptPath: callmeter.Ptr(dead), SeatDir: callmeter.Ptr(seat)})
+			})
+			seedEvent(t, store, callmeter.Event{EventID: "moved-up", Event: "UserPromptSubmit", TS: ms(time.Hour), SessionID: callmeter.Ptr("s-moved")})
+			table, err := Faults(ctx, store, Filter{}, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, row := range table.Rows {
+				if row[0] == "refusal" && row[1] == "rate_limit" && row[6] == refusalFromTranscript {
+					found = true
+				}
+			}
+			if !found {
+				t.Error("faults read the transcript error instead of the API error kind")
+			}
+			for _, note := range table.Notes {
+				if strings.Contains(note, "could not be checked for an API error") {
+					t.Error("moved transcript remained unchecked")
+				}
+			}
+		})
+	}
+}
+
+func TestFaultsLateStopLeavesTheNextPromptUnanswered(t *testing.T) {
+	store := openStore(t)
+	path := filepath.Join(t.TempDir(), "s-late.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join([]string{refusalPrompt, refusalLine("rate_limit"), refusalTail}, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
+		return tx.TouchSession(ctx, callmeter.Session{SessionID: "s-late", TS: 200, TranscriptPath: callmeter.Ptr(path)})
+	})
+	seedEvent(t, store, callmeter.Event{EventID: "u1", Event: "UserPromptSubmit", TS: 100, SessionID: callmeter.Ptr("s-late"), PromptID: callmeter.Ptr("p-u1")})
+	seedEvent(t, store, callmeter.Event{EventID: "u2", Event: "UserPromptSubmit", TS: 200, SessionID: callmeter.Ptr("s-late"), PromptID: callmeter.Ptr("p-u2")})
+	batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
+		_, err := tx.InsertTurn(ctx, callmeter.Turn{EventID: "late-stop", Event: "Stop", TS: 210, SessionID: callmeter.Ptr("s-late"), PromptID: callmeter.Ptr("p-u1")})
+		return err
+	})
+	table, err := Faults(context.Background(), store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range table.Rows {
+		if row[0] == "refusal" && row[1] == "rate_limit" && row[6] == refusalFromTranscript {
+			return
+		}
+	}
+	t.Error("an earlier prompt's late Stop suppressed the next prompt's transcript refusal")
+}

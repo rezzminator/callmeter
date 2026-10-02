@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -272,5 +273,51 @@ func TestSessionsNamesASessionWithNoSessionEnd(t *testing.T) {
 		if strings.Contains(note, "no SessionEnd") {
 			t.Errorf("s1 notes = %q, want no no-SessionEnd note outside the filter", table.Notes)
 		}
+	}
+}
+
+func TestSessionsNotesCountTheWholeWindow(t *testing.T) {
+	cases := []struct{ name, end, event, note string }{
+		{"never", "never", "", "sessions ended with no SessionEnd (END never): Claude Code did not run their SessionEnd hooks, and no lost one was recorded; once they went quiet, the report settled their turns and calls from their transcripts as SessionEnd would; a session idle past the quiet hour reads so too, until its next hook"},
+		{"before-start", "", "SessionEnd", "sessions ended before they started (START never): Claude Code sent a SessionEnd and no SessionStart, and nothing ran in them; exiting while a /clear still runs its SessionEnd hooks ends the cleared chat's successor so"},
+		{"idle", "", "SessionStart", "sessions ran nothing (MODEL unused): they started, then ended or idled with no prompt submitted and no request, call or sub-agent (only local commands such as /model or /effort, or an exit at the prompt); the model is the one they started with, never one that answered"},
+		{"lost", "lost", "", "sessions lost their SessionEnd (END lost): the SessionEnd hook ran, but its event was not recorded (the hook was killed, its binary was unavailable, or the store stayed busy past the hook's timeout; see the faults topic); once they went quiet, the report settled their turns and calls from their transcripts as SessionEnd would"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStore(t)
+			for i := 0; i < 31; i++ {
+				id := fmt.Sprintf("s-%02d", i)
+				ts := ms(time.Hour)
+				if i == 30 {
+					ts = ms(48 * time.Hour)
+				}
+				if tc.event != "" {
+					seedEvent(t, store, callmeter.Event{EventID: "e-" + id, Event: tc.event, SessionID: &id, TS: ts})
+				}
+				seedSession(t, store, callmeter.Session{SessionID: id, TS: ts})
+				if tc.end != "" {
+					if _, err := store.DB().Exec("UPDATE sessions SET end_reason = ? WHERE session_id = ?", tc.end, id); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			filter := Filter{Since: testNow.Add(-24 * time.Hour), Limit: 5}
+			table, err := Sessions(context.Background(), store, filter, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(table.Rows) != 5 || !slices.Contains(table.Notes, "30 "+tc.note) {
+				t.Errorf("rows = %d, notes = %q, want 5 rows and %q", len(table.Rows), table.Notes, "30 "+tc.note)
+			}
+			filter.Session = "s-00"
+			table, err = Sessions(context.Background(), store, filter, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(table.Rows) != 1 || !slices.Contains(table.Notes, "1 "+tc.note) {
+				t.Errorf("session filter: rows = %d, notes = %q, want 1 row and %q", len(table.Rows), table.Notes, "1 "+tc.note)
+			}
+		})
 	}
 }

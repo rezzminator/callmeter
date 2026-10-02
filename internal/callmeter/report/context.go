@@ -76,11 +76,18 @@ func growthCellText(delta int64, labels []string) string {
 // predecessor, each named by the predecessor's calls.
 func Context(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
-	where, args := f.where()
-	// A request is kept when it is sized and one of its calls passes the
-	// filter: requests carry no cwd or agent type of their own.
-	kept := `COALESCE(r.pending, 0) = 0 AND r.context_tokens IS NOT NULL
-		AND EXISTS (SELECT 1 FROM calls c WHERE c.request_id = r.request_id AND ` + where + `)`
+	kept := `COALESCE(r.pending, 0) = 0 AND r.context_tokens IS NOT NULL`
+	var args []any
+	if f.Project == "" && f.AgentType == "" {
+		where, requestArgs := requestFilter(f)
+		kept += " AND " + where
+		args = requestArgs
+	} else {
+		// Requests carry no cwd or agent type, so these filters need a matching call.
+		where, callArgs := f.where()
+		kept += ` AND EXISTS (SELECT 1 FROM calls c WHERE c.request_id = r.request_id AND ` + where + `)`
+		args = callArgs
+	}
 	agents := map[string]*contextAgent{}
 	var order []*contextAgent
 	err := query(ctx, store, "sized requests",
@@ -143,6 +150,7 @@ func Context(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 		return agentKey(order[i].session, order[i].agent) < agentKey(order[j].session, order[j].agent)
 	})
 	t := &Table{
+		Empty: "callmeter: no sized requests in window",
 		Title: f.title("context", n),
 		Header: []string{
 			"CHAT", "SESSION", "AGENT", "TYPE", "REQUESTS", "START", "PEAK", "MEAN GROWTH",

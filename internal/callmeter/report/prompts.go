@@ -22,6 +22,7 @@ type promptRow struct {
 func Prompts(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty: "callmeter: no prompts in window",
 		Title: f.title("prompts", n),
 		Header: []string{
 			"PROMPT", "CHAT", "FIRST", "LAST", "CALLS", "FAILED", "AGENTS", "REQUESTS", "CONTEXT TOKENS", "OUTPUT TOKENS",

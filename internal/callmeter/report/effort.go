@@ -12,6 +12,7 @@ import (
 func Effort(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty:  "callmeter: no effort recorded in window",
 		Title:  f.title("effort", n),
 		Header: []string{"EFFORT", "PERMISSION MODE", "AGENT TYPE", "CALLS", "TURNS", "FAILED"},
 	}

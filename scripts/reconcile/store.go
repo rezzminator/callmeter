@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/sqlitedb"
 )
 
@@ -30,16 +31,19 @@ type sCall struct {
 	noTS                                           bool // ts IS NULL; ts reads 0
 	hasSize                                        bool
 	failed                                         int64 // -1: NULL
-	// batchOnly: only PostToolBatch wrote the row (a delivered size, no
-	// PostToolUse or PostToolUseFailure outcome, no refusal label). The Stop
-	// and SessionEnd sweep (resolveUnfinished) may fill failed=0 from the
-	// transcript result, never the real size, so failed 0 or NULL both count.
+	// batchOnly: a delivered size with no error label; real-output tools
+	// have no real size and no failure, including swept successes. Tools
+	// with no separate real output have no landed outcome (failed NULL).
 	batchOnly bool
 	// noCommand: the stored input keeps only command_bytes, the command the
 	// heredoc cutter could not cut safely (docs/design.md § Privacy).
 	noCommand bool
 	// delivered: bytes_delivered is set (PostToolBatch stored the size).
 	delivered bool
+}
+
+func (c *sCall) resultLanded() bool {
+	return c.hasSize || c.failed == 1 || (c.failed == 0 && !callmeter.HasRealOutput(c.tool))
 }
 
 type sRequest struct {
@@ -80,17 +84,18 @@ type sFault struct {
 }
 
 type storeData struct {
-	sessions  map[string]*sSession
-	calls     map[string]*sCall
-	requests  map[string]*sRequest
-	agents    map[string]*sAgent
-	turns     map[string][]sTurn
-	events    []sEvent
-	parts     map[string][]sPart
-	faults    []sFault
-	maxParser int64
-	latest    int64
-	earliest  int64 // the earliest session's first row; 0: no session
+	sessions     map[string]*sSession
+	calls        map[string]*sCall
+	requests     map[string]*sRequest
+	agents       map[string]*sAgent
+	turns        map[string][]sTurn
+	turnSessions map[string]bool
+	events       []sEvent
+	parts        map[string][]sPart
+	faults       []sFault
+	maxParser    int64
+	latest       int64
+	earliest     int64 // the earliest session's first row; 0: no session
 }
 
 type sPart struct {
@@ -111,6 +116,7 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 	d := &storeData{
 		sessions: map[string]*sSession{}, calls: map[string]*sCall{}, requests: map[string]*sRequest{},
 		agents: map[string]*sAgent{}, turns: map[string][]sTurn{}, parts: map[string][]sPart{},
+		turnSessions: map[string]bool{},
 	}
 	steps := []struct {
 		name, query string
@@ -128,11 +134,17 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				}
 				return nil
 			}},
-		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), bytes_delivered IS NOT NULL AND bytes_real IS NULL AND COALESCE(failed,0) = 0 AND error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL FROM calls`,
+		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL FROM calls`,
 			func(r *sql.Rows) error {
 				c := &sCall{}
-				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &c.batchOnly, &c.noCommand, &c.delivered); err != nil {
+				var noError bool
+				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &noError, &c.noCommand, &c.delivered); err != nil {
 					return err
+				}
+				if callmeter.HasRealOutput(c.tool) {
+					c.batchOnly = c.delivered && noError && !c.hasSize && c.failed != 1
+				} else {
+					c.batchOnly = c.delivered && noError && c.failed == -1
 				}
 				d.calls[c.id] = c
 				d.latest = max(d.latest, c.ts)
@@ -166,6 +178,15 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 					return err
 				}
 				d.turns[id] = append(d.turns[id], t)
+				return nil
+			}},
+		{"turns", `SELECT DISTINCT session_id FROM turns WHERE session_id IS NOT NULL AND session_id != ''`,
+			func(r *sql.Rows) error {
+				var id string
+				if err := r.Scan(&id); err != nil {
+					return err
+				}
+				d.turnSessions[id] = true
 				return nil
 			}},
 		// A Stop's stop_hook_active lives on its turns row, keyed by the same event_id.

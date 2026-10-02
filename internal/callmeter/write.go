@@ -258,11 +258,25 @@ type Tx struct {
 }
 
 // Batch runs fn in one transaction, committed when fn returns nil and rolled
-// back otherwise.
+// back otherwise. The transaction takes the store's write lock at its BEGIN
+// (sqlitedb.OpenStore), so a concurrent writer is waited out there, before fn
+// runs.
 func (s *Store) Batch(ctx context.Context, fn func(*Tx) error) error {
+	return s.BatchHeld(ctx, nil, fn)
+}
+
+// BatchHeld is Batch with held, when not nil, called once the transaction
+// holds the store's write lock, before fn: a caller holding something off
+// until the batch's outcome is known (the hook's signal handler) takes it
+// there, never across the wait for a busy store. A batch whose wait failed
+// never calls held.
+func (s *Store) BatchHeld(ctx context.Context, held func(), fn func(*Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("callmeter store %s: begin transaction: %w", s.path, err)
+	}
+	if held != nil {
+		held()
 	}
 	if err := fn(&Tx{tx: tx, path: s.path}); err != nil {
 		return errors.Join(err, tx.Rollback())
@@ -302,7 +316,25 @@ func (s *Store) ReplaceCommandParts(ctx context.Context, toolUseID string, parts
 
 // UpsertCall writes c's provided columns by tool_use_id.
 func (t *Tx) UpsertCall(ctx context.Context, c Call, mode Mode) error {
-	return t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode)
+	if c.Cwd == nil && c.Input == nil {
+		return t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode)
+	}
+	var cwd, input sql.NullString
+	err := t.tx.QueryRowContext(ctx, "SELECT cwd, input FROM calls WHERE tool_use_id = ?", c.ToolUseID).Scan(&cwd, &input)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("callmeter store %s: read parse inputs of %q: %w", t.path, c.ToolUseID, err)
+	}
+	if err := t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode); err != nil {
+		return err
+	}
+	// Compare the stored values after merging, including NULL: FillEmpty may
+	// leave both unchanged. Parse faults stay until ReplaceCommandParts.
+	if _, err := t.tx.ExecContext(ctx, `DELETE FROM command_parts WHERE tool_use_id = ?
+		AND EXISTS (SELECT 1 FROM calls WHERE tool_use_id = ? AND (cwd IS NOT ? OR input IS NOT ?))`,
+		c.ToolUseID, c.ToolUseID, cwd, input); err != nil {
+		return fmt.Errorf("callmeter store %s: invalidate command parts of %q: %w", t.path, c.ToolUseID, err)
+	}
+	return nil
 }
 
 // UpsertRequest writes r's provided columns by request_id.
@@ -601,26 +633,28 @@ func jsonList(values []string) (string, error) {
 // UnfinishedCall is a call with neither an outcome nor a delivered size: its
 // PreToolUse alone landed.
 type UnfinishedCall struct {
+	Tool      string
 	ToolUseID string
 	AgentID   *string
 	AgentType *string
 	NoTS      bool // ts IS NULL: stored before every hook set one
 	// Delivered: bytes_delivered is set, so the batch already stored the call's
-	// size; RecoverQuiet settles only a call whose size is still unknown.
+	// size; RecoverQuiet fills its real size, or its no-real-output outcome.
 	Delivered bool
 	// Rebuilt: a call recovery rebuilt from a transcript (source transcript)
 	// that did not fail, so its real size is its result's toolUseResult.
 	Rebuilt bool
 }
 
-// UnfinishedCalls lists the session's calls with no real size: running, ended
+// UnfinishedCalls lists calls still needing a real size or, for a tool with
+// no separate output, an outcome: running, ended
 // with no PostToolUse or PostToolUseFailure (the user interrupted a sub-agent),
 // or refused by Claude Code before any PostToolUse, its batch alone landed.
 func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]UnfinishedCall, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL,
+		`SELECT COALESCE(tool, ''), tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL,
 		COALESCE(source, '') = `+sqlText(SourceTranscript)+` AND COALESCE(failed, 0) = 0 FROM calls
-		WHERE session_id = ? AND bytes_real IS NULL
+		WHERE session_id = ? AND `+realSizeOpen("")+`
 		ORDER BY ts, tool_use_id`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("callmeter store %s: list unfinished calls of session %q: %w", s.path, sessionID, err)
@@ -628,7 +662,7 @@ func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]Unfini
 	var calls []UnfinishedCall
 	for rows.Next() {
 		var c UnfinishedCall
-		if err := rows.Scan(&c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered, &c.Rebuilt); err != nil {
+		if err := rows.Scan(&c.Tool, &c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered, &c.Rebuilt); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("callmeter store %s: scan unfinished call: %w", s.path, err),
 				rows.Close(),

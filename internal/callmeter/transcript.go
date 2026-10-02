@@ -662,7 +662,8 @@ const UnknownAPIError = "unknown"
 
 // apiErrorKind is the shape of an error kind Claude Code writes (`rate_limit`,
 // `oauth_org_not_allowed`): anything else is not passed on, so no message
-// text leaves the transcript.
+// text leaves the transcript. A StopFailure hook's error passes the same gate
+// to be stored as a label (detailLabels).
 var apiErrorKind = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type messageEntry struct {

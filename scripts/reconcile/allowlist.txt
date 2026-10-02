@@ -13,7 +13,7 @@
 # T2 = 2026-10-02T01:26:49Z: the second fixed binary went live. A row the T1
 # binary wrote (T..T2) is listed per id, naming its defect fixed at T2.
 # Claude Code behaviour that recurs is a classification in compare.go, printed
-# EXPECTED with its own reason and needing no line here: session-no-prompt,
+# EXPECTED with its own reason and needing no line here: session-ran-nothing,
 # a fault-binary StopFailure kill beside its StopFailure row, a fault-binary
 # kill of unknown event whose every neighbouring session reconciles, a
 # fault-terminated Stop whose cancelled turn has its Stop row,

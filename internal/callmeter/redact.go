@@ -148,3 +148,42 @@ func rewriteColumn(
 	}
 	return changed, nil
 }
+
+// UnredactedCalls counts the calls Redact would rewrite: a stored input that
+// SanitizeInput, run again over it, changes or cannot read, or a stored error
+// that SanitizeError changes. Both sanitizers leave their own output
+// unchanged, so a call written under the current rules never counts and a
+// rule added later counts every call stored before it. It reads the whole
+// calls table, whatever a report's window, and writes nothing.
+func (s *Store) UnredactedCalls(ctx context.Context) (n int64, err error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(tool, ''), input, error FROM calls WHERE input IS NOT NULL OR error IS NOT NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: read calls to check their privacy form: %w", s.path, err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: close calls read: %w", s.path, closeErr))
+		}
+	}()
+	for rows.Next() {
+		var tool string
+		var input, text sql.NullString
+		if err := rows.Scan(&tool, &input, &text); err != nil {
+			return 0, fmt.Errorf("callmeter store %s: scan a call's input and error: %w", s.path, err)
+		}
+		if input.Valid {
+			if again, err := SanitizeInput(tool, json.RawMessage(input.String)); err != nil || again != input.String {
+				n++
+				continue
+			}
+		}
+		if text.Valid && SanitizeError(text.String) != text.String {
+			n++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("callmeter store %s: read calls to check their privacy form: %w", s.path, err)
+	}
+	return n, nil
+}

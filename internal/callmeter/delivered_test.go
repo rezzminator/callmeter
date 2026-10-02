@@ -64,6 +64,9 @@ func TestResultOutcome(t *testing.T) {
 		{"harness refusal", "<tool_use_error>String to replace not found in file.\nString: private-edit-text</tool_use_error>", OutcomeRefused, true},
 		{"hook deny", "PreToolUse:Bash hook error: private-reason", OutcomeDeniedByHook, true},
 		{"permission", "Claude requested permissions to write to /tmp/demo-proj/a.txt, but you haven't granted it yet.", OutcomeDeniedByPermission, true},
+		{"auto-mode permission denial", "Permission for this action was denied", OutcomeDeniedByPermission, true},
+		{"auto-mode denial with detail", "Permission for this action was denied by the auto mode classifier.", OutcomeDeniedByPermission, true},
+		{"auto-mode no verdict", "The server-side auto mode classifier gave no verdict (error),", "", false},
 		{"user rejection", "The user doesn't want to proceed with this tool use.", OutcomeRejectedByUser, true},
 		{"ordinary output", "Exit code 137", "", false},
 	}
@@ -147,19 +150,21 @@ func TestFindResultsOutcome(t *testing.T) {
 func TestRealBytes(t *testing.T) {
 	tests := []struct {
 		name, raw string
+		tool      string
 		want      int64
 		wantErr   bool
+		wantNil   bool
 	}{
 		{name: "string", raw: `"hello world"`, want: 11},
 		{name: "content block array", raw: `[{"type":"text","text":"abc"},{"type":"image","text":"x"}]`, want: 3},
 		{name: "empty", raw: ``, want: 0},
 		{name: "null", raw: `null`, want: 0},
-		{name: "stdout", raw: `{"stdout":"hi\n","stderr":"err"}`, want: 3},
+		{name: "stdout", tool: "Bash", raw: `{"stdout":"hi\n","stderr":"err"}`, want: 3},
 		{name: "empty stdout", raw: `{"stdout":"","stderr":"err"}`, want: 0},
 		{name: "persistedOutputSize beats stdout", raw: `{"stdout":"preview","persistedOutputPath":"/tmp/o","persistedOutputSize":4096}`, want: 4096},
 		{name: "persistedOutputSize 0 is a size", raw: `{"stdout":"preview","persistedOutputSize":0}`, want: 0},
 		{name: "stdout beats file", raw: `{"stdout":"ab","file":{"content":"abcdef"}}`, want: 2},
-		{name: "file.content", raw: `{"type":"text","file":{"filePath":"/tmp/f","content":"abcdef"}}`, want: 6},
+		{name: "file.content", tool: "Read", raw: `{"type":"text","file":{"filePath":"/tmp/f","content":"abcdef"}}`, want: 6},
 		{name: "content blocks", raw: `{"content":[{"type":"text","text":"abc"},{"type":"text","text":"de"}]}`, want: 5},
 		{name: "content string", raw: `{"content":"abcd","prompt":"long prompt"}`, want: 4},
 		{name: "null content falls back", raw: `{"content":null}`, want: int64(len(`{"content":null}`))},
@@ -168,20 +173,35 @@ func TestRealBytes(t *testing.T) {
 		{name: "number", raw: `42`, wantErr: true},
 		{name: "malformed object", raw: `{"stdout":5}`, wantErr: true},
 	}
+	for _, response := range noRealOutputResponses(t) {
+		tests = append(tests, struct {
+			name, raw string
+			tool      string
+			want      int64
+			wantErr   bool
+			wantNil   bool
+		}{name: response.name, tool: response.tool, raw: string(response.raw), wantNil: true})
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := RealBytes(json.RawMessage(tt.raw))
+			got, err := RealBytes(tt.tool, json.RawMessage(tt.raw))
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("RealBytes(%q) = %v, nil; want an error", tt.raw, got)
+					t.Fatalf("RealBytes(%s) = %v, nil; want an error", tt.name, got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("RealBytes(%q) unexpected error: %v", tt.raw, err)
+				t.Fatalf("RealBytes(%s) unexpected error: %v", tt.name, err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("RealBytes(%s) = %d, want NULL", tt.tool, *got)
+				}
+				return
 			}
 			if got == nil || *got != tt.want {
-				t.Fatalf("RealBytes(%q) = %v, want %d", tt.raw, got, tt.want)
+				t.Fatalf("RealBytes(%s) = %v, want %d", tt.name, got, tt.want)
 			}
 		})
 	}
@@ -224,6 +244,19 @@ func TestFindResultsReal(t *testing.T) {
 			t.Errorf("toolu_b = %+v, want the response's own length", got)
 		}
 	})
+	for _, response := range noRealOutputResponses(t) {
+		t.Run(response.name, func(t *testing.T) {
+			use := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_a","name":"` + response.tool + `","input":{}}]}}` + "\n"
+			path := write(t, use, line(string(response.raw), "toolu_a"))
+			found, err := FindResults(path, []string{"toolu_a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := found["toolu_a"]; !ok || got.Real != nil || got.Failed || got.Bytes != 7 {
+				t.Fatalf("result found=%t Real=%v Failed=%t Bytes=%d, want NULL, false, 7", ok, got.Real, got.Failed, got.Bytes)
+			}
+		})
+	}
 	t.Run("none", func(t *testing.T) {
 		path := write(t, line("", "toolu_a"), line("null", "toolu_b"), line(`{"stdout":"x"}`, "toolu_c", "toolu_d"))
 		found, err := FindResults(path, []string{"toolu_a", "toolu_b", "toolu_c", "toolu_d"})
@@ -253,4 +286,56 @@ func TestFindResultsReal(t *testing.T) {
 			t.Fatalf("FindResults error = %v, want one naming toolu_a", err)
 		}
 	})
+}
+
+type capturedOutputResponse struct {
+	name, tool string
+	raw, input json.RawMessage
+}
+
+// noRealOutputResponses reads completed and async responses from captures;
+// response bodies stay inside the test, never in its diagnostics.
+func noRealOutputResponses(t *testing.T) []capturedOutputResponse {
+	t.Helper()
+	var responses []capturedOutputResponse
+	seen := map[string]bool{}
+	for _, file := range []string{"callmeter/scripted.jsonl", "gym/S2/payloads.jsonl"} {
+		data, err := os.ReadFile(filepath.Join("..", "hookentry", "testdata", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var p struct {
+				Event    string          `json:"hook_event_name"`
+				Tool     string          `json:"tool_name"`
+				Response json.RawMessage `json:"tool_response"`
+				Input    json.RawMessage `json:"tool_input"`
+			}
+			if err := json.Unmarshal([]byte(line), &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.Event != "PostToolUse" || (p.Tool != "Edit" && p.Tool != "Write" && p.Tool != "Agent") {
+				continue
+			}
+			var shape struct {
+				Async bool `json:"isAsync"`
+			}
+			if err := json.Unmarshal(p.Response, &shape); err != nil {
+				t.Fatal(err)
+			}
+			name := p.Tool
+			if shape.Async {
+				name += " async"
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			responses = append(responses, capturedOutputResponse{name, p.Tool, p.Response, p.Input})
+		}
+	}
+	if len(responses) != 4 {
+		t.Fatalf("captured response shapes = %d, want 4", len(responses))
+	}
+	return responses
 }

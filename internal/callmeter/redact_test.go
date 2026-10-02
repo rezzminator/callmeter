@@ -28,7 +28,9 @@ var oldRows = []string{
 		('ev1', 'Notification', 6, '{"notification_type":"idle","message":"private-note"}'),
 		('ev2', 'Notification', 7, '{"notification_type":"idle","message_bytes":4}'),
 		('ev3', 'PermissionDenied', 8, '{"reason":"private-reason"}'),
-		('ev4', 'StopFailure', 9, '{"error":"rate_limit"}')`,
+		('ev4', 'StopFailure', 9, '{"error":"rate_limit"}'),
+		('ev5', 'PermissionDenied', 10, '{"tool_name":"Bash","tool_use_id_bytes":12}'),
+		('ev6', 'PermissionDenied', 11, '{"tool_use_id":"toolu_denied"}')`,
 	`INSERT INTO faults (ts, tool_use_id, stage, error) VALUES
 		(10, 'toolu_plain', 'parse', 'part 0 (): 1:9: private-token must be followed by )'),
 		(11, 'toolu_plain', 'parse', 'part 2 (grep): 1:4: reached EOF near private-quote'),
@@ -69,6 +71,11 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	}
 	if !strings.Contains(detail, `{"reason_bytes":14}`) || !strings.Contains(detail, `{"error":"rate_limit"}`) {
 		t.Fatalf("details = %s, want the unknown reason sized and the StopFailure label kept", detail)
+	}
+	// A PermissionDenied detail stored before its tool_use_id was kept as an id,
+	// and one stored after, are both their own sanitized form.
+	if !strings.Contains(detail, `{"tool_name":"Bash","tool_use_id_bytes":12}`) || !strings.Contains(detail, `{"tool_use_id":"toolu_denied"}`) {
+		t.Fatalf("details = %s, want both PermissionDenied details unchanged", detail)
 	}
 	var faults string
 	if err := store.DB().QueryRow(`SELECT group_concat(error, '|') FROM (SELECT error FROM faults ORDER BY ts)`).Scan(&faults); err != nil {

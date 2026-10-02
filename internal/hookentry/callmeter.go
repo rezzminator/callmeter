@@ -70,30 +70,28 @@ type callmeterPayload struct {
 	SessionCrons         json.RawMessage `json:"session_crons"`
 }
 
-// calls names the tool calls this payload is about, for a failure that loses
-// its whole record: the tool_use_id, or a batch's ids joined by commas.
-func (p callmeterPayload) calls() string {
+// callIDs names each lost call separately; a payload without calls still
+// gets one fault with an empty id.
+func (p callmeterPayload) callIDs() []string {
 	if p.ToolUseID != "" || len(p.ToolCalls) == 0 {
-		return p.ToolUseID
+		return []string{p.ToolUseID}
 	}
 	ids := make([]string, 0, len(p.ToolCalls))
 	for _, call := range p.ToolCalls {
 		ids = append(ids, call.ToolUseID)
 	}
-	return strings.Join(ids, ",")
+	return ids
 }
 
 // callmeterResponse is the part of a PostToolUse tool_response callmeter
-// reads for itself: the persisted path and an Agent call's sub-agent totals.
+// reads for itself: the persisted path and the agent an Agent call spawned.
 // The output size is callmeter.RealBytes's and the file columns
 // callmeter.FileColumnsFromResult's.
 type callmeterResponse struct {
-	PersistedOutputPath *string  `json:"persistedOutputPath"`
-	AgentID             string   `json:"agentId"`
-	AgentType           string   `json:"agentType"`
-	TotalTokens         *float64 `json:"totalTokens"`
-	TotalToolUseCount   *float64 `json:"totalToolUseCount"`
-	ResolvedModel       *string  `json:"resolvedModel"`
+	PersistedOutputPath *string `json:"persistedOutputPath"`
+	AgentID             string  `json:"agentId"`
+	AgentType           string  `json:"agentType"`
+	ResolvedModel       *string `json:"resolvedModel"`
 }
 
 // callmeterRun is one `callmeter hook` invocation: one payload, one store, one
@@ -125,12 +123,19 @@ type callmeterRun struct {
 	endsTurn   bool // a Stop or StopFailure: its row replaces a rebuilt turn end
 	batches    int  // writes tried: a run that tried none writes its rows alone
 	// accounted: the run's event is accounted for, by a committed batch, a
-	// fault row or the store-busy line, whatever the signal state. storeBusy:
-	// the store stayed locked past the run's wait and the run gave up on it
-	// (giveUpBusy), so it writes nothing more.
+	// fault row or the run's own missed.log line, whatever the signal state.
+	// gaveUp: the store stayed locked past the run's wait (giveUpBusy) or
+	// could take neither the event nor its fault (giveUp), the run left that
+	// line, and it writes nothing more.
 	accounted bool
-	storeBusy bool
+	gaveUp    bool
 }
+
+// AccountedPanic carries a panic after the run's event was accounted for.
+type AccountedPanic struct{ Value any }
+
+// afterEventCommit is a test seam, nil in production.
+var afterEventCommit func()
 
 // Callmeter is the hook entry: it records each hook event into the callmeter
 // store under $CALLMETER_HOME. It exits 0 on every path and writes nothing to
@@ -141,7 +146,9 @@ type callmeterRun struct {
 // before the run's event is accounted for leaves one missed.log line instead
 // (terminateOnSignal); one of them ignored on entry stays ignored. A store that
 // stays locked past the run's wait (storeWait, inside its event's hook timeout)
-// leaves the line `terminated by store busy` the same way (giveUpBusy).
+// leaves the line `terminated by store busy` the same way (giveUpBusy), and one
+// that can take neither the event nor its fault the line `store unavailable:
+// {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	home, err := paths.Home(getenv)
 	if err != nil {
@@ -151,6 +158,17 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	}
 	logPath := paths.Log(home)
 	state := &terminationState{}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			state.mu.Lock()
+			accounted := state.accounted
+			state.mu.Unlock()
+			if accounted {
+				panic(AccountedPanic{Value: recovered})
+			}
+			panic(recovered)
+		}
+	}()
 	signals := make(chan os.Signal, 1)
 	// A signal ignored on entry (`nohup`, a background job of a non-interactive
 	// shell) stays ignored: Notify would install a handler in its place and
@@ -184,8 +202,11 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 // that handles its termination signal: the event name and session id once the
 // payload decoded, and whether the run's event is accounted for, meaning its first
 // write batch committed or its first fault row was written. mu is held, from
-// the start of a write that can account for the run until that write's
-// outcome is known, so a signal landing mid-commit waits for the outcome.
+// the moment a write that can account for the run holds the store's write lock
+// until that write's outcome is known, so a signal landing mid-commit waits for
+// the outcome; never across a wait for a busy store, so a signal landing there
+// is decided at once, well inside the 1.5 s Claude Code gives a cancelled hook
+// before its SIGKILL.
 type terminationState struct {
 	mu        sync.Mutex
 	event     string
@@ -256,9 +277,11 @@ func (hold termHold) release() {
 // rule: a run whose event is not accounted for appends one missed.log line
 // (event `unknown` until the payload decoded), a run whose event is accounted
 // for appends none, and either way the process exits 0 through exit. It takes
-// the state's lock first, so a write in flight finishes and is judged by its
-// outcome; the lock is not released before exit, so the run writes nothing
-// after the decision. A failure to append the line is said on stderr and in
+// the state's lock first, so a write in flight, one holding the store's write
+// lock, finishes and is judged by its outcome, while a write still waiting on
+// a busy store never got the lock and leaves the decision to the signal; the
+// lock is not released before exit, so the run writes nothing after the
+// decision. A failure to append the line is said on stderr and in
 // the log, never a non-zero exit. done ends the wait without a signal. The
 // line's reason is `terminated by {SIGNAL}`; a run whose store stays locked
 // leaves `terminated by store busy` itself (giveUpBusy).
@@ -279,7 +302,7 @@ func terminateOnSignal(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if !state.accounted {
-		if err := appendTerminated(
+		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
 			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
 		}
@@ -287,12 +310,15 @@ func terminateOnSignal(
 	exit(0)
 }
 
-// appendTerminated appends `{unix seconds}\t{event}\t{reason}` (reason opens
-// callmeter.TerminatedReason) to the missed.log at path, followed by `\t{session_id}` when session is one
+// AppendMissed appends the binary's own missed.log line,
+// `{unix seconds}\t{event}\t{reason}` (reason opens callmeter.TerminatedReason
+// or callmeter.StoreUnavailableReason, or is callmeter.PanicReason), to the
+// missed.log at path, followed by `\t{session_id}` when session is one
 // (callmeter.MissedSessionID), the wrapper's own layout, so recovery ties a
-// lost SessionEnd to its session; it creates the file and its directory when
+// lost SessionEnd to its session; event is `unknown` when it is empty or would
+// break the line (missedEvent). It creates the file and its directory when
 // absent: one write, so concurrent appenders never interleave a line.
-func appendTerminated(path, event, session, reason string, now time.Time) error {
+func AppendMissed(path, event, session, reason string, now time.Time) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create the directory of %s: %w", path, err)
 	}
@@ -371,30 +397,41 @@ func runCallmeter(
 	}
 	store, err := callmeter.OpenDBWaiting(ctx, files.store, storeWait(run.payload.HookEventName))
 	if err != nil {
-		run.fault(callmeter.StageStore, run.payload.calls(), errors.Join(payloadErr, err))
+		for _, id := range run.payload.callIDs() {
+			run.fault(callmeter.StageStore, id, errors.Join(payloadErr, err))
+		}
 		return 0
 	}
 	run.store = store
 	defer func() {
 		if err := store.Close(); err != nil {
 			run.store = nil // closed: the fault is said, never written
-			run.fault(callmeter.StageStore, run.payload.calls(), err)
+			for _, id := range run.payload.callIDs() {
+				run.fault(callmeter.StageStore, id, err)
+			}
 		}
 	}()
 	// The wrapper's own failures (no binary, a bad checksum) land as binary
 	// faults on the next run that reaches the store; failing to ingest them
-	// is one store fault and never stops this run's record.
-	if _, err := store.IngestMissed(ctx, files.missed); err != nil {
+	// is one store fault and never stops this run's record. The signal handler
+	// is held off from the commit until the claim is moved, so a signal there
+	// leaves no committed claim in place to be ingested again.
+	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
 		run.fault(callmeter.StageStore, "", fmt.Errorf("ingest %s: %w", files.missed, err))
 	}
-	if run.storeBusy {
+	if run.gaveUp {
 		return 0
 	}
 	if payloadErr != nil {
 		run.fault(callmeter.StagePayload, run.payload.ToolUseID, payloadErr)
 		return 0
 	}
-	run.effort = effortOf(run.payload.Effort, getenv)
+	run.effort = effortOf(run.payload.Effort, run.payload.HookEventName, getenv, func() (string, error) {
+		if run.payload.HookEventName == callmeter.EventSessionStart {
+			return run.payload.Model, nil
+		}
+		return run.store.SessionModel(run.ctx, run.payload.SessionID)
+	})
 	run.record()
 	return 0
 }
@@ -507,7 +544,7 @@ func (run *callmeterRun) record() {
 			// running SessionEnd; report-time recovery settles that session
 			// once it is quiet (callmeter.RecoverQuiet).
 			run.write(p.ToolUseID, nil)
-			if run.storeBusy {
+			if run.gaveUp {
 				return
 			}
 			run.deadline = clock.Real.Now().Add(sessionEndBudget)
@@ -591,9 +628,14 @@ func (run *callmeterRun) recordCall(failed bool) {
 	}
 	call := run.base(p.ToolUseID)
 	run.tier1(&call)
+	prompt := call.PromptID
+	call.PromptID = nil
 	call.TS = callmeter.Ptr(run.now)
 	call.Tool = callmeter.Ptr(p.ToolName)
 	call.DurationMS = wholeNumber(p.DurationMS)
+	if call.DurationMS != nil && *call.DurationMS >= 0 {
+		call.TS = callmeter.Ptr(run.now - *call.DurationMS)
+	}
 	call.Failed = callmeter.Ptr(failed)
 	call.IsInterrupt = p.IsInterrupt
 	run.inputColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
@@ -602,6 +644,10 @@ func (run *callmeterRun) recordCall(failed bool) {
 	if failed {
 		if p.Error != nil {
 			call.Error = callmeter.Ptr(callmeter.SanitizeError(*p.Error))
+			if p.ToolName == "Bash" {
+				command, _ := callmeter.BashCommand(p.ToolInput) // inputColumns already reports malformed input
+				callmeter.CommitFromText(&call, command, *p.Error)
+			}
 		}
 		// A failure's output reaches the model as this text: it is the size.
 		if p.Error != nil {
@@ -616,21 +662,14 @@ func (run *callmeterRun) recordCall(failed bool) {
 		}
 		// This cwd is where the command left the shell; PreToolUse's, the
 		// directory it started in, wins whenever it lands (recordStartCwd).
-		after := callmeter.Call{ToolUseID: p.ToolUseID, Cwd: presentString(p.Cwd)}
+		after := callmeter.Call{ToolUseID: p.ToolUseID, Cwd: presentString(p.Cwd), PromptID: prompt}
 		if err := tx.UpsertCall(run.ctx, after, callmeter.FillEmpty); err != nil {
 			return err
 		}
 		if agent == nil {
 			return nil
 		}
-		// The totals only fill: the agent's own transcript, summed at its
-		// stop, holds every turn (recordAgent).
-		totals := callmeter.Agent{AgentID: agent.AgentID, TotalTokens: agent.TotalTokens, ToolUses: agent.ToolUses}
-		agent.TotalTokens, agent.ToolUses = nil, nil
-		if err := tx.UpsertAgent(run.ctx, *agent, callmeter.Overwrite); err != nil {
-			return err
-		}
-		return tx.UpsertAgent(run.ctx, totals, callmeter.FillEmpty)
+		return tx.UpsertAgent(run.ctx, *agent, callmeter.Overwrite)
 	})
 }
 
@@ -639,7 +678,7 @@ func (run *callmeterRun) recordCall(failed bool) {
 // stored cwd, so only PreToolUse's is right; it overwrites whatever PostToolUse
 // filled, and PostToolUse never overwrites it, in either landing order. ts is
 // set so a call that never finishes still ages out of the store; the earliest
-// hook's ts wins (Call.TS). The command's
+// start wins, including PostToolUse's duration estimate (Call.TS). The command's
 // input and test runner only fill, so a call whose PostToolUse is lost still
 // has them, and a PostToolUse landing in either order overwrites them.
 func (run *callmeterRun) recordStartCwd() {
@@ -658,9 +697,11 @@ func (run *callmeterRun) recordStartCwd() {
 	}
 	call := run.base(p.ToolUseID)
 	call.Cwd = callmeter.Ptr(p.Cwd)
-	// The start only fills: PostToolUse's prompt, effort and mode win.
+	call.PromptID = presentString(p.PromptID)
+	// The issuing prompt wins; PostToolUse's effort and mode still win.
 	start := callmeter.Call{ToolUseID: p.ToolUseID, TS: callmeter.Ptr(run.now), Tool: presentString(p.ToolName)}
 	run.tier1(&start)
+	start.PromptID = nil
 	run.inputColumns(&start, p.ToolUseID, p.ToolName, p.ToolInput)
 	run.write(p.ToolUseID, func(tx *callmeter.Tx) error {
 		if err := tx.UpsertCall(run.ctx, call, callmeter.Overwrite); err != nil {
@@ -733,7 +774,13 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 	p := run.payload
 	trimmed := bytes.TrimSpace(p.ToolResponse)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		size, err := callmeter.RealBytes(trimmed)
+		if !callmeter.HasRealOutput(p.ToolName) {
+			if _, err := callmeter.DeliveredBytes(trimmed); err != nil {
+				run.fault(callmeter.StagePayload, p.ToolUseID, err)
+				return nil
+			}
+		}
+		size, err := callmeter.RealBytes(p.ToolName, trimmed)
 		if err != nil {
 			run.fault(callmeter.StagePayload, p.ToolUseID, err)
 			return nil
@@ -748,7 +795,7 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 	}
 	// The size is callmeter.RealBytes's, the one path a transcript's
 	// toolUseResult is measured by too.
-	size, err := callmeter.RealBytes(trimmed)
+	size, err := callmeter.RealBytes(p.ToolName, trimmed)
 	if err != nil {
 		run.fault(callmeter.StagePayload, p.ToolUseID, err)
 	} else {
@@ -771,8 +818,6 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 		SessionID:       callmeter.Ptr(p.SessionID),
 		AgentType:       presentString(response.AgentType),
 		ParentToolUseID: callmeter.Ptr(p.ToolUseID),
-		TotalTokens:     wholeNumber(response.TotalTokens),
-		ToolUses:        wholeNumber(response.TotalToolUseCount),
 		Model:           response.ResolvedModel,
 		Source:          callmeter.Ptr(callmeter.SourceHook),
 		ConfigDir:       run.seat.configDir,
@@ -787,7 +832,7 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 func (run *callmeterRun) recordBatch() {
 	p := run.payload
 	if len(p.ToolCalls) == 0 {
-		run.fault(callmeter.StagePayload, "", errors.New("PostToolBatch payload carries no tool_calls"))
+		run.fault(callmeter.StagePayload, "", errors.New(callmeter.BatchWithoutCalls))
 		return
 	}
 	transcript := p.TranscriptPath
@@ -817,6 +862,7 @@ func (run *callmeterRun) recordBatch() {
 			return
 		}
 		call := run.base(toolCall.ToolUseID)
+		call.PromptID = presentString(p.PromptID)
 		size, err := callmeter.DeliveredBytes(toolCall.ToolResponse)
 		if err != nil {
 			run.fault(callmeter.StagePayload, toolCall.ToolUseID, err)
@@ -829,6 +875,7 @@ func (run *callmeterRun) recordBatch() {
 		// ever lands (a refused call); an earlier one wins (Call.TS).
 		fill := callmeter.Call{ToolUseID: toolCall.ToolUseID, TS: callmeter.Ptr(run.now), Tool: presentString(toolCall.ToolName)}
 		run.tier1(&fill)
+		fill.PromptID = nil
 		if len(toolCall.ToolInput) > 0 {
 			run.inputColumns(&fill, toolCall.ToolUseID, toolCall.ToolName, toolCall.ToolInput)
 			run.fileColumns(&fill, toolCall.ToolUseID, toolCall.ToolName, toolCall.ToolInput)
@@ -1292,8 +1339,9 @@ func (run *callmeterRun) awaitResults(
 // call of the session with no real size — its PreToolUse alone landed, as when
 // the user interrupts a sub-agent mid-call, or Claude Code refused it before
 // any PostToolUse — from the tool_result its transcript holds: the delivered
-// size, failed and the outcome label, each only filling, and for a failed
-// call the real size too (callmeter.SettledCall). A call with no result on disk (still running, or its
+// size, failed, the outcome label and the real size (a failure's text, else
+// RealBytes of the result's toolUseResult, as PostToolUse stores it), each
+// only filling (callmeter.SettledCall). A call with no result on disk (still running, or its
 // session killed) stays unknown, as does one whose typed agent's transcript is
 // missing: that absence is already a transcript fault at its batch or stop. At
 // Stop a call with no result is left alone: a background call may still be
@@ -1376,15 +1424,18 @@ func (run *callmeterRun) resolveUnfinished() {
 // write runs one event's writes in one transaction, the run's own rows with
 // them (runRows); a failure is a store fault. fn nil writes the run's rows only.
 // While the run's event is not accounted for, the signal handler is held off
-// until the batch committed or, failed, until its fault row was written.
+// from the moment the batch holds the store's write lock until it committed
+// or, failed, until its fault row was written; never across the wait for a
+// busy store, so a signal during that wait is decided at once.
 func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	run.batches++
-	if run.storeBusy {
+	if run.gaveUp {
 		return
 	}
-	hold := run.state.hold()
-	defer hold.release()
-	err := run.store.Batch(run.ctx, func(tx *callmeter.Tx) error {
+	var hold termHold
+	held := false
+	defer func() { hold.release() }()
+	err := run.store.BatchHeld(run.ctx, func() { hold, held = run.state.hold(), true }, func(tx *callmeter.Tx) error {
 		if fn != nil {
 			if err := fn(tx); err != nil {
 				return err
@@ -1393,64 +1444,107 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 		return run.runRows(tx)
 	})
 	if err != nil {
-		run.faultHeld(hold, callmeter.StageStore, toolUseID, err)
+		run.faultHeld(&hold, held, callmeter.StageStore, toolUseID, err)
 		return
 	}
 	hold.account()
 	run.accounted = true
+	if afterEventCommit != nil {
+		afterEventCommit()
+	}
 }
 
 // fault says a failure to record: stderr and callmeter.log always, and a
-// faults row when the store is open. A fault the store refuses is logged only,
-// and so is every fault of a run that gave up on a busy store.
+// faults row when the store is open. While the run's event is not accounted
+// for, a fault with no store or one the store refuses leaves the run's
+// missed.log line instead (giveUp); after it, such a fault is logged only, and
+// so is every fault of a run that gave up.
 func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
-	if run.storeBusy {
+	if run.gaveUp {
 		applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
-	hold := run.state.hold()
-	defer hold.release()
-	run.faultHeld(hold, stage, toolUseID, cause)
+	var hold termHold
+	defer func() { hold.release() }()
+	run.faultHeld(&hold, false, stage, toolUseID, cause)
 }
 
-// faultHeld is fault for a caller that already holds the signal handler off
-// (write, after its batch failed): hold is that caller's, released by it.
-func (run *callmeterRun) faultHeld(hold termHold, stage, toolUseID string, cause error) {
+// faultHeld is fault with the caller's hold on the signal handler, released by
+// the caller: held is true when the caller already took it (write, after its
+// batch failed), otherwise faultHeld takes it into hold, for a fault row once
+// that row's transaction holds the store's write lock (AddFaultHeld), never
+// across the wait for a busy store.
+func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID string, cause error) {
+	take := func() {
+		if !held {
+			*hold, held = run.state.hold(), true
+		}
+	}
 	if callmeter.IsBusy(cause) && !run.accounted {
-		run.giveUpBusy(hold, stage, toolUseID, cause)
+		take()
+		run.giveUpBusy(*hold, stage, toolUseID, cause)
 		return
 	}
 	session := run.payload.SessionID
 	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
-	if run.store == nil {
+	if run.store == nil { // no store opened (OpenDBWaiting), or it closed
+		take()
+		run.giveUp(*hold, toolUseID, cause)
 		return
 	}
-	err := run.store.AddFault(run.ctx, callmeter.Fault{
+	err := run.store.AddFaultHeld(run.ctx, callmeter.Fault{
 		TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error(),
-	})
+	}, take)
 	if err != nil {
 		applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		take()
+		run.giveUp(*hold, toolUseID, err)
 		return
 	}
 	hold.account()
 	run.accounted = true
+}
+
+// giveUp ends a run whose store could take neither its event nor the fault
+// saying so, before that event was accounted for: one missed.log line
+// `store unavailable: {class}` (callmeter.StoreFailureClass of cause, never
+// its text; `terminated by store busy` when cause is a busy store) carries the
+// event and session to the next run that reaches the store (IngestMissed), and
+// the run is accounted for and writes nothing more. A run already accounted
+// for leaves no line. cause is already said; hold is the caller's, as in
+// faultHeld.
+func (run *callmeterRun) giveUp(hold termHold, toolUseID string, cause error) {
+	if run.accounted {
+		return
+	}
+	reason := callmeter.StoreUnavailableReason + callmeter.StoreFailureClass(cause)
+	if callmeter.IsBusy(cause) {
+		reason = callmeter.TerminatedByStoreBusy
+	}
+	run.leaveMissedLine(hold, toolUseID, reason)
+}
+
+// leaveMissedLine appends the run's own missed.log line with reason, accounts
+// the run for and stops its store work (gaveUp); a failed append is said.
+func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string) {
+	session := run.payload.SessionID
+	err := AppendMissed(run.missed, run.payload.HookEventName, session, reason, clock.Real.Now())
+	if err != nil {
+		applog.Failure(run.stderr, run.logPath, callmeter.StageTerminated, session, toolUseID, err)
+	}
+	hold.account()
+	run.accounted = true
+	run.gaveUp = true
 }
 
 // giveUpBusy ends a run whose store stayed locked for its whole wait before
 // its event was accounted for: the failure is said, one missed.log line
 // `terminated by store busy` carries the event and session so report-time
 // recovery still sees them (IngestMissed, endLost), and the run is accounted
-// for and writes nothing more (storeBusy). hold is the caller's, as in faultHeld.
+// for and writes nothing more (gaveUp). hold is the caller's, as in faultHeld.
 func (run *callmeterRun) giveUpBusy(hold termHold, stage, toolUseID string, cause error) {
-	session := run.payload.SessionID
-	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
-	err := appendTerminated(run.missed, run.payload.HookEventName, session, callmeter.TerminatedByStoreBusy, clock.Real.Now())
-	if err != nil {
-		applog.Failure(run.stderr, run.logPath, callmeter.StageTerminated, session, toolUseID, err)
-	}
-	hold.account()
-	run.accounted = true
-	run.storeBusy = true
+	applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
+	run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
 }
 
 func presentString(value string) *string {

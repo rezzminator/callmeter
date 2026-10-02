@@ -318,3 +318,19 @@ func TestCoverageUnreadableTranscriptIsAClassAndANote(t *testing.T) {
 		t.Errorf("notes = %q, want the class counted and one note naming %s", table.Notes, path)
 	}
 }
+
+func TestCoverageFullCoverageSaysEveryTranscriptIsRecorded(t *testing.T) {
+	store := openStore(t)
+	seat := t.TempDir()
+	transcriptFile(t, seat, "-w-p", "recorded.jsonl", 10, time.Hour)
+	seedSession(t, store, callmeter.Session{SessionID: "recorded", TS: ms(time.Hour)})
+	table, err := Coverage(context.Background(), store, Filter{Since: testNow.Add(-24 * time.Hour), OwnSeat: seat}, chatOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(render(t, table)), "\n")
+	want := "callmeter: every transcript in the window is recorded"
+	if len(table.Rows) != 0 || len(lines) < 2 || lines[1] != want {
+		t.Errorf("empty body = %q, want %q", lines, want)
+	}
+}

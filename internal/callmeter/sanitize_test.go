@@ -134,11 +134,23 @@ func TestSanitizeDetail(t *testing.T) {
 		{"everything omitted", `{"session_id":"s"}`, map[string]bool{"session_id": true}, `{}`},
 		{"an error or reason of an event with no labels becomes bytes", `{"hook_event_name":"PermissionDenied","reason":"private why","error":"rate_limit","nested":{"error":"boom"}}`,
 			map[string]bool{"hook_event_name": true}, `{"reason_bytes":11,"error_bytes":10,"nested":{"error_bytes":4}}`},
+		{"a tool_use_id stays an id", `{"hook_event_name":"PermissionDenied","tool_name":"Bash","tool_use_id":"toolu_denied","tool_input":{"command":"ls"}}`,
+			map[string]bool{"hook_event_name": true, "tool_name": true}, `{"tool_use_id":"toolu_denied","tool_input":{"command_bytes":2}}`},
 		{"an unknown value of a labelled key becomes bytes", `{"hook_event_name":"StopFailure","error":"private failure text"}`,
 			map[string]bool{"hook_event_name": true}, `{"error_bytes":20}`},
 		{"a known label stays", `{"hook_event_name":"StopFailure","error":"max_output_tokens"}`,
 			map[string]bool{"hook_event_name": true}, `{"error":"max_output_tokens"}`},
 		{"an error with no event becomes bytes", `[{"id":"a1","error":"rate_limit"}]`, nil, `[{"id":"a1","error_bytes":10}]`},
+		{"overloaded is a label", `{"hook_event_name":"StopFailure","error":"overloaded"}`,
+			map[string]bool{"hook_event_name": true}, `{"error":"overloaded"}`},
+		{"account_on_hold is a label", `{"hook_event_name":"StopFailure","error":"account_on_hold"}`,
+			map[string]bool{"hook_event_name": true}, `{"error":"account_on_hold"}`},
+		{"cloud_credential_error is a label", `{"hook_event_name":"StopFailure","error":"cloud_credential_error"}`,
+			map[string]bool{"hook_event_name": true}, `{"error":"cloud_credential_error"}`},
+		{"an error in words with spaces becomes bytes", `{"hook_event_name":"StopFailure","error":"overloaded try again"}`,
+			map[string]bool{"hook_event_name": true}, `{"error_bytes":20}`},
+		{"an error off the kind shape becomes bytes", `{"hook_event_name":"StopFailure","error":"Overloaded"}`,
+			map[string]bool{"hook_event_name": true}, `{"error_bytes":10}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -246,6 +258,7 @@ func TestSanitizeInputUnsplittableCommandKeepsOnlyItsSize(t *testing.T) {
 		"cat <<EOF > /tmp/demo-proj/x.txt\n" + heredocBody + "EOF\nif then fi )",
 		"bash -c \"cat <<EOF\n" + heredocBody + "EOF\n$X\"",
 		"bash -c 'cat <<EOF\n" + heredocBody + "EOF\nif then fi )'",
+		"git commit -m \"unterminated private message",
 	} {
 		raw, err := json.Marshal(map[string]string{"command": command})
 		if err != nil {
@@ -303,4 +316,176 @@ func derefString(s *string) string {
 		return "<absent>"
 	}
 	return *s
+}
+
+// A kept field is kept only as a string: an object or array under a kept key
+// (an MCP tool's own input shape) is sized like any other field, so no string
+// nested in it is stored.
+func TestSanitizeInputSizesKeptFieldContainers(t *testing.T) {
+	const secret = "SENTINEL_KEPT_NESTED"
+	values := map[string]string{
+		"object": `{"content":"` + secret + `"}`,
+		"array":  `["` + secret + `"]`,
+	}
+	for name := range keptFields {
+		for shape, value := range values {
+			t.Run(name+" "+shape, func(t *testing.T) {
+				raw := `{"` + name + `":` + value + `,"timeout":3}`
+				got, err := SanitizeInput("mcp__demo__send", json.RawMessage(raw))
+				if err != nil {
+					t.Fatalf("SanitizeInput: %v", err)
+				}
+				want := `{"` + name + `_bytes":` + strconv.Itoa(len(value)) + `,"timeout":3}`
+				if got != want {
+					t.Errorf("SanitizeInput = %s\nwant             %s", got, want)
+				}
+				if strings.Contains(got, secret) {
+					t.Errorf("SanitizeInput kept the nested string: %s", got)
+				}
+			})
+		}
+	}
+}
+
+// An MCP tool's keys mean what its server says: a `to` may be a recipient
+// address, a `type` or `model` free text, a `path` a private name. Every string
+// of an mcp__ tool is sized, kept and label fields included; its numbers,
+// booleans and null stay.
+func TestSanitizeInputSizesEveryMCPString(t *testing.T) {
+	const secret = "SENTINEL_MCP"
+	raw := `{"to":"alice@` + secret + `.example","type":"` + secret + `_TYPE","model":"` + secret + `_MODEL",` +
+		`"url":"https://x.example/cb?token=` + secret + `","path":"/tmp/` + secret + `","limit":3,"all":true,"none":null}`
+	got, err := SanitizeInput("mcp__x__y", json.RawMessage(raw))
+	if err != nil {
+		t.Fatalf("SanitizeInput: %v", err)
+	}
+	want := `{"all":true,"limit":3,"model_bytes":18,"none":null,"path_bytes":17,"to_bytes":26,"type_bytes":17,"url_bytes":39}`
+	if got != want {
+		t.Errorf("SanitizeInput = %s\nwant             %s", got, want)
+	}
+	if strings.Contains(got, secret) {
+		t.Errorf("SanitizeInput kept an mcp string: %s", got)
+	}
+}
+
+// A kept url loses its userinfo, query and fragment, which may carry a
+// credential or a token.
+func TestSanitizeInputCutsURLQueryAndFragment(t *testing.T) {
+	cases := []struct{ name, raw, want string }{
+		{"query and fragment", `{"url":"https://x.example/cb?token=SENTINEL_URL#frag-SENTINEL_URL","prompt":"p"}`, `{"prompt_bytes":1,"url":"https://x.example/cb"}`},
+		{"fragment alone", `{"url":"https://x.example/doc#SENTINEL_URL"}`, `{"url":"https://x.example/doc"}`},
+		{"fragment holding a question mark", `{"url":"https://x.example/doc#a?SENTINEL_URL"}`, `{"url":"https://x.example/doc"}`},
+		{"no query stays", `{"url":"https://x.example/a/b"}`, `{"url":"https://x.example/a/b"}`},
+		{"userinfo with query and fragment", `{"url":"https://u:p@example.com/a?q#f"}`, `{"url":"https://example.com/a"}`},
+		{"userinfo alone", `{"url":"https://SENTINEL_URL:SENTINEL_URL@example.com/a/b"}`, `{"url":"https://example.com/a/b"}`},
+		{"userinfo with no path", `{"url":"https://SENTINEL_URL@example.com"}`, `{"url":"https://example.com"}`},
+		{"userinfo holding an at sign", `{"url":"https://a@SENTINEL_URL:p@example.com/"}`, `{"url":"https://example.com/"}`},
+		{"an at sign in the path stays", `{"url":"https://x.example/@scope/pkg"}`, `{"url":"https://x.example/@scope/pkg"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := SanitizeInput("WebFetch", json.RawMessage(c.raw))
+			if err != nil {
+				t.Fatalf("SanitizeInput: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("SanitizeInput = %s\nwant             %s", got, c.want)
+			}
+			if strings.Contains(got, "SENTINEL") {
+				t.Errorf("SanitizeInput kept the userinfo, query or fragment: %s", got)
+			}
+			again, err := SanitizeInput("WebFetch", json.RawMessage(got))
+			if err != nil || again != got {
+				t.Errorf("sanitized again = %s, %v; want the same bytes", again, err)
+			}
+		})
+	}
+}
+
+// TestSanitizeInputCutsCommandContent: a commit message and the text an echo
+// or printf writes to a file are content, cut to the placeholder with their
+// bytes under operand_bytes; the rest of the command stays as written, and a
+// stored input sanitized again comes back the same bytes.
+func TestSanitizeInputCutsCommandContent(t *testing.T) {
+	cases := []struct {
+		name, command, want string
+		bytes               int // operand_bytes, 0 for absent
+	}{
+		{"commit -m", `git commit -m "MSG-private"`, `git commit -m '[cut]'`, 13},
+		{"commit -am", `git commit -am 'MSG-private'`, `git commit -am '[cut]'`, 13},
+		{"commit --message=", `git commit --message=MSG-private`, `git commit --message='[cut]'`, 11},
+		{"commit --message", `git commit --message "MSG-private" --no-verify`, `git commit --message '[cut]' --no-verify`, 13},
+		{"commit -m attached", `git commit -mMSG-private`, `git commit -m'[cut]'`, 11},
+		{"commit -m=", `git commit -m=MSG-private`, `git commit -m='[cut]'`, 11},
+		{
+			"commit global options, two messages, a trailer",
+			`git -C /tmp/demo-proj commit -s -m "MSG-private one" -m 'MSG-private two' --trailer "Ack: MSG-private" && git push`,
+			`git -C /tmp/demo-proj commit -s -m '[cut]' -m '[cut]' --trailer '[cut]' && git push`,
+			17 + 17 + 18,
+		},
+		{"commit message keeps its substitution", `git commit -m "MSG-private $(git rev-parse HEAD)"`, `git commit -m '[cut]'"$(git rev-parse HEAD)"`, 12},
+		// One pair of quotes held both substitutions: the text between them all counts.
+		{"commit message keeps two substitutions", `git commit -m "MSG-private $(git rev-parse HEAD) and $(date)"`, `git commit -m '[cut]'"$(git rev-parse HEAD)""$(date)"`, 12 + 5},
+		{"echo > file", `echo "TXT-private" > f`, `echo '[cut]' > f`, 13},
+		{"printf >> file", `printf '%s' TXT-private >> f`, `printf '[cut]' '[cut]' >> f`, 4 + 11},
+		{"echo | tee", `echo TXT-private | tee f`, `echo '[cut]' | tee f`, 11},
+		{"echo -n | sudo tee -a", `echo -n TXT-private | sudo tee -a /tmp/demo-proj/f > /dev/null`, `echo -n '[cut]' | sudo tee -a /tmp/demo-proj/f > /dev/null`, 11},
+		{"block redirect", `{ echo TXT-private; echo "$X"; } >> /tmp/demo-proj/f`, `{ echo '[cut]'; echo "$X"; } >> /tmp/demo-proj/f`, 11},
+		{"loop redirect", "for i in 1 2; do echo TXT-private $i; done > f", "for i in 1 2; do echo '[cut]' $i; done > f", 11},
+		{"echo in a substitution", `x=$(echo TXT-private > f) && wc -l f`, `x=$(echo '[cut]' > f) && wc -l f`, 11},
+		{"echo hi stays", `echo hi`, `echo hi`, 0},
+		{"echo into a pipe stays", `echo hi | grep h`, `echo hi | grep h`, 0},
+		{"echo to stderr stays", `echo hi >&2`, `echo hi >&2`, 0},
+		{"echo to /dev/null stays", `echo hi > /dev/null`, `echo hi > /dev/null`, 0},
+		{"echo of a variable stays", `echo "$X" > f`, `echo "$X" > f`, 0},
+		{"commit -F keeps its file", `git commit -F /tmp/demo-proj/msg.txt`, `git commit -F /tmp/demo-proj/msg.txt`, 0},
+		{"git log -m stays", `git log -m --oneline`, `git log -m --oneline`, 0},
+		{"python -c stays", `python3 -c 'print("echo x > f")'`, `python3 -c 'print("echo x > f")'`, 0},
+		// A substitution whose own cut grows it still leaves the word's text cut and counted.
+		{"echo word ending in a cut substitution", `echo secret$(echo a>f) > out`, `echo '[cut]'$(echo '[cut]'>f) > out`, 7},
+		{"echo | sudo -u user tee", `echo secret | sudo -u root tee f`, `echo '[cut]' | sudo -u root tee f`, 6},
+		{"echo | sudo --user user tee", `echo secret | sudo --user root -E tee -a f`, `echo '[cut]' | sudo --user root -E tee -a f`, 6},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := json.Marshal(map[string]string{"command": c.command})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := SanitizeInput("Bash", raw)
+			if err != nil {
+				t.Fatalf("SanitizeInput: %v", err)
+			}
+			if strings.Contains(got, "private") || strings.Contains(got, "secret") {
+				t.Fatalf("stored input carries content: %s", got)
+			}
+			var fields struct {
+				Command      *string `json:"command"`
+				OperandBytes *int    `json:"operand_bytes"`
+			}
+			if err := json.Unmarshal([]byte(got), &fields); err != nil {
+				t.Fatalf("decode %s: %v", got, err)
+			}
+			if fields.Command == nil || *fields.Command != c.want {
+				t.Fatalf("command = %q\nwant      %q", derefString(fields.Command), c.want)
+			}
+			gotBytes := 0
+			if fields.OperandBytes != nil {
+				gotBytes = *fields.OperandBytes
+				if gotBytes == 0 {
+					t.Fatalf("operand_bytes present as 0 in %s", got)
+				}
+			}
+			if gotBytes != c.bytes {
+				t.Fatalf("operand_bytes = %d, want %d (input %s)", gotBytes, c.bytes, got)
+			}
+			again, err := SanitizeInput("Bash", json.RawMessage(got))
+			if err != nil {
+				t.Fatalf("SanitizeInput again: %v", err)
+			}
+			if again != got {
+				t.Fatalf("sanitized again:\n%s\nwant\n%s", again, got)
+			}
+		})
+	}
 }

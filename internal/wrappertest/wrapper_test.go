@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -760,6 +761,33 @@ func TestDownloadFailsUnderHook(t *testing.T) {
 	}
 }
 
+// unwritable missed.log: the would-be line goes to stderr, the exit stays 0
+// and stdout empty, with the session when the payload names one.
+func TestUnwritableMissedLogPrintsTheReason(t *testing.T) {
+	cases := []struct {
+		name, stdin, want string
+	}{
+		{"with session", `{"hook_event_name":"PostToolUse","session_id":"s-1"}`, "callmeter: missed: PostToolUse download failed s-1\n"},
+		{"no session", `{"hook_event_name":"PostToolUse"}`, "callmeter: missed: PostToolUse download failed\n"},
+	}
+	for _, shell := range []string{"sh", "dash", "bash"} {
+		for _, c := range cases {
+			t.Run(shell+"/"+c.name, func(t *testing.T) {
+				r := newRig(t, rigOpts{status: http.StatusNotFound})
+				if err := os.MkdirAll(r.missedPath(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				res := r.runShell(shell, c.stdin, nil, "hook")
+				if res.code != 0 || res.stdout != "" {
+					t.Fatalf("exit %d stdout %q, want 0 and empty", res.code, res.stdout)
+				}
+				assertEqual(t, "stderr", res.stderr, c.want)
+				r.wantNoCachedBinary()
+			})
+		}
+	}
+}
+
 // other subcommand fails: stderr line, exit 1, no missed line.
 func TestDownloadFailsUnderReport(t *testing.T) {
 	r := newRig(t, rigOpts{status: http.StatusNotFound})
@@ -946,21 +974,92 @@ func TestHookKilledBeforeTheBinaryIsMissed(t *testing.T) {
 	r.wantMissedSession("SessionEnd", "killed by signal", "s-killed")
 }
 
-// kill during download: the signal is handled once curl, waiting on a slow
-// server, returns: exit 0 and one missed line, no leftover.
-func TestHookKilledDuringTheDownloadIsMissed(t *testing.T) {
-	t.Parallel()
-	r := newRig(t, rigOpts{delay: 3 * time.Second})
-	p := r.start("sh", `{"hook_event_name":"PostToolUse"}`, nil, "hook")
-	waitFor(t, "the server's first request", func() bool { return r.hits.Load() == 1 })
-	p.signal(syscall.SIGTERM)
-	res := p.wait()
-	if res.code != 0 || res.stdout != "" {
-		t.Fatalf("exit %d stdout %q, want 0 and empty", res.code, res.stdout)
+// hangingBase is a release base on a local listener that accepts every
+// connection and then goes silent: at once (silent), or after the status, the
+// headers and half the asset (half), so curl hangs mid-download with its temp
+// file written, until its own 40 s limit. It returns the base URL and the
+// count of accepted connections.
+func hangingBase(t *testing.T, half bool) (string, *atomic.Int32) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	r.wantMissed("PostToolUse", "killed by signal")
-	r.wantNoCachedBinary()
-	r.wantNoLockOrTemp()
+	var accepted atomic.Int32
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			if half {
+				_, _ = fmt.Fprintf(c, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(fakeBinary), fakeBinary[:len(fakeBinary)/2])
+			}
+			accepted.Add(1)
+		}
+	}()
+	return "http://" + ln.Addr().String(), &accepted
+}
+
+// kill during download: a SIGTERM while curl hangs on a release server that
+// accepted and went silent, before or after the first bytes, is handled at
+// once. The wrapper kills curl, removes its temp file, writes the missed line
+// and exits 0 within 1 s of the signal, inside Claude Code's ~1.5 s grace
+// before its SIGKILL, never after curl's 40 s limit.
+func TestHookKilledDuringAHangingDownloadIsMissedAtOnce(t *testing.T) {
+	t.Parallel()
+	for _, shell := range []string{"sh", "dash", "bash"} {
+		for _, half := range []bool{false, true} {
+			name := shell + "/silent"
+			if half {
+				name = shell + "/half-sent"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				r := newRig(t, rigOpts{})
+				base, accepted := hangingBase(t, half)
+				r.base = base
+				p := r.start(shell, `{"session_id":"s-dl","hook_event_name":"SessionEnd","reason":"other"}`, nil, "hook")
+				waitFor(t, "the release server's first connection", func() bool { return accepted.Load() == 1 })
+				if half {
+					waitForFile(t, filepath.Join(r.home, "bin", ".tmp-"+strconv.Itoa(p.pid())))
+				}
+				time.Sleep(time.Until(p.began.Add(500 * time.Millisecond)))
+				p.signal(syscall.SIGTERM)
+				exited := make(chan error, 1)
+				go func() { exited <- p.cmd.Wait() }()
+				var err error
+				select {
+				case err = <-exited:
+				case <-time.After(time.Second):
+					t.Fatalf("the wrapper under %s still runs 1 s after its SIGTERM", shell)
+				}
+				if err != nil {
+					t.Fatalf("the wrapper under %s ended %v, want exit 0", shell, err)
+				}
+				assertEqual(t, "stdout", p.stdout.String(), "")
+				r.wantMissedSession("SessionEnd", "killed by signal", "s-dl")
+				if err := syscall.Kill(-p.pid(), 0); !errors.Is(err, syscall.ESRCH) {
+					t.Fatalf("a process of the wrapper's group (curl) outlived it: kill -0 = %v", err)
+				}
+				r.wantNoCachedBinary()
+				r.wantNoLockOrTemp()
+			})
+		}
+	}
 }
 
 // kill after install, pid only: the post-install run is a child, so a signal
@@ -1044,6 +1143,45 @@ func TestVersionCleanupFollowsTheStampAge(t *testing.T) {
 			}
 			if present := exists(filepath.Dir(old)); present == tc.removed {
 				t.Fatalf("bin/0.0.9 present = %v, want %v", present, !tc.removed)
+			}
+		})
+	}
+}
+
+// version names: the cleanup removes an aged directory only when its name is a
+// version string, N.N.N with an optional -/+ suffix of [0-9A-Za-z.-]; any other
+// directory under bin/ (CALLMETER_HOME=$HOME makes bin/ the user's ~/bin) stays.
+func TestVersionCleanupRemovesOnlyVersionNames(t *testing.T) {
+	removed := []string{"0.0.9", "1.2.3-rc.1", "1.2.3+build", "10.20.30-beta-2.x", "0.0.1+20260101.sha.0a"}
+	kept := []string{"notes", "1.2", "1.2.3.", "1.2.3.4", ".1.2.3", "1..2.3", "v1.2.3", "1.2.3-", "1.2.3+",
+		"1.2.3-rc+b", "1.2.3_x", "1.2.3 x", "a.b.c", "1.2.x"}
+	for _, shell := range []string{"sh", "dash", "bash"} {
+		t.Run(shell, func(t *testing.T) {
+			r := newRig(t, rigOpts{})
+			bin := filepath.Join(r.home, "bin")
+			for _, name := range append(append([]string{}, removed...), kept...) {
+				d := filepath.Join(bin, name)
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				r.age(d, 8*24*time.Hour)
+			}
+			res := r.runShell(shell, "", nil, "version")
+			if res.code != 0 {
+				t.Fatalf("exit %d stderr %q", res.code, res.stderr)
+			}
+			if _, err := os.Stat(r.cachePath()); err != nil {
+				t.Fatalf("new version missing: %v", err)
+			}
+			for _, name := range removed {
+				if exists(filepath.Join(bin, name)) {
+					t.Errorf("bin/%s survived; a version directory 8 days old goes", name)
+				}
+			}
+			for _, name := range kept {
+				if !exists(filepath.Join(bin, name)) {
+					t.Errorf("bin/%q was removed; it is not a version name", name)
+				}
 			}
 		})
 	}
