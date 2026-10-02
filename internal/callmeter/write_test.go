@@ -716,3 +716,62 @@ func TestUnfinishedCallsSkipsALandedEdit(t *testing.T) {
 		})
 	}
 }
+
+// TestSettleRequestLeavesAnotherOwnersRow: a forked session starts with a copy
+// of its parent's history under the same message ids, one of them written with
+// all-zero usage. The fork's sweep (SettleRequest, Overwrite) must leave the
+// parent's row as it stands, whether the copy is older than the fork's first
+// run (the UPDATE) or not (the upsert); so must a sub-agent's sweep over a
+// main-chat row. The owner's own sweep still overwrites.
+func TestSettleRequestLeavesAnotherOwnersRow(t *testing.T) {
+	ctx := context.Background()
+	parent := func() Request {
+		return Request{
+			RequestID: "msg_m", SessionID: Ptr("sess-a"), TS: Ptr(int64(100)), Model: Ptr("claude-opus-4-1"),
+			StopReason: Ptr("tool_use"), InputTokens: Ptr(int64(2)), CacheReadTokens: Ptr(int64(331235)),
+			CacheCreationTokens: Ptr(int64(344)), ContextTokens: Ptr(int64(331581)), OutputTokens: Ptr(int64(583)),
+		}
+	}
+	zeroed := func(session string, agent *string) Request {
+		return Request{
+			RequestID: "msg_m", SessionID: Ptr(session), AgentID: agent, TS: Ptr(int64(100)),
+			Model: Ptr("claude-opus-4-1"), StopReason: Ptr("tool_use"), Pending: Ptr(false), Source: Ptr(SourceHook),
+			InputTokens: Ptr(int64(0)), CacheReadTokens: Ptr(int64(0)), CacheCreationTokens: Ptr(int64(0)),
+			ContextTokens: Ptr(int64(0)), OutputTokens: Ptr(int64(0)),
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		sweep Request
+		since int64
+		want  int64 // output_tokens after the sweep
+	}{
+		{"fork older than its first run", zeroed("sess-b", nil), 200, 583},
+		{"fork at or after its first run", zeroed("sess-b", nil), 50, 583},
+		{"sub-agent over a main-chat row", zeroed("sess-a", Ptr("agent-1")), 200, 583},
+		{"owner older than its first run", zeroed("sess-a", nil), 200, 0},
+		{"owner at or after its first run", zeroed("sess-a", nil), 50, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStore(t)
+			if err := store.UpsertRequest(ctx, parent(), Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				return tx.SettleRequest(ctx, tc.sweep, nil, tc.since)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got := row(t, store, "requests", "request_id = ?", "msg_m")
+			if got["output_tokens"] != tc.want || got["session_id"] != "sess-a" || got["agent_id"] != nil {
+				t.Errorf("msg_m output %v session %v agent %v, want %d sess-a <nil>",
+					got["output_tokens"], got["session_id"], got["agent_id"], tc.want)
+			}
+			if tc.want != 0 && (got["input_tokens"] != int64(2) || got["cache_read_tokens"] != int64(331235) ||
+				got["cache_creation_tokens"] != int64(344)) {
+				t.Errorf("msg_m tokens %v/%v/%v, want 2/331235/344 unchanged",
+					got["input_tokens"], got["cache_read_tokens"], got["cache_creation_tokens"])
+			}
+		})
+	}
+}

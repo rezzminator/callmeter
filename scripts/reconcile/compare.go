@@ -262,6 +262,8 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			unknown = append(unknown, f)
 		case f.stage == "transcript" && unfillable(st, w, f) != "":
 			rep.expect("fault-transcript-unfillable", f.session, f.ts, reasonUnfillable, unfillable(st, w, f))
+		case f.stage == callmeter.StageTranscript && f.session != "" && strings.HasPrefix(f.err, endBudgetPrefix) && !workMismatch(rep.mismatches, f.session):
+			rep.expect("fault-"+f.stage, f.session, f.ts, reasonEndBudget, "")
 		default:
 			rep.add("fault-"+f.stage, f.session, f.ts, "", nonEmpty(f.toolUseID)...)
 		}
@@ -289,6 +291,9 @@ var lostHookReason = map[string]string{
 
 const (
 	reasonRanNothing             = "the session started and ran nothing: only idle lifecycle events, no calls, requests, agents or turns, and no fault or lost event that could hide work (internal/callmeter/report/sessions.go ranNothing)"
+	reasonIdleNotification       = "the session's only store rows are Notification events, with no SessionStart, and its transcript holds no assistant line: a chat already open when the hooks loaded (a /reload-plugins, a local command firing no SessionStart or UserPromptSubmit) whose first hook was an idle notification"
+	reasonBlockedPrompt          = "another UserPromptSubmit hook blocked the prompt: the store records every UserPromptSubmit that fired, and Claude Code wrote no prompt line, only a system line with preventContinuation within 2 s of it"
+	reasonEndBudget              = "SessionEnd spent its transcript-read budget and recorded the skipped reads as a fault by design (internal/hookentry/callmeter.go, sessionEndBudget); none of the session's calls, requests or agents mismatch, so the skipped reads hid nothing"
 	reasonKilledBeforeReply      = "the session was killed before the model's first reply: the store holds only its SessionStart, UserPromptSubmit and SessionEnd events, and its transcript holds a prompt and no assistant line (a launch killed or cleared mid-request)"
 	reasonUnfillable             = "report-time recovery read every transcript of the session in full and an agent turn, a Stop, a prompt's turn end, an open call or a sub-agent's open turn still had nothing to fill it, and it recorded that once; this check's own parse of the transcripts confirms they hold none at or after the session's first row (callmeter.RecoverQuiet)"
 	reasonKilledStopFailure      = "Claude Code killed the StopFailure hook at a headless exit; the StopFailure row of the session ending right after it (hook or rebuilt from its transcript at SessionEnd) stands for it"
@@ -1078,6 +1083,65 @@ func ranNothing(id string, st storeData) bool {
 	return true
 }
 
+// endBudgetPrefix opens the fault SessionEnd records when its transcript-read
+// budget ran out (internal/hookentry/callmeter.go, sessionEndBudget).
+const endBudgetPrefix = "SessionEnd spent its "
+
+// workMismatch reports whether a call, request or agent of the session holds an
+// unexplained mismatch: work a skipped transcript read could have left unsettled.
+func workMismatch(ms []mismatch, session string) bool {
+	for _, m := range ms {
+		if m.session != session || m.reason != "" {
+			continue
+		}
+		for _, p := range []string{"call-", "request-", "agent-"} {
+			if strings.HasPrefix(m.class, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// notificationOnly reports whether the store's only rows for a session are
+// Notification events: no SessionStart, no prompt, no work, no fault.
+func notificationOnly(id string, st *storeData) bool {
+	found := false
+	for _, e := range st.events {
+		if e.session != id {
+			continue
+		}
+		if e.event != "Notification" {
+			return false
+		}
+		found = true
+	}
+	if !found || st.turnSessions[id] {
+		return false
+	}
+	for _, c := range st.calls {
+		if c.session == id {
+			return false
+		}
+	}
+	for _, r := range st.requests {
+		if r.session == id {
+			return false
+		}
+	}
+	for _, a := range st.agents {
+		if a.session == id {
+			return false
+		}
+	}
+	for _, f := range st.faults {
+		if f.session == id {
+			return false
+		}
+	}
+	return true
+}
+
 // promptlessDetail names what the store holds for a session that never
 // reached the model: its model, start source and lifecycle events.
 func promptlessDetail(s *sSession, st *storeData) string {
@@ -1103,11 +1167,20 @@ func compareSessions(rep *report, st *storeData, w *world, compared []*sSession,
 		}
 		// Model activity before the session's first store row: hooks were not
 		// yet delivered (a session already running when the plugin was enabled).
-		subLines, preAssistants, preTools := 0, t.preAssistants, len(t.preToolUses)
-		for _, a := range w.subagents[s.id] {
-			subLines += a.windowLines
-			preAssistants += a.preAssistants
-			preTools += len(a.preToolUses)
+		// A line whose message the store holds under another session is that
+		// session's (a fork's copied history), never back-filled into this one.
+		subLines, preAssistants, preTools := 0, 0, 0
+		for _, tr := range append([]*transcript{t}, w.subagents[s.id]...) {
+			if tr != t {
+				subLines += tr.windowLines
+			}
+			for id, c := range tr.preByMsg {
+				if r := st.requests[id]; id != "" && r != nil && r.session != "" && r.session != s.id {
+					continue
+				}
+				preAssistants += c.lines
+				preTools += c.tools
+			}
 		}
 		if preAssistants > 0 {
 			rep.add("session-pre-first-row", s.id, 0, fmt.Sprintf("first_row=%s assistant_lines=%d tool_uses=%d start_source=%s", msString(s.firstTS), preAssistants, preTools, orDash(s.startSource)))
@@ -1120,6 +1193,8 @@ func compareSessions(rep *report, st *storeData, w *world, compared []*sSession,
 				rep.add("session-no-transcript", s.id, 0, fmt.Sprintf("window_lines=%d", t.windowLines))
 			} else if promptOnly(s.id, *st) && len(t.prompts) > 0 {
 				rep.expect("session-promptless", s.id, 0, reasonKilledBeforeReply, promptlessDetail(s, st))
+			} else if notificationOnly(s.id, st) {
+				rep.expect("session-promptless", s.id, 0, reasonIdleNotification, promptlessDetail(s, st))
 			} else {
 				rep.add("session-promptless", s.id, 0, promptlessDetail(s, st))
 			}
@@ -1435,7 +1510,7 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 			}
 		}
 		// Mirrors ReadAgentTotals, which counts the whole agent transcript.
-		toolUses := int64(len(t.toolUses) + len(t.preToolUses))
+		toolUses := int64(len(t.toolUses) + len(t.preToolUses) + len(t.earlyToolUses))
 		if a.toolUses >= 0 && a.toolUses != toolUses {
 			detail := fmt.Sprintf("transcript=%d store=%d", toolUses, a.toolUses)
 			// The count is written at SubagentStop: a stopped agent's open last
@@ -1570,8 +1645,9 @@ func compareParts(rep *report, st *storeData, w *world) {
 // UserPromptSubmit carrying its promptId, repeated once per queued command.
 func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 	type tally struct {
-		n       map[string]int
-		prompts map[string]bool
+		n        map[string]int
+		prompts  map[string]bool
+		promptTS map[string]int64 // a prompt's first UserPromptSubmit (unix ms)
 	}
 	per := map[string]*tally{}
 	for _, e := range st.events {
@@ -1580,7 +1656,7 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		}
 		t := per[e.session]
 		if t == nil {
-			t = &tally{n: map[string]int{}, prompts: map[string]bool{}}
+			t = &tally{n: map[string]int{}, prompts: map[string]bool{}, promptTS: map[string]int64{}}
 			per[e.session] = t
 		}
 		if e.agent != "" {
@@ -1600,6 +1676,9 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		}
 		if e.event == "UserPromptSubmit" && e.promptID != "" {
 			t.prompts[e.promptID] = true
+			if ts, ok := t.promptTS[e.promptID]; !ok || e.ts < ts {
+				t.promptTS[e.promptID] = e.ts
+			}
 		}
 	}
 	// A session's latest run ended when its main chat holds a SessionEnd at or
@@ -1666,11 +1745,13 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		if pre, post := c.n["PreCompact"]+c.n["agent:PreCompact"], c.n["PostCompact"]+c.n["agent:PostCompact"]; pre != post {
 			rep.add("event-precompact-unfinished", s.id, 0, fmt.Sprintf("pre=%d post=%d", pre, post))
 		}
-		if t.entrypoints["cli"] && len(t.entrypoints) == 1 && c.n["Stop"] != t.turnDurations {
-			detail := fmt.Sprintf("transcript_turns=%d store_stop=%d", t.turnDurations, c.n["Stop"])
+		// A turn ends in Stop or StopFailure: a turn_duration right after an
+		// API error ends a failed turn, which event-stopfailure checks.
+		if stopped := t.turnDurations - t.failedDurations; t.entrypoints["cli"] && len(t.entrypoints) == 1 && c.n["Stop"] != stopped {
+			detail := fmt.Sprintf("transcript_turns=%d store_stop=%d", stopped, c.n["Stop"])
 			// Stops within hookLag of the snapshot whose turn_duration line
 			// falls after --until: the turn's end is not yet on both sides.
-			if excess := c.n["Stop"] - t.turnDurations; excess > 0 && excess <= c.n["Stop:lag"] {
+			if excess := c.n["Stop"] - stopped; excess > 0 && excess <= c.n["Stop:lag"] {
 				rep.edge("event-stop-lag", s.id, 0, detail)
 			} else {
 				rep.add("event-stop", s.id, 0, detail)
@@ -1695,13 +1776,41 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		if len(missing) > 0 {
 			rep.add("event-prompt-missing", s.id, 0, fmt.Sprintf("transcript_prompts=%d", len(t.prompts)), missing...)
 		}
-		if len(extra) > 0 {
-			rep.add("event-prompt-extra", s.id, 0, fmt.Sprintf("store_prompts=%d", len(c.prompts)), extra...)
+		// A prompt another UserPromptSubmit hook blocked: its hook fired, and
+		// the transcript holds only the warning that stopped it.
+		var blocked, unblocked []string
+		for _, p := range extra {
+			if blockedNear(t.blocks, c.promptTS[p]) {
+				blocked = append(blocked, p)
+			} else {
+				unblocked = append(unblocked, p)
+			}
+		}
+		if len(blocked) > 0 {
+			rep.expect("event-prompt-extra", s.id, 0, reasonBlockedPrompt, fmt.Sprintf("store_prompts=%d", len(c.prompts)), blocked...)
+		}
+		if len(unblocked) > 0 {
+			rep.add("event-prompt-extra", s.id, 0, fmt.Sprintf("store_prompts=%d", len(c.prompts)), unblocked...)
 		}
 		if repeats := c.n["UserPromptSubmit"] - len(c.prompts); repeats != t.queued {
 			rep.add("event-prompt-repeat", s.id, 0, fmt.Sprintf("store_repeats=%d transcript_queued=%d", repeats, t.queued))
 		}
 	}
+}
+
+// blockedWindow is how far a preventContinuation warning may sit from the
+// UserPromptSubmit it answers.
+const blockedWindow int64 = 2_000 // ms
+
+// blockedNear reports whether a preventContinuation warning lies within
+// blockedWindow of a UserPromptSubmit at ts.
+func blockedNear(blocks []int64, ts int64) bool {
+	for _, b := range blocks {
+		if b >= ts-blockedWindow && b <= ts+blockedWindow {
+			return true
+		}
+	}
+	return false
 }
 
 // allowlist entries: `class | scopes | reason`, scopes space-separated, any one
