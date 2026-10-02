@@ -169,10 +169,12 @@ type Result struct {
 }
 
 // SettledCall is the calls row a transcript's result settles: the delivered
-// size, failed and the outcome label (nil when the result has none), and for a
-// failed call (a refusal included) the real size too: a failure's text is its
-// whole output, the size PostToolUseFailure stores, and a refusal's is Claude
-// Code's own text.
+// size, failed, the outcome label (nil when the result has none) and the real
+// size. A failed call's (a refusal included) is its text: a failure's text is
+// its whole output, the size PostToolUseFailure stores, and a refusal's is
+// Claude Code's own text. Any other call's is r.Real, the size PostToolUse
+// stores (RealBytes of the result line's toolUseResult), nil when the line
+// carries none.
 // It holds sizes and labels only, never the result's text, and no ts: the
 // caller sets one only for a call stored before every hook set it.
 func SettledCall(toolUseID string, r Result) Call {
@@ -181,6 +183,7 @@ func SettledCall(toolUseID string, r Result) Call {
 		BytesDelivered: Ptr(r.Bytes),
 		Failed:         Ptr(r.Failed),
 		Error:          presentString(r.Outcome),
+		BytesReal:      r.Real,
 	}
 	if r.Failed {
 		call.BytesReal = Ptr(r.Bytes)

@@ -606,7 +606,7 @@ type UnfinishedCall struct {
 	AgentType *string
 	NoTS      bool // ts IS NULL: stored before every hook set one
 	// Delivered: bytes_delivered is set, so the batch already stored the call's
-	// size; RecoverQuiet settles only a call whose size is still unknown.
+	// size; RecoverQuiet fills only its real size, from a result that has one.
 	Delivered bool
 	// Rebuilt: a call recovery rebuilt from a transcript (source transcript)
 	// that did not fail, so its real size is its result's toolUseResult.

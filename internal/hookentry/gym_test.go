@@ -552,10 +552,18 @@ func TestReplayDuplicates(t *testing.T) {
 }
 
 // TestReplayLostPostToolUse: a call whose PostToolUse never arrived keeps
-// what its PreToolUse and its batch said, and the reports still run.
+// what its PreToolUse and its batch said, the main chat's Stop sweep fills the
+// real size PostToolUse would have stored from the transcript result's
+// toolUseResult, and the reports still run.
 func TestReplayLostPostToolUse(t *testing.T) {
+	full := newReplay(t, "gym/S1")
+	full.feedInOrder()
 	r := newReplay(t, "gym/S1")
 	id, call := r.commandCall("wc -l data.csv")
+	wantReal := full.lab.call(id)["bytes_real"]
+	if wantReal == "<nil>" {
+		t.Fatalf("the full replay stored no real size for %s", id)
+	}
 	lost := -1
 	for i, payload := range r.payloads {
 		fields := decoded(t, payload)
@@ -571,6 +579,7 @@ func TestReplayLostPostToolUse(t *testing.T) {
 	row := r.lab.call(id)
 	expect(t, "call without PostToolUse", row, map[string]any{
 		"tool": "Bash", "cwd": call.preCwd, "bytes_delivered": len(r.batchResponse(id)), "prompt_id": call.prompt,
+		"bytes_real": wantReal,
 	})
 	for _, column := range []string{"ts", "request_id"} {
 		if row[column] == "<nil>" {

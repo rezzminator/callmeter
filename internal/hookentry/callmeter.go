@@ -1292,8 +1292,9 @@ func (run *callmeterRun) awaitResults(
 // call of the session with no real size — its PreToolUse alone landed, as when
 // the user interrupts a sub-agent mid-call, or Claude Code refused it before
 // any PostToolUse — from the tool_result its transcript holds: the delivered
-// size, failed and the outcome label, each only filling, and for a failed
-// call the real size too (callmeter.SettledCall). A call with no result on disk (still running, or its
+// size, failed, the outcome label and the real size (a failure's text, else
+// RealBytes of the result's toolUseResult, as PostToolUse stores it), each
+// only filling (callmeter.SettledCall). A call with no result on disk (still running, or its
 // session killed) stays unknown, as does one whose typed agent's transcript is
 // missing: that absence is already a transcript fault at its batch or stop. At
 // Stop a call with no result is left alone: a background call may still be
