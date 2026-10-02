@@ -1907,16 +1907,22 @@ func TestNoticeEndedAgentTurnIsShown(t *testing.T) {
 				{name: "notice in agent transcript", agent: fxAgent, status: "<status>completed</status>", origin: "task-notification", noticeTS: 9, stopped: 9, inAgent: true, wantMismatch: true},
 				{name: "other origin", agent: fxAgent, status: "<status>completed</status>", origin: "peer", noticeTS: 9, stopped: 9, wantMismatch: true},
 				{name: "missing origin", agent: fxAgent, status: "<status>completed</status>", noticeTS: 9, stopped: 9, wantMismatch: true},
-				{name: "content array", agent: fxAgent, status: "<status>completed</status>", origin: "task-notification", noticeTS: 9, stopped: 9, arrayContent: true, wantMismatch: form == "user"},
+				{name: "content array", agent: fxAgent, status: "<status>completed</status>", origin: "task-notification", noticeTS: 9, stopped: 9, arrayContent: true},
 			} {
 				t.Run(c.name, func(t *testing.T) {
 					body := "<task-notification><task-id>" + c.agent + "</task-id>" + c.status + "<summary>" + fxSecret + "</summary></task-notification>"
 					origin := map[string]any{"kind": c.origin, "producer": "session-task"}
+					// A content array (a queued prompt carrying an image is one) is
+					// read from its "text" blocks, as prompt or message.content.
+					var content any = body
+					if c.arrayContent {
+						content = []map[string]any{{"type": "text", "text": body}}
+					}
 					var notice string
 					if form == "attachment" {
 						// Gym S2 main transcript line 38: queued_command, prompt,
 						// commandMode, origin.kind/producer and timestamp.
-						a := map[string]any{"type": "queued_command", "prompt": body, "commandMode": "task-notification"}
+						a := map[string]any{"type": "queued_command", "prompt": content, "commandMode": "task-notification"}
 						if c.origin != "" {
 							a["origin"] = origin
 						}
@@ -1924,10 +1930,6 @@ func TestNoticeEndedAgentTurnIsShown(t *testing.T) {
 					} else {
 						// Gym S2 main transcript line 50: user, origin.kind/producer,
 						// promptSource, turnOrigin and string message.content.
-						var content any = body
-						if c.arrayContent {
-							content = []map[string]any{{"type": "text", "text": body}}
-						}
 						l := map[string]any{"type": "user", "timestamp": fxTS(c.noticeTS), "promptSource": "system", "turnOrigin": "task_notification", "isMeta": true, "message": map[string]any{"role": "user", "content": content}}
 						if c.origin != "" {
 							l["origin"] = origin
@@ -2023,7 +2025,14 @@ func TestNoticeAgent(t *testing.T) {
 }
 
 func TestNoticeCollectionBounds(t *testing.T) {
-	for _, form := range []string{"attachment", "user"} {
+	// Real shape (3e663996, a queued human prompt carrying an image): the prompt
+	// is a content-block array, not a string,
+	// {"type":"attachment","attachment":{"type":"queued_command","origin":{"kind":"human"},
+	// "prompt":[{"type":"<str>","source":{"type":"<str>","media_type":"<str>","data":"<str>"}}, …]}}.
+	// Such a line never fails the transcript, and a notice in that shape (as a
+	// prompt or a user message's content) is read from its "text" blocks.
+	image := map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}}
+	for _, form := range []string{"attachment", "user", "attachment blocks", "user blocks"} {
 		t.Run(form, func(t *testing.T) {
 			for _, c := range []struct {
 				name               string
@@ -2041,15 +2050,23 @@ func TestNoticeCollectionBounds(t *testing.T) {
 					// origin, or user string message.content with top-level origin.
 					body := "<task-id>" + fxAgent + "</task-id><status>completed</status><summary>" + fxSecret + "</summary>"
 					origin := map[string]any{"kind": "task-notification"}
-					l := map[string]any{"type": form, "timestamp": fxTS(9)}
-					if form == "attachment" {
-						l["attachment"] = map[string]any{"type": "queued_command", "origin": origin, "prompt": body}
+					kind, blocks := strings.CutSuffix(form, " blocks")
+					var prompt any = body
+					if blocks {
+						prompt = []any{map[string]any{"type": "text", "text": body}, image}
+					}
+					l := map[string]any{"type": kind, "timestamp": fxTS(9)}
+					if kind == "attachment" {
+						l["attachment"] = map[string]any{"type": "queued_command", "origin": origin, "prompt": prompt}
 					} else {
 						l["origin"] = origin
-						l["message"] = map[string]any{"content": body}
+						l["message"] = map[string]any{"content": prompt}
 					}
+					human := map[string]any{"type": "attachment", "timestamp": fxTS(8), "attachment": map[string]any{
+						"type": "queued_command", "origin": map[string]any{"kind": "human"}, "prompt": []any{image, map[string]any{"type": "text", "text": fxSecret}},
+					}}
 					path := filepath.Join(t.TempDir(), "notice.jsonl")
-					writeLines(t, path, []string{jsonLine(t, l)})
+					writeLines(t, path, []string{jsonLine(t, human), jsonLine(t, l)})
 					w := newWorld(fxMS(c.since), fxMS(c.until))
 					if c.from != 0 {
 						w.from[fxSession] = fxMS(c.from)

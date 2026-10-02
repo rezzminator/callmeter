@@ -444,23 +444,26 @@ func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
 					Kind string `json:"kind"`
 				} `json:"origin"`
 				Message struct {
-					Content string `json:"content"`
+					Content json.RawMessage `json:"content"`
 				} `json:"message"`
 				Attachment struct {
 					Type   string `json:"type"`
 					Origin struct {
 						Kind string `json:"kind"`
 					} `json:"origin"`
-					Prompt string `json:"prompt"`
+					Prompt json.RawMessage `json:"prompt"`
 				} `json:"attachment"`
 			}
 			if json.Unmarshal(raw, &entry) == nil {
-				body := ""
+				// The body is a string, or a content-block array (a queued prompt
+				// carrying an image) read from its "text" blocks; any other shape
+				// is no notice, never a failed line.
+				var body string
 				switch {
 				case entry.Type == "user" && entry.Origin.Kind == "task-notification":
-					body = entry.Message.Content
+					body, _ = ResultText(entry.Message.Content)
 				case entry.Type == "attachment" && entry.Attachment.Type == "queued_command" && entry.Attachment.Origin.Kind == "task-notification":
-					body = entry.Attachment.Prompt
+					body, _ = ResultText(entry.Attachment.Prompt)
 				}
 				_, task, hasTask := strings.Cut(body, "<task-id>")
 				agentID, _, taskClosed := strings.Cut(task, "</task-id>")

@@ -17,8 +17,40 @@ func TestReadTaskNoticesReadsOnlyIdAndStatus(t *testing.T) {
 	at := time.Date(2026, 10, 1, 0, 52, 21, 292000000, time.UTC)
 	attachment := taskNoticeLine("attachment", "a1", "completed", at)
 	user := taskNoticeLine("user", "a1", "failed", at.Add(time.Second))
+	// Real shape (a queued human prompt carrying an image): the prompt, or a
+	// user message's content, is a content-block array, not a string,
+	// {"type":"attachment","attachment":{"type":"queued_command","origin":{"kind":"human"},
+	// "prompt":[{"type":"text","text":…},{"type":"image","source":{"type":…,"media_type":…,"data":…}}]}}.
+	// A notice in that shape is read from its "text" blocks.
+	asBlocks := func(line string) string {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		holder, key := entry["message"], "content"
+		if entry["type"] == "attachment" {
+			holder, key = entry["attachment"], "prompt"
+		}
+		fields, ok := holder.(map[string]any)
+		if !ok {
+			t.Fatalf("no %s to wrap in %s", key, line)
+		}
+		fields[key] = []any{
+			map[string]any{"type": "text", "text": fields[key]},
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+		}
+		out, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+	human := strings.Replace(asBlocks(taskNoticeLine("attachment", "h1", "completed", at)), `"kind":"task-notification"`, `"kind":"human"`, 1)
 	lines := []string{
 		attachment, user, taskNoticeLine("user", "a2", "killed", at.Add(2*time.Second)),
+		asBlocks(taskNoticeLine("attachment", "a3", "completed", at.Add(3*time.Second))),
+		asBlocks(taskNoticeLine("user", "a3", "failed", at.Add(4*time.Second))),
+		human,
 		// Synthetic queue-operation shape from gym S2: content is not a notice.
 		`{"type":"queue-operation","content":"<task-notification><task-id>queued</task-id><status>completed</status></task-notification>","timestamp":"2026-10-01T00:52:21.292Z"}`,
 		`{"type":"attachment","task-notification": broken`,
@@ -44,7 +76,10 @@ func TestReadTaskNoticesReadsOnlyIdAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string][]int64{"a1": {at.UnixMilli(), at.Add(time.Second).UnixMilli(), at.Add(-time.Second).UnixMilli()}, "a2": {at.Add(2 * time.Second).UnixMilli()}}
+	want := map[string][]int64{
+		"a1": {at.UnixMilli(), at.Add(time.Second).UnixMilli(), at.Add(-time.Second).UnixMilli()}, "a2": {at.Add(2 * time.Second).UnixMilli()},
+		"a3": {at.Add(3 * time.Second).UnixMilli(), at.Add(4 * time.Second).UnixMilli()},
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReadTaskNotices = %v, want %v", got, want)
 	}

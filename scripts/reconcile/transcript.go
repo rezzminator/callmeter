@@ -231,7 +231,9 @@ type line struct {
 		Origin    *struct {
 			Kind string `json:"kind"`
 		} `json:"origin"`
-		Prompt string `json:"prompt"`
+		// Prompt is a string, or a content-block array when the queued prompt
+		// carries an image (promptText).
+		Prompt json.RawMessage `json:"prompt"`
 	} `json:"attachment"`
 	Message *struct {
 		ID         string          `json:"id"`
@@ -438,19 +440,40 @@ func (w *world) notice(l *line, ms int64) {
 		if l.Origin == nil || l.Origin.Kind != "task-notification" || l.Message == nil {
 			return
 		}
-		if err := json.Unmarshal(l.Message.Content, &body); err != nil {
-			return
-		}
+		body = promptText(l.Message.Content)
 	case "attachment":
 		a := l.Attachment
 		if a == nil || a.Type != "queued_command" || a.Origin == nil || a.Origin.Kind != "task-notification" {
 			return
 		}
-		body = a.Prompt
+		body = promptText(a.Prompt)
 	}
 	if agent, ok := noticeAgent(body); ok {
 		w.notices[agent] = append(w.notices[agent], ms)
 	}
+}
+
+// promptText is a prompt's text: a string as it is, a content-block array's
+// "text" blocks joined (a queued prompt carrying an image), any other shape "".
+func promptText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var joined strings.Builder
+	for _, b := range blocks {
+		if b.Type == "text" {
+			joined.WriteString(b.Text)
+		}
+	}
+	return joined.String()
 }
 
 // noticeAgent reads only the task id and the presence of a non-empty status.
