@@ -1,6 +1,6 @@
 # callmeter
 
-**Every tool call, model request, sub-agent turn and lifecycle event of every Claude Code chat, recorded into one local SQLite store, with reports that show where the context went.**
+**Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 ## What it records
 

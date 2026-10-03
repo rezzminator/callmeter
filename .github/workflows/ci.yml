@@ -31,6 +31,8 @@ jobs:
       - name: validate the plugin
         run: claude plugin validate --strict plugins/callmeter
       - name: leak gate
+        # A fork's pull request gets no secrets; the gate runs on every push to develop and main.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           LEAK_TERMS_CONTENT: ${{ secrets.LEAK_TERMS }}
         run: |
