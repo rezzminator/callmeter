@@ -22,8 +22,8 @@ It records counts and sizes, never your prompts, messages or file contents. It n
 ## 🚀 Quick start
 
 ```sh
-claude plugin marketplace add rezzminator/callmeter
-claude plugin install callmeter@callmeter
+claude plugin marketplace add rezzminator/professor
+claude plugin install callmeter@professor
 ```
 
 Start a new session, work as usual, then ask:
@@ -165,7 +165,7 @@ scripts/release-check.sh
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), passes `scripts/release-check.sh --release`, and is tagged `callmeter--v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
 
 ## 🎓 Built with Professor
 

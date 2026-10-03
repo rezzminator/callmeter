@@ -146,7 +146,7 @@ func newRig(t *testing.T, opts rigOpts) *rig {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/callmeter--v"+version+"/"+r.asset {
+		if req.URL.Path != "/v"+version+"/"+r.asset {
 			http.NotFound(w, req)
 			return
 		}
