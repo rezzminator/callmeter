@@ -1,0 +1,197 @@
+# reconcile allowlist: one entry per line, `class | scopes | reason`.
+# scopes, space-separated, any one matching: a prefix of a session, call,
+# request, prompt or agent id; `tool={name}` (matched exactly) for a class whose
+# mismatch carries its tool; or `ts<{RFC 3339}` for a row older than that time.
+# No entry matches a whole class: the loader refuses a bare wildcard scope.
+# Every entry carries the reason it is expected; an allowlisted mismatch still
+# prints, as "expected: {reason}". A state not yet due at --until (a call in
+# flight, a provisional request with no fill due, a Bash call no report has
+# parsed) prints as PENDING, never a mismatch, so it needs no entry.
+#
+# T = 2026-10-02T00:24:39Z: the fixed binary went live. A `ts<` entry names a
+# defect of the binary before it; nothing at or after T is ever allowlisted.
+# T2 = 2026-10-02T01:26:49Z: the second fixed binary went live. A row the T1
+# binary wrote (T..T2) is listed per id, naming its defect fixed at T2.
+# Claude Code behaviour that recurs is a classification in compare.go, printed
+# EXPECTED with its own reason and needing no line here: session-ran-nothing,
+# a fault-binary StopFailure kill beside its StopFailure row, a fault-binary
+# kill of unknown event whose every neighbouring session reconciles, a
+# fault-terminated Stop whose cancelled turn has its Stop row,
+# parse-script-body, parse-python-code-unresolved, parse-python-unparsed-pre6,
+# parse-node-eval, parts-command-not-stored, parts-no-cwd, a swept batch-only call, a session-no-end-hook
+# whose end_reason is never and whose transcript holds no SessionEnd hook
+# entry, a session-unrecorded a scratch store under --scratch records, the
+# call-no-request, call-no-size, request-missing and agent-tool-uses of a call
+# TaskStop cut, and the `-lag` PENDING states within hookLag of the snapshot's
+# latest row.
+
+# --- the window's start ---
+
+# Sessions already running when the plugin was enabled (2026-10-01 14:39 UTC):
+# their transcripts begin 2026-09-29 (f0d28042) and 2026-10-01 00:17
+# (f8e9fb29); hooks reached them only from their first store row.
+session-pre-first-row | f0d28042 f8e9fb29 | session already running when the plugin was enabled; hooks reached it only from its first store row
+# Seat 1 at install (store first row 11:29:09Z): the main transcripts hold
+# assistant lines before each first row; 7cd99294 and ae3d8096 were resumed
+# into the hooks at 12:38Z, 96b51bab loaded them with /reload-plugins.
+session-pre-first-row | 7cd99294 96b51bab ae3d8096 | session already running when callmeter loaded in that chat (install time); hooks reached it only from its first store row
+
+# --- rows the binary before T wrote ---
+
+request-tokens | ts<2026-10-02T00:24:39Z | pre-fix binary, backfilled by the store-v2 migration: it kept the first transcript line's partial usage, not the message's last
+request-stop-reason | ts<2026-10-02T00:24:39Z | pre-fix binary, backfilled by the store-v2 migration: it stored no stop_reason
+agent-turn-no-start | ts<2026-10-02T00:24:39Z | lost-before-fix: the pre-fix binary never stored these turns' starts, so they cannot be recovered
+# A text-only reply: the binary before T wrote a request row only from a tool
+# call's batch, so no text-only message has one (the store holds no calls=0 row
+# before 2026-10-02T00:03:56Z among 4817 earlier requests); sweepRequests
+# writes them at Stop, SubagentStop and SessionEnd since.
+request-untracked | ts<2026-10-02T00:24:39Z | pre-fix binary: it wrote a request only from a tool call's batch, never a text-only reply's
+# The totals differ only through rows reported apiece: the pre-fix partial
+# usage (request-tokens) and the killed headless runs' missing requests.
+token-sum | ts<2026-10-02T00:24:39Z | the sums differ through the pre-fix request-tokens rows and the request-missing rows, each reported on its own line
+agent-turns | aca0290759df48209 | its 24th store turn is a SubagentStop with no start at 2026-10-02T00:01:39Z (agent-turn-no-start, lost-before-fix); the transcript counts 23
+# Refused before its hooks ran (failed=1, PostToolBatch alone): the binary
+# before T wrote no ts, no bytes_real and no input for such a row; recordBatch
+# fills ts and bytes_real now. With no input, no report can parse it.
+call-no-ts | toolu_01NoH7k5tzEWLgeKzAVWmh2f | refused before its hooks ran: the pre-fix recordBatch wrote no ts (fixed: internal/hookentry/callmeter.go recordBatch fills TS)
+call-no-size | toolu_01NoH7k5tzEWLgeKzAVWmh2f | refused before its hooks ran: the pre-fix recordBatch wrote no bytes_real (fixed: internal/hookentry/callmeter.go recordBatch fills it)
+# Unparsed at the last live report while a later call (22:02:31) was parsed;
+# a replay of `callmeter report` on a copy parses all eight, so the report
+# skips none of them: they wait for its next run.
+parts-missing | toolu_01CGxZPty4pMb3AfDvy45tqL toolu_01FLzGgyFcGsdVbnb8mfhGvj toolu_01JT9kFR75ENssnLmZKJVNQA toolu_01MjjickpwMDTh4k8wZkN9qQ toolu_01Vai6KaTTdnMTPoaJdTVqH1 toolu_012wBd1vucCF7VJWsDHYSB4U toolu_01NN3oPUM81kP8xLaFoirGxZ toolu_01WRXXVv2aD2JVSVYuR9jPFs | not parsed by the last live report; a replay of the report on a copy parses each, so they wait for its next run
+
+# --- rows the T1 binary wrote (T..T2), per id ---
+
+# Headless -p teardown killed the StopFailure hook before its row landed (no
+# hook row; the transcript holds the API error); since T2 SessionEnd rebuilds
+# it from the transcript (events.detail {"from_transcript":true}).
+event-stopfailure | 9782d7a0 54ff01df 84eed7bd 064bb827 | T1 binary: StopFailure lost in the -p teardown, fixed at T2 (SessionEnd rebuilds it from the transcript)
+# The interrupted call's tool_result is stamped 00:30:06.510, its SessionEnd
+# hook 00:30:06.562; the T1 sweep read the transcript once, before the flush.
+call-no-size | toolu_01PePtGLXw1GywYuALGb73au | T1 binary: the SessionEnd sweep read the transcript before the interrupted call's result was flushed, fixed at T2 (resolveUnfinished re-reads while the file grows)
+# Refused before its hooks ran (failed=1, PostToolBatch alone), each stamped
+# between T and T2 (00:27:47, 01:16:24, 01:25:49) with no input and no cwd: the
+# T1 recordBatch stored no tool_input, so no report can parse them. Since T2
+# PostToolBatch fills the sanitized input and the file columns (the T2
+# permission-denied Write of session 926875a5 holds its input).
+parts-missing | toolu_0143uBCHKGBx9hnUUmpkRLiY toolu_01A9EPp3ZAHU8e4EF3uMFzcY toolu_0142XvQHVnfhGXYR3QCYLDJY | T1 binary: PostToolBatch did not fill input, fixed at T2
+
+# --- commands that are themselves malformed ---
+
+parse-error | toolu_01XK2eSmmRQMPwRspjZGLLDh | the command itself is malformed: its quoted heredoc is never closed, and the call failed with a SyntaxError
+fault-parse | toolu_01XK2eSmmRQMPwRspjZGLLDh | the command itself is malformed: its quoted heredoc is never closed, and the call failed with a SyntaxError
+parse-error | toolu_013ETVmfLBStMni9P784KHgw | the stored python heredoc body is itself invalid Python: ast rejects the raw body (an unterminated string literal)
+fault-parse | toolu_013ETVmfLBStMni9P784KHgw | the stored python heredoc body is itself invalid Python: ast rejects the raw body (an unterminated string literal)
+
+# --- sessions, proven per id ---
+
+# c222fd5d's /clear at 01:25:49 landed here; SessionEnd prompt_input_exit
+# followed 1.8 s later.
+session-promptless | 489dee09 | /clear landing session: the user exited at the empty prompt, so its transcript holds no prompt
+
+# --- Claude Code's own behaviour, proven per class ---
+
+# Claude Code sends a sub-agent's compaction hooks without agent_id, and its
+# transcript_path is the main transcript (live probe 76a01ba7).
+event-compact-subagent | 92cb932e c222fd5d e00f5098 ae3d8096 b210fe1d | Claude Code sends a sub-agent's PreCompact/PostCompact/SessionStart(compact) without agent_id and with the main transcript_path, so no store row can name the sub-agent
+# PROVISIONAL (the dedupe part): the running sibling call-residuals may change
+# how byte-identical payloads collapse; recheck these after it lands.
+event-compact | ca215ad9 e00f5098 f0d28042 | sub-agent compactions fire the main session's hooks (some write no boundary); a cancelled /compact (ca215ad9 15:35:43) fires PreCompact only; byte-identical payloads collapse into one row (docs/design.md:201; provisional)
+event-precompact-unfinished | ca215ad9 e00f5098 | sub-agent compactions fire the main session's hooks (some write no boundary); a cancelled /compact (ca215ad9 15:35:43) fires PreCompact only; byte-identical payloads collapse into one row (docs/design.md:201; provisional)
+# Two byte-identical auto PreCompact payloads 7.1 s apart; the model kept
+# working after the first, and only the second led to a compact_boundary.
+event-precompact-unfinished | aadff338 | Claude Code fired an auto PreCompact and did not compact: the model kept working, and a second PreCompact 7 s later led to the boundary, so one PreCompact has no PostCompact
+event-compact | 9238090b | Claude Code 2.1.288 fired PreCompact auto (2026-10-03 00:17:51Z), SessionStart(compact) and PostCompact (00:18:47Z) with no agent_id while the main chat sat inside one Bash call (00:16:35 to 00:19:12Z), no request of its own to compact; no transcript holds a boundary, and the main chat's next request still read its whole context (cache_read 171123 after 170973): not the main chat's compaction
+event-compact | 3412b620 | Claude Code 2.1.288 fired two PreCompact auto (2026-10-03 02:04:28Z, 02:04:31Z) and two SessionStart(compact)+PostCompact pairs (02:04:58Z, 02:05:08Z) for one compaction; the transcript holds one boundary (02:04:58Z), the second pair wrote none
+# A /reload submit blocked by a UserPromptSubmit hook leaves no prompt line.
+event-prompt-extra | d998e317 31ff639e a141a9a7 | a /reload submit blocked by a UserPromptSubmit hook: the hook ran, Claude Code wrote no transcript prompt line
+# The headless limits-picker "ACK" probe: async StopFailure cancelled at exit.
+event-stopfailure | 57296eea | the async StopFailure hook was cancelled at headless exit; StopFailure is now sync, and the refusal is read from the transcript in `report faults`
+
+# A tool a function-hooks plugin registers ($.tool.register) is answered by its
+# own tool.call hook, which runs above the settings hooks and never calls
+# next(): Claude Code fires no PreToolUse, PostToolUse or PostToolUseFailure for
+# it, only PostToolBatch (live probe 0f832764, Claude Code 2.1.287: compact and
+# Bash in one batch; Bash got PreToolUse and PostToolUse, compact neither).
+call-batch-only | tool=mcp__sub-agent-compact__compact | sub-agent-compact answers its compact tool in its own tool.call hook, above every settings hook: no PostToolUse fires for it, so only its PostToolBatch size exists (live probe 0f832764)
+
+# A call a PreToolUse hook blocked, or permission denied, fires no PostToolUse
+# or PostToolUseFailure (Claude Code's own behaviour); only its PostToolBatch
+# carries the harness's text. The binary that wrote these rows labelled only a
+# `<tool_use_error>` from that text, so each kept its delivered size alone:
+# a capture gap, since fixed (recordBatch labels them through ResultOutcome,
+# TestCallmeterBatchLabelsRefusalBesideItsStart). History, so per id; each
+# transcript result is is_error with the opening named in its reason.
+call-batch-only | toolu_01ErEP8TriKpf5dKQ1GYtArf toolu_01TMEtuLgb3wgKgMmF9zdZz7 toolu_01V5uUNPZ9McYcHTqw2pCrjM toolu_018sFz7cJm8cJgVsP4VaPoKE toolu_0124FzT6nJ8hGbr5XJLBKwx7 toolu_01TC8BN7tAzkzRFejZVKG5Vb | denied by a PreToolUse hook (result opens `PreToolUse:{tool} hook error:`), so no PostToolUse fired; captured before recordBatch labelled the denial from its batch text
+call-batch-only | toolu_01SatqJC2UpCV3Bg1JtvsmZw | denied by permission (result opens `Claude requested permissions to`), so no PostToolUse fired; captured before recordBatch labelled the denial from its batch text
+
+# --- Bash commands no parser accepts ---
+
+parse-error | toolu_01TC8BN7tAzkzRFejZVKG5Vb | bash -n rejects the command too: a quote closed by an apostrophe inside a bash -c string
+fault-parse | toolu_01TC8BN7tAzkzRFejZVKG5Vb | bash -n rejects the command too: a quote closed by an apostrophe inside a bash -c string
+parse-unparsed | toolu_01NM3nzwJoBPcvUJvUKqgRuB toolu_01EZjNe8ppad5gUYPAJi9d7i | node -e inline JS stays unparsed by design (docs/design.md:386)
+
+# --- sessions that never reached the model ---
+
+session-no-transcript | c9871201 06bfc8c0 | /clear landing session that exited within 2 s; Claude Code wrote no transcript
+session-promptless | 0c306939 9343b98f b6f94099 | /clear landing session: its transcript holds only the /clear echo, no assistant entry
+# SessionStart(clear) fires only after the old id's SessionEnd hooks finish.
+session-no-transcript | 662f7fcb | ended-before-start: Claude Code exited during a /clear before firing the successor's SessionStart; `report sessions` shows START never
+session-promptless | 6f874378 | ended-before-start: Claude Code exited during a /clear before firing the successor's SessionStart; `report sessions` shows START never
+session-promptless | 0f6fcd35 | started and ran nothing; `report sessions` marks MODEL "(unused)"
+session-no-transcript | 861e4ea1 c0cf2f46 ca72df03 | started and ran nothing, so Claude Code wrote no transcript; `report sessions` marks MODEL "(unused)"
+# cache-live-control harness runs: the harness removed their projects
+# directories (-private-tmp-cache-live-control-*) after the run.
+session-no-transcript | 0077e28e 947aefe2 787e0ca6 | cache-live-control harness run: the harness deleted its projects transcript directory after the run
+
+# --- disk sessions no store row names ---
+
+# Its transcript runs 2026-09-30 10:00 to 2026-10-01 14:39:44, 44 s after the
+# plugin was enabled; no hook ever reached it (before-store).
+session-unrecorded | 08883407 | before-store: already running when the plugin was enabled; it ended 44 s later with no hook delivered
+# hook-ran, own CALLMETER_HOME: runtime-check / rt-after-install runs whose
+# scratch stores are gone, so --scratch finds no store recording them.
+session-unrecorded | 4a9e3004 7e00a681 | hook-ran: runtime-check / rt-after-install run recorded in its own scratch CALLMETER_HOME, since deleted
+# no-hook: launched with project-only setting sources, so user-scope
+# enabledPlugins never load; its scratch CALLMETER_HOME holds no store.
+session-unrecorded | cc9fabfb | no-hook: the settingsources probe's project-only arm; user-scope enabledPlugins never load, and its scratch CALLMETER_HOME holds no store
+# The round-1 B1 `claude -p` probe (entrypoint sdk-cli, 27 lines over 3 s).
+session-unrecorded | f55c2fe1 | probe: the round-1 B1 `claude -p` run recorded in its own scratch CALLMETER_HOME, since deleted
+
+# Test chats (2026-10-01 21:09-23:49 UTC, cwd the professor checkout): their
+# transcripts were deleted after the run under the 2026-10-02 test-chat ruling
+# ("delete what it leaves"); each one's session-env and scratch directories
+# remain. Every row of theirs is unmatched for that one reason.
+session-no-transcript | 11569871 16d12c98 19837743 222da865 406d4836 41e368d1 5bb5bb7f 5ec15fab 63e80976 675eb32a 7936c32c 8efaa30f 96f218aa 9bd33ed9 b5dded8b c8f4566a ce683014 dcb92b41 e03fd73a e4970c0f ea295923 ebc61c89 fae3e577 | test chat whose transcript was deleted after the run (2026-10-02 test-chat ruling)
+call-extra | 11569871 19837743 222da865 406d4836 41e368d1 5bb5bb7f 5ec15fab 63e80976 675eb32a 7936c32c 8efaa30f 96f218aa 9bd33ed9 b5dded8b ce683014 e03fd73a e4970c0f ea295923 ebc61c89 fae3e577 | its session's transcript was deleted after the run (2026-10-02 test-chat ruling)
+request-extra | 11569871 19837743 222da865 406d4836 41e368d1 5bb5bb7f 5ec15fab 63e80976 675eb32a 7936c32c 8efaa30f 96f218aa 9bd33ed9 b5dded8b ce683014 e03fd73a e4970c0f ea295923 ebc61c89 fae3e577 | its session's transcript was deleted after the run (2026-10-02 test-chat ruling)
+agent-extra | 19837743 222da865 5bb5bb7f 5ec15fab ce683014 ea295923 ebc61c89 | its session's transcript, sub-agents included, was deleted after the run (2026-10-02 test-chat ruling)
+
+# --- Claude Code's own behaviour, proven per id from the transcript ---
+
+# A prompt typed while a turn is ending fires UserPromptSubmit at submit time
+# with the running turn's prompt_id; the turn ends first, so Claude Code runs
+# it as a new turn under a new promptId and fires no second UserPromptSubmit.
+# The missing prompt is that new turn; the repeat is its UPS, paired with no
+# queued_command (27a0106d 17:30:53Z; ae3d8096 16:53:44Z and 18:04:12Z).
+event-prompt-missing | a1186b3b 48e985b9 | a prompt submitted while the turn was ending: its UserPromptSubmit carried the running turn's prompt_id, and Claude Code ran it as a new turn under this promptId with no second UserPromptSubmit
+event-prompt-repeat | 27a0106d ae3d8096 | each unpaired repeat is the UserPromptSubmit of a prompt submitted while the turn was ending, carrying the running turn's prompt_id (the event-prompt-missing lines above); every other repeat pairs with a queued_command
+# The fork inherited its parent's running turn; a task notification moved into
+# its queue was delivered mid-turn and fired no UserPromptSubmit.
+event-prompt-repeat | 3e663996 | the fork inherited its parent's running turn, and a task notification queued in the fork was delivered mid-turn with no UserPromptSubmit
+
+# The rate-limited turn: an api-error <synthetic> assistant (15:33:22.975),
+# then its turn_duration (15:33:22.988), no assistant between; the store holds
+# StopFailure rate_limit at 15:33:23 and no Stop, as Claude Code fires.
+event-stop | ca215ad9 | its 15:33:22 turn ended in the rate_limit StopFailure: the transcript's turn_duration follows the api-error entry with no reply between, and Claude Code fires StopFailure, not Stop
+# The transcript's last line is this tool_use (23:53:15.051), SessionEnd
+# followed 0.45 s later, and no tool_result exists.
+call-missing | toolu_01JYMyFiBMvWfPvd7RoW365w | Claude Code ended the session right after writing the tool_use, before running it: no PreToolUse fired, no tool_result exists
+request-calls | msg_011CfcRAzkhKp3cbarr5vGR4 | its only tool_use (toolu_01JYMyFiBMvWfPvd7RoW365w, the call-missing line above) never ran: the session ended first, so the request recovered from the transcript links no call row
+session-promptless | 87420264 | headless run ended 2 s after its prompt (SessionEnd reason other, 23:57:32, the same instant as the killed runs beside it), before any reply
+session-no-transcript | 8ac927b0 | Claude Code fired only a SessionEnd (prompt_input_exit), no SessionStart and no prompt, and wrote no transcript
+# Untyped internal agents: agent_type NULL, no SubagentStart, no agents row,
+# one PreToolUse each; no sub-agent transcript exists among their sessions'.
+call-extra | toolu_01KfYq6scTjfZ3XQrq8dU1Dh toolu_01HUwy9sbWhpbvGBU3HWCfmG toolu_019AgrH3HyRzAAeHAxiFQc81 toolu_01CNCTS3pcv5R2Apivps7d2H toolu_01Q6TynshMP1HUNKgJ3Bmkwb toolu_01TNRvPQVdYik7W4DBeNe34s toolu_0137gSgpC3UmXpWSr3M5EA6J | an untyped internal agent's call: Claude Code fires its PreToolUse with an agent_id but writes no sub-agent transcript
+call-extra | toolu_01WCJNW3LXatacCiRdFXjvMv | Claude Code never persisted this Agent call's assistant message; its id appears only in later queue-operation and attachment lines of the main transcript
+request-pending | pending:toolu_01LRh1eQt7vN8zD3ZoNeqGkp pending:toolu_01YW4aMbLbP3VW3f5keKgpxF | provisional request of a test chat whose transcript was deleted after the run (2026-10-02 test-chat ruling): the fill its SessionEnd owed cannot be read again

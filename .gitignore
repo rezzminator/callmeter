@@ -3,3 +3,5 @@ dist/
 *.log
 .DS_Store
 /callmeter
+scripts/leak-terms.txt
+__pycache__/

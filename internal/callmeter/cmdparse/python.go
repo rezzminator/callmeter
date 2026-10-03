@@ -1,0 +1,131 @@
+package cmdparse
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/rezzminator/callmeter/internal/runner"
+)
+
+//go:embed pyscan.py
+var pyscanScript string
+
+// Snippet is one piece of Python source found inside a Bash call.
+type Snippet struct {
+	ID   string `json:"id"`
+	Code string `json:"code"`
+}
+
+// PyCall is one call expression of a snippet. Args holds each positional
+// argument's string constant, nil where the argument is not a string
+// literal. Recv holds the positional arguments of the call a method is
+// invoked on (`Path("x").read_text()` → Recv ["x"]). Argv is a
+// `subprocess.*` call's first argument as an argv, when it is literal.
+type PyCall struct {
+	Func   string            `json:"func"`
+	Args   []*string         `json:"args"`
+	Kwargs map[string]string `json:"kwargs"`
+	Recv   []*string         `json:"recv"`
+	Argv   []string          `json:"argv"`
+}
+
+// PyResult is the scan of one snippet. Error is the parser's message when the
+// snippet did not parse, empty otherwise.
+type PyResult struct {
+	ID      string   `json:"id"`
+	Calls   []PyCall `json:"calls"`
+	Strings []string `json:"strings"`
+	Error   string   `json:"error"`
+}
+
+// ErrNoPython means the Python interpreter could not be found on PATH.
+var ErrNoPython = errors.New("cmdparse: no Python interpreter")
+
+// PythonRunner scans a batch of snippets with Python's own ast module.
+// An error wrapping ErrNoPython makes parts python-unavailable; every other
+// error or missing snippet result makes them python-error, with its cause.
+type PythonRunner interface {
+	Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error)
+}
+
+// Python3 runs the embedded scanner as `{Program} -c {script}`, one process
+// per batch. A nil Runner is runner.Real; an empty Program is "python3".
+type Python3 struct {
+	Runner  runner.Runner
+	Program string
+}
+
+// Resolve returns the interpreter path, or an error wrapping ErrNoPython.
+func (p Python3) Resolve() (string, error) {
+	cmdRunner := p.Runner
+	if cmdRunner == nil {
+		cmdRunner = runner.Real{}
+	}
+	program := p.Program
+	if program == "" {
+		program = "python3"
+	}
+	path, err := cmdRunner.LookPath(program)
+	if err != nil {
+		return "", fmt.Errorf("cmdparse: %s not found on PATH: %w: %w", program, ErrNoPython, err)
+	}
+	return path, nil
+}
+
+// PythonResolves reports whether the runner's interpreter resolves; a runner
+// without Resolve is called directly and needs no interpreter lookup here.
+func PythonResolves(py PythonRunner) bool {
+	if py == nil {
+		py = Python3{}
+	}
+	if resolver, ok := py.(interface{ Resolve() (string, error) }); ok {
+		_, err := resolver.Resolve()
+		return err == nil
+	}
+	return true
+}
+
+// Analyze implements PythonRunner.
+func (p Python3) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error) {
+	if len(snippets) == 0 {
+		return nil, nil
+	}
+	cmdRunner := p.Runner
+	if cmdRunner == nil {
+		cmdRunner = runner.Real{}
+	}
+	path, err := p.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	input, err := json.Marshal(snippets)
+	if err != nil {
+		return nil, fmt.Errorf("cmdparse: encode %d python snippets: %w", len(snippets), err)
+	}
+	res, err := cmdRunner.Run(ctx, []string{path, "-c", pyscanScript}, runner.RunOptions{Stdin: input})
+	if err != nil {
+		return nil, fmt.Errorf("cmdparse: run %s: %w", path, err)
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("cmdparse: %s exited %d: %s", path, res.ExitCode, strings.TrimSpace(string(res.Stderr)))
+	}
+	var out []PyResult
+	if err := json.Unmarshal(res.Stdout, &out); err != nil {
+		return nil, fmt.Errorf("cmdparse: decode %s output (%d bytes): %w", path, len(res.Stdout), err)
+	}
+	if len(out) != len(snippets) {
+		return nil, fmt.Errorf("cmdparse: %s answered %d results for %d snippets", path, len(out), len(snippets))
+	}
+	for i := range out {
+		if out[i].ID != snippets[i].ID {
+			return nil, fmt.Errorf("cmdparse: %s result %d has id %q, want %q", path, i, out[i].ID, snippets[i].ID)
+		}
+	}
+	return out, nil
+}
+
+var errNoResult = errors.New("no scan result for snippet")
