@@ -38,6 +38,9 @@ type sCall struct {
 	// noCommand: the stored input keeps only command_bytes, the command the
 	// heredoc cutter could not cut safely (docs/design.md § Privacy).
 	noCommand bool
+	// absCwd: the stored cwd is absolute, as report.EnsureParsed requires of
+	// a call it parses.
+	absCwd bool
 	// delivered: bytes_delivered is set (PostToolBatch stored the size).
 	delivered bool
 }
@@ -134,13 +137,15 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				}
 				return nil
 			}},
-		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL FROM calls`,
+		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL, COALESCE(cwd,'') FROM calls`,
 			func(r *sql.Rows) error {
 				c := &sCall{}
 				var noError bool
-				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &noError, &c.noCommand, &c.delivered); err != nil {
+				var cwd string
+				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &noError, &c.noCommand, &c.delivered, &cwd); err != nil {
 					return err
 				}
+				c.absCwd = filepath.IsAbs(cwd)
 				if callmeter.HasRealOutput(c.tool) {
 					c.batchOnly = c.delivered && noError && !c.hasSize && c.failed != 1
 				} else {

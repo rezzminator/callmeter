@@ -143,7 +143,7 @@ func newFixture(t *testing.T, extraMain, extraSQL []string) fixture {
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, agent_id, agent_type) VALUES('e4', 'SubagentStop', %d, '%s', '%s', 'demo-agent')`, fxMS(9), fxSession, fxAgent),
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id) VALUES('e5', 'Stop', %d, '%s')`, fxMS(21), fxSession),
 		fmt.Sprintf(`INSERT INTO events(event_id, event, ts, session_id, reason) VALUES('e5end', 'SessionEnd', %d, '%s', 'other')`, fxMS(21), fxSession),
-		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A1', '%s', 'msg_A1', %d, 'Bash', 10, 0)`, fxSession, fxMS(2)),
+		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, cwd, bytes_real, failed) VALUES('toolu_A1', '%s', 'msg_A1', %d, 'Bash', '/work/demo', 10, 0)`, fxSession, fxMS(2)),
 		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, bytes_real, failed) VALUES('toolu_A2', '%s', 'msg_A1', %d, 'Agent', 10, 0)`, fxSession, fxMS(2.1)),
 		fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, agent_id, agent_type, request_id, ts, tool, bytes_real, failed) VALUES('toolu_B1', '%s', '%s', 'demo-agent', 'msg_B1', %d, 'Read', 10, 0)`, fxSession, fxAgent, fxMS(6)),
 		fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, calls, pending) VALUES('msg_A1', '%s', %d, 'claude-demo', 'tool_use', 3, 50, 100, 20, 2, 0)`, fxSession, fxMS(2)),
@@ -945,6 +945,34 @@ func TestRedactedCommandHasNoParts(t *testing.T) {
 	f = newFixture(t, nil, []string{`UPDATE command_parts SET tool_use_id='toolu_B1'`})
 	if code, out := f.run(t, "2030-01-01T00:00:00Z"); code != 1 || !strings.Contains(out, "MISMATCH parts-missing ") {
 		t.Fatalf("exit %d, want 1: a stored command without parts stays parts-missing:\n%s", code, out)
+	}
+}
+
+// TestCwdlessCallHasNoParts: a Bash call whose stored cwd is absent or not
+// absolute (no PreToolUse or PostToolUse recorded where it started: a call
+// Claude Code refused before any PreToolUse, or both hooks lost) is one
+// report.EnsureParsed never parses, so it owes no parts; one with an absolute
+// cwd stays parts-missing (TestRedactedCommandHasNoParts).
+func TestCwdlessCallHasNoParts(t *testing.T) {
+	for _, cwd := range []string{"NULL", "''", "'work/demo'"} {
+		t.Run(cwd, func(t *testing.T) {
+			f := newFixture(t, nil, []string{`UPDATE calls SET cwd=` + cwd + ` WHERE tool_use_id='toolu_A1'`, `UPDATE command_parts SET tool_use_id='toolu_B1'`})
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != 0 || !strings.Contains(out, "EXPECTED parts-no-cwd session="+fxSession+" ids=toolu_A1") || strings.Contains(out, "parts-missing") {
+				t.Fatalf("exit %d, want 0 and an expected parts-no-cwd:\n%s", code, out)
+			}
+		})
+	}
+}
+
+// TestNodeEvalParts: a node -e/--eval/-p/--print part is unparsed by design
+// (no JavaScript parser runs): expected as parse-node-eval. A shell part
+// unparsed stays a mismatch (TestSeededMismatchIsCaught).
+func TestNodeEvalParts(t *testing.T) {
+	f := newFixture(t, nil, []string{`UPDATE command_parts SET parse_status='unparsed', lang='node', program='node'`})
+	code, out := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 0 || !strings.Contains(out, "EXPECTED parse-node-eval session="+fxSession+" ids=toolu_A1") || strings.Contains(out, "parse-unparsed") {
+		t.Fatalf("exit %d, want 0 and an expected parse-node-eval:\n%s", code, out)
 	}
 }
 

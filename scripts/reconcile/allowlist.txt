@@ -18,7 +18,7 @@
 # kill of unknown event whose every neighbouring session reconciles, a
 # fault-terminated Stop whose cancelled turn has its Stop row,
 # parse-script-body, parse-python-code-unresolved, parse-python-unparsed-pre6,
-# parts-command-not-stored, a swept batch-only call, a session-no-end-hook
+# parse-node-eval, parts-command-not-stored, parts-no-cwd, a swept batch-only call, a session-no-end-hook
 # whose end_reason is never and whose transcript holds no SessionEnd hook
 # entry, a session-unrecorded a scratch store under --scratch records, the
 # call-no-request, call-no-size, request-missing and agent-tool-uses of a call
@@ -102,6 +102,7 @@ event-precompact-unfinished | ca215ad9 e00f5098 | sub-agent compactions fire the
 # working after the first, and only the second led to a compact_boundary.
 event-precompact-unfinished | aadff338 | Claude Code fired an auto PreCompact and did not compact: the model kept working, and a second PreCompact 7 s later led to the boundary, so one PreCompact has no PostCompact
 event-compact | 9238090b | Claude Code 2.1.288 fired PreCompact auto (2026-10-03 00:17:51Z), SessionStart(compact) and PostCompact (00:18:47Z) with no agent_id while the main chat sat inside one Bash call (00:16:35 to 00:19:12Z), no request of its own to compact; no transcript holds a boundary, and the main chat's next request still read its whole context (cache_read 171123 after 170973): not the main chat's compaction
+event-compact | 3412b620 | Claude Code 2.1.288 fired two PreCompact auto (2026-10-03 02:04:28Z, 02:04:31Z) and two SessionStart(compact)+PostCompact pairs (02:04:58Z, 02:05:08Z) for one compaction; the transcript holds one boundary (02:04:58Z), the second pair wrote none
 # A /reload submit blocked by a UserPromptSubmit hook leaves no prompt line.
 event-prompt-extra | d998e317 31ff639e a141a9a7 | a /reload submit blocked by a UserPromptSubmit hook: the hook ran, Claude Code wrote no transcript prompt line
 # The headless limits-picker "ACK" probe: async StopFailure cancelled at exit.

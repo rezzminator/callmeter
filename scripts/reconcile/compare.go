@@ -22,11 +22,13 @@ import (
 // out of cmdparse.StatusUnparsed for a python part.
 const scriptBodyParser = 6
 
-// The python parts the parse loop counts apart from their stored
-// parse_status (see scriptBodyParser); neither is a stored value.
+// The parts the parse loop counts apart from their stored parse_status: the
+// python ones (see scriptBodyParser) and a node one, which cmdparse never
+// parses (a node -e, --eval, -p or --print part); none is a stored value.
 const (
 	statusPythonUnparsedPre6   = "python-unparsed-pre6"
 	statusPythonCodeUnresolved = "python-code-unresolved"
+	statusNodeEval             = "node-eval"
 )
 
 // endReasonNever is the sessions.end_reason `callmeter report` writes for a
@@ -315,6 +317,8 @@ const (
 	reasonStoppedAgent           = "TaskStop stopped the sub-agent while this call ran: Claude Code wrote the call's error result itself and the agent never spoke again, so no PostToolUse, PostToolBatch or SubagentStop fired to write its request, its size or the agent's tool count"
 	reasonScratchStore           = "the session ran with CALLMETER_HOME pointing at a scratch store, which records it"
 	reasonCommandNotStored       = "the heredoc cutter could not cut this command safely, so the store kept only command_bytes and no report can parse it (docs/design.md § Privacy)"
+	reasonNoCwd                  = "the call has no absolute cwd: no PreToolUse or PostToolUse recorded the directory it started in (Claude Code refused it before any PreToolUse, or both hooks were lost), and report.EnsureParsed never parses a command whose cd it cannot replay, counting it skipped"
+	reasonNodeEval               = "a node -e, --eval, -p or --print part is unparsed by design: no JavaScript parser runs, a named gap every report that counts commands counts (docs/design.md § Parsing a command)"
 )
 
 // The tails of the transcript faults report-time recovery records for an agent
@@ -1571,7 +1575,10 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 // compareParts checks every Bash call's command_parts. The parse runs at
 // report time only (docs/design.md § Parsing a command), so a call newer than
 // every parsed call waits for the next report run: parts-pending-report. A call
-// older than a parsed one, still without parts, was skipped: parts-missing.
+// older than a parsed one, still without parts, was skipped: parts-missing,
+// unless report.EnsureParsed never parses it: a stored input without its
+// command (parts-command-not-stored) or a cwd that is not absolute
+// (parts-no-cwd).
 func compareParts(rep *report, st *storeData, w *world) {
 	var lastParsed int64
 	for id := range st.parts {
@@ -1587,6 +1594,10 @@ func compareParts(rep *report, st *storeData, w *world) {
 		parts := st.parts[u.id]
 		if len(parts) == 0 && c.noCommand {
 			rep.expect("parts-command-not-stored", u.session, c.ts, reasonCommandNotStored, "", u.id)
+			continue
+		}
+		if len(parts) == 0 && !c.absCwd {
+			rep.expect("parts-no-cwd", u.session, c.ts, reasonNoCwd, "", u.id)
 			continue
 		}
 		if len(parts) == 0 {
@@ -1610,6 +1621,8 @@ func compareParts(rep *report, st *storeData, w *world) {
 				counts[statusPythonUnparsedPre6]++
 			case p.status == cmdparse.StatusUnparsed && p.lang == cmdparse.LangPython:
 				counts[statusPythonCodeUnresolved]++
+			case p.status == cmdparse.StatusUnparsed && p.lang == cmdparse.LangNode:
+				counts[statusNodeEval]++
 			default:
 				counts[p.status]++
 			}
@@ -1625,6 +1638,8 @@ func compareParts(rep *report, st *storeData, w *world) {
 				rep.expect("parse-python-code-unresolved", u.session, c.ts, reasonPythonCodeUnresolved, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			case status == statusPythonUnparsedPre6:
 				rep.expect("parse-python-unparsed-pre6", u.session, c.ts, reasonPythonUnparsedPre6, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
+			case status == statusNodeEval:
+				rep.expect("parse-node-eval", u.session, c.ts, reasonNodeEval, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			case status != "ok":
 				rep.add("parse-"+orDash(status), u.session, c.ts, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			}
