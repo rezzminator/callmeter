@@ -1,6 +1,6 @@
 # Changelog
 
-Every release of callmeter. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `callmeter--v<version>`, with a GitHub release carrying the section below and the four platform binaries.
+Every release of callmeter. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `v<version>`, with a GitHub release carrying the section below and the four platform binaries.
 
 ## [Unreleased]
 

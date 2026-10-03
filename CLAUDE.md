@@ -23,7 +23,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
 - version places: the manifest, the marketplace entry, the README badge and the `CHANGELOG.md` heading, kept in agreement · `scripts/release-check.sh`
-- release: tag `callmeter--v{version}` on `main` builds and publishes the four binaries · `.github/workflows/release.yml`, `scripts/build-release.sh`
+- release: tag `v{version}` on `main` builds and publishes the four binaries · `.github/workflows/release.yml`, `scripts/build-release.sh`
 - testing manual: what a change owes in tests, and every run command · `docs/testing.md`
 
 # Runtime
