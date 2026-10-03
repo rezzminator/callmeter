@@ -4,7 +4,7 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
-## [0.1.0] — Unreleased
+## [0.1.0] — 2026-10-03
 
 ### Added
 - callmeter as a standalone Claude Code plugin, ported from Professor's built-in recorder: the hook, the store, the Bash command parser (shell through `mvdan.cc/sh`, Python through its own `ast`) and the `files`, `writes`, `commands`, `context`, `sequences` and `faults` reports, unchanged in what they answer.
