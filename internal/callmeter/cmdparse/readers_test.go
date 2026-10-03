@@ -142,6 +142,26 @@ func TestShellAttribution(t *testing.T) {
 				return []FileRef{ref(cwd, "script.py", ActionExec, "")}
 			},
 		},
+		{
+			name:    "awk inline program skips options and reads operands",
+			files:   []string{"data.csv"},
+			command: "awk -v FS=, -F , '{print $1}' data.csv",
+			want: func(cwd string) []FileRef {
+				return []FileRef{ref(cwd, "data.csv", ActionReadWhole, "")}
+			},
+		},
+		{
+			name:    "awk file program and every operand are reads",
+			files:   []string{"rules.awk", "one.csv", "two.csv"},
+			command: "awk -v OFS=, -F , -f rules.awk one.csv two.csv",
+			want: func(cwd string) []FileRef {
+				return []FileRef{
+					ref(cwd, "rules.awk", ActionReadWhole, ""),
+					ref(cwd, "one.csv", ActionReadWhole, ""),
+					ref(cwd, "two.csv", ActionReadWhole, ""),
+				}
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -3149,7 +3149,7 @@
     "files": [
      {
       "path": "/tmp/demo-proj/tmp/template-restructure/numstat.txt",
-      "action": "unknown",
+      "action": "read-whole",
       "exists": true
      }
     ]

@@ -4,6 +4,9 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+### Fixed
+- Attribute `awk` program files and input operands as reads, without counting `-v` and `-F` option values (#3).
+
 ## [0.1.0] — 2026-10-03
 
 ### Added
