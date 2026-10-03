@@ -71,7 +71,7 @@ Resolution order:
 
 1. `$CALLMETER_BIN`, when set and executable: a development or test override that skips every step below.
 2. `{CALLMETER_HOME}/bin/{version}/callmeter`, when executable: the cached binary of this plugin version.
-3. A download of `${CALLMETER_RELEASE_BASE}/callmeter--v{version}/callmeter_{version}_{os}_{arch}` (`CALLMETER_RELEASE_BASE` defaults to `https://github.com/rezzminator/callmeter/releases/download`; os `darwin` or `linux` from `uname -s`, arch `amd64` or `arm64` from `uname -m`, anything else `unsupported platform`).
+3. A download of `${CALLMETER_RELEASE_BASE}/v{version}/callmeter_{version}_{os}_{arch}` (`CALLMETER_RELEASE_BASE` defaults to `https://github.com/rezzminator/callmeter/releases/download`; os `darwin` or `linux` from `uname -s`, arch `amd64` or `arm64` from `uname -m`, anything else `unsupported platform`).
 
 - Lock: `mkdir {CALLMETER_HOME}/bin/.lock-{version}` is the lock, removed by its holder on every exit path. A waiter polls for the cached file for up to 50 s, then fails with `lock wait timed out`; a lock older than 120 s is stale, removed once and retried. Eight hooks firing together on an empty cache download once. The holder sweeps only `{CALLMETER_HOME}/bin/.tmp-*` files older than 120 s, so another run's download in flight is never removed. The race is accepted: a holder suspended past 120 s can lose its lock to a waiter, and the two downloads then each verify against `SHA256SUMS` and land by atomic rename, so the cache path only ever holds a verified binary.
 - Download: `curl` (connect 5 s, whole transfer 40 s) runs in the background under `wait`, which a trapped signal interrupts at once, where a foreground `curl` would hold the trap until it returned: a SIGTERM, SIGINT or SIGHUP mid-download kills `curl`, removes its temporary file and, under `hook`, appends the `killed by signal` line before the wrapper exits, inside Claude Code's grace between its SIGTERM and SIGKILL. A `curl` failure fails with `download failed`.
@@ -88,7 +88,7 @@ The binary's CLI:
 - `callmeter version`: `callmeter {version}`, set at build by `-ldflags "-X main.version={v}"`, default `dev`.
 - `callmeter help`, `-h`, `--help`: usage on stdout, exit 0; no argument or an unknown subcommand: usage on stderr, exit 2.
 
-Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `callmeter--v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the committed `SHA256SUMS` reproduces from source.
+Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the committed `SHA256SUMS` reproduces from source.
 
 ## What the harness gives a hook
 
