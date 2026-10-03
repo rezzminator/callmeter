@@ -308,6 +308,7 @@ const (
 	reasonScriptBody             = "a part whose program reads its script from a heredoc (python3 - <<EOF) leaves the script unparsed by design: the store keeps no quoted heredoc body and of an unquoted one only its command substitutions (cmdparse.StatusScriptBody)"
 	reasonPythonUnparsedPre6     = "a parser before 6 marked a python part unparsed both for a heredoc body the store cut and for code holding an unresolved expansion, by design; the next report run reparses it as script-body or unparsed"
 	reasonPythonCodeUnresolved   = "a python -c script or here-string holding an expansion with no known value is unparsed by design: the code the interpreter ran is unknown, so it is never parsed as written (docs/design.md § Parsing a command)"
+	reasonReloadedChat           = "the chat was already running when a /reload-plugins loaded the hooks into it: its transcript holds that command at or before the session's first store row, and Claude Code fires no SessionStart for a reload; a restart since would fire one, and a lost hook leaves its own fault row"
 	reasonNoEndHook              = "Claude Code ended the session without running its SessionEnd hooks: the transcript holds no SessionEnd hook entry, and report-time recovery settled the session and set end_reason never"
 	reasonEndKilled              = "the session's SessionEnd hook ran and was lost before it recorded (a headless exit or its timeout killed it, or the wrapper could not run the binary): its own missed.log line named the session, and report-time recovery set end_reason lost"
 	reasonAgentNeverStopped      = "the sub-agent's last turn never reached the SubagentStop that carries its tool count (killed mid-turn): report-time recovery read its quiet transcript and marked that turn open once, and this check's own parse confirms no turn end after its start (callmeter.UnfilledAgentStop)"
@@ -1727,7 +1728,12 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 			}
 		}
 		if c.n["SessionStart"] == 0 && t.assistants > 0 && t.preAssistants == 0 {
-			rep.add("event-no-sessionstart", s.id, 0, fmt.Sprintf("session_end=%d stop=%d", c.n["SessionEnd"], c.n["Stop"]))
+			detail := fmt.Sprintf("session_end=%d stop=%d", c.n["SessionEnd"], c.n["Stop"])
+			if at := t.reloadedBy(s.firstTS); at > 0 {
+				rep.expect("event-no-sessionstart", s.id, 0, reasonReloadedChat, fmt.Sprintf("%s reload_plugins=%s first_row=%s", detail, msString(at), msString(s.firstTS)))
+			} else {
+				rep.add("event-no-sessionstart", s.id, 0, detail)
+			}
 		}
 		subCompacts := 0
 		for _, a := range w.subagents[s.id] {

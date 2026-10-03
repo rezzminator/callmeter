@@ -77,8 +77,9 @@ type transcript struct {
 	lastMsg              string // the latest message's id
 	lastAssistant        int64  // the latest assistant line (unix ms)
 	lastTS               int64
-	prompt               string // the latest user line's promptId, whatever the window
-	endHook              bool   // any line is a SessionEnd hook attachment, in or out of the window
+	prompt               string  // the latest user line's promptId, whatever the window
+	endHook              bool    // any line is a SessionEnd hook attachment, in or out of the window
+	reloads              []int64 // each typed /reload-plugins (unix ms), in or out of the window
 	preLines             int
 	preAssistants        int
 	preToolUses          map[string]bool
@@ -326,6 +327,11 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 				w.results[b.ToolUseID] = result{ts: ms, isError: b.IsError}
 			}
 		}
+		// A typed /reload-plugins counts whenever it landed: the check on it
+		// compares it with the session's first store row.
+		if isReloadPlugins(&l) {
+			t.reloads = append(t.reloads, ms)
+		}
 		// ReadAgentTotals counts every tool use of the whole agent transcript,
 		// one dated before --since too.
 		if t.agent != "" && ms < w.since && l.Type == "assistant" {
@@ -515,6 +521,36 @@ func scheduledPrompt(l *line) bool { return l.TurnOrigin == "scheduled" }
 // localCommand marks the lines of a local slash command (`/model`, `/effort`):
 // they carry a promptId but never reach the model, so no UserPromptSubmit.
 var localCommand = []string{"<command-name>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"}
+
+// reloadPlugins opens a typed /reload-plugins as Claude Code writes it (2.1.283
+// to 2.1.287): a user line whose string content starts with this tag, then a
+// system local_command line. The reload loads the hooks into the running chat
+// and fires no SessionStart.
+const reloadPlugins = "<command-name>/reload-plugins</command-name>"
+
+// isReloadPlugins reports whether a line is a typed /reload-plugins. The text
+// is inspected, never kept.
+func isReloadPlugins(l *line) bool {
+	if l.Type != "user" || l.Message == nil || len(l.Message.Content) == 0 || l.Message.Content[0] != '"' {
+		return false
+	}
+	var text string
+	if err := json.Unmarshal(l.Message.Content, &text); err != nil {
+		return false
+	}
+	return strings.HasPrefix(text, reloadPlugins)
+}
+
+// reloadedBy is the latest typed /reload-plugins at or before ts, 0 when none.
+func (t *transcript) reloadedBy(ts int64) int64 {
+	var at int64
+	for _, r := range t.reloads {
+		if r <= ts {
+			at = max(at, r)
+		}
+	}
+	return at
+}
 
 // isPrompt reports whether a user line is a prompt bound for the model: not a
 // tool result, not a local command. The text is inspected, never kept.

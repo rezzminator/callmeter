@@ -863,6 +863,64 @@ func TestSessionNoEndHook(t *testing.T) {
 	}
 }
 
+// TestReloadedChatHasNoSessionStart: a chat already running when a
+// /reload-plugins loaded the hooks into it fires no SessionStart; its
+// transcript holds that command before the session's first store row.
+func TestReloadedChatHasNoSessionStart(t *testing.T) {
+	// Synthetic lines in the real shape (Claude Code 2.1.283 to 2.1.287, seen in
+	// session 3412b620): a typed /reload-plugins is a user line whose string
+	// content opens <command-name>/reload-plugins</command-name>, followed by a
+	// system local_command line.
+	reload := func(sec float64) []string {
+		return []string{
+			jsonLine(t, map[string]any{
+				"type": "user", "timestamp": fxTS(sec), "sessionId": fxSession, "entrypoint": "cli",
+				"message": map[string]any{"role": "user", "content": "<command-name>/reload-plugins</command-name>\n<command-message>reload-plugins</command-message>\n<command-args></command-args>"},
+			}),
+			jsonLine(t, map[string]any{"type": "system", "subtype": "local_command", "timestamp": fxTS(sec + 0.1), "sessionId": fxSession, "entrypoint": "cli", "level": "info", "content": "<local-command-stdout>reloaded</local-command-stdout>"}),
+		}
+	}
+	noStart := `DELETE FROM events WHERE event='SessionStart'`
+	for _, tc := range []struct {
+		name      string
+		extraMain []string
+		sql       []string
+		code      int
+		want      []string
+		absent    []string
+	}{
+		{"reloaded before its first store row", reload(0.2), []string{noStart}, 0,
+			[]string{"EXPECTED event-no-sessionstart session=" + fxSession + " session_end=1 stop=1 reload_plugins=2030-01-01T00:00:00Z first_row=2030-01-01T00:00:00Z: expected: "},
+			[]string{"MISMATCH"}},
+		{"reloaded only after its first store row", reload(22), []string{noStart}, 1,
+			[]string{"MISMATCH event-no-sessionstart session=" + fxSession + " session_end=1 stop=1"},
+			[]string{"EXPECTED event-no-sessionstart"}},
+		{"never reloaded", nil, []string{noStart}, 1,
+			[]string{"MISMATCH event-no-sessionstart session=" + fxSession + " session_end=1 stop=1"},
+			[]string{"EXPECTED event-no-sessionstart"}},
+		{"reloaded, its SessionStart stored", reload(0.2), nil, 0,
+			nil, []string{"event-no-sessionstart"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, tc.extraMain, tc.sql)
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d:\n%s", code, tc.code, out)
+			}
+			for _, w := range tc.want {
+				if strings.Count(out, w) != 1 {
+					t.Fatalf("want exactly one %q:\n%s", w, out)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(out, a) {
+					t.Fatalf("output holds %q:\n%s", a, out)
+				}
+			}
+		})
+	}
+}
+
 // TestHookLagIsPending: a transcript entry within hookLag of the store's
 // latest row may still have its async hook in flight: PENDING, not a mismatch.
 func TestHookLagIsPending(t *testing.T) {

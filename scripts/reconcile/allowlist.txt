@@ -101,6 +101,7 @@ event-precompact-unfinished | ca215ad9 e00f5098 | sub-agent compactions fire the
 # Two byte-identical auto PreCompact payloads 7.1 s apart; the model kept
 # working after the first, and only the second led to a compact_boundary.
 event-precompact-unfinished | aadff338 | Claude Code fired an auto PreCompact and did not compact: the model kept working, and a second PreCompact 7 s later led to the boundary, so one PreCompact has no PostCompact
+event-compact | 9238090b | Claude Code 2.1.288 fired PreCompact auto (2026-10-03 00:17:51Z), SessionStart(compact) and PostCompact (00:18:47Z) with no agent_id while the main chat sat inside one Bash call (00:16:35 to 00:19:12Z), no request of its own to compact; no transcript holds a boundary, and the main chat's next request still read its whole context (cache_read 171123 after 170973): not the main chat's compaction
 # A /reload submit blocked by a UserPromptSubmit hook leaves no prompt line.
 event-prompt-extra | d998e317 31ff639e a141a9a7 | a /reload submit blocked by a UserPromptSubmit hook: the hook ran, Claude Code wrote no transcript prompt line
 # The headless limits-picker "ACK" probe: async StopFailure cancelled at exit.
