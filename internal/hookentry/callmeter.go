@@ -438,7 +438,9 @@ func runCallmeter(
 	}()
 	// The wrapper's own failures (no binary, a bad checksum) land as binary
 	// faults on the next run that reaches the store; failing to ingest them
-	// is one store fault and never stops this run's record. The signal handler
+	// is one store fault, except on a busy store: there the run gives up
+	// (faultHeld, giveUpBusy) and leaves its own line in missed.log, since a
+	// second wait could outlast a sync hook's timeout. The signal handler
 	// is held off from the commit until the claim is moved, so a signal there
 	// leaves no committed claim in place to be ingested again.
 	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {

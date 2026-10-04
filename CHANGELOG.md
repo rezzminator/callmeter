@@ -4,6 +4,9 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+### Fixed
+- Hooks no longer lose events to a busy store on long sessions. The Stop hook re-counted every request of its session by scanning all of `calls`, so it held the store's write lock for seconds and concurrent hooks gave up after their 5 s wait. `calls` gains an index on `request_id`, added once to an existing store on its next open; the schema version is unchanged.
+
 ## [0.1.0] — 2026-10-03
 
 ### Added
