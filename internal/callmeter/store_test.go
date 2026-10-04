@@ -213,10 +213,65 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	}
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-	wantIndexes := "calls_file_path,calls_prompt,calls_session_agent_ts,calls_ts,events_event_ts,events_session_ts," +
+	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,events_event_ts,events_session_ts," +
 		"requests_session_agent_pending,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
+	}
+	if got := keys(t, store.DB(), "SELECT CAST(user_version AS TEXT) FROM pragma_user_version"); got != "1" {
+		t.Errorf("user_version = %s, want 1", got)
+	}
+}
+
+// queryPlan is the detail lines of EXPLAIN QUERY PLAN of query, joined by "; ".
+func queryPlan(t *testing.T, db *sql.DB, query string) string {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN QUERY PLAN " + query)
+	if err != nil {
+		t.Fatalf("explain %q: %v", query, err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close plan rows: %v", err)
+		}
+	}()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan plan of %q: %v", query, err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read plan of %q: %v", query, err)
+	}
+	return strings.Join(details, "; ")
+}
+
+// TestOpenAddsTheCallsRequestIndexToAVersionOneStore: a version-1 store created
+// before calls_request existed gets it on the next open, and the version stays 1.
+func TestOpenAddsTheCallsRequestIndexToAVersionOneStore(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	old, err := OpenDB(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if _, err := old.DB().Exec("DROP INDEX calls_request"); err != nil {
+		t.Fatalf("drop the index: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	store := openStoreAt(t, path)
+	if got := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'calls_request'"); got != "calls_request" {
+		t.Errorf("calls_request after a reopen = %q, want present", got)
+	}
+	plan := queryPlan(t, store.DB(), "SELECT COUNT(*) FROM calls WHERE request_id = 'x'")
+	if !strings.Contains(plan, "calls_request") || strings.Contains(plan, "SCAN calls") {
+		t.Errorf("the recount plan = %q, want a search by calls_request and no SCAN calls", plan)
 	}
 	if got := keys(t, store.DB(), "SELECT CAST(user_version AS TEXT) FROM pragma_user_version"); got != "1" {
 		t.Errorf("user_version = %s, want 1", got)

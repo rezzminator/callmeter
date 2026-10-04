@@ -2,9 +2,13 @@ package callmeter
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // postToolUse and batch are the two events that write one call: the hook's
@@ -773,5 +777,129 @@ func TestSettleRequestLeavesAnotherOwnersRow(t *testing.T) {
 					got["input_tokens"], got["cache_read_tokens"], got["cache_creation_tokens"])
 			}
 		})
+	}
+}
+
+// TestSettleSweepLeavesTheStoreToConcurrentHooks reproduces the Stop hook's
+// request sweep over a store of many calls: one transaction settles every
+// transcript request (SettleRequest, each recounting its calls), while async
+// hooks of other chats write. Without an index on calls(request_id) each
+// recount scans calls, the sweep holds the write lock past the writers' wait,
+// and they drop their events busy.
+func TestSettleSweepLeavesTheStoreToConcurrentHooks(t *testing.T) {
+	const (
+		requests      = 800
+		callsPerReq   = 1
+		storedCalls   = 30000 // calls rows of the session, most of them no request's
+		writers       = 8
+		writerWait    = time.Second
+		session       = "sess-sweep"
+		since         = int64(1000)
+		sweepSettleTS = int64(2000)
+	)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	store := openStoreAt(t, path)
+
+	// Seed in one transaction: storedCalls calls of the session, none pointing
+	// at a request yet; the first callsPerReq of each request's are its own.
+	seed, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin seed: %v", err)
+	}
+	insert, err := seed.PrepareContext(ctx, "INSERT INTO calls (tool_use_id, session_id, ts, tool, source) VALUES (?, ?, ?, 'Bash', ?)")
+	if err != nil {
+		t.Fatalf("prepare seed: %v", err)
+	}
+	callIDs := make([][]string, requests)
+	for n := 0; n < storedCalls; n++ {
+		id := fmt.Sprintf("toolu_%d", n)
+		if r := n / callsPerReq; r < requests {
+			callIDs[r] = append(callIDs[r], id)
+		}
+		if _, err := insert.ExecContext(ctx, id, session, sweepSettleTS, SourceHook); err != nil {
+			t.Fatalf("seed call %s: %v", id, err)
+		}
+	}
+	if err := insert.Close(); err != nil {
+		t.Fatalf("close seed statement: %v", err)
+	}
+	if err := seed.Commit(); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	handles := make([]*Store, writers)
+	for i := range handles {
+		handle, err := OpenDBWaiting(ctx, path, writerWait)
+		if err != nil {
+			t.Fatalf("open writer %d: %v", i, err)
+		}
+		handles[i] = handle
+	}
+
+	start := make(chan struct{})
+	waits := make([]time.Duration, writers)
+	errs := make([]error, writers)
+	var group sync.WaitGroup
+	for i := range handles {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			begun := time.Now()
+			errs[i] = handles[i].UpsertCall(ctx, Call{
+				ToolUseID: fmt.Sprintf("toolu_writer_%d", i),
+				SessionID: Ptr("sess-other"),
+				TS:        Ptr(sweepSettleTS),
+				Tool:      Ptr("Read"),
+				Source:    Ptr(SourceHook),
+			}, Overwrite)
+			waits[i] = time.Since(begun)
+		}()
+	}
+
+	var heldAt time.Time
+	sweepErr := store.BatchHeld(ctx, func() {
+		heldAt = time.Now()
+		close(start)
+	}, func(tx *Tx) error {
+		for r := 0; r < requests; r++ {
+			err := tx.SettleRequest(ctx, Request{
+				RequestID: fmt.Sprintf("msg_%d", r),
+				SessionID: Ptr(session),
+				Pending:   Ptr(false),
+				Source:    Ptr(SourceHook),
+				TS:        Ptr(sweepSettleTS),
+			}, callIDs[r], since)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	hold := time.Since(heldAt)
+	group.Wait()
+	for i, handle := range handles {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close writer %d: %v", i, err)
+		}
+	}
+
+	t.Logf("the sweep held the write lock %v (writers wait %v)", hold, writerWait)
+	if sweepErr != nil {
+		t.Fatalf("the sweep: %v", sweepErr)
+	}
+	for i, err := range errs {
+		t.Logf("writer %d waited %v", i, waits[i])
+		switch {
+		case err == nil:
+		case IsBusy(err):
+			t.Errorf("writer %d dropped its event, SQLITE_BUSY after %v: %v", i, waits[i], err)
+		default:
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_0"); got == nil || got["calls"] != int64(callsPerReq) {
+		t.Errorf("request msg_0 = %v, want %d calls", got, callsPerReq)
 	}
 }

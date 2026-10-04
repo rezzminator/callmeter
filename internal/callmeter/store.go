@@ -98,6 +98,7 @@ CREATE INDEX IF NOT EXISTS calls_session_agent_ts ON calls(session_id, agent_id,
 CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts);
 CREATE INDEX IF NOT EXISTS calls_file_path ON calls(file_path);
 CREATE INDEX IF NOT EXISTS calls_prompt ON calls(prompt_id);
+CREATE INDEX IF NOT EXISTS calls_request ON calls(request_id);
 CREATE TABLE IF NOT EXISTS requests (
 	request_id TEXT PRIMARY KEY,
 	session_id TEXT,
@@ -258,6 +259,10 @@ func OpenDB(ctx context.Context, path string) (*Store, error) {
 // the store, and the loser must not lose its record. wait is also the wait of
 // every later statement on the store, since the driver does not stop a busy
 // wait on a ctx deadline.
+//
+// An open of a current-version store writes nothing, except once, best effort,
+// to add the calls_request index a store created before it lacks
+// (addCallsRequestIndex).
 func OpenDBWaiting(ctx context.Context, path string, wait time.Duration) (*Store, error) {
 	deadline := clock.Real.Now().Add(wait)
 	for {
@@ -319,9 +324,45 @@ func prepare(ctx context.Context, db *sql.DB, path string) error {
 		)
 	}
 	if version == SchemaVersion {
-		return nil // current: an open writes nothing, so concurrent hooks never collide here
+		// current: an open writes nothing but, once, the calls_request index a
+		// store created before it lacks (best effort), so concurrent hooks
+		// never collide here
+		addCallsRequestIndex(ctx, db)
+		return nil
 	}
 	return createSchema(ctx, db, path)
+}
+
+// addCallsRequestIndex adds calls_request to a version-1 store that lacks it:
+// a store created before the index existed has none, and without it every
+// request recount (RecountRequest) and re-point (ResolveRequest) scans calls
+// under the write lock. An open that finds the index writes nothing. An open
+// that does not find it creates it once, under BEGIN IMMEDIATE. Any failure
+// (busy included) leaves the open to go on without it, and a later open tries
+// again: the index only speeds the store up, and an open must never lose a
+// hook's record over it.
+func addCallsRequestIndex(ctx context.Context, db *sql.DB) {
+	var found int
+	if err := db.QueryRowContext(
+		ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'calls_request'",
+	).Scan(&found); err != nil || found > 0 {
+		return
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS calls_request ON calls(request_id)"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+	}
 }
 
 // createSchema writes the schema and its version in one transaction that takes
