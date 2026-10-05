@@ -978,7 +978,7 @@ type StopHookSummary struct {
 // HookRun is one hook a Stop ran. DurationMS is nil for an async hook, which
 // the summary gives none.
 type HookRun struct {
-	Name         string // HookName of its command
+	Name         string // StopHookName of its command; never a word of a prompt
 	CommandBytes int64  // the command's length; the command itself is never kept
 	DurationMS   *int64
 }
@@ -1011,7 +1011,13 @@ var (
 	compactTrigger = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 	modelCostKey   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@\[\]/-]{0,127}$`)
 	hookNameShape  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
-	envAssignment  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+	// programName is the shape of every name HookName keeps: a lowercase
+	// program name, or a file name ending in an extension. A capitalized word,
+	// the way a prompt opens, is neither.
+	programName   = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9_+-]*|[A-Za-z0-9][A-Za-z0-9._+-]*\.[A-Za-z0-9]+)$`)
+	hashedHook    = regexp.MustCompile(`^(?:prompt)?#[0-9a-f]{8}$`)
+	proseWord     = regexp.MustCompile(`^[A-Za-z][A-Za-z']*[,.:;!?]?$`)
+	envAssignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 )
 
 // interpreters are the programs whose first argument, not their own name, says
@@ -1022,36 +1028,85 @@ var interpreters = map[string]bool{
 	"deno": true, "ruby": true, "perl": true,
 }
 
-// HookName is the stored name of a hook command: the basename of its program,
-// or of the script an interpreter runs, when that has the shape of a file name;
-// else `#` and the first 8 hex digits of the command's SHA-256. The command is
+// HookName is the stored name of a command hook. The name comes only from a
+// token that says what runs: a path (it holds a `/`), whose basename is the
+// name, or a known interpreter, whose first argument wins when that is a path
+// or a file name with an extension (`python3 hook.py`), else the interpreter
+// is the name. A bare word is never a name, so free prose yields none of its
+// words. The name must also have a program's shape (programName); every other
+// command is `#` and the first 8 hex digits of its SHA-256. The command is
 // never kept, so no argument or path leaves the transcript.
 func HookName(command string) string {
-	base := func(field string) string {
-		field = strings.Trim(field, `"'`)
-		return field[strings.LastIndex(field, "/")+1:]
-	}
 	fields := strings.Fields(command)
 	for len(fields) > 0 && envAssignment.MatchString(fields[0]) {
 		fields = fields[1:]
 	}
 	name := ""
 	if len(fields) > 0 {
-		name = base(fields[0])
-		if interpreters[name] {
+		program := strings.Trim(fields[0], `"'`)
+		base := program[strings.LastIndex(program, "/")+1:]
+		switch {
+		case interpreters[base]:
+			name = base
 			for _, field := range fields[1:] {
-				if !strings.HasPrefix(field, "-") && field != "run" {
-					name = base(field)
-					break
+				field = strings.Trim(field, `"'`)
+				if strings.HasPrefix(field, "-") || field == "run" || envAssignment.MatchString(field) {
+					continue
 				}
+				if script := field[strings.LastIndex(field, "/")+1:]; strings.Contains(field, "/") || strings.Contains(script, ".") {
+					name = script
+				}
+				break
 			}
+		case strings.Contains(program, "/"):
+			name = base
 		}
 	}
-	if hookNameShape.MatchString(name) {
+	if hookNameShape.MatchString(name) && programName.MatchString(name) {
 		return name
 	}
-	sum := sha256.Sum256([]byte(command))
-	return "#" + hex.EncodeToString(sum[:])[:8]
+	return "#" + shortSum(command)
+}
+
+// StopHookName is the stored name of one hookInfos entry of a Stop-hook
+// summary. A prompt-type hook, whose entry carries promptText and whose
+// command is the prompt itself, and a command that reads as prose are
+// `prompt#` and the first 8 hex digits of the command's SHA-256; every other
+// command is its HookName.
+func StopHookName(command string, prompt bool) string {
+	if prompt || readsAsProse(command) {
+		return "prompt#" + shortSum(command)
+	}
+	return HookName(command)
+}
+
+// HookNameKept reports whether name is a shape StopHookName can store: a
+// program name of programName's shape, or a hash. Redact rewrites every other
+// stored name.
+func HookNameKept(name string) bool {
+	return hashedHook.MatchString(name) || hookNameShape.MatchString(name) && programName.MatchString(name)
+}
+
+// readsAsProse reports whether a hook command is a sentence rather than a
+// command line: three or more fields, the first a plain word that is no known
+// interpreter, and no field an option or holding a path or shell syntax.
+func readsAsProse(command string) bool {
+	fields := strings.Fields(command)
+	if len(fields) < 3 || !proseWord.MatchString(fields[0]) || interpreters[fields[0]] {
+		return false
+	}
+	for _, field := range fields {
+		if strings.HasPrefix(field, "-") || strings.ContainsAny(field, "/$=|&<>`") {
+			return false
+		}
+	}
+	return true
+}
+
+// shortSum is the first 8 hex digits of text's SHA-256.
+func shortSum(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // wholeNumber is n as an integer, nil when it is absent; a number written with
@@ -1112,8 +1167,9 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 		var entry struct {
 			HookCount *float64 `json:"hookCount"`
 			HookInfos []struct {
-				Command    string   `json:"command"`
-				DurationMS *float64 `json:"durationMs"`
+				Command    string          `json:"command"`
+				DurationMS *float64        `json:"durationMs"`
+				PromptText json.RawMessage `json:"promptText"` // only its presence is read
 			} `json:"hookInfos"`
 			HookErrors []json.RawMessage `json:"hookErrors"`
 		}
@@ -1133,7 +1189,7 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 		}
 		for _, info := range entry.HookInfos {
 			summary.Hooks = append(summary.Hooks, HookRun{
-				Name: HookName(info.Command), CommandBytes: int64(len(info.Command)), DurationMS: wholeNumber(info.DurationMS),
+				Name: StopHookName(info.Command, info.PromptText != nil), CommandBytes: int64(len(info.Command)), DurationMS: wholeNumber(info.DurationMS),
 			})
 		}
 		scan.marks.StopHooks = append(scan.marks.StopHooks, summary)

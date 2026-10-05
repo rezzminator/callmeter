@@ -18,12 +18,14 @@ type RedactCount struct {
 // transaction that takes the write lock at BEGIN IMMEDIATE: every calls.input
 // through SanitizeInput (a Bash command's heredoc bodies cut out, free text
 // sized), every calls.error through SanitizeError, every events.detail through
-// SanitizeDetail for its event, every faults.error through sanitizeFault. A call whose input changed loses its command_parts rows,
+// SanitizeDetail for its event, every faults.error through sanitizeFault, every stop_hook_runs.name
+// StopHookName could not store through redactHookName. A call whose input changed loses its command_parts rows,
 // which the next report parses again from the redacted input. A row that
 // cannot be rewritten fails the whole pass and changes nothing. Redact is an
 // explicit command, never a migration; a second pass changes nothing. It
 // returns the rows changed per column: calls.input, calls.error,
-// events.detail, faults.error, then the command_parts rows deleted.
+// events.detail, faults.error, stop_hook_runs.name, then the command_parts
+// rows deleted.
 func (s *Store) Redact(ctx context.Context) (counts []RedactCount, err error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -95,13 +97,34 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 	if err != nil {
 		return nil, err
 	}
+	hookNames, err := rewriteColumn(ctx, conn, "stop_hook_runs.name",
+		`SELECT rowid, entry_id || char(0) || seq, name FROM stop_hook_runs WHERE name IS NOT NULL`,
+		`UPDATE stop_hook_runs SET name = ? WHERE rowid = ?`,
+		func(row, name string) (string, error) { return redactHookName(row, name), nil })
+	if err != nil {
+		return nil, err
+	}
 	return []RedactCount{
 		{Column: "calls.input", Rows: int64(len(inputs))},
 		{Column: "calls.error", Rows: int64(len(errorRows))},
 		{Column: "events.detail", Rows: int64(len(details))},
 		{Column: "faults.error", Rows: int64(len(faults))},
+		{Column: "stop_hook_runs.name", Rows: int64(len(hookNames))},
 		{Column: "command_parts", Rows: parts},
 	}, nil
+}
+
+// redactHookName is a stored Stop-hook name as StopHookName could store it.
+// The command is gone, so the name's shape decides: one HookNameKept accepts
+// stays; any other came from a prompt hook's prose under an older namer and
+// becomes `prompt#` and 8 hex digits of the SHA-256 of the old name salted
+// with its row (entry_id and seq), since a lone word's hash is reversed by
+// trying a dictionary. The result is a kept shape, so a second pass keeps it.
+func redactHookName(row, name string) string {
+	if HookNameKept(name) {
+		return name
+	}
+	return "prompt#" + shortSum(name+"\x00"+row)
 }
 
 // rewriteColumn reads every (key, aux, value) row selectRows yields, then

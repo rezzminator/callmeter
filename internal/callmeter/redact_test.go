@@ -57,7 +57,7 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Redact: %v", err)
 	}
-	want := []RedactCount{{"calls.input", 2}, {"calls.error", 2}, {"events.detail", 2}, {"faults.error", 2}, {"command_parts", 2}}
+	want := []RedactCount{{"calls.input", 2}, {"calls.error", 2}, {"events.detail", 2}, {"faults.error", 2}, {"stop_hook_runs.name", 0}, {"command_parts", 2}}
 	if !reflect.DeepEqual(counts, want) {
 		t.Fatalf("Redact = %v, want %v", counts, want)
 	}
@@ -165,6 +165,66 @@ func TestSanitizeError(t *testing.T) {
 	for text, want := range cases {
 		if got := SanitizeError(text); got != want {
 			t.Errorf("SanitizeError(%q) = %q, want %q", text, got, want)
+		}
+	}
+}
+
+// A Stop-hook name an older namer took from a prompt hook's prose becomes
+// prompt# and a hash salted with its row, once; every name the current namer
+// can emit stays. Invented names only.
+func TestRedactRewritesProseHookNames(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenDB(ctx, filepath.Join(t.TempDir(), "callmeter.db"))
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	kept := []string{"callmeter", "notify.sh", "guard-stamp.sh", "codex-sync.sh", "#0123abcd", "prompt#89abcdef"}
+	for i, name := range append([]string{"I"}, kept...) {
+		if _, err := store.DB().Exec(`INSERT INTO stop_hook_runs (entry_id, seq, name, command_bytes) VALUES ('e1', ?, ?, 327)`, i, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func() []string {
+		rows, err := store.DB().Query(`SELECT name FROM stop_hook_runs ORDER BY seq`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var got []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, name)
+		}
+		return got
+	}
+	for pass, want := range []int64{1, 0} {
+		counts, err := store.Redact(ctx)
+		if err != nil {
+			t.Fatalf("Redact pass %d: %v", pass+1, err)
+		}
+		var got int64 = -1
+		for _, c := range counts {
+			if c.Column == "stop_hook_runs.name" {
+				got = c.Rows
+			}
+		}
+		if got != want {
+			t.Errorf("pass %d: stop_hook_runs.name rewritten = %d, want %d (%v)", pass+1, got, want, counts)
+		}
+		after := names()
+		if len(after) != 7 || !strings.HasPrefix(after[0], "prompt#") || len(after[0]) != len("prompt#")+8 || after[0] == "prompt#a83dd0cc" {
+			t.Errorf("pass %d: the prose name became %q, want prompt# and a salted 8-hex hash", pass+1, after[0])
+		}
+		if !reflect.DeepEqual(after[1:], kept) {
+			t.Errorf("pass %d: kept names = %v, want %v", pass+1, after[1:], kept)
 		}
 	}
 }

@@ -780,9 +780,103 @@ func TestHookName(t *testing.T) {
 		"/opt/hooks/wé.sh":                                        sum("/opt/hooks/wé.sh"),
 		"./" + strings.Repeat("a", 65):                            sum("./" + strings.Repeat("a", 65)),
 		"CALLMETER_HOME=/tmp/x":                                   sum("CALLMETER_HOME=/tmp/x"),
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/guard-stamp.sh stop": "guard-stamp.sh",
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/codex-sync.sh sync":  "codex-sync.sh",
+		"npx prettier --check .":                                  "npx",
+		"python3 hook.py":                                         "hook.py",
+		"/opt/hooks/Tool":                                         sum("/opt/hooks/Tool"),
+		"terminal-notifier -message done":                         sum("terminal-notifier -message done"),
+		// Free prose never yields a word of itself.
+		"I want to verify the change before stopping": sum("I want to verify the change before stopping"),
+		"Check":         sum("Check"),
+		"check it now":  sum("check it now"),
+		"Node.js first": sum("Node.js first"),
 	} {
 		if got := HookName(command); got != want {
 			t.Errorf("HookName(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
+// A prompt-type hook (its entry carries promptText, its command the prompt
+// itself) and a command that reads as prose are named prompt# and a hash: no
+// word of the prompt reaches any table. Invented prompt text only.
+func TestPromptHookNeverStoresItsText(t *testing.T) {
+	const prompt = "Zebrafinch wants the quokka ledger reconciled before this turn ends, then a short marmoset summary."
+	const prose = "Please confirm the wombat tally"
+	async := `{"command":"${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook"}`
+	read, err := readMarksVariant(t, async, async+
+		`,{"command":"`+prompt+`","durationMs":5058,"promptText":"`+prompt+`"},{"command":"`+prose+`","durationMs":12}`)
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	sum := func(command string) string {
+		digest := sha256.Sum256([]byte(command))
+		return "prompt#" + hex.EncodeToString(digest[:])[:8]
+	}
+	var names []string
+	for _, run := range read.Marks.StopHooks[0].Hooks {
+		names = append(names, run.Name)
+	}
+	if want := []string{"notify.sh", "guard-stamp.sh", "codex-sync.sh", "callmeter", sum(prompt), sum(prose)}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("hook names = %v, want %v", names, want)
+	}
+	if got := read.Marks.StopHooks[0].Hooks[4].CommandBytes; got != int64(len(prompt)) {
+		t.Errorf("prompt hook command_bytes = %d, want %d", got, len(prompt))
+	}
+	store := openTestStore(t)
+	putMarks(t, store, "", 5000, read.Marks)
+	words := map[string]bool{}
+	for _, word := range strings.Fields(prompt + " " + prose) {
+		words[strings.Trim(word, ",.")] = true
+	}
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names2 []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names2 = append(names2, name)
+	}
+	if err := errors.Join(tables.Err(), tables.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range names2 {
+		rows, err := store.DB().Query("SELECT * FROM " + table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			for i, value := range values {
+				text := fmt.Sprint(value)
+				if b, ok := value.([]byte); ok {
+					text = string(b)
+				}
+				for _, word := range strings.FieldsFunc(text, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') }) {
+					if words[word] && len(word) > 4 || text == "Zebrafinch" || text == "Please" {
+						t.Errorf("%s.%s holds the prompt word %q: %q", table, columns[i], word, text)
+					}
+				}
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
