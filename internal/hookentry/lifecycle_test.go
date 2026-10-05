@@ -591,8 +591,12 @@ func TestCallmeterEffortFollowsThePayloadAndTheSessionModel(t *testing.T) {
 		lab := newCallmeterLab(t)
 		lab.env["CLAUDE_EFFORT"] = "high"
 		lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": "claude-opus-4-6"}))
-		if _, err := lab.db().DB().Exec("DROP TABLE requests"); err != nil {
-			t.Fatal(err)
+		// A dropped table would be added back by the next open (completeSchema);
+		// a view of that name whose table is gone keeps the read failing.
+		for _, statement := range []string{"DROP TABLE requests", "CREATE VIEW requests AS SELECT * FROM requests_gone"} {
+			if _, err := lab.db().DB().Exec(statement); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if _, err := lab.db().SessionModel(lab.ctx, cmSessionA); err == nil {
 			t.Fatal("model read succeeded without requests")

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -2210,5 +2211,100 @@ func TestRecoverQuietSettlesAnEditWithoutARealSize(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// appendMarkLines appends the fixture's real mark lines (testdata/transcript-marks.jsonl)
+// to a transcript, each restamped at `at` + its position and with its uuid
+// suffixed by tag, so two transcripts hold distinct entries; the mtime is kept.
+func (q quietStore) appendMarkLines(t *testing.T, path, tag string, at time.Time, kinds ...string) {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/transcript-marks.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped := regexp.MustCompile(`"timestamp":"[^"]*"`)
+	uuid := regexp.MustCompile(`"uuid":"([^"]*)"`)
+	var add []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		for _, kind := range kinds {
+			if !strings.Contains(line, kind) {
+				continue
+			}
+			line = stamped.ReplaceAllString(line, `"timestamp":"`+stamp(at.Add(time.Duration(len(add))*time.Second))+`"`)
+			line = uuid.ReplaceAllString(line, `"uuid":"${1}-`+tag+`"`)
+			add = append(add, line)
+			break
+		}
+	}
+	if len(add) < len(kinds) {
+		t.Fatalf("fixture holds %d lines for the %d kinds %v", len(add), len(kinds), kinds)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(strings.Join(add, "\n") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverQuietWritesTheMarksOfAQuietSession(t *testing.T) {
+	q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+	at := q.now.Add(-2*time.Hour + time.Minute)
+	q.appendMarkLines(t, q.main, "main", at, `"stop_hook_summary"`, `"turn_duration"`, `"compact_boundary"`, `"cost-state"`)
+	q.appendMarkLines(t, q.sub, "sub", at, `"turn_duration"`)
+	q.recover(t)
+
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 2, "session_costs": 1} {
+		if got := count(t, q.store, table); got != want {
+			t.Errorf("%s rows = %d, want %d", table, got, want)
+		}
+	}
+	hook := row(t, q.store, "stop_hooks", "1 = 1")
+	if hook["session_id"] != "sess-1" || hook["agent_id"] != nil || hook["prompt_id"] != "prompt-1" || hook["hook_count"] != int64(4) ||
+		hook["seat_dir"] != "/tmp/demo-seat" {
+		t.Errorf("stop_hooks row = %v", hook)
+	}
+	main := row(t, q.store, "turn_durations", "agent_id IS NULL")
+	if main["prompt_id"] != "prompt-1" || main["duration_ms"] != int64(81557) {
+		t.Errorf("main turn_durations row = %v, want prompt-1 and 81557 ms", main)
+	}
+	if sub := row(t, q.store, "turn_durations", "agent_id = 'a1'"); sub == nil || sub["duration_ms"] != int64(81557) {
+		t.Errorf("sub-agent turn_durations row = %v", sub)
+	}
+	cost := row(t, q.store, "session_costs", "session_id = 'sess-1'")
+	if cost["cost_usd"] != 59.30682170000001 || cost["wall_ms"] != int64(53062358) || cost["ts"] != q.now.UnixMilli() {
+		t.Errorf("session_costs row = %v, want the last cost-state stamped now", cost)
+	}
+	if row(t, q.store, "compactions", "pre_tokens = 333677 AND post_tokens = 18677") == nil {
+		t.Errorf("no compaction row of the real numbers")
+	}
+
+	// Read again, the same marks write nothing and the stored cost stands.
+	again, err := q.store.RecoverQuiet(context.Background(), q.now.Add(time.Hour), QuietAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Sessions != 0 {
+		t.Errorf("second RecoverQuiet = %+v, want nothing written", again)
+	}
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 2, "session_costs": 1} {
+		if got := count(t, q.store, table); got != want {
+			t.Errorf("%s rows after a second pass = %d, want %d", table, got, want)
+		}
+	}
+	if got := row(t, q.store, "session_costs", "session_id = 'sess-1'")["ts"]; got != q.now.UnixMilli() {
+		t.Errorf("session_costs.ts after a second pass = %v, want it unchanged", got)
 	}
 }

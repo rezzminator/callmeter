@@ -2,6 +2,8 @@ package callmeter
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -901,5 +903,291 @@ func TestSettleSweepLeavesTheStoreToConcurrentHooks(t *testing.T) {
 	}
 	if got := row(t, store, "requests", "request_id = ?", "msg_0"); got == nil || got["calls"] != int64(callsPerReq) {
 		t.Errorf("request msg_0 = %v, want %d calls", got, callsPerReq)
+	}
+}
+
+// openIncompleteStore opens a store whose schema the open could not complete:
+// a version-1 store opened while another connection holds the write lock.
+func openIncompleteStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	makeVersionOneStore(t, path)
+	holderDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := holderDB.Close(); err != nil {
+			t.Errorf("close holder: %v", err)
+		}
+	})
+	holder, err := holderDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := holder.Close(); err != nil {
+			t.Errorf("close holder connection: %v", err)
+		}
+	})
+	if _, err := holder.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenDBWaiting(ctx, path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("OpenDBWaiting while the write lock is held: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if _, err := holder.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if store.SchemaComplete() {
+		t.Fatal("SchemaComplete = true although the open could not write")
+	}
+	return store
+}
+
+func putMarks(t *testing.T, store *Store, agentID string, now int64, marks TranscriptMarks) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		return tx.PutMarks(ctx, "sess-demo", agentID, "/tmp/demo-home/.claude", now, marks)
+	}); err != nil {
+		t.Fatalf("PutMarks: %v", err)
+	}
+}
+
+func TestPutMarksWritesTheRowsOnce(t *testing.T) {
+	store := openTestStore(t)
+	marks := readMarksFixture(t).Marks
+	putMarks(t, store, "", 5000, marks)
+	putMarks(t, store, "", 5000, marks)
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 1, "session_costs": 1} {
+		if got := count(t, store, table); got != want {
+			t.Errorf("%s rows after a write and an identical write = %d, want %d", table, got, want)
+		}
+	}
+	for table, want := range map[string]map[string]any{
+		"compactions": {
+			"entry_id": "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7", "session_id": "sess-demo", "agent_id": nil, "ts": int64(1791113158553),
+			"trigger": "auto", "pre_tokens": int64(333677), "post_tokens": int64(18677), "cumulative_dropped_tokens": int64(315000),
+			"duration_ms": int64(72119), "seat_dir": "/tmp/demo-home/.claude",
+		},
+		"stop_hooks": {
+			"entry_id": "8b7a2d0e-b849-4d10-a191-b1cd766d87f3", "session_id": "sess-demo", "agent_id": nil, "prompt_id": marksPrompt1,
+			"ts": int64(1791065682790), "hook_count": int64(4), "hook_errors": int64(0), "seat_dir": "/tmp/demo-home/.claude",
+		},
+		"turn_durations": {
+			"entry_id": "463cc8cc-6d27-4c84-b49d-06fa061a443b", "session_id": "sess-demo", "agent_id": nil, "prompt_id": marksPrompt1,
+			"ts": int64(1791065682814), "duration_ms": int64(81557), "message_count": int64(60), "background_agents": int64(4),
+			"seat_dir": "/tmp/demo-home/.claude",
+		},
+		"session_costs": {
+			"session_id": "sess-demo", "ts": int64(5000), "started": int64(1791065248155), "cost_usd": 59.30682170000001,
+			"api_ms": int64(9190688), "api_no_retry_ms": int64(9181361), "tool_ms": int64(3682088), "wall_ms": int64(53062358),
+			"model_costs": `{"claude-opus-5-5":45.53485040000004,"claude-sonnet-5-5":13.771971300000002}`, "seat_dir": "/tmp/demo-home/.claude",
+		},
+	} {
+		got := row(t, store, table, "1 = 1")
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s row = %v\nwant %v", table, got, want)
+		}
+	}
+	runs := row(t, store, "stop_hook_runs", "entry_id = ? AND seq = 4", "8b7a2d0e-b849-4d10-a191-b1cd766d87f3")
+	if runs["name"] != "callmeter" || runs["duration_ms"] != nil || runs["ts"] != int64(1791065682790) ||
+		runs["command_bytes"] != int64(len("${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook")) {
+		t.Errorf("async hook run = %v, want callmeter, NULL duration, the summary's ts", runs)
+	}
+	// The cost-state is cumulative: a later one replaces the stored one, an
+	// earlier one that lands after it (async hooks arrive in any order) does not.
+	later := TranscriptMarks{Cost: &CostState{CostUSD: Ptr(60.5), WallMS: Ptr(int64(53062359))}}
+	putMarks(t, store, "", 7000, later)
+	if got := row(t, store, "session_costs", "session_id = ?", "sess-demo"); got["cost_usd"] != 60.5 || got["ts"] != int64(7000) ||
+		got["wall_ms"] != int64(53062359) || got["started"] != nil || got["model_costs"] != nil {
+		t.Errorf("session_costs after a later cost-state = %v", got)
+	}
+	putMarks(t, store, "", 9000, marks)
+	if got := row(t, store, "session_costs", "session_id = ?", "sess-demo"); got["cost_usd"] != 60.5 || got["wall_ms"] != int64(53062359) || got["ts"] != int64(7000) {
+		t.Errorf("session_costs after an earlier cost-state landed late = %v, want the later state kept, ts 7000", got)
+	}
+}
+
+func TestPutMarksOfAnAgentKeepsItsIdAndNoCost(t *testing.T) {
+	store := openTestStore(t)
+	putMarks(t, store, "agent-1", 5000, readMarksFixture(t).Marks)
+	if got := count(t, store, "session_costs"); got != 0 {
+		t.Errorf("session_costs rows after an agent's marks = %d, want 0", got)
+	}
+	if got := row(t, store, "turn_durations", "1 = 1"); got["agent_id"] != "agent-1" {
+		t.Errorf("turn_durations.agent_id = %v, want agent-1", got["agent_id"])
+	}
+	if got := row(t, store, "compactions", "1 = 1"); got["agent_id"] != "agent-1" {
+		t.Errorf("compactions.agent_id = %v, want agent-1", got["agent_id"])
+	}
+}
+
+func TestPutMarksIsANoOpOnAnIncompleteStore(t *testing.T) {
+	ctx := context.Background()
+	store := openIncompleteStore(t)
+	putMarks(t, store, "", 5000, readMarksFixture(t).Marks)
+	known, err := store.KnownMarks(ctx, "sess-demo")
+	if err != nil || len(known) != 0 {
+		t.Errorf("KnownMarks on an incomplete store = %v, %v; want empty, nil", known, err)
+	}
+	var tables int
+	if err := store.DB().QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('compactions','session_costs','stop_hooks','stop_hook_runs','turn_durations')").Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Errorf("an incomplete store holds %d mark tables after PutMarks, want none", tables)
+	}
+	// The request still lands, without the column it cannot hold.
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		return tx.SettleRequest(ctx, Request{
+			RequestID: "msg_think", SessionID: Ptr("sess-demo"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(7)),
+		}, nil, 0)
+	}); err != nil {
+		t.Fatalf("SettleRequest with thinking tokens on an incomplete store: %v", err)
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_think"); got["output_tokens"] != int64(50) {
+		t.Errorf("request row = %v, want output_tokens 50", got)
+	}
+}
+
+func TestSettleRequestStoresThinkingTokens(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		for _, r := range []Request{
+			{RequestID: "msg_think", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(0))},
+			{RequestID: "msg_plain", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50))},
+			{RequestID: "msg_more", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(31))},
+		} {
+			if err := tx.SettleRequest(ctx, r, nil, 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]any{"msg_think": int64(0), "msg_plain": nil, "msg_more": int64(31)} {
+		if got := row(t, store, "requests", "request_id = ?", id)["thinking_tokens"]; got != want {
+			t.Errorf("%s.thinking_tokens = %v, want %v", id, got, want)
+		}
+	}
+}
+
+// TestResolveRequestCarriesThinkingTokens: the merge of a provisional request
+// into its message row keeps the stored thinking count and fills it where NULL.
+func TestResolveRequestCarriesThinkingTokens(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_1"), SessionID: Ptr("sess-1"), TS: Ptr(int64(5)),
+		Pending: Ptr(true), ThinkingTokens: Ptr(int64(12))}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResolveRequest(ctx, ProvisionalKey("toolu_1"), Request{RequestID: "msg_1", Model: Ptr("m")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_1")["thinking_tokens"]; got != int64(12) {
+		t.Errorf("resolved thinking_tokens = %v, want 12", got)
+	}
+}
+
+func TestKnownMarksAndSince(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	marks := readMarksFixture(t).Marks
+	putMarks(t, store, "", 5000, marks)
+	known, err := store.KnownMarks(ctx, "sess-demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7": true, "8b7a2d0e-b849-4d10-a191-b1cd766d87f3": true, "463cc8cc-6d27-4c84-b49d-06fa061a443b": true,
+	}
+	if !reflect.DeepEqual(known, want) {
+		t.Errorf("KnownMarks = %v, want %v", known, want)
+	}
+	if other, err := store.KnownMarks(ctx, "sess-other"); err != nil || len(other) != 0 {
+		t.Errorf("KnownMarks of another session = %v, %v; want none", other, err)
+	}
+	left := marks.Since(0, known)
+	if len(left.Compactions)+len(left.StopHooks)+len(left.TurnDurations) != 0 || left.Cost != marks.Cost {
+		t.Errorf("Since with every id known = %+v, want only the cost", left)
+	}
+	// Older than since is not back-filled: the stop hook and turn duration
+	// (1791065682xxx) go, the compaction (1791113158553) stays.
+	young := marks.Since(1791100000000, nil)
+	if len(young.Compactions) != 1 || len(young.StopHooks) != 0 || len(young.TurnDurations) != 0 || young.Cost == nil {
+		t.Errorf("Since(1791100000000) = %+v", young)
+	}
+}
+
+// TestPutMarksStoresNoCommandText: a hook's command and arguments never reach
+// the store: only its derived name and its length.
+func TestPutMarksStoresNoCommandText(t *testing.T) {
+	store := openTestStore(t)
+	read, err := readMarksVariant(t,
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/notify.sh stop", "/srv/PRIVATEPATH/hook.sh --token=PRIVATEARG",
+		"Conversation compacted", "PRIVATECONTENT",
+		"Summarize the notes.", "PRIVATEPROMPT",
+		"Done.", "PRIVATEREPLY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putMarks(t, store, "", 5000, read.Marks)
+	runs := row(t, store, "stop_hook_runs", "seq = 1")
+	if runs["name"] != "hook.sh" || runs["command_bytes"] != int64(len("/srv/PRIVATEPATH/hook.sh --token=PRIVATEARG")) {
+		t.Fatalf("hook run = %v, want name hook.sh and the command's length", runs)
+	}
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := errors.Join(tables.Err(), tables.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		rows, err := store.DB().Query("SELECT * FROM " + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range values {
+				if text, ok := v.(string); ok && strings.Contains(text, "PRIVATE") {
+					t.Errorf("%s.%s holds %q", name, columns[i], text)
+				}
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

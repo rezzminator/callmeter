@@ -3242,3 +3242,67 @@ func TestAppendMissedNamesItsWriter(t *testing.T) {
 		}
 	}
 }
+
+// TestCallmeterStopWritesTheTranscriptMarks: a Stop whose transcript holds the
+// numbers Claude Code writes beside the messages (real Claude Code 2.1.289
+// lines, testdata/callmeter/demo-home/.../marks-transcript.jsonl) stores each
+// reply's thinking tokens (NULL where the usage has none), the compaction, the
+// Stop-hook summary with its runs, the turn's wall time and the session's last
+// cost-state. A second Stop over the same transcript writes no duplicate row,
+// and none of the hook commands' text is stored.
+func TestCallmeterStopWritesTheTranscriptMarks(t *testing.T) {
+	settle := agentSettle
+	agentSettle = 0 // the fixture's last reply is a tool_use: do not wait for a final one
+	t.Cleanup(func() { agentSettle = settle })
+	const (
+		prompt1 = "af8da24f-ac08-45b1-9c9e-b2015b11f360"
+		prompt2 = "11111111-2222-4333-8444-555555555555"
+		before  = 1782000000000 // 2026-06-21T00:00:00Z, before every entry of the fixture
+	)
+	lab := newCallmeterLab(t)
+	main := lab.transcript(cmSessionA)
+	fixture, err := os.ReadFile(filepath.Join(lab.home, ".claude", "projects", "-tmp-demo-proj", "marks-transcript.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	promptLine, _, _ := strings.Cut(string(fixture), "\n")
+	lab.write(main, []byte(promptLine+"\n"))
+	lab.feedAt(before, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": prompt1}))
+	lab.write(main, fixture)
+	stop := hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": prompt2})
+	lab.feedAt(1791200000000, stop)
+
+	for id, want := range map[string]string{"msg_011Cfg5BFXP8ktxFkALGfUL3": "118", "msg_011Cfg5GzuUN3vDHbBc86k21": "0", "msg_01ApKzvSCV54JEQyKJBGg11V": "<nil>"} {
+		expect(t, id, lab.row("SELECT thinking_tokens FROM requests WHERE request_id = ?", id), map[string]any{"thinking_tokens": want})
+	}
+	expect(t, "compaction", lab.row("SELECT * FROM compactions"), map[string]any{
+		"entry_id": "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7", "session_id": cmSessionA, "agent_id": "<nil>", "trigger": "auto",
+		"pre_tokens": 333677, "post_tokens": 18677, "cumulative_dropped_tokens": 315000, "duration_ms": 72119,
+	})
+	expect(t, "stop hook", lab.row("SELECT * FROM stop_hooks"), map[string]any{
+		"entry_id": "8b7a2d0e-b849-4d10-a191-b1cd766d87f3", "session_id": cmSessionA, "agent_id": "<nil>", "prompt_id": prompt1,
+		"hook_count": 4, "hook_errors": 0,
+	})
+	expect(t, "async hook run", lab.row("SELECT * FROM stop_hook_runs WHERE seq = 4"), map[string]any{"name": "callmeter", "duration_ms": "<nil>"})
+	expect(t, "first hook run", lab.row("SELECT * FROM stop_hook_runs WHERE seq = 1"), map[string]any{"name": "notify.sh", "duration_ms": 139})
+	expect(t, "turn duration", lab.row("SELECT * FROM turn_durations"), map[string]any{
+		"entry_id": "463cc8cc-6d27-4c84-b49d-06fa061a443b", "session_id": cmSessionA, "prompt_id": prompt1,
+		"duration_ms": 81557, "message_count": 60, "background_agents": 4,
+	})
+	expect(t, "session cost", lab.row("SELECT * FROM session_costs"), map[string]any{
+		"session_id": cmSessionA, "cost_usd": 59.30682170000001, "wall_ms": 53062358, "api_ms": 9190688, "ts": 1791200000000,
+	})
+	if strings.Contains(lab.storeText(), "CLAUDE_PROJECT_DIR") {
+		t.Errorf("the store holds a hook command's text")
+	}
+
+	lab.feedAt(1791200060000, stop)
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 1, "session_costs": 1} {
+		if n := lab.count("SELECT count(*) FROM " + table); n != want {
+			t.Errorf("%s rows after a second Stop = %d, want %d", table, n, want)
+		}
+	}
+	if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+		t.Errorf("faults = %d, want 0: %s", n, lab.faultsText())
+	}
+}

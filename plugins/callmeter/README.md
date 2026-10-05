@@ -12,7 +12,7 @@ Each tool call with its sanitized input, duration, failure, the bytes it produce
 /callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--json]
 ```
 
-Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`.
+Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`, `compactions`, `cost`, `hooks`, `turns`, `resumes`, `waiting`.
 
 ## Where the store lives
 

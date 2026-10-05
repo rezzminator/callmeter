@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,8 +57,11 @@ const (
 const ArchiveFile = "archive.db"
 
 // schema is the one store DDL (docs/design.md § The store). Every column line
-// is one tab, `name TYPE`, and one trailing comma but the table's last line:
-// archiveSchema derives the archive's tables from this text.
+// is one tab, `name TYPE`, and one trailing comma but the table's last line,
+// with no SQL comment: deriveTables derives the archive's tables and the
+// columns completeSchema adds to an older store from this text. A column added
+// after version 1 goes last in its table, so a store that gained it by ALTER
+// has the order of one created fresh.
 const schema = `
 CREATE TABLE IF NOT EXISTS calls (
 	tool_use_id TEXT PRIMARY KEY,
@@ -118,7 +122,8 @@ CREATE TABLE IF NOT EXISTS requests (
 	pending INTEGER,
 	source TEXT,
 	config_dir TEXT,
-	seat_dir TEXT
+	seat_dir TEXT,
+	thinking_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS requests_session_agent_pending ON requests(session_id, agent_id, pending);
 CREATE TABLE IF NOT EXISTS agents (
@@ -236,13 +241,76 @@ CREATE TABLE IF NOT EXISTS faults (
 	stage TEXT,
 	error TEXT
 );
+CREATE TABLE IF NOT EXISTS compactions (
+	entry_id TEXT PRIMARY KEY,
+	session_id TEXT,
+	agent_id TEXT,
+	ts INTEGER,
+	trigger TEXT,
+	pre_tokens INTEGER,
+	post_tokens INTEGER,
+	cumulative_dropped_tokens INTEGER,
+	duration_ms INTEGER,
+	seat_dir TEXT
+);
+CREATE INDEX IF NOT EXISTS compactions_session_ts ON compactions(session_id, ts);
+CREATE TABLE IF NOT EXISTS session_costs (
+	session_id TEXT PRIMARY KEY,
+	ts INTEGER,
+	started INTEGER,
+	cost_usd REAL,
+	api_ms INTEGER,
+	api_no_retry_ms INTEGER,
+	tool_ms INTEGER,
+	wall_ms INTEGER,
+	model_costs TEXT,
+	seat_dir TEXT
+);
+CREATE TABLE IF NOT EXISTS stop_hooks (
+	entry_id TEXT PRIMARY KEY,
+	session_id TEXT,
+	agent_id TEXT,
+	prompt_id TEXT,
+	ts INTEGER,
+	hook_count INTEGER,
+	hook_errors INTEGER,
+	seat_dir TEXT
+);
+CREATE INDEX IF NOT EXISTS stop_hooks_session_ts ON stop_hooks(session_id, ts);
+CREATE TABLE IF NOT EXISTS stop_hook_runs (
+	entry_id TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	ts INTEGER,
+	name TEXT,
+	command_bytes INTEGER,
+	duration_ms INTEGER,
+	PRIMARY KEY (entry_id, seq)
+);
+CREATE TABLE IF NOT EXISTS turn_durations (
+	entry_id TEXT PRIMARY KEY,
+	session_id TEXT,
+	agent_id TEXT,
+	prompt_id TEXT,
+	ts INTEGER,
+	duration_ms INTEGER,
+	message_count INTEGER,
+	background_agents INTEGER,
+	seat_dir TEXT
+);
+CREATE INDEX IF NOT EXISTS turn_durations_session_ts ON turn_durations(session_id, ts);
 `
 
 // Store is an open callmeter database.
 type Store struct {
-	db   *sql.DB
-	path string
+	db       *sql.DB
+	path     string
+	complete bool // every table, column and index of schema is present
 }
+
+// SchemaComplete reports whether every table, column and index of schema is
+// present; false only when an open could not add them (a busy store), and a
+// later open tries again.
+func (s *Store) SchemaComplete() bool { return s.complete }
 
 // OpenDB opens the store at path with the default wait (OpenDBWaiting).
 func OpenDB(ctx context.Context, path string) (*Store, error) {
@@ -261,8 +329,8 @@ func OpenDB(ctx context.Context, path string) (*Store, error) {
 // wait on a ctx deadline.
 //
 // An open of a current-version store writes nothing, except once, best effort,
-// to add the calls_request index a store created before it lacks
-// (addCallsRequestIndex).
+// to add the tables, columns and indexes a store created before them lacks
+// (completeSchema); Store.SchemaComplete tells whether it found or added them.
 func OpenDBWaiting(ctx context.Context, path string, wait time.Duration) (*Store, error) {
 	deadline := clock.Real.Now().Add(wait)
 	for {
@@ -300,22 +368,26 @@ func openAndPrepare(ctx context.Context, path string, wait time.Duration) (*Stor
 	if err != nil {
 		return nil, fmt.Errorf("open callmeter store: %w", err)
 	}
-	if err := prepare(ctx, db, path); err != nil {
+	complete, err := prepare(ctx, db, path)
+	if err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	return &Store{db: db, path: path}, nil
+	return &Store{db: db, path: path, complete: complete}, nil
 }
 
-func prepare(ctx context.Context, db *sql.DB, path string) error {
+// prepare brings the store to SchemaVersion and reports whether its schema is
+// complete: a fresh store is, a current-version store is when completeSchema
+// found or added what it lacked.
+func prepare(ctx context.Context, db *sql.DB, path string) (bool, error) {
 	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return fmt.Errorf("callmeter store %s: disable foreign keys: %w", path, err)
+		return false, fmt.Errorf("callmeter store %s: disable foreign keys: %w", path, err)
 	}
 	var version int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
-		return fmt.Errorf("callmeter store %s: read schema version: %w", path, err)
+		return false, fmt.Errorf("callmeter store %s: read schema version: %w", path, err)
 	}
 	if version > SchemaVersion {
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"callmeter store %s has schema version %d, newer than this callmeter's version %d: %w",
 			path,
 			version,
@@ -324,45 +396,133 @@ func prepare(ctx context.Context, db *sql.DB, path string) error {
 		)
 	}
 	if version == SchemaVersion {
-		// current: an open writes nothing but, once, the calls_request index a
-		// store created before it lacks (best effort), so concurrent hooks
-		// never collide here
-		addCallsRequestIndex(ctx, db)
-		return nil
+		// current: an open writes nothing but, once, what a store created
+		// before it lacks (best effort), so concurrent hooks never collide here
+		return completeSchema(ctx, db), nil
 	}
-	return createSchema(ctx, db, path)
+	return true, createSchema(ctx, db, path)
 }
 
-// addCallsRequestIndex adds calls_request to a version-1 store that lacks it:
-// a store created before the index existed has none, and without it every
-// request recount (RecountRequest) and re-point (ResolveRequest) scans calls
-// under the write lock. An open that finds the index writes nothing. An open
-// that does not find it creates it once, under BEGIN IMMEDIATE. Any failure
-// (busy included) leaves the open to go on without it, and a later open tries
-// again: the index only speeds the store up, and an open must never lose a
-// hook's record over it.
-func addCallsRequestIndex(ctx context.Context, db *sql.DB) {
-	var found int
-	if err := db.QueryRowContext(
-		ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'calls_request'",
-	).Scan(&found); err != nil || found > 0 {
-		return
+// completeSchema adds to a version-1 store whatever of schema it lacks: a store
+// created before a column, table or index existed has none of it, and the
+// version stays 1 because every addition is only a column or a table the store
+// can do without (a hook then writes the old columns, and the prune leaves
+// the store alone: Prune). An open that finds everything writes nothing, one
+// read-only query. An open that does not takes the write lock at BEGIN
+// IMMEDIATE, works out again what is missing (a concurrent open may have added
+// it), adds each missing column by ALTER TABLE, then runs schema, which
+// creates the missing tables and indexes since every statement of it is IF NOT
+// EXISTS, and commits. It reports true when the store is complete. Any failure
+// (busy included) rolls back and reports false, and the open goes on without:
+// an open must never lose a hook's record over it, and a later open tries
+// again.
+func completeSchema(ctx context.Context, db *sql.DB) bool {
+	alters, schemaMissing, err := missingFromSchema(ctx, db)
+	if err != nil {
+		return false
+	}
+	if len(alters) == 0 && !schemaMissing {
+		return true
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return
+		return false
 	}
 	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return
+		return false
 	}
-	if _, err := conn.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS calls_request ON calls(request_id)"); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
-		return
+	rollback := func() bool {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+		return false
+	}
+	if alters, _, err = missingFromSchema(ctx, conn); err != nil {
+		return rollback()
+	}
+	for _, alter := range alters {
+		if _, err := conn.ExecContext(ctx, alter); err != nil {
+			return rollback()
+		}
+	}
+	if _, err := conn.ExecContext(ctx, schema); err != nil {
+		return rollback()
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return rollback()
 	}
+	return true
+}
+
+// queryer is what *sql.DB and *sql.Conn share for a read.
+type queryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// missingFromSchema compares the store behind q with schema, writing nothing:
+// the ALTER TABLE statements for the columns missing from a table that exists
+// (in schema order), and whether any table or index is missing as a whole.
+func missingFromSchema(ctx context.Context, q queryer) (alters []string, schemaMissing bool, err error) {
+	have := map[string]map[string]bool{}
+	rows, err := q.QueryContext(ctx,
+		"SELECT m.name, p.name FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type = 'table'")
+	if err != nil {
+		return nil, false, fmt.Errorf("read the store's columns: %w", err)
+	}
+	for rows.Next() {
+		var table, column string
+		if err := rows.Scan(&table, &column); err != nil {
+			return nil, false, errors.Join(fmt.Errorf("read the store's columns: %w", err), rows.Close())
+		}
+		if have[table] == nil {
+			have[table] = map[string]bool{}
+		}
+		have[table][column] = true
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, false, fmt.Errorf("read the store's columns: %w", err)
+	}
+	haveIndex := map[string]bool{}
+	rows, err = q.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'index'")
+	if err != nil {
+		return nil, false, fmt.Errorf("read the store's indexes: %w", err)
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, false, errors.Join(fmt.Errorf("read the store's indexes: %w", err), rows.Close())
+		}
+		haveIndex[name] = true
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, false, fmt.Errorf("read the store's indexes: %w", err)
+	}
+	for _, name := range sortedKeys(storeTables) {
+		table := storeTables[name]
+		if have[name] == nil {
+			schemaMissing = true
+			continue
+		}
+		for i, column := range table.columns {
+			if !have[name][column] {
+				alters = append(alters, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", name, table.definitions[i]))
+			}
+		}
+	}
+	for _, name := range schemaIndexes {
+		if !haveIndex[name] {
+			schemaMissing = true
+		}
+	}
+	return alters, schemaMissing, nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // createSchema writes the schema and its version in one transaction that takes
@@ -478,6 +638,11 @@ var pruneTables = []pruneTable{
 	{name: "agents", verb: "REPLACE", key: []string{"agent_id"}, expired: "COALESCE(stopped, started) < ?"},
 	{name: "agent_turns", verb: "IGNORE", key: []string{"agent_id", "seq"}, expired: "COALESCE(stopped, started) < ?"},
 	{name: "sessions", verb: "REPLACE", key: []string{"session_id"}, expired: "last_ts < ?"},
+	{name: "compactions", verb: "IGNORE", key: []string{"entry_id"}, expired: "ts < ?"},
+	{name: "session_costs", verb: "REPLACE", key: []string{"session_id"}, expired: "ts < ?"},
+	{name: "stop_hooks", verb: "IGNORE", key: []string{"entry_id"}, expired: "ts < ?"},
+	{name: "stop_hook_runs", verb: "IGNORE", key: []string{"entry_id", "seq"}, expired: "ts < ?"},
+	{name: "turn_durations", verb: "IGNORE", key: []string{"entry_id"}, expired: "ts < ?"},
 	{
 		name:    "command_parts",
 		verb:    "IGNORE",
@@ -529,42 +694,66 @@ var omittedFromArchive = map[string]bool{
 	"events.detail": true,
 }
 
-// archiveTable is one table of archive.db, derived from the store's schema.
+// archiveTable is one table of the store's schema: its columns, with the
+// definition of each, and the DDL of its archive twin.
 type archiveTable struct {
-	columns []string // the kept columns, in store order
-	ddl     string   // CREATE TABLE IF NOT EXISTS archive.{table} (...)
+	columns     []string // the kept columns, in store order
+	definitions []string // the definition of each column, parallel to columns: `name TYPE`
+	ddl         string   // CREATE TABLE IF NOT EXISTS archive.{table} (...)
 }
 
 // archiveTables is the archive's shape: the store schema's tables without
 // their indexes and without the omittedFromArchive columns.
-var archiveTables = deriveArchiveTables(schema)
+var archiveTables = deriveTables(schema, omittedFromArchive)
 
-// deriveArchiveTables reads the tables out of the store DDL text, one column
-// per line (see schema), and rebuilds each without its omitted columns.
-func deriveArchiveTables(ddl string) map[string]archiveTable {
+// storeTables is the store's own shape: every table of schema with every column,
+// what completeSchema checks an open store against.
+var storeTables = deriveTables(schema, nil)
+
+// schemaIndexes names the indexes of schema.
+var schemaIndexes = deriveIndexes(schema)
+
+// deriveIndexes reads the index names out of the store DDL text.
+func deriveIndexes(ddl string) []string {
+	const create = "CREATE INDEX IF NOT EXISTS "
+	var names []string
+	for _, line := range strings.Split(ddl, "\n") {
+		if strings.HasPrefix(line, create) {
+			names = append(names, strings.Fields(strings.TrimPrefix(line, create))[0])
+		}
+	}
+	return names
+}
+
+// deriveTables reads the tables out of the store DDL text, one column per line
+// (see schema), and rebuilds each without the columns omit names as
+// `table.column`.
+func deriveTables(ddl string, omit map[string]bool) map[string]archiveTable {
 	const create = "CREATE TABLE IF NOT EXISTS "
 	tables := map[string]archiveTable{}
 	var name string
-	var definitions, columns []string
+	var lines, columns, definitions []string
 	for _, line := range strings.Split(ddl, "\n") {
 		switch {
 		case strings.HasPrefix(line, create):
 			name = strings.Fields(strings.TrimPrefix(line, create))[0]
-			definitions, columns = nil, nil
+			lines, columns, definitions = nil, nil, nil
 		case name != "" && strings.HasPrefix(line, "\t"):
 			definition := strings.TrimSuffix(strings.TrimSpace(line), ",")
 			column := strings.Fields(definition)[0]
-			if omittedFromArchive[name+"."+column] {
+			if omit[name+"."+column] {
 				continue
 			}
-			definitions = append(definitions, definition)
+			lines = append(lines, definition)
 			if column != "PRIMARY" {
 				columns = append(columns, column)
+				definitions = append(definitions, definition)
 			}
 		case name != "" && strings.HasPrefix(line, ")"):
 			tables[name] = archiveTable{
-				columns: columns,
-				ddl:     create + "archive." + name + " (\n\t" + strings.Join(definitions, ",\n\t") + "\n)",
+				columns:     columns,
+				definitions: definitions,
+				ddl:         create + "archive." + name + " (\n\t" + strings.Join(lines, ",\n\t") + "\n)",
 			}
 			name = ""
 		}
@@ -579,9 +768,10 @@ var pruneAfterArchive func() error
 
 // Prune removes every row older than before from the store and keeps its copy
 // in archive.db beside the store (see archiveTables): calls, requests, turns,
-// events and faults by ts; agents and agent_turns by COALESCE(stopped, started);
-// sessions by last_ts; then every command_parts row whose call is gone. It
-// returns how many store rows went.
+// events, faults, compactions, stop_hooks, stop_hook_runs and turn_durations by
+// ts; session_costs by the ts of its snapshot; agents and agent_turns by
+// COALESCE(stopped, started); sessions by last_ts; then every command_parts row
+// whose call is gone. It returns how many store rows went.
 //
 // A commit spanning two WAL databases is atomic per file only, so each
 // transaction writes one file. Phase 1 uses deferred archive transactions of
@@ -591,9 +781,16 @@ var pruneAfterArchive func() error
 // whose key the archive already holds stays in the store past retention.
 // Committed chunks survive a failure; the next prune resumes from those copies.
 //
+// A store whose schema is incomplete (SchemaComplete: an open could not add
+// what it lacked) is left alone and returns 0, nil: the prune's statements name
+// columns and tables it lacks. A later open that completes the store prunes it.
+//
 // A store with no row to archive is left alone and archive.db is never
 // attached, so a prune with nothing to do creates no file beside the store.
 func (s *Store) Prune(ctx context.Context, before time.Time) (removed int64, err error) {
+	if !s.complete {
+		return 0, nil
+	}
 	cutoff := before.UnixMilli()
 	pending, err := s.anyToArchive(ctx, cutoff)
 	if err != nil {
@@ -784,8 +981,9 @@ func pruneRowIDs(ctx context.Context, conn *sql.Conn, table, predicate string, c
 	return ids, nil
 }
 
-// prepareArchive creates the archive's tables on first use and stamps its
-// version; an archive written by a newer schema is refused, never written.
+// prepareArchive creates the archive's tables on first use, adds to a table an
+// older archive wrote the kept columns it lacks, and stamps its version; an
+// archive written by a newer schema is refused, never written.
 func prepareArchive(ctx context.Context, conn *sql.Conn, archivePath string) error {
 	var version int
 	if err := conn.QueryRowContext(ctx, "PRAGMA archive.user_version").Scan(&version); err != nil {
@@ -803,10 +1001,46 @@ func prepareArchive(ctx context.Context, conn *sql.Conn, archivePath string) err
 		if _, err := conn.ExecContext(ctx, archiveTables[table.name].ddl); err != nil {
 			return fmt.Errorf("archive %s: create the table in %s: %w", table.name, archivePath, err)
 		}
+		if err := addArchiveColumns(ctx, conn, table.name, archivePath); err != nil {
+			return err
+		}
 	}
 	if version == 0 {
 		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA archive.user_version=%d", SchemaVersion)); err != nil {
 			return fmt.Errorf("archive %s: set schema version: %w", archivePath, err)
+		}
+	}
+	return nil
+}
+
+// addArchiveColumns adds to archive.{table} each kept column an archive written
+// before the column existed lacks, so the prune's copy statements name only
+// columns the archive has.
+func addArchiveColumns(ctx context.Context, conn *sql.Conn, table, archivePath string) error {
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf("PRAGMA archive.table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("archive %s: read the columns of %s: %w", table, archivePath, err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return errors.Join(fmt.Errorf("archive %s: read the columns of %s: %w", table, archivePath, err), rows.Close())
+		}
+		have[name] = true
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("archive %s: read the columns of %s: %w", table, archivePath, err)
+	}
+	kept := archiveTables[table]
+	for i, column := range kept.columns {
+		if have[column] {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("ALTER TABLE archive.%s ADD COLUMN %s", table, kept.definitions[i])); err != nil {
+			return fmt.Errorf("archive %s: add column %s in %s: %w", table, column, archivePath, err)
 		}
 	}
 	return nil

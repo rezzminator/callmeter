@@ -108,13 +108,19 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `sequences` | call runs that recur across agents, ranked by occurrences × bytes |
 | `faults` | calls not recorded, snippets not parsed, hooks the wrapper missed, turns refused by an API error |
 | `sessions` | one row per session: model, start and end, calls, agents, cwd, host |
-| `prompts` | one row per prompt: calls, failures, agents, requests, tokens |
+| `prompts` | one row per prompt: calls, failures, agents, requests, tokens, wall seconds |
 | `effort` | calls and turns per effort level, permission mode and agent type |
-| `tokens` | the token split and cache hit rate per model and agent type |
+| `tokens` | the token split, thinking tokens and cache hit rate per model and agent type |
 | `agents` | every sub-agent turn: start, stop, duration, prompt |
 | `outcomes` | lines changed per file, commits, test runs |
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
+| `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
+| `cost` | Claude Code's own cost per session: USD, seconds in the API, in retries, in tools, per model |
+| `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
+| `turns` | the wall time of every turn, with its messages, background agents and effort |
+| `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
+| `waiting` | time spent waiting on you: idle prompts and permission prompts, total, median and longest |
 
 | Flag | Meaning |
 | --- | --- |
@@ -129,10 +135,10 @@ The `tokens` report over the same scratch store:
 
 ```text
 callmeter tokens · window: since 2026-09-03 14:36 UTC · limit=25
-MODEL                      AGENT TYPE       REQUESTS  INPUT  CACHE READ  CACHE WRITE 5M  CACHE WRITE 1H  CACHE WRITE  OUTPUT  CACHE HIT %
-claude-sonnet-5-5          -                40        80     751947      0               107762          107762       7276    87.5
-claude-haiku-4-5-20251001  -                10        90     204852      0               71009           71009        2245    74.2
-claude-haiku-4-5-20251001  general-purpose  6         58     33030       41033           0               41033        935     44.6
+MODEL                      AGENT TYPE       REQUESTS  INPUT  CACHE READ  CACHE WRITE 5M  CACHE WRITE 1H  CACHE WRITE  OUTPUT  THINKING  CACHE HIT %  THINK %
+claude-sonnet-5-5          -                40        80     751947      0               107762          107762       7276    -         87.5         -
+claude-haiku-4-5-20251001  -                10        90     204852      0               71009           71009        2245    -         74.2         -
+claude-haiku-4-5-20251001  general-purpose  6         58     33030       41033           0               41033        935     -         44.6         -
 ```
 
 Every report, column and note is specified in [docs/design.md § Reports](./docs/design.md#reports).
@@ -140,10 +146,14 @@ Every report, column and note is specified in [docs/design.md § Reports](./docs
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
-- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output) and the context size.
+- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
 - `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.
+- `compactions`: one row per context compaction: trigger, context tokens before and after, tokens dropped so far, duration.
+- `session_costs`: one row per session: Claude Code's own latest cost snapshot (USD, API, retry, tool and wall time, cost per model).
+- `stop_hooks`, `stop_hook_runs`: one row per Stop-hook summary and per hook run in it: a derived name (the program's basename, else a short hash; never the command), the command's size, the duration (none for an async hook).
+- `turn_durations`: one row per turn: wall time, message count, background agents.
 - `events`: one row per lifecycle event: session start and end, prompts (their size only), slash-command expansions, instructions loaded, compactions, stop failures, permission requests, notifications, tasks.
 - `sessions`: one row per session: first and last activity, model, how it started and ended, cwd, seat, host, time zone.
 - `command_parts`: every simple command inside a Bash call, with the files it read or wrote, parsed at report time.

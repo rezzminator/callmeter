@@ -3,6 +3,8 @@ package callmeter
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +35,10 @@ type RequestUsage struct {
 	CacheCreation1h *int64
 	ContextTokens   int64 // input + cache read + cache creation tokens
 	OutputTokens    int64
+	// ThinkingTokens is the share of OutputTokens spent thinking
+	// (usage.output_tokens_details.thinking_tokens); nil when the usage carries
+	// none (an older Claude Code) — a missing count is never zero.
+	ThinkingTokens *int64
 }
 
 // SubagentTranscriptPath is the transcript of sub-agent agentID of the chat
@@ -119,6 +125,7 @@ func ApplyUsage(request *Request, usage RequestUsage) {
 	request.CacheCreation1hTokens = usage.CacheCreation1h
 	request.ContextTokens = Ptr(usage.ContextTokens)
 	request.OutputTokens = Ptr(usage.OutputTokens)
+	request.ThinkingTokens = usage.ThinkingTokens
 }
 
 type transcriptEntry struct {
@@ -138,7 +145,10 @@ type assistantMessage struct {
 		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		OutputTokens             int64 `json:"output_tokens"`
-		CacheCreation            *struct {
+		OutputTokensDetails      *struct {
+			ThinkingTokens *int64 `json:"thinking_tokens"`
+		} `json:"output_tokens_details"`
+		CacheCreation *struct {
 			Ephemeral5mInputTokens *int64 `json:"ephemeral_5m_input_tokens"`
 			Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
 		} `json:"cache_creation"`
@@ -347,6 +357,10 @@ func foldEntry(request *RequestUsage, message *assistantMessage) {
 	request.CacheCreationTokens = usage.CacheCreationInputTokens
 	request.ContextTokens = usage.InputTokens + usage.CacheReadInputTokens + usage.CacheCreationInputTokens
 	request.OutputTokens = usage.OutputTokens
+	request.ThinkingTokens = nil
+	if usage.OutputTokensDetails != nil {
+		request.ThinkingTokens = usage.OutputTokensDetails.ThinkingTokens
+	}
 	request.CacheCreation5m, request.CacheCreation1h = nil, nil
 	if usage.CacheCreation != nil {
 		request.CacheCreation5m = usage.CacheCreation.Ephemeral5mInputTokens
@@ -489,27 +503,52 @@ func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
 // before it ended an earlier turn. A promptID no entry carries, or "", is
 // ReadRequests.
 func ReadTurnRequests(path, promptID string) (requests []TranscriptRequest, final bool, err error) {
+	read, err := ReadTranscript(path, promptID)
+	if err != nil {
+		return nil, false, err
+	}
+	return read.Requests, read.Final, nil
+}
+
+// TranscriptRead is what one pass over a transcript holds: its requests, the
+// final flag of ReadTurnRequests and the numeric marks Claude Code writes
+// beside them.
+type TranscriptRead struct {
+	Requests []TranscriptRequest
+	Final    bool
+	Marks    TranscriptMarks
+}
+
+// ReadTranscript is ReadTurnRequests in one pass that also collects the
+// transcript's marks (TranscriptMarks): compactions, Stop-hook summaries, turn
+// durations and the last cost-state. A mark line follows the rules of the
+// others: a final line with no newline that does not parse is skipped, any
+// other malformed line is an error naming the path and its byte offset. Only
+// lines naming an assistant entry, a prompt or a mark are decoded.
+func ReadTranscript(path, promptID string) (read TranscriptRead, err error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, false, fmt.Errorf("read transcript: %w", err)
+		return TranscriptRead{}, fmt.Errorf("read transcript: %w", err)
 	}
 	defer func() {
 		if closeErr := file.Close(); closeErr != nil {
 			err = errors.Join(err, fmt.Errorf("close transcript %s: %w", path, closeErr))
 		}
 	}()
-	scan := transcriptRequests{index: map[string]int{}, used: map[string]bool{}, turn: promptID}
+	scan := transcriptRequests{index: map[string]int{}, used: map[string]bool{}, turn: promptID, seen: map[string]bool{}}
 	reader := bufio.NewReaderSize(file, 1<<16)
 	var offset int64
 	for {
 		raw, readErr := reader.ReadBytes('\n')
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, false, fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
+			return TranscriptRead{}, fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
 		}
 		partial := errors.Is(readErr, io.EOF)
-		if bytes.Contains(raw, []byte(`"assistant"`)) || bytes.Contains(raw, []byte(`"promptId"`)) {
+		if bytes.Contains(raw, []byte(`"assistant"`)) || bytes.Contains(raw, []byte(`"promptId"`)) ||
+			bytes.Contains(raw, []byte(`"compact_boundary"`)) || bytes.Contains(raw, []byte(`"stop_hook_summary"`)) ||
+			bytes.Contains(raw, []byte(`"turn_duration"`)) || bytes.Contains(raw, []byte(`"cost-state"`)) {
 			if err := scan.entry(raw); err != nil && !partial {
-				return nil, false, fmt.Errorf("transcript %s at byte %d: %w", path, offset, err)
+				return TranscriptRead{}, fmt.Errorf("transcript %s at byte %d: %w", path, offset, err)
 			}
 		}
 		offset += int64(len(raw))
@@ -519,10 +558,12 @@ func ReadTurnRequests(path, promptID string) (requests []TranscriptRequest, fina
 	}
 	for _, request := range scan.requests {
 		if scan.used[request.MessageID] {
-			requests = append(requests, request)
+			read.Requests = append(read.Requests, request)
 		}
 	}
-	return requests, scan.final, nil
+	read.Final = scan.final
+	read.Marks = scan.marks
+	return read, nil
 }
 
 // transcriptRequests is one ReadRequests pass.
@@ -533,6 +574,8 @@ type transcriptRequests struct {
 	prompt   string          // the latest user entry's promptId
 	turn     string          // the promptId whose answer final waits for; "" for none
 	final    bool
+	marks    TranscriptMarks
+	seen     map[string]bool // entry ids of the marks kept, so a repeated line counts once
 }
 
 func (scan *transcriptRequests) entry(raw []byte) error {
@@ -540,9 +583,17 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 		transcriptEntry
 		PromptID string `json:"promptId"`
 		Cwd      string `json:"cwd"`
+		UUID     string `json:"uuid"`
+		Subtype  string `json:"subtype"`
 	}
 	if err := json.Unmarshal(raw, &entry); err != nil {
 		return fmt.Errorf("malformed entry: %w", err)
+	}
+	switch {
+	case entry.Type == "system":
+		return scan.system(raw, entry.UUID, entry.Subtype, entry.Timestamp)
+	case entry.Type == "cost-state":
+		return scan.cost(raw)
 	}
 	if entry.Type == "user" && entry.PromptID != "" {
 		scan.prompt = entry.PromptID
@@ -889,4 +940,258 @@ func APIErrorKind(s string) string {
 func absentJSON(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
+}
+
+// TranscriptMarks are the numbers Claude Code writes into a transcript beside
+// the messages: compactions, the Stop hooks of a turn, a turn's wall time and
+// the session's cost-state. Nothing but numbers, a trigger label and a derived
+// hook name is read: no prompt, message or command text is kept.
+type TranscriptMarks struct {
+	Compactions   []Compaction
+	StopHooks     []StopHookSummary
+	TurnDurations []TurnDuration
+	Cost          *CostState // the last cost-state entry in file order; nil when none
+}
+
+// Compaction is one compact_boundary entry. A number the entry lacks is nil.
+type Compaction struct {
+	EntryID                 string
+	TS                      int64  // Unix ms UTC
+	Trigger                 string // "" unless it has the shape of a label (compactTrigger)
+	PreTokens               *int64
+	PostTokens              *int64
+	CumulativeDroppedTokens *int64
+	DurationMS              *int64
+}
+
+// StopHookSummary is one stop_hook_summary entry: the Stop hooks of a turn.
+// PromptID is the latest user promptId before it, the turn it closes.
+type StopHookSummary struct {
+	EntryID    string
+	TS         int64
+	PromptID   string
+	HookCount  int64
+	HookErrors int64 // how many errors it lists, never their text
+	Hooks      []HookRun
+}
+
+// HookRun is one hook a Stop ran. DurationMS is nil for an async hook, which
+// the summary gives none.
+type HookRun struct {
+	Name         string // HookName of its command
+	CommandBytes int64  // the command's length; the command itself is never kept
+	DurationMS   *int64
+}
+
+// TurnDuration is one turn_duration entry, written after the turn's Stop-hook
+// summary and carrying no promptId: PromptID is the latest user promptId
+// before it, the turn it closes.
+type TurnDuration struct {
+	EntryID          string
+	TS               int64
+	PromptID         string
+	DurationMS       *int64
+	MessageCount     *int64
+	BackgroundAgents *int64
+}
+
+// CostState is one cost-state entry: the session's cumulative cost so far.
+type CostState struct {
+	SessionID    string
+	CostUSD      *float64
+	APIMS        *int64
+	APINoRetryMS *int64
+	ToolMS       *int64
+	WallMS       *int64
+	Started      *int64             // the session's start, Unix ms UTC
+	ModelCosts   map[string]float64 // USD by model, keys of the shape of a model name only
+}
+
+var (
+	compactTrigger = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	modelCostKey   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@\[\]/-]{0,127}$`)
+	hookNameShape  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	envAssignment  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+)
+
+// interpreters are the programs whose first argument, not their own name, says
+// what a hook runs.
+var interpreters = map[string]bool{
+	"sh": true, "bash": true, "zsh": true, "dash": true, "env": true, "exec": true, "node": true,
+	"python": true, "python3": true, "uv": true, "uvx": true, "npx": true, "bunx": true, "bun": true,
+	"deno": true, "ruby": true, "perl": true,
+}
+
+// HookName is the stored name of a hook command: the basename of its program,
+// or of the script an interpreter runs, when that has the shape of a file name;
+// else `#` and the first 8 hex digits of the command's SHA-256. The command is
+// never kept, so no argument or path leaves the transcript.
+func HookName(command string) string {
+	base := func(field string) string {
+		field = strings.Trim(field, `"'`)
+		return field[strings.LastIndex(field, "/")+1:]
+	}
+	fields := strings.Fields(command)
+	for len(fields) > 0 && envAssignment.MatchString(fields[0]) {
+		fields = fields[1:]
+	}
+	name := ""
+	if len(fields) > 0 {
+		name = base(fields[0])
+		if interpreters[name] {
+			for _, field := range fields[1:] {
+				if !strings.HasPrefix(field, "-") && field != "run" {
+					name = base(field)
+					break
+				}
+			}
+		}
+	}
+	if hookNameShape.MatchString(name) {
+		return name
+	}
+	sum := sha256.Sum256([]byte(command))
+	return "#" + hex.EncodeToString(sum[:])[:8]
+}
+
+// wholeNumber is n as an integer, nil when it is absent; a number written with
+// a fraction is cut, so a version that writes durations as floats never fails
+// the read.
+func wholeNumber(n *float64) *int64 {
+	if n == nil {
+		return nil
+	}
+	return Ptr(int64(*n))
+}
+
+// markTime is the timestamp of a mark entry, Unix ms UTC. An unparsable one is
+// an error naming only its size, as entryTime does.
+func markTime(timestamp string) (int64, error) {
+	at, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return 0, fmt.Errorf("mark entry: timestamp of %d bytes is not RFC 3339", len(timestamp))
+	}
+	return at.UnixMilli(), nil
+}
+
+// system reads one system entry when it is a mark: a compaction, a Stop-hook
+// summary or a turn duration. Any other subtype, and an entry with no uuid, is
+// no mark.
+func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp string) error {
+	if uuid == "" || scan.seen[uuid] {
+		return nil
+	}
+	switch subtype {
+	case "compact_boundary":
+		var entry struct {
+			CompactMetadata struct {
+				Trigger                 string   `json:"trigger"`
+				PreTokens               *float64 `json:"preTokens"`
+				PostTokens              *float64 `json:"postTokens"`
+				CumulativeDroppedTokens *float64 `json:"cumulativeDroppedTokens"`
+				DurationMS              *float64 `json:"durationMs"`
+			} `json:"compactMetadata"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return fmt.Errorf("malformed compact_boundary entry: %w", err)
+		}
+		at, err := markTime(timestamp)
+		if err != nil {
+			return err
+		}
+		meta := entry.CompactMetadata
+		compaction := Compaction{
+			EntryID: uuid, TS: at, PreTokens: wholeNumber(meta.PreTokens), PostTokens: wholeNumber(meta.PostTokens),
+			CumulativeDroppedTokens: wholeNumber(meta.CumulativeDroppedTokens), DurationMS: wholeNumber(meta.DurationMS),
+		}
+		if compactTrigger.MatchString(meta.Trigger) {
+			compaction.Trigger = meta.Trigger
+		}
+		scan.marks.Compactions = append(scan.marks.Compactions, compaction)
+	case "stop_hook_summary":
+		var entry struct {
+			HookCount *float64 `json:"hookCount"`
+			HookInfos []struct {
+				Command    string   `json:"command"`
+				DurationMS *float64 `json:"durationMs"`
+			} `json:"hookInfos"`
+			HookErrors []json.RawMessage `json:"hookErrors"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return fmt.Errorf("malformed stop_hook_summary entry: %w", err)
+		}
+		at, err := markTime(timestamp)
+		if err != nil {
+			return err
+		}
+		summary := StopHookSummary{
+			EntryID: uuid, TS: at, PromptID: scan.prompt,
+			HookCount: int64(len(entry.HookInfos)), HookErrors: int64(len(entry.HookErrors)),
+		}
+		if entry.HookCount != nil {
+			summary.HookCount = *wholeNumber(entry.HookCount)
+		}
+		for _, info := range entry.HookInfos {
+			summary.Hooks = append(summary.Hooks, HookRun{
+				Name: HookName(info.Command), CommandBytes: int64(len(info.Command)), DurationMS: wholeNumber(info.DurationMS),
+			})
+		}
+		scan.marks.StopHooks = append(scan.marks.StopHooks, summary)
+	case "turn_duration":
+		var entry struct {
+			DurationMS       *float64 `json:"durationMs"`
+			MessageCount     *float64 `json:"messageCount"`
+			BackgroundAgents *float64 `json:"pendingBackgroundAgentCount"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return fmt.Errorf("malformed turn_duration entry: %w", err)
+		}
+		at, err := markTime(timestamp)
+		if err != nil {
+			return err
+		}
+		scan.marks.TurnDurations = append(scan.marks.TurnDurations, TurnDuration{
+			EntryID: uuid, TS: at, PromptID: scan.prompt, DurationMS: wholeNumber(entry.DurationMS),
+			MessageCount: wholeNumber(entry.MessageCount), BackgroundAgents: wholeNumber(entry.BackgroundAgents),
+		})
+	default:
+		return nil
+	}
+	scan.seen[uuid] = true
+	return nil
+}
+
+// cost reads one cost-state entry; the last one read stands.
+func (scan *transcriptRequests) cost(raw []byte) error {
+	var entry struct {
+		SessionID    string   `json:"sessionId"`
+		CostUSD      *float64 `json:"totalCostUSD"`
+		APIMS        *float64 `json:"totalAPIDuration"`
+		APINoRetryMS *float64 `json:"totalAPIDurationWithoutRetries"`
+		ToolMS       *float64 `json:"totalToolDuration"`
+		WallMS       *float64 `json:"totalDuration"`
+		Started      *float64 `json:"startTime"`
+		ModelUsage   map[string]struct {
+			CostUSD *float64 `json:"costUSD"`
+		} `json:"modelUsage"`
+	}
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return fmt.Errorf("malformed cost-state entry: %w", err)
+	}
+	cost := &CostState{
+		SessionID: entry.SessionID, CostUSD: entry.CostUSD, APIMS: wholeNumber(entry.APIMS),
+		APINoRetryMS: wholeNumber(entry.APINoRetryMS), ToolMS: wholeNumber(entry.ToolMS),
+		WallMS: wholeNumber(entry.WallMS), Started: wholeNumber(entry.Started),
+	}
+	for model, usage := range entry.ModelUsage {
+		if usage.CostUSD == nil || !modelCostKey.MatchString(model) {
+			continue
+		}
+		if cost.ModelCosts == nil {
+			cost.ModelCosts = map[string]float64{}
+		}
+		cost.ModelCosts[model] = *usage.CostUSD
+	}
+	scan.marks.Cost = cost
+	return nil
 }

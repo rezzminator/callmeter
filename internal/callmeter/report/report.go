@@ -270,6 +270,9 @@ var inapplicable = map[string][]string{
 	"faults":   {"project", "agent-type"},
 	"sessions": {"agent-type"},
 	"coverage": {"project", "agent-type"},
+	// the six topics over the transcript metrics carry no agent type
+	"compactions": {"agent-type"}, "cost": {"agent-type"}, "hooks": {"agent-type"},
+	"turns": {"agent-type"}, "resumes": {"agent-type"}, "waiting": {"agent-type"},
 }
 
 // InapplicableNotes names every flag set on the command line that topic
