@@ -15,7 +15,7 @@
         "ref": "main"
       },
       "description": "Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "license": "MIT",
       "keywords": ["claude-code", "claude-code-plugin", "hooks", "telemetry", "tool-calls", "token-usage", "cost", "sqlite", "sub-agents", "claude-code-hooks", "context-window", "prompt-caching", "local-first", "observability", "professor"],
       "author": {

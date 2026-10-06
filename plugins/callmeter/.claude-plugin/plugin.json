@@ -1,6 +1,6 @@
 {
   "name": "callmeter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite",
   "license": "MIT",
   "author": {
