@@ -42,7 +42,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 
 - Affected, an executor's only run: `go test ./internal/<pkg>/ -run <Test> -count=1`, timeout 600 s.
 - Full, the lander's: `go test ./...`.
-- Lint: `go vet ./...`, and `gofmt -l .` printing nothing.
+- Lint: `go vet ./...`, and `"$(go env GOROOT)/bin/gofmt" -l .` printing nothing: the toolchain's own gofmt, since a `gofmt` on `PATH` from another Go formats differently.
 - Leak gate: `scripts/leak-check.sh`.
 - Plugin manifests: `claude plugin validate --strict .` (the marketplace) and `claude plugin validate --strict plugins/callmeter` (the plugin).
 - Release consistency: `scripts/release-check.sh` (the version places agree, the committed `SHA256SUMS` matches a fresh build).

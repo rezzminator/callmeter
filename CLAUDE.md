@@ -32,7 +32,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 - Affected: `go test ./internal/{pkg}/ -run {Test} -count=1`
 - Full: `go test ./...`
-- Lint: `go vet ./...`, and `gofmt -l .` printing nothing.
+- Lint: `go vet ./...`, and `"$(go env GOROOT)/bin/gofmt" -l .` printing nothing: the toolchain's own gofmt, since a `gofmt` on `PATH` from another Go formats differently.
 - Leak gate: `scripts/leak-check.sh`; in a worktree, `LEAK_TERMS={checkout}/scripts/leak-terms.txt scripts/leak-check.sh`.
 - Validate: `claude plugin validate --strict .` (the marketplace) and `claude plugin validate --strict plugins/callmeter` (the plugin)
 - Version places: `scripts/release-check.sh`
