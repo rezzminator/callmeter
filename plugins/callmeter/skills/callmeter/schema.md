@@ -1,6 +1,6 @@
 # callmeter store schema
 
-Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; `source` is `hook` for a row a hook wrote, `transcript` for one rebuilt from a transcript by a report run. Contents: [calls](#calls) · [requests](#requests) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [Joins](#joins)
+Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; On `calls`, `requests` and `agents`, `source` is `hook` for a row a hook wrote and `transcript` for one rebuilt from a transcript by a report run (`events.source` is something else, below). Contents: [calls](#calls) · [requests](#requests) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [Joins](#joins)
 
 A store gains newer tables and columns on its next open; `PRAGMA user_version` stays 1, so test for one with `SELECT 1 FROM pragma_table_info('requests') WHERE name = 'thinking_tokens'` or `sqlite_master`, never by version.
 
@@ -11,11 +11,11 @@ One row per tool call. Key `tool_use_id`.
 - `session_id`, `agent_id` (NULL: the main chat), `agent_type`, `request_id` (the model request that issued it), `prompt_id` (the user prompt it ran under).
 - `ts`: the call's start. `duration_ms`: NULL while running or when no result hook landed.
 - `tool`: the name as called (`Bash`, `Read`, `Agent`, `mcp__server__tool`, …).
-- `input`: sanitized JSON, never content; see SKILL.md § Rules. An `mcp__` tool keeps only numbers, booleans and `*_bytes` of its strings.
-- `cwd`: the directory a Bash command started in; NULL for tools that report none and for refused calls.
+- `input`: sanitized JSON, never content. Every text field it drops becomes `{name}_bytes`, its byte count. Bash and Monitor keep `command`, with each heredoc body cut (`heredoc_bytes`) and a commit message or the operands an `echo`/`printf` writes to a file replaced by `'[cut]'` (`operand_bytes`); a command that cannot be cut safely keeps only `command_bytes`. Edit and Write keep `file_path`, with `content_bytes`, `old_string_bytes`, `new_string_bytes`; MultiEdit `edits_bytes`. Agent keeps `subagent_type`, `model` and its booleans, with `prompt_bytes`, `description_bytes`, `name_bytes`. File tools keep `file_path`, `path`, `pattern`, `glob`; numbers and booleans stay. An `mcp__` tool keeps only numbers, booleans and `*_bytes` of its strings.
+- `cwd`: for Bash, the directory the command started in (where it ended when its start hook was lost); for other tools, the directory the result hook reported; NULL for refused calls.
 - `failed`: 1 failed, 0 succeeded, NULL outcome not recorded. `is_interrupt`: the user interrupted it. `error`: never the error text, only `Exit code N`, an outcome label (`denied by a PreToolUse hook`, `denied by permission`, `rejected or interrupted by the user`, `refused by Claude Code`) or `error text not stored`.
-- `bytes_real`: the tool's real output size; `bytes_delivered`: what reached the model's context (smaller when Claude Code spilled the output to a file, whose path is `persisted_path`). `bytes_real` is NULL by rule for Edit, Write and Agent.
-- `file_path`: the file a file tool named. `file_bytes`, `file_bytes_before`: its size after and before an Edit or Write. `read_start`, `read_lines`, `read_total_lines`: the range a Read returned and the file's length.
+- `bytes_real`: the tool's real output size; `bytes_delivered`: what reached the model's context (smaller when Claude Code spilled the output to a file, whose path is `persisted_path`). `bytes_real` is NULL for a successful Edit, Write or Agent call; a failed call of any tool stores its error text's length.
+- `file_path`: the file a file tool named. `file_bytes`, `file_bytes_before`: its size after and before an Edit or Write; `file_bytes_before` is 0 on a Write that created the file and NULL when the call recorded no result. MultiEdit and NotebookEdit carry `file_bytes` only, and NotebookEdit no line counts. `read_start`, `read_lines`, `read_total_lines`: the range a Read returned and the file's length.
 - `lines_added`, `lines_removed`: an Edit's or Write's diff size. `commit_sha`, `commit_branch`: a `git commit` the call made. `test_runner`: the runner a test command used.
 - `effort`, `permission_mode`: as the hook payload carried them.
 
@@ -33,7 +33,7 @@ One row per sub-agent. Key `agent_id`, the id the Agent tool returns.
 
 - `session_id`: the main chat it belongs to. `agent_type`, `model`, `prompt_id`.
 - `parent_tool_use_id`: the `calls.tool_use_id` of the Agent call that started it; NULL when that link was never recorded.
-- `started`, `stopped` (NULL: running, or killed mid-turn). `total_tokens`, `tool_uses`: whole-transcript totals written at the stop, NULL before it.
+- `started`, `stopped` (NULL: running, or its stop never recorded). `total_tokens`, `tool_uses`: whole-transcript totals written when a stop is recorded or rebuilt by a report run; NULL while running or after a lost stop.
 - `transcript_path`: may be NULL; sub-agent transcripts sit at `{config dir}/projects/{project}/{session_id}/subagents/agent-{agent_id}.jsonl`.
 
 ## agent_turns
@@ -46,11 +46,11 @@ One row per `Stop` or `SubagentStop` firing: turn ends only, never prompts. Key 
 
 ## events
 
-One row per lifecycle hook firing other than the four tool events: `UserPromptSubmit` (prompts live here, `prompt_bytes` their size), `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`, `Notification`, `PreCompact`, `PostCompact`, `InstructionsLoaded`, `PermissionRequest`, `UserPromptExpansion` (a typed slash command: `command_name`), `StopFailure` (`error_type`), and others as Claude Code adds them. Key `event_id`.
+One row per lifecycle hook firing other than the four tool events: `Stop`, `UserPromptSubmit` (prompts live here, `prompt_bytes` their size), `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`, `Notification`, `PreCompact`, `PostCompact`, `InstructionsLoaded`, `PermissionRequest`, `UserPromptExpansion` (a typed slash command: `command_name`), `StopFailure` (`error_type`), and others as Claude Code adds them. Key `event_id`.
 
 - `source`: SessionStart's `startup`, `resume`, `clear`, `compact`, `fork`. `reason`: SessionEnd's reason. `trigger`: a compaction's `auto` or `manual`. `load_reason`, `memory_type`, `file_path`: an InstructionsLoaded's.
 - `detail`: sanitized JSON of the rest, numbers and labels only. A resume's `SessionStart` carries `seconds_since_last_response`, `context_tokens`, `prompt_cache_likely_expired`, `estimated_cache_write_usd`; a Notification carries `notification_type` (`idle_prompt`, `permission_prompt`, …).
-- Compaction events of a sub-agent may carry no `agent_id`.
+- `PreCompact` and `PostCompact` carry no `agent_id`, so they cannot tell a sub-agent's compaction from the main chat's: `compactions.agent_id` does.
 
 ## sessions
 
@@ -71,7 +71,7 @@ One row per simple command inside a Bash call, filled by report runs, never by t
 
 ## faults
 
-One row per failure to record or parse. Key `fault_id`. `ts` (whole-second resolution), `session_id`, `tool_use_id`, `stage` (`payload`, `store`, `transcript`, `parse`, `binary`, `terminated`), `error` (a label, never captured text). `terminated` and `binary` rows are events lost before they reached the store: count them before claiming something did not happen.
+One row per failure to record or parse. Key `fault_id`. `ts` (milliseconds; whole seconds for rows ingested from `missed.log`), `session_id`, `tool_use_id`, `stage` (`payload`, `store`, `transcript`, `parse`, `binary`, `terminated`), `error` (the failure's own message, which may name a file path; a parse fault keeps only a label and byte count). `terminated` and `binary` rows are events lost before they reached the store: count them before claiming something did not happen.
 
 ## compactions
 

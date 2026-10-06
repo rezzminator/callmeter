@@ -44,7 +44,7 @@ The repository is a one-plugin marketplace. `.claude-plugin/marketplace.json` at
 | `libexec/callmeter` | the POSIX sh wrapper every hook and both skills run |
 | `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's |
 | `skills/report/SKILL.md` | `/callmeter:report {topic} [flags]`, which runs the wrapper's `report` |
-| `skills/callmeter/SKILL.md`, `skills/callmeter/schema.md` | `/callmeter:callmeter`: how a model reads the store directly, read-only, with SQL or Python (where it lives, safe reads, units, joins, tested recipes), and every table's columns; it runs the wrapper only for one `report` that settles quiet sessions before a query |
+| `skills/callmeter/SKILL.md`, `skills/callmeter/schema.md` | `/callmeter:callmeter`: how a model reads the store directly, read-only, with SQL or Python (where it lives, safe reads, units, joins, tested recipes), and every table's columns; it runs the wrapper only for a `report` the user asked for or agreed to, since a report run prunes |
 | `README.md`, `LICENSE` | what an installed plugin shows |
 
 Everything else (`cmd/callmeter/`, `internal/`, `e2e/`, `scripts/`, `.github/workflows/`, `docs/`) builds, tests and releases the binary and never installs. There is no top-level `bin/`, and nothing is written to `${CLAUDE_PLUGIN_DATA}`.
