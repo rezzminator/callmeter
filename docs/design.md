@@ -41,9 +41,10 @@ The repository is a one-plugin marketplace. `.claude-plugin/marketplace.json` at
 | `.claude-plugin/plugin.json` | name, version (the one version the wrapper reads), description, author, keywords; no `hooks` or `skills` key, both sit at their default locations |
 | `.claude-plugin/icon.svg` | the plugin's icon |
 | `hooks/hooks.json` | the registration below |
-| `libexec/callmeter` | the POSIX sh wrapper every hook and the skill run |
+| `libexec/callmeter` | the POSIX sh wrapper every hook and both skills run |
 | `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's |
 | `skills/report/SKILL.md` | `/callmeter:report {topic} [flags]`, which runs the wrapper's `report` |
+| `skills/callmeter/SKILL.md`, `skills/callmeter/schema.md` | `/callmeter:callmeter`: how a model reads the store directly, read-only, with SQL or Python (where it lives, safe reads, units, joins, tested recipes), and every table's columns; it runs the wrapper only for one `report` that settles quiet sessions before a query |
 | `README.md`, `LICENSE` | what an installed plugin shows |
 
 Everything else (`cmd/callmeter/`, `internal/`, `e2e/`, `scripts/`, `.github/workflows/`, `docs/`) builds, tests and releases the binary and never installs. There is no top-level `bin/`, and nothing is written to `${CLAUDE_PLUGIN_DATA}`.
@@ -65,7 +66,7 @@ Never registered: `WorktreeCreate`, `WorktreeRemove`, `MessageDisplay`, `FileCha
 
 ## The wrapper
 
-`plugins/callmeter/libexec/callmeter`, POSIX sh, mode 0755. It resolves a binary, then hands it its own arguments and untouched stdin. The hand-off is `exec` for the `$CALLMETER_BIN` override and for every run of an already installed cached binary: the cache check, the lock-wait loop finding the target, and the lock holder finding it installed after taking the lock. Only the run right after this run's own download and install, under `hook`, runs the binary as a child, so its non-zero exit or failed start still becomes a `binary exited {rc}` line in `missed.log`; under another subcommand that run is an `exec` too. Its root is the directory above the script's own, cut from the script's path by parameter expansion (a hook names the script by its path), so it works the same from a hook and from the skill; `{version}` is the first `version` string of `{root}/.claude-plugin/plugin.json`, read by a builtin `while read` loop over the file. The cache-hit path starts no process before its `exec`: the root, the version and the `.last-use` stamp come from shell builtins alone, because a headless exit kills a running hook within tens of milliseconds and every process started before the hand-off is a chance to lose the event.
+`plugins/callmeter/libexec/callmeter`, POSIX sh, mode 0755. It resolves a binary, then hands it its own arguments and untouched stdin. The hand-off is `exec` for the `$CALLMETER_BIN` override and for every run of an already installed cached binary: the cache check, the lock-wait loop finding the target, and the lock holder finding it installed after taking the lock. Only the run right after this run's own download and install, under `hook`, runs the binary as a child, so its non-zero exit or failed start still becomes a `binary exited {rc}` line in `missed.log`; under another subcommand that run is an `exec` too. Its root is the directory above the script's own, cut from the script's path by parameter expansion (a hook names the script by its path), so it works the same from a hook and from a skill; `{version}` is the first `version` string of `{root}/.claude-plugin/plugin.json`, read by a builtin `while read` loop over the file. The cache-hit path starts no process before its `exec`: the root, the version and the `.last-use` stamp come from shell builtins alone, because a headless exit kills a running hook within tens of milliseconds and every process started before the hand-off is a chance to lose the event.
 
 Resolution order:
 

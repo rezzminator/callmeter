@@ -143,6 +143,14 @@ claude-haiku-4-5-20251001  general-purpose  6         58     33030       41033  
 
 Every report, column and note is specified in [docs/design.md § Reports](./docs/design.md#reports).
 
+## 🔎 Ask the store your own questions
+
+A question no report answers (which sub-agent peaked highest, what a whole agent tree cost, what one agent spent its time on) goes to the store itself. The `callmeter` skill teaches Claude to read it safely: read-only with a busy timeout, millisecond UTC times, the main chat as `agent_id IS NULL`, content stored only as byte counts, and tested SQL and Python recipes over every table. Ask in plain words, or load it yourself:
+
+```text
+/callmeter:callmeter which of my sub-agents in this session hit the highest context?
+```
+
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
@@ -245,7 +253,7 @@ internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
 internal/…                clock, sqlitedb, runner, testjail, paths, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
-plugins/callmeter/        only what installs: manifest, hooks, wrapper, skill
+plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/
 docs/                     design.md, testing.md
 ```

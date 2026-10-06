@@ -14,6 +14,10 @@ Each tool call with its sanitized input, duration, failure, the bytes it produce
 
 Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`, `compactions`, `cost`, `hooks`, `turns`, `resumes`, `waiting`.
 
+## Your own questions
+
+`/callmeter:callmeter` teaches Claude to read the store directly, read-only, with SQL or Python: the schema, units, joins and tested recipes for questions no report answers.
+
 ## Where the store lives
 
 `${CALLMETER_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/callmeter}/callmeter.db`: one store per machine, shared by every Claude Code config dir, never the plugin's per-seat data directory. The binary is downloaded on first use into `bin/` beside it and checked against `libexec/SHA256SUMS`.

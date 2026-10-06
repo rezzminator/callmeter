@@ -8,7 +8,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - marketplace: the plugin listing · `.claude-plugin/marketplace.json`
 - manifest: the plugin's version and author · `plugins/callmeter/.claude-plugin/plugin.json`
 - hooks: every registered event runs the wrapper with `hook`, async · `plugins/callmeter/hooks/hooks.json`
-- wrapper: the POSIX sh entry every hook and the report skill run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
+- wrapper: the POSIX sh entry every hook and both skills run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
 - binary: the Go program behind `callmeter {hook|report|version}` · `cmd/callmeter/main.go`
 - `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset · `internal/paths/paths.go`
 - binary cache: the installed binary per plugin version · `{CALLMETER_HOME}/bin/{version}/callmeter`
@@ -67,5 +67,6 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## Plugin
 
-- `plugins/callmeter/` holds only what installs: manifest, hooks, wrapper, skill; every other file lives outside it.
-- Text the model reads (the report skill, report output, hook output) stays unbranded; Professor's credit lives only in the READMEs and the `author` and `keywords` of the manifest and the marketplace.
+- `plugins/callmeter/` holds only what installs: manifest, hooks, wrapper, skills; every other file lives outside it.
+- A store change (a table, a column, a unit, a NULL meaning) updates `plugins/callmeter/skills/callmeter/schema.md` and any recipe in its `SKILL.md` that it touches, each recipe re-run against a snapshot.
+- Text the model reads (the skills, report output, hook output) stays unbranded; Professor's credit lives only in the READMEs and the `author` and `keywords` of the manifest and the marketplace.
