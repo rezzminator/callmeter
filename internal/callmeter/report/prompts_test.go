@@ -52,6 +52,10 @@ func seedPrompts(t *testing.T, store *callmeter.Store) {
 		AgentID: "a2", SessionID: callmeter.Ptr("s1"), AgentType: callmeter.Ptr("Plan"), PromptID: callmeter.Ptr("p1"),
 		Started: callmeter.Ptr(ms(2 * time.Hour)),
 	})
+	// p1 took two turns of 12 s and 3 s; p3's duration was never measured
+	exec(t, store, `INSERT INTO turn_durations (entry_id, session_id, prompt_id, ts, duration_ms) VALUES
+		('d1', 's1', 'p1', ?, 12000), ('d2', 's1', 'p1', ?, 3000), ('d3', 's9', 'p3', ?, NULL)`,
+		ms(2*time.Hour), ms(time.Hour), ms(time.Hour))
 }
 
 func TestPromptsListsOneRowPerPromptMostCallsFirst(t *testing.T) {
@@ -62,11 +66,11 @@ func TestPromptsListsOneRowPerPromptMostCallsFirst(t *testing.T) {
 		t.Fatalf("Prompts: %v", err)
 	}
 	wantHeader(t, table,
-		"PROMPT", "CHAT", "FIRST", "LAST", "CALLS", "FAILED", "AGENTS", "REQUESTS", "CONTEXT TOKENS", "OUTPUT TOKENS")
+		"PROMPT", "CHAT", "FIRST", "LAST", "CALLS", "FAILED", "AGENTS", "REQUESTS", "CONTEXT TOKENS", "OUTPUT TOKENS", "WALL S")
 	wantRows(t, table,
-		"p1|chat-s1|2026-09-23 09:00|2026-09-23 11:00|3|1|2|2|300|30",
-		"p2|chat-s1|2026-09-23 11:30|2026-09-23 11:30|1|0|0|0|0|0",
-		"p3|chat-s9|-|-|0|0|0|1|50|5",
+		"p1|chat-s1|2026-09-23 09:00|2026-09-23 11:00|3|1|2|2|300|30|15.0",
+		"p2|chat-s1|2026-09-23 11:30|2026-09-23 11:30|1|0|0|0|0|0|-",
+		"p3|chat-s9|-|-|0|0|0|1|50|5|-",
 	)
 }
 
@@ -79,7 +83,7 @@ func TestPromptsAgentTypeNarrowsCallsAgentsAndRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prompts: %v", err)
 	}
-	wantRows(t, table, "p1|chat-s1|2026-09-23 10:00|2026-09-23 10:00|1|0|1|1|200|20")
+	wantRows(t, table, "p1|chat-s1|2026-09-23 10:00|2026-09-23 10:00|1|0|1|1|200|20|15.0")
 }
 
 func TestPromptsSessionAndLimitNarrow(t *testing.T) {
@@ -90,7 +94,7 @@ func TestPromptsSessionAndLimitNarrow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prompts: %v", err)
 	}
-	wantRows(t, table, "p3|chat-s9|-|-|0|0|0|1|50|5")
+	wantRows(t, table, "p3|chat-s9|-|-|0|0|0|1|50|5|-")
 	table, err = Prompts(ctx, store, Filter{Limit: 2}, chatOf)
 	if err != nil {
 		t.Fatalf("Prompts: %v", err)

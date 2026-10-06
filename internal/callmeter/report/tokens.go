@@ -11,7 +11,11 @@ import (
 // requests, input, cache read, cache write (at 5 m and at 1 h when the usage
 // carried the split, "-" when no request did), output, and the cache hit rate
 // cache_read / (input + cache_read + cache_creation) as a percentage with one
-// decimal, "-" when the denominator is zero. A request still pending has no
+// decimal, "-" when the denominator is zero. THINKING is the thinking tokens,
+// a subset of OUTPUT, and THINK % is thinking as a percentage of the output of
+// only those requests that carried it, one decimal; both are "-" when no
+// request of the row carried the split (the transcript did not, or the store
+// has not gained the column yet), never 0. A request still pending has no
 // tokens read yet: it is not counted, and the pending note names it.
 func Tokens(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
@@ -20,15 +24,20 @@ func Tokens(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 		Title: f.title("tokens", n),
 		Header: []string{
 			"MODEL", "AGENT TYPE", "REQUESTS", "INPUT", "CACHE READ", "CACHE WRITE 5M", "CACHE WRITE 1H", "CACHE WRITE",
-			"OUTPUT", "CACHE HIT %",
+			"OUTPUT", "THINKING", "CACHE HIT %", "THINK %",
 		},
 	}
 	where, args := f.scoped(scope{ts: "r.ts", session: "r.session_id", agentType: "a.agent_type"})
+	// a store that has not gained the column is not asked for it
+	thinking := "NULL, NULL"
+	if store.SchemaComplete() {
+		thinking = "SUM(r.thinking_tokens), SUM(CASE WHEN r.thinking_tokens IS NOT NULL THEN COALESCE(r.output_tokens, 0) END)"
+	}
 	err := query(ctx, store, "tokens",
 		`SELECT COALESCE(NULLIF(r.model, ''), '-'), COALESCE(NULLIF(a.agent_type, ''), '-'), COUNT(*),
 			COALESCE(SUM(r.input_tokens), 0), COALESCE(SUM(r.cache_read_tokens), 0),
 			SUM(r.cache_creation_5m_tokens), SUM(r.cache_creation_1h_tokens),
-			COALESCE(SUM(r.cache_creation_tokens), 0), COALESCE(SUM(r.output_tokens), 0)
+			COALESCE(SUM(r.cache_creation_tokens), 0), COALESCE(SUM(r.output_tokens), 0), `+thinking+`
 		FROM requests r LEFT JOIN agents a ON a.agent_id = r.agent_id
 		WHERE COALESCE(r.pending, 0) = 0 AND `+where+`
 		GROUP BY 1, 2 ORDER BY COUNT(*) DESC, 1, 2 LIMIT ?`,
@@ -36,13 +45,14 @@ func Tokens(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 		func(r rowSource) error {
 			var model, agentType string
 			var requests, input, read, write, output int64
-			var write5m, write1h *int64
-			if err := r.Scan(&model, &agentType, &requests, &input, &read, &write5m, &write1h, &write, &output); err != nil {
+			var write5m, write1h, thinkingTokens, thinkingOutput *int64
+			if err := r.Scan(&model, &agentType, &requests, &input, &read, &write5m, &write1h, &write, &output, &thinkingTokens, &thinkingOutput); err != nil {
 				return err
 			}
 			t.Rows = append(t.Rows, []string{
 				model, agentType, itoa(requests), itoa(input), itoa(read), intCell(write5m), intCell(write1h),
-				itoa(write), itoa(output), hitRate(read, input+read+write),
+				itoa(write), itoa(output), intCell(thinkingTokens), hitRate(read, input+read+write),
+				thinkShare(thinkingTokens, thinkingOutput),
 			})
 			return nil
 		})
@@ -62,4 +72,14 @@ func hitRate(read, total int64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.1f", float64(read)*100/float64(total))
+}
+
+// thinkShare is the thinking tokens as a percentage of the output of the
+// requests that carried them, with one decimal; "-" when no request did or
+// that output is zero, never 0.0.
+func thinkShare(thinking, output *int64) string {
+	if thinking == nil || output == nil {
+		return "-"
+	}
+	return hitRate(*thinking, *output)
 }

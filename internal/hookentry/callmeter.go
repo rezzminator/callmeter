@@ -438,7 +438,9 @@ func runCallmeter(
 	}()
 	// The wrapper's own failures (no binary, a bad checksum) land as binary
 	// faults on the next run that reaches the store; failing to ingest them
-	// is one store fault and never stops this run's record. The signal handler
+	// is one store fault, except on a busy store: there the run gives up
+	// (faultHeld, giveUpBusy) and leaves its own line in missed.log, since a
+	// second wait could outlast a sync hook's timeout. The signal handler
 	// is held off from the commit until the claim is moved, so a signal there
 	// leaves no committed claim in place to be ingested again.
 	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
@@ -1269,7 +1271,9 @@ func (run *callmeterRun) sweepSession(allAgents bool) {
 }
 
 // sweepRequests writes every request of one chat's or sub-agent's transcript
-// (callmeter.ReadRequests) through Tx.SettleRequest. settle waits, as
+// (callmeter.ReadTranscript) through Tx.SettleRequest, and the marks of the
+// same read the store lacks through Tx.PutMarks. Every transcript and store
+// read happens before the write closure, which only writes. settle waits, as
 // SubagentStop does, until the last message is on disk: Claude Code fires the
 // hook before flushing it. A path holding no transcript file is skipped, as
 // resolveAgentsPending skips one: an untyped internal agent and a session run
@@ -1283,12 +1287,13 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 	if info, err := os.Stat(transcript); errors.Is(err, fs.ErrNotExist) || (err == nil && !info.Mode().IsRegular()) {
 		return
 	}
-	requests, err := run.transcriptRequests(transcript, settle)
+	read, err := run.transcriptRequests(transcript, settle)
 	if err != nil {
 		run.fault(callmeter.StageTranscript, "", fmt.Errorf("requests of %s: %w", transcript, err))
 		return
 	}
-	if len(requests) == 0 {
+	requests := read.Requests
+	if len(requests) == 0 && read.Marks.Empty() {
 		return
 	}
 	// A session with no run recorded yet back-fills nothing older than now:
@@ -1300,6 +1305,25 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 	}
 	if !ok {
 		since = run.now
+	}
+	// The marks the store lacks, filtered before the write like the requests:
+	// a store that cannot say what it holds loses the marks, not the requests.
+	marks := read.Marks
+	if !marks.Empty() {
+		known, err := run.store.KnownMarks(run.ctx, p.SessionID)
+		if err != nil {
+			run.fault(callmeter.StageStore, "", err)
+			marks = callmeter.TranscriptMarks{}
+		} else {
+			marks = marks.Since(since, known)
+		}
+	}
+	if len(requests) == 0 && marks.Empty() {
+		return
+	}
+	seatDir := ""
+	if run.seat.dir != nil {
+		seatDir = *run.seat.dir
 	}
 	run.write("", func(tx *callmeter.Tx) error {
 		for _, read := range requests {
@@ -1320,25 +1344,25 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 				return err
 			}
 		}
-		return nil
+		return tx.PutMarks(run.ctx, p.SessionID, agentID, seatDir, run.now, marks)
 	})
 }
 
-// transcriptRequests reads the transcript's requests; settle re-reads until
+// transcriptRequests reads the transcript's requests and marks; settle re-reads until
 // its last assistant entry ends the turn of the hook's prompt_id, no user
-// entry of that turn after it (callmeter.ReadTurnRequests' final), or
+// entry of that turn after it (callmeter.TranscriptRead's Final), or
 // agentSettle has passed (a turn
 // interrupted mid-call never writes one), on the wall clock as
 // settledAgentTotals does. A transcript with no request is not waited on.
-func (run *callmeterRun) transcriptRequests(transcript string, settle bool) ([]callmeter.TranscriptRequest, error) {
+func (run *callmeterRun) transcriptRequests(transcript string, settle bool) (callmeter.TranscriptRead, error) {
 	deadline := clock.Real.Now().Add(agentSettle)
 	for {
-		requests, final, err := callmeter.ReadTurnRequests(transcript, run.payload.PromptID)
-		if err != nil || !settle || final || len(requests) == 0 || !clock.Real.Now().Before(deadline) {
-			return requests, err
+		read, err := callmeter.ReadTranscript(transcript, run.payload.PromptID)
+		if err != nil || !settle || read.Final || len(read.Requests) == 0 || !clock.Real.Now().Before(deadline) {
+			return read, err
 		}
 		if err := clock.Real.Sleep(run.ctx, 25*time.Millisecond); err != nil {
-			return requests, fmt.Errorf("wait for the final message of %s: %w", transcript, err)
+			return read, fmt.Errorf("wait for the final message of %s: %w", transcript, err)
 		}
 	}
 }

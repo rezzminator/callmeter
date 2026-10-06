@@ -422,11 +422,17 @@ func TestTerminatedFaultsBecomeTheUnrecordedEventsNoteOnEveryTopic(t *testing.T)
 func TestInapplicableNotesNameEachFlagATopicCannotApply(t *testing.T) {
 	both := Filter{Project: "/w/p", AgentType: "Explore", Session: "s", Limit: 3}
 	for topic, want := range map[string]string{
-		"sessions": "--agent-type does not apply to sessions",
-		"coverage": "--project does not apply to coverage;--agent-type does not apply to coverage",
-		"faults":   "--project does not apply to faults;--agent-type does not apply to faults",
-		"tokens":   "",
-		"files":    "",
+		"sessions":    "--agent-type does not apply to sessions",
+		"coverage":    "--project does not apply to coverage;--agent-type does not apply to coverage",
+		"faults":      "--project does not apply to faults;--agent-type does not apply to faults",
+		"tokens":      "",
+		"files":       "",
+		"compactions": "--agent-type does not apply to compactions",
+		"cost":        "--agent-type does not apply to cost",
+		"hooks":       "--agent-type does not apply to hooks",
+		"turns":       "--agent-type does not apply to turns",
+		"resumes":     "--agent-type does not apply to resumes",
+		"waiting":     "--agent-type does not apply to waiting",
 	} {
 		if got := strings.Join(InapplicableNotes(topic, both), ";"); got != want {
 			t.Errorf("InapplicableNotes(%s) = %q, want %q", topic, got, want)
@@ -795,6 +801,12 @@ func TestEmptyTopicsNameWhatTheyFoundNone(t *testing.T) {
 		{"agents", Agents, "callmeter: no sub-agents in window"},
 		{"events", Events, "callmeter: no events in window"},
 		{"effort", Effort, "callmeter: no effort recorded in window"},
+		{"compactions", Compactions, "callmeter: no compactions in window"},
+		{"cost", Cost, "callmeter: no cost-state recorded in window"},
+		{"hooks", Hooks, "callmeter: no Stop hook summaries in window"},
+		{"turns", Turns, "callmeter: no turn durations in window"},
+		{"resumes", Resumes, "callmeter: no resumes in window"},
+		{"waiting", Waiting, "callmeter: no waits in window"},
 		{"files", Files, EmptyLine},
 		{"writes", Writes, EmptyLine},
 		{"commands", Commands, EmptyLine},

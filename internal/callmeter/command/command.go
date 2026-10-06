@@ -23,7 +23,7 @@ import (
 )
 
 // Usage is the report action's usage text.
-const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events} [--since D] [--project P]
+const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events|compactions|cost|hooks|turns|resumes|waiting} [--since D] [--project P]
                        [--agent-type T] [--session S] [--limit N] [--json]
   --since D         a duration (7d, 24h) or a date (2026-09-01); default and floor: the 30-day retention window
   --json            one JSON object on stdout instead of the text table`
@@ -35,6 +35,8 @@ var topics = map[string]topicFunc{
 	"context": report.Context, "sequences": report.Sequences, "faults": report.Faults,
 	"sessions": report.Sessions, "prompts": report.Prompts, "effort": report.Effort, "tokens": report.Tokens,
 	"agents": report.Agents, "outcomes": report.Outcomes, "coverage": report.Coverage, "events": report.Events,
+	"compactions": report.Compactions, "cost": report.Cost, "hooks": report.Hooks, "turns": report.Turns,
+	"resumes": report.Resumes, "waiting": report.Waiting,
 }
 
 // CLI is `callmeter {args}` for the report action: the reports over the call

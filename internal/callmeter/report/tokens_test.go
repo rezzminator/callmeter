@@ -28,6 +28,9 @@ func seedTokens(t *testing.T, store *callmeter.Store) {
 		Model: callmeter.Ptr("haiku"), InputTokens: i64(0), CacheReadTokens: i64(0), CacheCreationTokens: i64(0),
 		OutputTokens: i64(7),
 	})
+	// the transcript split thinking out of r1 and r2 only
+	exec(t, store, "UPDATE requests SET thinking_tokens = 20 WHERE request_id = 'r1'")
+	exec(t, store, "UPDATE requests SET thinking_tokens = 10 WHERE request_id = 'r2'")
 }
 
 func TestTokensSumsTheSplitPerModelAndAgentType(t *testing.T) {
@@ -38,10 +41,10 @@ func TestTokensSumsTheSplitPerModelAndAgentType(t *testing.T) {
 		t.Fatalf("Tokens: %v", err)
 	}
 	wantHeader(t, table, "MODEL", "AGENT TYPE", "REQUESTS", "INPUT", "CACHE READ", "CACHE WRITE 5M", "CACHE WRITE 1H",
-		"CACHE WRITE", "OUTPUT", "CACHE HIT %")
+		"CACHE WRITE", "OUTPUT", "THINKING", "CACHE HIT %", "THINK %")
 	wantRows(t, table,
-		"opus|-|2|200|1500|260|40|300|80|75.0",
-		"haiku|Explore|1|0|0|-|-|0|7|-",
+		"opus|-|2|200|1500|260|40|300|80|30|75.0|37.5",
+		"haiku|Explore|1|0|0|-|-|0|7|-|-|-",
 	)
 	if len(table.Notes) != 0 {
 		t.Errorf("notes = %q, want none", table.Notes)
@@ -71,7 +74,7 @@ func TestTokensAgentTypeNarrowsAndPendingIsANoteNotARow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tokens: %v", err)
 	}
-	wantRows(t, table, "haiku|Explore|1|0|0|-|-|0|7|-")
+	wantRows(t, table, "haiku|Explore|1|0|0|-|-|0|7|-|-|-")
 	table, err = Tokens(ctx, store, Filter{}, chatOf)
 	if err != nil {
 		t.Fatalf("Tokens: %v", err)
@@ -96,7 +99,7 @@ func TestTokensSessionSinceAndLimitNarrow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tokens: %v", err)
 	}
-	wantRows(t, table, "sonnet|-|1|1|1|-|-|0|1|50.0")
+	wantRows(t, table, "sonnet|-|1|1|1|-|-|0|1|-|50.0|-")
 	table, err = Tokens(ctx, store, Filter{Since: testNow.Add(-24 * time.Hour)}, chatOf)
 	if err != nil {
 		t.Fatalf("Tokens: %v", err)
@@ -110,5 +113,36 @@ func TestTokensSessionSinceAndLimitNarrow(t *testing.T) {
 	}
 	if len(table.Rows) != 1 {
 		t.Errorf("limit 1 rows = %v, want 1", rowsOf(table))
+	}
+}
+
+// THINK % is over the output of the requests that carried thinking only: a
+// request with no split adds its output to OUTPUT and nothing to the share.
+func TestTokensThinkShareLeavesRequestsWithoutTheSplitOut(t *testing.T) {
+	store := openStore(t)
+	seedTokens(t, store)
+	seedRequest(t, store, callmeter.Request{
+		RequestID: "r6", SessionID: callmeter.Ptr("s1"), TS: callmeter.Ptr(ms(time.Hour)), Model: callmeter.Ptr("opus"),
+		InputTokens: i64(0), CacheReadTokens: i64(0), CacheCreationTokens: i64(0), OutputTokens: i64(1000),
+	})
+	table, err := Tokens(context.Background(), store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Tokens: %v", err)
+	}
+	wantRows(t, table,
+		"opus|-|3|200|1500|260|40|300|1080|30|75.0|37.5",
+		"haiku|Explore|1|0|0|-|-|0|7|-|-|-",
+	)
+}
+
+func TestThinkShareIsDashWithoutAThinkingRequest(t *testing.T) {
+	if got := thinkShare(nil, nil); got != "-" {
+		t.Errorf("thinkShare(nil, nil) = %q, want -", got)
+	}
+	if got := thinkShare(i64(5), i64(0)); got != "-" {
+		t.Errorf("thinkShare over zero output = %q, want -", got)
+	}
+	if got := thinkShare(i64(0), i64(40)); got != "0.0" {
+		t.Errorf("thinkShare(0, 40) = %q, want 0.0: a split of zero thinking is a real zero", got)
 	}
 }

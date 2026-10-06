@@ -708,6 +708,8 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	// complete: every transcript of the session was read in full, so what no
 	// request of theirs fills stays unfilled for good (MarkUnfillable).
 	complete := haveSince
+	var markReads []markWrite // the marks of each transcript read, before filtering
+	var markWrites []markWrite
 	if haveSince {
 		for i, file := range files {
 			agentID := ""
@@ -719,7 +721,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 				}
 				metas[agentID] = subagentMeta{agentType: agentType, parent: parent}
 			}
-			requests, _, err := ReadRequests(file)
+			read, err := ReadTranscript(file, "")
 			if errors.Is(err, fs.ErrNotExist) {
 				complete = false
 				continue
@@ -729,6 +731,8 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 				skip(file, err)
 				continue
 			}
+			requests := read.Requests
+			markReads = append(markReads, markWrite{agentID: agentID, marks: read.Marks})
 			if i == 0 {
 				notices, err = ReadTaskNotices(file)
 				if err != nil {
@@ -771,6 +775,10 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 				}
 			}
 		}
+	}
+
+	if markWrites, err = s.marksToWrite(ctx, session.id, since, markReads); err != nil {
+		return err
 	}
 
 	end, endRead, err := s.lostTurnEnd(ctx, session.id, session.transcript, skip)
@@ -833,7 +841,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		}
 	}
 	if resolvedCount == 0 && len(settled) == 0 && len(writes) == 0 && end.Event == "" && !endUnfilled && !noEnd && !lostEnd && !unfilled &&
-		len(markCalls) == 0 && len(rebuilt) == 0 && len(parents) == 0 && len(markTurns) == 0 && len(settleStops) == 0 {
+		len(markCalls) == 0 && len(rebuilt) == 0 && len(parents) == 0 && len(markTurns) == 0 && len(settleStops) == 0 && len(markWrites) == 0 {
 		return nil
 	}
 	rebuiltEnd, marked, lost, unfillable, agentStops := false, false, false, 0, 0
@@ -867,6 +875,11 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		}
 		if mainRequest {
 			if err := tx.RefreshSessionModel(ctx, session.id); err != nil {
+				return err
+			}
+		}
+		for _, write := range markWrites {
+			if err := tx.PutMarks(ctx, session.id, write.agentID, seatDir, now.UnixMilli(), write.marks); err != nil {
 				return err
 			}
 		}
@@ -925,7 +938,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		return err
 	}
 	if resolvedCount == 0 && len(settled) == 0 && len(writes) == 0 && !rebuiltEnd && !marked && !lost && unfillable == 0 &&
-		len(rebuilt) == 0 && len(parents) == 0 && agentStops == 0 {
+		len(rebuilt) == 0 && len(parents) == 0 && agentStops == 0 && len(markWrites) == 0 {
 		return nil
 	}
 	summary.AgentStops += agentStops
@@ -945,6 +958,63 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	summary.Calls += len(settled)
 	summary.Requests += resolvedCount + len(writes)
 	return nil
+}
+
+// markWrite is the marks one transcript holds that the store lacks, with the
+// agent it belongs to ("" for the main chat).
+type markWrite struct {
+	agentID string
+	marks   TranscriptMarks
+}
+
+// marksToWrite filters the marks each transcript of a session holds (reads) to
+// the ones the store lacks: those not older than since and not stored
+// (KnownMarks), and a cost-state only when it differs from the stored one, so a
+// session read again with nothing new writes nothing. It reads the store, never
+// a transcript, and is called before the write transaction opens. A store whose
+// schema is incomplete holds none of the tables, so nothing is written to it.
+func (s *Store) marksToWrite(ctx context.Context, sessionID string, since int64, reads []markWrite) ([]markWrite, error) {
+	if !s.complete {
+		return nil, nil
+	}
+	anyMarks := false
+	for _, read := range reads {
+		anyMarks = anyMarks || !read.marks.Empty()
+	}
+	if !anyMarks {
+		return nil, nil
+	}
+	known, err := s.KnownMarks(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	var writes []markWrite
+	for _, read := range reads {
+		marks := read.marks.Since(since, known)
+		if marks.Cost != nil && read.agentID == "" {
+			var cost sql.NullFloat64
+			var wall, api sql.NullInt64
+			err := s.db.QueryRowContext(ctx, "SELECT cost_usd, wall_ms, api_ms FROM session_costs WHERE session_id = ?", sessionID).
+				Scan(&cost, &wall, &api)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, fmt.Errorf("callmeter store %s: read session cost of %q: %w", s.path, sessionID, err)
+			}
+			c := marks.Cost
+			same := err == nil &&
+				cost.Valid == (c.CostUSD != nil) && (c.CostUSD == nil || cost.Float64 == *c.CostUSD) &&
+				wall.Valid == (c.WallMS != nil) && (c.WallMS == nil || wall.Int64 == *c.WallMS) &&
+				api.Valid == (c.APIMS != nil) && (c.APIMS == nil || api.Int64 == *c.APIMS)
+			if same {
+				marks.Cost = nil
+			}
+		} else {
+			marks.Cost = nil
+		}
+		if !marks.Empty() {
+			writes = append(writes, markWrite{agentID: read.agentID, marks: marks})
+		}
+	}
+	return writes, nil
 }
 
 // callsToMark lists the open, unmarked calls of a session whose transcripts

