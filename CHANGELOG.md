@@ -15,6 +15,9 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 - Hooks no longer lose events to a busy store on long sessions. The Stop hook re-counted every request of its session by scanning all of `calls`, so it held the store's write lock for seconds and concurrent hooks gave up after their 5 s wait. `calls` gains an index on `request_id`, added once to an existing store on its next open; the schema version is unchanged.
 - A prompt-type Stop hook no longer stores a word of its prompt: its run was named from the first word of the prompt text (`stop_hook_runs.name` = `I`). Such a hook, and a command that reads as prose, is now `prompt#` and a hash; a command hook is named only from a path or a known interpreter, never a bare word. `callmeter redact` rewrites every stored name the new rule could not produce, reported as `stop_hook_runs.name`.
 
+### Fixed
+- Attribute `awk` program files and input operands as reads, without counting `-v` and `-F` option values (#3).
+
 ## [0.1.0] — 2026-10-03
 
 ### Added

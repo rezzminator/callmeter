@@ -57,7 +57,7 @@ const (
 // Version names this parser's behaviour. A stored call parsed by an older
 // version is parsed again, so a fix reaches every call still in the window;
 // raise it with every change to the parts or files a command parses to.
-const Version = 7
+const Version = 8
 
 // errHeredocNotStored is the cause on a Python part whose heredoc has no body:
 // the store cuts every heredoc body out of a command.

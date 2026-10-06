@@ -27,6 +27,8 @@ func (p *callParser) attribute(program string, args []arg) []FileRef {
 		return nil
 	case "cat", "wc":
 		return p.named(operands(args), ActionReadWhole, "")
+	case "awk":
+		return p.awk(args)
 	case "head", "tail":
 		return p.headTail(program, args)
 	case "sed":
@@ -40,6 +42,40 @@ func (p *callParser) attribute(program string, args []arg) []FileRef {
 		return p.plain(findStarts(args), ActionStat)
 	}
 	return p.plain(args, ActionUnknown)
+}
+
+// awk attributes its program file and input operands as whole reads. An inline
+// program is text, not a path; -v and -F consume values that are not operands.
+func (p *callParser) awk(args []arg) []FileRef {
+	var programFiles, files []arg
+	programFromFile := false
+	for i := 0; i < len(args); i++ {
+		a := args[i].text
+		switch {
+		case a == "-v" || a == "-F":
+			i++
+		case a == "-f":
+			programFromFile = true
+			if i+1 < len(args) {
+				programFiles = append(programFiles, args[i+1])
+				i++
+			}
+		case strings.HasPrefix(a, "-v") && len(a) > 2:
+		case strings.HasPrefix(a, "-F") && len(a) > 2:
+		case strings.HasPrefix(a, "-f") && len(a) > 2:
+			programFromFile = true
+			programFile := args[i]
+			programFile.text = a[2:]
+			programFiles = append(programFiles, programFile)
+		case strings.HasPrefix(a, "-"):
+		default:
+			if !programFromFile {
+				return p.named(append(programFiles, args[i+1:]...), ActionReadWhole, "")
+			}
+			files = append(files, args[i])
+		}
+	}
+	return p.named(append(programFiles, files...), ActionReadWhole, "")
 }
 
 // operands drops flags (everything up to `--` that starts with "-").
