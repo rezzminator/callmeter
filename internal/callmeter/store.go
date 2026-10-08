@@ -38,7 +38,11 @@ const SourceTranscript = "transcript"
 
 // Fault stages: where a failure to record or parse happened. StageBinary and
 // StageTerminated rows come only from ingesting missed.log (IngestMissed):
-// binary from a wrapper line, terminated from a line the binary itself wrote.
+// binary from a wrapper line, terminated from a line the binary itself wrote
+// (a signal, a busy or unavailable store, a panic: parseMissedLine).
+// IngestMissed writes a row of a claim another run left only beyond the
+// identical rows already stored, so a missed.log claim ingested again adds
+// none, while its own fresh claim's rows all go in.
 const (
 	StagePayload    = "payload"
 	StageStore      = "store"
@@ -282,6 +286,11 @@ func IsBusy(err error) bool {
 	return errors.As(err, &sqliteError) && sqliteError.Code()&0xff == sqliteBusy
 }
 
+// ErrNewerSchema is wrapped by the refusal to open a store whose schema
+// version is newer than SchemaVersion (a seat on a newer callmeter raised it):
+// the hook names it `store unavailable: newer schema` (StoreFailureClass).
+var ErrNewerSchema = errors.New("refusing to open it")
+
 func openAndPrepare(ctx context.Context, path string, wait time.Duration) (*Store, error) {
 	db, err := sqlitedb.OpenStore(ctx, path, wait)
 	if err != nil {
@@ -303,10 +312,11 @@ func prepare(ctx context.Context, db *sql.DB, path string) error {
 	}
 	if version > SchemaVersion {
 		return fmt.Errorf(
-			"callmeter store %s has schema version %d, newer than this callmeter's version %d: refusing to open it",
+			"callmeter store %s has schema version %d, newer than this callmeter's version %d: %w",
 			path,
 			version,
 			SchemaVersion,
+			ErrNewerSchema,
 		)
 	}
 	if version == SchemaVersion {
@@ -375,7 +385,50 @@ type Fault struct {
 // AddFault records f in its own transaction; an empty SessionID or ToolUseID
 // is stored as NULL.
 func (s *Store) AddFault(ctx context.Context, f Fault) error {
-	return s.Batch(ctx, func(tx *Tx) error { return tx.AddFault(ctx, f) })
+	return s.AddFaultHeld(ctx, f, nil)
+}
+
+// AddFaultHeld is AddFault with held called once its transaction holds the
+// store's write lock (BatchHeld).
+func (s *Store) AddFaultHeld(ctx context.Context, f Fault, held func()) error {
+	return s.BatchHeld(ctx, held, func(tx *Tx) error { return tx.AddFault(ctx, f) })
+}
+
+// AddFaultIfFree records f in its own transaction only when the store's write
+// lock is free at once: busy reports another writer holds it, and nothing is
+// written. The store's own busy wait is restored after, on its one connection.
+func (s *Store) AddFaultIfFree(ctx context.Context, f Fault) (busy bool, err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: take its connection: %w", s.path, err)
+	}
+	defer func() { err = errors.Join(err, conn.Close()) }()
+	var wait int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&wait); err != nil {
+		return false, fmt.Errorf("callmeter store %s: read busy_timeout: %w", s.path, err)
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
+		return false, fmt.Errorf("callmeter store %s: set busy_timeout: %w", s.path, err)
+	}
+	defer func() {
+		if _, restoreErr := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", wait)); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: restore busy_timeout: %w", s.path, restoreErr))
+		}
+	}()
+	tx, err := conn.BeginTx(ctx, nil)
+	if IsBusy(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: begin transaction: %w", s.path, err)
+	}
+	if err := (&Tx{tx: tx, path: s.path}).AddFault(ctx, f); err != nil {
+		return false, errors.Join(err, tx.Rollback())
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("callmeter store %s: commit: %w", s.path, err)
+	}
+	return false, nil
 }
 
 // AddFault records f as part of the transaction; an empty SessionID or

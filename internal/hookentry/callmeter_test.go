@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -594,10 +596,11 @@ func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {
 	}
 }
 
-// TestCallmeterEntryStoreUnopenableIsSaidTwice: CALLMETER_HOME is a regular
-// file, so neither the store nor the log can be created: exit 0 and one stderr
-// line for the store error, one for the failed log append, no panic.
-func TestCallmeterEntryStoreUnopenableIsSaidTwice(t *testing.T) {
+// TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME is a regular file,
+// so neither the store, the log nor missed.log can be created: exit 0, a
+// stderr line for the store error and one for the failed missed.log append,
+// each followed by its failed log append, no panic.
+func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	lab := newCallmeterLab(t)
 	blocker := filepath.Join(lab.root, "a-file")
 	lab.write(blocker, []byte("a file where the home should be"))
@@ -607,10 +610,13 @@ func TestCallmeterEntryStoreUnopenableIsSaidTwice(t *testing.T) {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
 		!strings.Contains(lines[0], "toolu_01UGaJs715PJE1hKtJWM2ANC") ||
-		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) {
-		t.Errorf("stderr = %q, want the store error then the failed log append", stderr.String())
+		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) ||
+		!strings.HasPrefix(lines[2], "callmeter: "+callmeter.StageTerminated+": ") ||
+		!strings.Contains(lines[2], paths.Missed(blocker)) ||
+		!strings.HasPrefix(lines[3], "callmeter: log "+paths.Log(blocker)) {
+		t.Errorf("stderr = %q, want the store error and the failed missed.log append, each then the failed log append", stderr.String())
 	}
 }
 
@@ -2609,5 +2615,97 @@ func TestHookTimeoutsAgreeWithHooksJSON(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestCallmeterStoreUnavailableLeavesAMissedLine: a hook whose store can take
+// neither its event nor its fault (a store a newer callmeter raised the schema
+// of, a store refusing every insert as a full disk would) leaves exactly one
+// missed.log line `store unavailable: {class}` naming its event and session,
+// never the raw error, and a report over the healed store counts that event.
+func TestCallmeterStoreUnavailableLeavesAMissedLine(t *testing.T) {
+	refusals := []string{"calls", "faults"}
+	cases := map[string]struct {
+		event, class string
+		refuse, heal func(*callmeterLab)
+	}{
+		"newer schema": {
+			event: "PostToolUse", class: callmeter.StoreClassNewerSchema,
+			refuse: func(lab *callmeterLab) {
+				store, err := callmeter.OpenDB(lab.ctx, lab.storePath)
+				if err != nil {
+					lab.t.Fatalf("create the store: %v", err)
+				}
+				if err := store.Close(); err != nil {
+					lab.t.Fatalf("close the store: %v", err)
+				}
+				setUserVersion(lab.t, lab.storePath, callmeter.SchemaVersion+1)
+			},
+			heal: func(lab *callmeterLab) { setUserVersion(lab.t, lab.storePath, callmeter.SchemaVersion) },
+		},
+		"every insert refused": {
+			event: "PreToolUse", class: callmeter.StoreClassOther,
+			refuse: func(lab *callmeterLab) {
+				for _, table := range refusals {
+					if _, err := lab.db().DB().ExecContext(lab.ctx, "CREATE TRIGGER refuse_"+table+" BEFORE INSERT ON "+table+
+						" BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+						lab.t.Fatalf("create the refusing trigger on %s: %v", table, err)
+					}
+				}
+			},
+			heal: func(lab *callmeterLab) {
+				for _, table := range refusals {
+					if _, err := lab.db().DB().ExecContext(lab.ctx, "DROP TRIGGER refuse_"+table); err != nil {
+						lab.t.Fatalf("drop the refusing trigger on %s: %v", table, err)
+					}
+				}
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			c.refuse(lab)
+			lab.feed(hookPayload(t, c.event, nil))
+			missed, err := os.ReadFile(lab.missed)
+			if err != nil {
+				t.Fatalf("read missed.log: %v", err)
+			}
+			reason := callmeter.StoreUnavailableReason + c.class
+			want := regexp.MustCompile(`^\d+\t` + c.event + `\t` + regexp.QuoteMeta(reason) + `\t` + cmSessionA + `\n$`)
+			if !want.Match(missed) {
+				t.Fatalf("missed.log = %q, want one line matching %s", missed, want)
+			}
+
+			c.heal(lab)
+			lab.feed(hookPayload(t, callmeter.EventSessionStart, map[string]any{"source": "startup"}))
+			if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND session_id = ? AND error = ?",
+				callmeter.StageTerminated, cmSessionA, c.event+": "+reason); n != 1 {
+				t.Errorf("terminated faults of the lost %s = %d, want 1", c.event, n)
+			}
+			table, err := report.Faults(lab.ctx, lab.db(), report.Filter{}, nil)
+			if err != nil {
+				t.Fatalf("faults report: %v", err)
+			}
+			if note := "1 events unrecorded: hook terminated before recording"; !slices.Contains(table.Notes, note) {
+				t.Errorf("report notes = %q, want %q", table.Notes, note)
+			}
+		})
+	}
+}
+
+// setUserVersion sets the store's schema version, a store OpenDB would refuse
+// included.
+func setUserVersion(t *testing.T, path string, version int) {
+	t.Helper()
+	db, err := sqlitedb.OpenReadWrite(path, time.Second)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", version)); err != nil {
+		t.Errorf("set user_version %d: %v", version, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("close %s: %v", path, err)
 	}
 }

@@ -28,7 +28,9 @@
 # Under `hook` this script never fails a call and never writes to stdout: any
 # failure exits 0 and appends one `{unix seconds}<TAB>{hook_event_name or unknown}<TAB>{reason}`
 # line, followed by `<TAB>{session_id}` when the payload carries one, to
-# {CALLMETER_HOME}/missed.log, which the binary counts on its next run.
+# {CALLMETER_HOME}/missed.log, which the binary counts on its next run. A line
+# that cannot be appended goes to stderr as `callmeter: missed: {event} {reason}`
+# plus ` {session}` when there is one; the exit stays 0.
 # Under any other subcommand a failure is `callmeter: binary unavailable: {reason}`
 # on stderr and exit 1. There is no `set -e`: every failure goes through fail().
 
@@ -45,6 +47,8 @@ tmp=
 stdin_spent=
 # Set after this run's own install: the one run handed off as a child.
 child=
+# The download's curl pid while it runs: on_signal kills it.
+fetch=
 
 cleanup() {
   if [ -n "$tmp" ]; then
@@ -62,8 +66,17 @@ cleanup() {
 # reaches here: the wrapper is gone, and the signal is the binary's own. Once
 # the post-install child has started, the signal is the harness ending the hook
 # (a headless exit cancels every running async hook), and the exit stays silent;
-# a signal to this pid alone is handled when the child returns.
+# a signal to this pid alone is handled when the child returns. A download runs
+# in the background under `wait`, which a trapped signal interrupts at once:
+# the handler kills curl and removes its temp file before it logs, inside
+# Claude Code's grace between its SIGTERM and SIGKILL.
 on_signal() {
+  if [ -n "$fetch" ]; then
+    kill "$fetch" 2>/dev/null
+    wait "$fetch" 2>/dev/null
+    fetch=
+    cleanup
+  fi
   if [ "$mode" = hook ]; then
     if [ -z "$stdin_spent" ]; then
       log_missed "killed by signal"
@@ -129,19 +142,23 @@ payload_fields() {
   esac
 }
 
+# log_missed REASON appends the missed line for this hook. A line that cannot
+# be appended (no home, a home that cannot be made, a missed.log that cannot be
+# opened or written) goes to stderr instead as
+# `callmeter: missed: {event} {reason}`, followed by ` {session}` when the
+# payload carries one, so the reason is never silently lost. Returns 0.
 log_missed() {
-  if [ -z "$home" ]; then
-    return 0
-  fi
   payload_fields
-  if [ ! -d "$home" ]; then
-    mkdir -p "$home" 2>/dev/null || return 0
+  if [ -n "$home" ]; then
+    if [ -d "$home" ] || mkdir -p "$home" 2>/dev/null; then
+      if [ -n "$session" ]; then
+        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
+      else
+        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log"; } 2>/dev/null && return 0
+      fi
+    fi
   fi
-  if [ -n "$session" ]; then
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" "$session" >>"$home/missed.log" 2>/dev/null
-  else
-    printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log" 2>/dev/null
-  fi
+  printf 'callmeter: missed: %s %s%s\n' "$event" "$1" "${session:+ $session}" >&2
   return 0
 }
 
@@ -346,7 +363,16 @@ for f in "$bin_dir"/.tmp-*; do
   fi
 done
 tmp=$bin_dir/.tmp-$$
-curl -fsSL --connect-timeout 5 --max-time 40 -o "$tmp" "$url" </dev/null >/dev/null 2>&1 || fail "download failed"
+# The download runs in the background so a signal is handled at once, not once
+# curl returns; `wait` returns curl's own status.
+curl -fsSL --connect-timeout 5 --max-time 40 -o "$tmp" "$url" </dev/null >/dev/null 2>&1 &
+fetch=$!
+wait "$fetch"
+rc=$?
+fetch=
+if [ "$rc" -ne 0 ]; then
+  fail "download failed"
+fi
 actual=$(sha256_of "$tmp")
 if [ -z "$actual" ] || [ "$actual" != "$expected" ]; then
   fail "checksum mismatch"
@@ -357,12 +383,35 @@ mv -f "$tmp" "$target" || fail "cannot install $target"
 tmp=
 stamp_version
 
+# is_version NAME: NAME is a version string, N.N.N (each N one or more digits)
+# with an optional `-` or `+` suffix of one or more of [0-9A-Za-z.-]. Builtins
+# only: a name with any other character is out, then the N.N.N core before the
+# first `-` or `+` is checked to hold digits and exactly two inner dots.
+is_version() {
+  case $1 in
+    '' | *[!0-9A-Za-z.+-]*) return 1 ;;
+  esac
+  v_core=${1%%[-+]*}
+  v_suffix=${1#"$v_core"}
+  case $v_suffix in
+    [-+]) return 1 ;;
+    ?*+*) return 1 ;;
+  esac
+  case $v_core in
+    *[!0-9.]* | .* | *. | *..* | *.*.*.*) return 1 ;;
+    *.*.*) return 0 ;;
+  esac
+  return 1
+}
+
 # Every other cached version goes once it has been unused for 7 days: its stamp
 # is at least 7 x 24 h old, a directory without a stamp ages by its own mtime.
-# Another plugin version may be live. Dot entries (locks, temp files) are not
-# versions: the glob never matches them.
+# Another plugin version may be live. Only a directory named as a version is
+# one: CALLMETER_HOME may be a directory whose bin/ holds the user's own, so
+# any other name (dot entries, locks and temp files among them) is never
+# removed.
 for d in "$bin_dir"/*; do
-  if [ -d "$d" ] && [ "${d##*/}" != "$version" ]; then
+  if [ -d "$d" ] && [ "${d##*/}" != "$version" ] && is_version "${d##*/}"; then
     ref=$d/.last-use
     if [ ! -f "$ref" ]; then
       ref=$d

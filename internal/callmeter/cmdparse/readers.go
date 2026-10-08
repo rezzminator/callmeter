@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -342,8 +343,8 @@ func (p *callParser) redirFiles(redirs []*syntax.Redirect) []FileRef {
 // glob expands an unquoted glob against the current directory; no match (or a
 // malformed pattern, or an unknown directory) leaves the word as written, as
 // the shell does, and reports it unmatched: a pattern is never a missing file.
-// A glob past the call's maxGlobLookups is left the same way, with a note
-// naming the gap.
+// A glob past one of the call's glob bounds is left the same way, with a note
+// naming the bound.
 func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched bool) {
 	if !isGlob || !strings.ContainsAny(val, "*?[") {
 		return []string{val}, false
@@ -356,8 +357,9 @@ func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched boo
 		pattern = filepath.Join(p.dir, pattern)
 	}
 	matches, err := p.globBounded(pattern)
-	if errors.Is(err, errGlobBound) {
-		p.notes = append(p.notes, fmt.Sprintf("glob %s over %d directory lookups, left unexpanded", val, maxGlobLookups))
+	var bound globBoundError
+	if errors.As(err, &bound) {
+		p.notes = append(p.notes, fmt.Sprintf("glob %s over %s, left unexpanded", val, bound))
 		return []string{val}, true
 	}
 	if err != nil || len(matches) == 0 {
@@ -378,14 +380,50 @@ func (p *callParser) glob(val string, isGlob bool) (vals []string, unmatched boo
 	return out, false
 }
 
-// errGlobBound stops a glob once the call's globs have spent maxGlobLookups.
-var errGlobBound = errors.New("glob over the lookup bound")
+// globBoundError stops a glob once the call's globs have spent one of the
+// glob bounds; its text names the bound.
+type globBoundError string
+
+func (e globBoundError) Error() string { return string(e) }
+
+// globLookups, globEntries and globTime are the call's glob bounds:
+// maxGlobLookups directory stats and reads, maxGlobEntries directory entries
+// read, and maxGlobTime of wall clock from the call's first glob lookup.
+func errGlobLookups() error {
+	return globBoundError(fmt.Sprintf("%d directory lookups", maxGlobLookups))
+}
+func errGlobEntries() error {
+	return globBoundError(fmt.Sprintf("%d directory entries", maxGlobEntries))
+}
+func errGlobTime() error { return globBoundError(fmt.Sprintf("%v", maxGlobTime)) }
+
+// globReadDir and globLstat are the glob walk's only filesystem calls; a
+// test replaces them to make a lookup block. globReadDir reports whether dir
+// is a directory and, when it is, its names (nil when unreadable).
+var (
+	globReadDir = readDirNames
+	globLstat   = func(path string) bool { _, err := os.Lstat(path); return err == nil }
+)
+
+func readDirNames(dir string) (names []string, isDir bool) {
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		return nil, false
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil, true
+	}
+	names, _ = d.Readdirnames(-1)
+	_ = d.Close()
+	return names, true
+}
 
 // globBounded is filepath.Glob with every directory stat and read counted
-// against the call's maxGlobLookups: `/*/*/*/*/*/a` would otherwise read
-// every directory five levels under the filesystem root. Past the bound it
-// returns errGlobBound; an unreadable directory matches nothing, as in
-// filepath.Glob.
+// against the call's glob bounds: `/*/*/*/*/*/a` would otherwise read every
+// directory five levels under the filesystem root, and one read of a
+// directory macOS guards (a privacy prompt, an automount) can block for
+// seconds. Past a bound it returns a globBoundError; an unreadable directory
+// matches nothing, as in filepath.Glob.
 func (p *callParser) globBounded(pattern string) ([]string, error) {
 	if _, err := filepath.Match(pattern, ""); err != nil {
 		return nil, err
@@ -395,10 +433,11 @@ func (p *callParser) globBounded(pattern string) ([]string, error) {
 
 func (p *callParser) globPattern(pattern string) ([]string, error) {
 	if !strings.ContainsAny(pattern, `*?[\`) {
-		if err := p.spendGlobLookup(); err != nil {
+		var exists bool
+		if err := p.globIO(1, func() { exists = globLstat(pattern) }); err != nil {
 			return nil, err
 		}
-		if _, err := os.Lstat(pattern); err != nil {
+		if !exists {
 			return nil, nil
 		}
 		return []string{pattern}, nil
@@ -430,27 +469,20 @@ func (p *callParser) globPattern(pattern string) ([]string, error) {
 	return matches, nil
 }
 
-// globDir appends the names in dir matching pattern, in sorted order.
+// globDir appends the names in dir matching pattern, in sorted order; its
+// stat and its read are two lookups.
 func (p *callParser) globDir(dir, pattern string, matches []string) ([]string, error) {
-	if err := p.spendGlobLookup(); err != nil {
+	var names []string
+	var isDir bool
+	if err := p.globIO(2, func() { names, isDir = globReadDir(dir) }); err != nil {
 		return nil, err
 	}
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+	if !isDir || len(names) == 0 {
 		return matches, nil
 	}
-	if err := p.spendGlobLookup(); err != nil {
-		return nil, err
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return matches, nil
-	}
-	names, readErr := d.Readdirnames(-1)
-	if err := d.Close(); err != nil {
-		return nil, fmt.Errorf("close %s: %w", dir, err)
-	}
-	if readErr != nil && len(names) == 0 {
-		return matches, nil
+	p.globEntries += len(names)
+	if p.globEntries > maxGlobEntries {
+		return nil, errGlobEntries()
 	}
 	slices.Sort(names)
 	for _, n := range names {
@@ -465,12 +497,37 @@ func (p *callParser) globDir(dir, pattern string, matches []string) ([]string, e
 	return matches, nil
 }
 
-func (p *callParser) spendGlobLookup() error {
-	if p.globLookups >= maxGlobLookups {
-		return errGlobBound
+// globIO spends lookups of the call's maxGlobLookups and runs io off the
+// parse's goroutine, waiting for it no later than the call's glob deadline:
+// a stat the kernel holds (a privacy prompt, an automount) then costs the
+// parse maxGlobTime, and the abandoned io finishes on its own. Nothing io
+// sets is read after the deadline.
+func (p *callParser) globIO(lookups int, io func()) error {
+	if p.globLookups+lookups > maxGlobLookups {
+		p.globLookups = maxGlobLookups
+		return errGlobLookups()
 	}
-	p.globLookups++
-	return nil
+	p.globLookups += lookups
+	if p.globDeadline.IsZero() {
+		p.globDeadline = time.Now().Add(maxGlobTime)
+	}
+	left := time.Until(p.globDeadline)
+	if left <= 0 {
+		return errGlobTime()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		io()
+	}()
+	timer := time.NewTimer(left)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errGlobTime()
+	}
 }
 
 // file reports whether a resolved argument is an existing regular file.

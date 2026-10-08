@@ -466,6 +466,115 @@ func TestUnrecordedCallsNoteCountsOnlyCallsMissingFromTheStore(t *testing.T) {
 	}
 }
 
+// everyTopicNotes runs the five lifecycle topics over store and returns each
+// one's notes by topic name.
+func everyTopicNotes(t *testing.T, store *callmeter.Store) map[string][]string {
+	t.Helper()
+	notes := map[string][]string{}
+	for name, topic := range map[string]func(context.Context, *callmeter.Store, Filter, NameOf) (*Table, error){
+		"files": Files, "faults": Faults, "sessions": Sessions, "events": Events, "coverage": Coverage,
+	} {
+		table, err := topic(context.Background(), store, Filter{OwnSeat: t.TempDir()}, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		notes[name] = table.Notes
+	}
+	return notes
+}
+
+// TestRecoveryMarkersAreTheirOwnNoteNeverLostCalls: the transcript faults
+// recovery writes for a turn or agent turn it read and could not settle carry
+// no tool_use_id and name no call; they are counted in their own note, never as
+// calls not recorded. The texts are the markers' own, as the live store holds
+// them.
+func TestRecoveryMarkersAreTheirOwnNoteNeverLostCalls(t *testing.T) {
+	markers := map[string]string{
+		"turn end":   "prompt p6 UserPromptSubmit e6: " + callmeter.UnfilledTurnEnd,
+		"agent stop": "agent a1 turn 1 open: " + callmeter.UnfilledAgentStop,
+		"agent turn": "agent a1 turn stopped 7: " + callmeter.UnfilledAgentTurn,
+		"stop reply": "prompt p6 Stop e7: " + callmeter.UnfilledStopReply,
+	}
+	for _, tc := range []struct {
+		name  string
+		kinds []string
+		want  string
+	}{
+		{"only an unended prompt", []string{"turn end"},
+			"1 turns or agent turns recovery could not settle from transcripts; see the faults topic"},
+		{"every marker kind", []string{"turn end", "agent stop", "agent turn", "stop reply"},
+			"4 turns or agent turns recovery could not settle from transcripts; see the faults topic"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openStore(t)
+			for _, kind := range tc.kinds {
+				if err := store.AddFault(ctx, callmeter.Fault{
+					TS: ms(time.Hour), SessionID: "s6", Stage: callmeter.StageTranscript, Error: markers[kind],
+				}); err != nil {
+					t.Fatalf("AddFault: %v", err)
+				}
+			}
+			for name, notes := range everyTopicNotes(t, store) {
+				for _, note := range notes {
+					if strings.Contains(note, "calls not recorded") || strings.Contains(note, "naming no call") {
+						t.Errorf("%s notes = %q: a recovery marker counted as a lost call or another fault", name, notes)
+					}
+				}
+				if !slices.Contains(notes, tc.want) {
+					t.Errorf("%s notes = %q, want %q", name, notes, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestLostCallsAreToolEventFaultsAloneOtherIdlessFaultsAreNamedApart: a fault
+// with no tool_use_id names a lost call only when it is a payload or store
+// fault of a tool event; every other one (a PostToolBatch with no tool_calls,
+// an ingest or SessionEnd budget fault, an unreadable payload) is named apart,
+// and a terminated hook is counted among the events unrecorded alone.
+func TestLostCallsAreToolEventFaultsAloneOtherIdlessFaultsAreNamedApart(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	for _, fault := range []callmeter.Fault{
+		// Lost calls: the texts hookentry writes for a tool event's payload.
+		{Stage: callmeter.StagePayload, Error: "PostToolUse payload lacks tool_use_id or tool_name"},
+		{Stage: callmeter.StagePayload, Error: `"PreToolUse" payload carries no session_id`},
+		{Stage: callmeter.StagePayload, Error: "PostToolBatch call carries no tool_use_id"},
+		// Faults naming no call.
+		{Stage: callmeter.StagePayload, Error: "PostToolBatch payload carries no tool_calls"},
+		{Stage: callmeter.StageStore, Error: "ingest missed.log: database is locked"},
+		{Stage: callmeter.StageTranscript, Error: "SessionEnd spent its 1m0s budget: 2 transcript reads skipped, " +
+			"their requests and calls left as their hooks wrote them"},
+		{Stage: callmeter.StagePayload, Error: "decode hook payload (12 bytes): unexpected end of JSON input"},
+		// Hooks terminated before recording, from missed.log.
+		{Stage: callmeter.StageTerminated, Error: "PostToolUse: store unavailable: full"},
+		{Stage: callmeter.StageTerminated, Error: "PostToolUse: panic"},
+	} {
+		fault.TS, fault.SessionID = ms(time.Hour), "s1"
+		if err := store.AddFault(ctx, fault); err != nil {
+			t.Fatalf("AddFault: %v", err)
+		}
+	}
+	want := []string{
+		"3 calls not recorded (payload, store or transcript faults; see the faults topic)",
+		"4 other payload, store or transcript faults, naming no call (see the faults topic)",
+		"2 events unrecorded: hook terminated before recording",
+	}
+	for name, notes := range everyTopicNotes(t, store) {
+		at := -1
+		for _, note := range want {
+			i := slices.Index(notes, note)
+			if i <= at {
+				t.Errorf("%s notes = %q, want %q in order", name, notes, want)
+				break
+			}
+			at = i
+		}
+	}
+}
+
 // TestAbsentSizesAreClassifiedNeverCountedAsZero: a call with no delivered
 // size is unknown, not 0 bytes. The note says why each has none, by what the
 // store holds: a start alone (interrupted, killed or still running), a result

@@ -609,8 +609,8 @@ func TestTouchSessionColumnNoRunCarriesStaysNull(t *testing.T) {
 }
 
 // TestInsertEventStoresOnlyALabel: a StopFailure error_type and a SessionEnd
-// reason are kept when they are a label of their event; any other value, which
-// may be free text, is stored as `label not stored (N bytes)`, and its session's
+// reason that are a label of their event (detailLabels) are kept; any other
+// value, which may be free text, is stored as `label not stored (N bytes)`, and its session's
 // end_reason follows.
 func TestInsertEventStoresOnlyALabel(t *testing.T) {
 	ctx := context.Background()

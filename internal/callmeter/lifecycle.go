@@ -54,8 +54,8 @@ type Event struct {
 }
 
 // LabelNotStored is what events.error_type or events.reason holds, followed by
-// ` (N bytes)`, for a value off its event's label list (detailLabels): such a
-// value may be free text, so only its UTF-8 byte count is stored.
+// ` (N bytes)`, for a value that is no label of its event (detailLabels): such
+// a value may be free text, so only its UTF-8 byte count is stored.
 const LabelNotStored = "label not stored"
 
 // EndReasonNever is what sessions.end_reason holds for a session whose latest
@@ -80,7 +80,7 @@ const EndReasonLost = "lost"
 // under key: a label of detailLabels as it is, nil as nil, and any other value
 // as LabelNotStored and its size.
 func labelColumn(event, key string, value *string) *string {
-	if value == nil || detailLabels[event][key][*value] {
+	if value == nil || isLabel(event, key, *value) {
 		return value
 	}
 	return Ptr(fmt.Sprintf("%s (%d bytes)", LabelNotStored, len(*value)))

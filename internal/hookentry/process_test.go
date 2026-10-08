@@ -3,6 +3,7 @@ package hookentry
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"errors"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
 	"github.com/rezzminator/callmeter/internal/sqlitedb"
+	"modernc.org/sqlite"
 )
 
 // buildCallmeter builds ./cmd/callmeter to binary.
@@ -486,48 +489,6 @@ func TestProcessSignalledHook(t *testing.T) {
 		scene.wantTerminatedLine(t, proc, "unknown", "SIGTERM", "")
 	})
 
-	t.Run("killed during the commit, which commits", func(t *testing.T) {
-		scene := newSignalScene(t, binary)
-		payload := scene.payload(t, "PreToolUse")
-		release := scene.holdStore(t)
-		proc := scene.start(t, payload)
-		time.Sleep(signalDelay)
-		proc.signal(t, syscall.SIGTERM)
-		time.Sleep(signalDelay)
-		release()
-		wantQuietExit(t, proc)
-		if got := scene.missedLines(t); got != "" {
-			t.Errorf("missed.log = %q, want no line for an event that committed", got)
-		}
-		id, _ := payloadField(t, payload, "tool_use_id").(string)
-		if n := scene.lab.count("SELECT COUNT(*) FROM calls WHERE tool_use_id = ?", id); n != 1 {
-			t.Errorf("calls holds %d rows for %s, want the committed one", n, id)
-		}
-	})
-
-	t.Run("killed during the commit, which fails", func(t *testing.T) {
-		scene := newSignalScene(t, binary)
-		payload := scene.payload(t, "PreToolUse")
-		if _, err := scene.lab.db().DB().ExecContext(ctx,
-			"CREATE TRIGGER refuse_calls BEFORE INSERT ON calls BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
-			t.Fatalf("create the refusing trigger: %v", err)
-		}
-		release := scene.holdStore(t)
-		proc := scene.start(t, payload)
-		time.Sleep(signalDelay)
-		proc.signal(t, syscall.SIGTERM)
-		time.Sleep(signalDelay)
-		release()
-		wantQuietExit(t, proc)
-		if got := scene.missedLines(t); got != "" {
-			t.Errorf("missed.log = %q, want no line: the failed batch's store fault accounts for the event", got)
-		}
-		if n := scene.lab.count(
-			"SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE '%refused by the test%'", callmeter.StageStore); n != 1 {
-			t.Errorf("store faults naming the refusal = %d, want 1", n)
-		}
-	})
-
 	t.Run("missed.log cannot be written", func(t *testing.T) {
 		scene := newSignalScene(t, binary)
 		if err := os.MkdirAll(paths.Missed(scene.home), 0o755); err != nil { // a directory where the file goes
@@ -688,8 +649,10 @@ func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
 			t.Errorf("handler exit code = %d, want 0", code)
 		}
 		session, _ := payloadField(t, scene.payload(t, "PreToolUse"), "session_id").(string)
-		if got := scene.missedLines(t); session == "" || !strings.Contains(got, "\tPreToolUse\tterminated by SIGHUP\t"+session+"\n") {
-			t.Errorf("missed.log = %q, want the line: a store nobody could write accounts for nothing", got)
+		want := regexp.MustCompile(`^\d+\tPreToolUse\t` + regexp.QuoteMeta(callmeter.StoreUnavailableReason+callmeter.StoreClassOpen) +
+			`\t` + regexp.QuoteMeta(session) + `\n$`)
+		if got := scene.missedLines(t); session == "" || !want.MatchString(got) {
+			t.Errorf("missed.log = %q, want the run's own line matching %s and none from the signal: that line accounts for the event", got, want)
 		}
 	})
 }
@@ -714,8 +677,8 @@ func waitHeld(t *testing.T, state *terminationState) {
 }
 
 // TestTerminationWaitsOutAnInFlightCommit: a signal landing while the run's
-// first batch is committing waits for its outcome — committed, no line and the
-// rows; failed, its store fault and no line.
+// first batch holds the store's write lock waits for its outcome — committed,
+// no line and the rows; failed, its store fault and no line.
 func TestTerminationWaitsOutAnInFlightCommit(t *testing.T) {
 	for _, failing := range []bool{false, true} {
 		name := "the batch commits"
@@ -726,16 +689,28 @@ func TestTerminationWaitsOutAnInFlightCommit(t *testing.T) {
 			scene := newSignalScene(t, "")
 			lab := scene.lab
 			payload := scene.payload(t, "PreToolUse")
+			// The batch holds the store's write lock, not waiting on it: a
+			// trigger stalls its calls insert (callmeter_test_stall) and, when
+			// failing, then refuses it.
+			body := "SELECT callmeter_test_stall();"
 			if failing {
-				if _, err := lab.db().DB().ExecContext(lab.ctx,
-					"CREATE TRIGGER refuse_calls BEFORE INSERT ON calls BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
-					t.Fatalf("create the refusing trigger: %v", err)
-				}
+				body += " SELECT RAISE(ABORT, 'refused by the test');"
 			}
-			release := scene.holdStore(t)
+			if _, err := lab.db().DB().ExecContext(lab.ctx,
+				"CREATE TRIGGER stall_calls BEFORE INSERT ON calls BEGIN "+body+" END"); err != nil {
+				t.Fatalf("create the stalling trigger: %v", err)
+			}
+			stall := &batchStall{entered: make(chan struct{}), release: make(chan struct{})}
+			currentStall.Store(stall)
+			defer currentStall.Store(nil)
 			state := &terminationState{}
 			ran := make(chan int, 1)
 			go func() { ran <- lab.feedWithState(state, payload) }()
+			select {
+			case <-stall.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the run's batch never reached its calls insert")
+			}
 			waitHeld(t, state)
 
 			var stderr bytes.Buffer
@@ -745,7 +720,7 @@ func TestTerminationWaitsOutAnInFlightCommit(t *testing.T) {
 				t.Fatalf("the handler exited %d while the commit was in flight", code)
 			case <-time.After(300 * time.Millisecond):
 			}
-			release()
+			close(stall.release)
 			if code := <-ran; code != 0 {
 				t.Errorf("run exit code = %d, want 0", code)
 			}
@@ -854,5 +829,290 @@ func TestProcessStoreBusySessionEndLeavesAMissedLine(t *testing.T) {
 				t.Errorf("sessions.end_reason = %q, want %q", got, callmeter.EndReasonLost)
 			}
 		})
+	}
+}
+
+// TestIngestCommitWaitsForTheTerminationHold: the hook's missed.log ingest
+// commits and moves its claim under the signal state's lock, so a signal
+// handler holding it (about to exit) never sees faults committed whose claim
+// is still in place for the next run to ingest again. The payload does not
+// decode, so the run takes the lock first at its ingest, not at setPayload.
+func TestIngestCommitWaitsForTheTerminationHold(t *testing.T) {
+	scene := newSignalScene(t, "")
+	lab := scene.lab
+	payload := "not a hook payload"
+	lab.count("SELECT COUNT(*) FROM faults") // the store exists before the run
+	if err := os.WriteFile(lab.missed, []byte("1790000001\tStop\tbinary exited 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := &terminationState{}
+	state.mu.Lock() // the signal handler, deciding
+	ran := make(chan int, 1)
+	go func() { ran <- lab.feedWithState(state, payload) }()
+	time.Sleep(300 * time.Millisecond)
+	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'binary'"); n != 0 {
+		t.Errorf("binary faults committed while the handler held the lock = %d, want 0", n)
+	}
+	state.mu.Unlock()
+	if code := <-ran; code != 0 {
+		t.Errorf("run exit code = %d, want 0", code)
+	}
+	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'binary'"); n != 1 {
+		t.Errorf("binary faults after the run = %d, want 1", n)
+	}
+}
+
+// claudeKillGrace is Claude Code 2.1.287's measured gap between the SIGTERM it
+// sends a cancelled async hook and the SIGKILL that follows (1.52 s and 1.47 s
+// in two headless runs).
+const claudeKillGrace = 1470 * time.Millisecond
+
+// signalLineWithin is how soon after a signal a run waiting on a busy store
+// leaves its missed.log line: well inside claudeKillGrace.
+const signalLineWithin = time.Second
+
+// TestProcessSignalOnABusyStoreBeatsTheKill drives Claude Code's cancel of an
+// async hook, SIGTERM and then SIGKILL claudeKillGrace later, into a
+// PostToolUse whose first batch waits on a write-locked store: the wait gives
+// way to the signal, so the run's `terminated by SIGTERM` line lands within
+// signalLineWithin, the process exits 0 before the SIGKILL, and no row is
+// written for it, even once the store frees.
+func TestProcessSignalOnABusyStoreBeatsTheKill(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "callmeter")
+	buildCallmeter(ctx, t, binary)
+	scene := newSignalScene(t, binary)
+	payload := scene.payload(t, "PostToolUse")
+	session, _ := payloadField(t, payload, "session_id").(string)
+	id, _ := payloadField(t, payload, "tool_use_id").(string)
+	release := scene.holdStore(t)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	proc := scene.start(t, payload)
+	waited := make(chan error, 1)
+	time.Sleep(signalDelay)
+	go func() { waited <- proc.cmd.Wait() }()
+	proc.signal(t, syscall.SIGTERM)
+	signalled := time.Now()
+	lineAt := time.Duration(-1)
+	for time.Since(signalled) < claudeKillGrace {
+		if lineAt < 0 && scene.missedLines(t) != "" {
+			lineAt = time.Since(signalled)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-waited:
+	default:
+		proc.signal(t, syscall.SIGKILL) // Claude Code's kill
+		<-waited
+	}
+	code := proc.cmd.ProcessState.ExitCode()
+	if lineAt < 0 || lineAt > signalLineWithin {
+		t.Errorf("missed.log line %v after SIGTERM (-1 = none before the SIGKILL at %v), want within %v",
+			lineAt, claudeKillGrace, signalLineWithin)
+	}
+	if code != 0 || proc.stdout.Len() != 0 {
+		t.Errorf("exit %d (-1 = killed), stdout %q, stderr %q; want exit 0 before the SIGKILL and an empty stdout",
+			code, proc.stdout, proc.stderr)
+	}
+	scene.wantTerminatedLine(t, proc, "PostToolUse", "SIGTERM", session)
+	release()
+	released = true
+	if n := scene.lab.count("SELECT COUNT(*) FROM calls WHERE tool_use_id = ?", id); n != 0 {
+		t.Errorf("calls holds %d rows for %s, want none: the run gave its batch up at the signal", n, id)
+	}
+}
+
+// batchStall is the gate of callmeter_test_stall, a SQL function a test's
+// trigger calls inside a run's batch: with no gate it returns at once,
+// otherwise it closes entered once and returns when release closes.
+type batchStall struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+var currentStall atomic.Pointer[batchStall]
+
+func init() {
+	sqlite.MustRegisterScalarFunction("callmeter_test_stall", 0,
+		func(*sqlite.FunctionContext, []driver.Value) (driver.Value, error) {
+			if stall := currentStall.Load(); stall != nil {
+				stall.once.Do(func() { close(stall.entered) })
+				<-stall.release
+			}
+			return nil, nil
+		})
+}
+
+// TestTerminationHoldIsNotTakenAcrossABusyWait: a run whose batch or fault row
+// waits on a write-locked store holds nothing the signal handler waits on, so
+// a signal during that wait is decided at once; once the store frees, the run
+// records as usual.
+func TestTerminationHoldIsNotTakenAcrossABusyWait(t *testing.T) {
+	for _, tc := range []struct {
+		name, event string // event "" feeds an undecodable payload, which faults
+		want        string
+	}{
+		{"a batch", "PreToolUse", "SELECT COUNT(*) FROM calls"},
+		{"a fault", "", "SELECT COUNT(*) FROM faults WHERE stage = '" + callmeter.StagePayload + "'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scene := newSignalScene(t, "")
+			lab := scene.lab
+			payload := "not a hook payload"
+			if tc.event != "" {
+				payload = scene.payload(t, tc.event)
+			}
+			release := scene.holdStore(t)
+			state := &terminationState{}
+			ran := make(chan int, 1)
+			go func() { ran <- lab.feedWithState(state, payload) }()
+			// Inside the wait of both: an undecodable payload's is 0.8 s.
+			time.Sleep(200 * time.Millisecond)
+			for until := time.Now().Add(400 * time.Millisecond); time.Now().Before(until); {
+				if !state.mu.TryLock() {
+					t.Error("the run held the signal state's lock while it waited on the busy store")
+					break
+				}
+				state.mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+			}
+			release()
+			if code := <-ran; code != 0 {
+				t.Errorf("run exit code = %d, want 0", code)
+			}
+			if n := lab.count(tc.want); n != 1 {
+				t.Errorf("%s = %d after the store freed, want 1", tc.want, n)
+			}
+			if got := scene.missedLines(t); got != "" {
+				t.Errorf("missed.log = %q, want no line for a run that recorded", got)
+			}
+		})
+	}
+}
+
+// TestTerminationHoldIsNotKeptFromAFailedBatchIntoItsFaultsWait: a batch that
+// held the store's write lock and failed lets the signal handler go before its
+// fault row waits on a store another writer took meanwhile, so a signal during
+// that wait is decided at once; once the store frees, the fault row lands. The
+// competing writer must win the lock between the rollback and the fault's
+// BEGIN, so a round the run wins is run again.
+func TestTerminationHoldIsNotKeptFromAFailedBatchIntoItsFaultsWait(t *testing.T) {
+	for round := 1; ; round++ {
+		if round > 5 {
+			t.Fatal("the competing writer never took the store between the batch's rollback and its fault")
+		}
+		if failedBatchRound(t) {
+			return
+		}
+	}
+}
+
+// failedBatchRound runs one round of the test above; false when the run's
+// fault took the lock before the competing writer did.
+func failedBatchRound(t *testing.T) (decided bool) {
+	scene := newSignalScene(t, "")
+	lab := scene.lab
+	payload := scene.payload(t, "PreToolUse")
+	if _, err := lab.db().DB().ExecContext(lab.ctx, "CREATE TRIGGER stall_calls BEFORE INSERT ON calls BEGIN "+
+		"SELECT callmeter_test_stall(); SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+		t.Fatalf("create the stalling trigger: %v", err)
+	}
+	stall := &batchStall{entered: make(chan struct{}), release: make(chan struct{})}
+	currentStall.Store(stall)
+	defer currentStall.Store(nil)
+	competitor, err := sqlitedb.OpenReadWrite(paths.Store(scene.home), 0)
+	if err != nil {
+		t.Fatalf("open the competing writer: %v", err)
+	}
+	defer func() {
+		if err := competitor.Close(); err != nil {
+			t.Errorf("close the competing writer: %v", err)
+		}
+	}()
+	conn, err := competitor.Conn(lab.ctx)
+	if err != nil {
+		t.Fatalf("take a connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	state := &terminationState{}
+	ran := make(chan int, 1)
+	go func() { ran <- lab.feedWithState(state, payload) }()
+	select {
+	case <-stall.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run's batch never reached its calls insert")
+	}
+	grabbed := make(chan error, 1)
+	go func() { // spin, no busy wait, to take the lock the rollback frees
+		for until := time.Now().Add(10 * time.Second); time.Now().Before(until); {
+			if _, err := conn.ExecContext(lab.ctx, "BEGIN IMMEDIATE"); err == nil {
+				grabbed <- nil
+				return
+			}
+		}
+		grabbed <- errors.New("the competing writer never took the store")
+	}()
+	close(stall.release)
+	if err := <-grabbed; err != nil {
+		t.Fatal(err)
+	}
+	var faults int
+	if err := conn.QueryRowContext(lab.ctx, "SELECT COUNT(*) FROM faults WHERE error LIKE '%refused by the test%'").Scan(&faults); err != nil {
+		t.Fatalf("count faults: %v", err)
+	}
+	if faults != 0 { // the run's fault went first: no wait to judge
+		if _, err := conn.ExecContext(lab.ctx, "ROLLBACK"); err != nil {
+			t.Fatalf("release the store: %v", err)
+		}
+		<-ran
+		return false
+	}
+	time.Sleep(100 * time.Millisecond) // the fault is inside its wait now
+	for until := time.Now().Add(300 * time.Millisecond); time.Now().Before(until); {
+		if !state.mu.TryLock() {
+			t.Error("the run kept the signal state's lock from its failed batch into its fault's wait on the busy store")
+			break
+		}
+		state.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := conn.ExecContext(lab.ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("release the store: %v", err)
+	}
+	if code := <-ran; code != 0 {
+		t.Errorf("run exit code = %d, want 0", code)
+	}
+	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE '%refused by the test%'", callmeter.StageStore); n != 1 {
+		t.Errorf("store faults of the refused batch = %d, want 1", n)
+	}
+	if got := scene.missedLines(t); got != "" {
+		t.Errorf("missed.log = %q, want no line: the fault row accounts for the event", got)
+	}
+	return true
+}
+
+// TestPanickedCarriesWhetherTheEventWasAccounted: a run's recovered panic
+// says whether its event was already accounted for, and marks it accounted, so
+// a signal after the panic leaves no line beside the panic's own.
+func TestPanickedCarriesWhetherTheEventWasAccounted(t *testing.T) {
+	for _, accounted := range []bool{false, true} {
+		state := &terminationState{accounted: accounted}
+		got := state.panicked("boom", []byte("stack"))
+		if got.Value != "boom" || string(got.Stack) != "stack" || got.Accounted != accounted {
+			t.Errorf("panicked with accounted %v = %+v, want boom, stack, %v", accounted, got, accounted)
+		}
+		if !state.accounted {
+			t.Errorf("after the panic (accounted %v) the state is not accounted: a signal would add a line", accounted)
+		}
 	}
 }

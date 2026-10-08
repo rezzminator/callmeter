@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
+	"github.com/rezzminator/callmeter/internal/callmeter/report"
 )
 
 // dropKey as a field value removes that key from the payload a helper builds:
@@ -813,9 +814,21 @@ func TestLifecycleNamedColumns(t *testing.T) {
 	if got := detailOf(t, lab.event("Notification"))["notification_type"]; got != "idle_prompt" {
 		t.Errorf("Notification detail.notification_type = %#v, want idle_prompt", got)
 	}
-	denied := detailOf(t, lab.event("PermissionDenied"))
-	if denied["tool_name"] != "Bash" || denied["tool_use_id_bytes"] == nil {
-		t.Errorf("PermissionDenied detail = %v, want every field sanitized in detail", denied)
+	deniedRow := lab.event("PermissionDenied")
+	expect(t, "PermissionDenied", deniedRow, map[string]any{"tool_name": "Bash"})
+	denied := detailOf(t, deniedRow)
+	if _, ok := denied["tool_name"]; ok || denied["tool_use_id"] != "toolu_denied" || denied["tool_use_id_bytes"] != nil {
+		t.Errorf("PermissionDenied detail = %s, want tool_use_id toolu_denied kept as an id and tool_name only in its column", deniedRow["detail"])
+	}
+	if input, _ := denied["tool_input"].(map[string]any); input["command_bytes"] != 7.0 {
+		t.Errorf("PermissionDenied detail = %s, want tool_input.command_bytes 7", deniedRow["detail"])
+	}
+	events, err := report.Events(lab.ctx, lab.db(), report.Filter{}, nil)
+	if err != nil {
+		t.Fatalf("report.Events: %v", err)
+	}
+	if !slices.ContainsFunc(events.Rows, func(row []string) bool { return row[0] == "PermissionDenied" && row[1] == "Bash" }) {
+		t.Errorf("the events report rows = %v, want PermissionDenied counted under Bash", events.Rows)
 	}
 	if n := lab.count("SELECT count(*) FROM events"); n != 10 {
 		t.Errorf("events = %d, want one per payload", n)

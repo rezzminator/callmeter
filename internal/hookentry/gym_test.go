@@ -121,6 +121,7 @@ func TestReplayVerify(t *testing.T) {
 		"StopFailure":               {"error": "error_type"},
 		"InstructionsLoaded":        {"load_reason": "load_reason", "memory_type": "memory_type", "file_path": "file_path"},
 		"PermissionRequest":         {"tool_name": "tool_name"},
+		"PermissionDenied":          {"tool_name": "tool_name"},
 		"UserPromptExpansion":       {"command_name": "command_name"},
 		"TaskCreated":               {"task_id": "task_id"},
 		"TaskCompleted":             {"task_id": "task_id"},

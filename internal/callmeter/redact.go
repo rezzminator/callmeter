@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // RedactCount is how many rows of one column a Redact pass changed.
@@ -80,10 +81,11 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 		return nil, err
 	}
 	details, err := rewriteColumn(ctx, conn, "events.detail",
-		`SELECT event_id, COALESCE(event, ''), detail FROM events WHERE detail IS NOT NULL`,
+		`SELECT event_id, COALESCE(event, '') || char(9) || COALESCE(tool_name, ''), detail FROM events WHERE detail IS NOT NULL`,
 		`UPDATE events SET detail = ? WHERE event_id = ?`,
-		func(event, detail string) (string, error) {
-			return sanitizeEventDetail(event, json.RawMessage(detail), nil)
+		func(eventTool, detail string) (string, error) {
+			event, tool, _ := strings.Cut(eventTool, "\t") // the tool from its column: the detail no longer names it
+			return sanitizeEventDetail(event, tool, json.RawMessage(detail), nil)
 		})
 	if err != nil {
 		return nil, err
@@ -147,4 +149,43 @@ func rewriteColumn(
 		changed = append(changed, r.key)
 	}
 	return changed, nil
+}
+
+// UnredactedCalls counts the calls Redact would rewrite: a stored input that
+// SanitizeInput, run again over it, changes or cannot read, or a stored error
+// that SanitizeError changes. Both sanitizers leave their own output
+// unchanged, so a call written under the current rules never counts and a
+// rule added later counts every call stored before it. It reads the whole
+// calls table, whatever a report's window, and writes nothing.
+func (s *Store) UnredactedCalls(ctx context.Context) (n int64, err error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT COALESCE(tool, ''), input, error FROM calls WHERE input IS NOT NULL OR error IS NOT NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: read calls to check their privacy form: %w", s.path, err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: close calls read: %w", s.path, closeErr))
+		}
+	}()
+	for rows.Next() {
+		var tool string
+		var input, text sql.NullString
+		if err := rows.Scan(&tool, &input, &text); err != nil {
+			return 0, fmt.Errorf("callmeter store %s: scan a call's input and error: %w", s.path, err)
+		}
+		if input.Valid {
+			if again, err := SanitizeInput(tool, json.RawMessage(input.String)); err != nil || again != input.String {
+				n++
+				continue
+			}
+		}
+		if text.Valid && SanitizeError(text.String) != text.String {
+			n++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("callmeter store %s: read calls to check their privacy form: %w", s.path, err)
+	}
+	return n, nil
 }
