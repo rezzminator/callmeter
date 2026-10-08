@@ -55,6 +55,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## Sacred ground
 
+- **Standalone:** NEVER require pfm, Professor or any other tool: the plugin, binary, tests and gates run for anyone with Claude Code and nothing else installed; other tools read the store, callmeter never calls them, and data it takes from one is optional.
 - **Privacy:** NEVER store prompt, message or file content; the store keeps only its `{name}_bytes` count.
 - **Publication:** NEVER push, tag or release without the user's explicit ask in the current turn.
 - **Nothing identifying** ships in a tracked file: no machine-absolute path (`/Users/…`, `/home/…`), no private term; the leak gate is the backstop.
