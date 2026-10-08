@@ -121,7 +121,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
 | `waiting` | time spent waiting on you: idle prompts and permission prompts, total, median and longest |
-| `cache` | prompt-cache hits, partial hits and misses per main chat and sub-agent and per cache TTL, with the cause the store proves (expired, compacted, model changed) and, from `wire.db`, where the prompt broke |
+| `cache` | prompt-cache hits, partial hits and misses per main chat and sub-agent and per cache TTL, with the cause the store proves (expired, compacted, model changed) |
 
 | Flag | Meaning |
 | --- | --- |
@@ -169,10 +169,6 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 - `faults`: every event that could not be recorded and every command part that could not be parsed, by stage; a parse fault keeps the byte count of the parser's message, never its text.
 - `request_iterations`: one row per entry of a request's usage `iterations` other than the message itself, such as a fallback model's answer, with its own token counts.
 - `request_cache`, a view computed when read: each request's cache outcome against the previous request of its chat or sub-agent: the gap, the cache TTL it could read, hit, partial or miss, and the proven cause.
-
-### Wire facts from a proxy, optional
-
-Some facts never reach a transcript: the cache TTL a request asked for, where its prompt stopped matching the previous request's, the rate-limit status of the response. A recording proxy between Claude Code and the API can write them to `wire.db` beside the store, when you opt in to it in that proxy; nothing writes the file by default, and callmeter never does. callmeter only reads it, read-only, when `callmeter report cache` runs, and joins it on the request id; without it every report works and those facts read as unknown. The file's layout is the contract in [docs/wire-db.md](./docs/wire-db.md).
 
 ## 🔒 Privacy
 

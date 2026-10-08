@@ -3,10 +3,7 @@ package report
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -46,78 +43,36 @@ func seedCacheRequests(t *testing.T, store *callmeter.Store) {
 	}
 }
 
-// TestCacheCountsOutcomesPerPartyAndTTLWithTheWireBreak: the requests are
-// counted per party, entry TTL, outcome, cause and the break kind wire.db
-// records (a NULL kind is unknown, no row is "-"), most first; the coverage
-// note counts the requests with a row and states the reader. Without wire.db,
-// or with one it cannot read, every outcome and cause stays as it was; only
-// the break column and the note change, and a warning is also a failure the
-// run logs.
-func TestCacheCountsOutcomesPerPartyAndTTLWithTheWireBreak(t *testing.T) {
+// TestCacheCountsOutcomesPerPartyAndTTL: the requests are counted per party,
+// entry TTL, outcome and cause, most first, and a filter narrows them.
+func TestCacheCountsOutcomesPerPartyAndTTL(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	seedCacheRequests(t, store)
-	dir := t.TempDir()
-	ok := filepath.Join(dir, "ok", "wire.db")
-	newer := filepath.Join(dir, "newer", "wire.db")
-	for _, path := range []string{ok, newer} {
-		version := 1
-		if path == newer {
-			version = 2
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		writeWire(t, path, version, []string{wireDDL}, map[string]string{"m2": "none", "m3": "system", "a2": "", "msg_elsewhere": "tools"})
-	}
-	withoutWire := []string{
-		"sub-agent|5m|hit|-|-|3",
-		"main chat|-|first|-|-|1",
-		"main chat|1h|hit|-|-|1",
-		"main chat|1h|miss|unknown|-|1",
-		"sub-agent|-|first|-|-|1",
-	}
 	for _, tt := range []struct {
 		name   string
 		filter Filter
 		rows   []string
-		note   string
-		failed bool
 	}{
-		{"wire facts", Filter{Wire: ok}, []string{
-			"sub-agent|5m|hit|-|-|2",
-			"main chat|-|first|-|-|1",
-			"main chat|1h|hit|-|none|1",
-			"main chat|1h|miss|unknown|system|1",
-			"sub-agent|-|first|-|-|1",
-			"sub-agent|5m|hit|-|unknown|1",
-		}, "wire data for 3 of 7 requests (wire.db: ok)", false},
-		{"one agent type", Filter{Wire: ok, AgentType: "Explore"}, []string{
-			"sub-agent|5m|hit|-|-|2",
-			"sub-agent|-|first|-|-|1",
-			"sub-agent|5m|hit|-|unknown|1",
-		}, "wire data for 1 of 4 requests (wire.db: ok)", false},
-		{"absent", Filter{Wire: filepath.Join(dir, "none", "wire.db")}, withoutWire,
-			"wire data for 0 of 7 requests (wire.db: absent)", false},
-		{"unreadable", Filter{Wire: newer}, withoutWire,
-			"wire data for 0 of 7 requests (wire.db: warning: user_version 2, this callmeter reads 1)", true},
+		{"every party", Filter{}, []string{
+			"sub-agent|5m|hit|-|3",
+			"main chat|-|first|-|1",
+			"main chat|1h|hit|-|1",
+			"main chat|1h|miss|unknown|1",
+			"sub-agent|-|first|-|1",
+		}},
+		{"one agent type", Filter{AgentType: "Explore"}, []string{
+			"sub-agent|5m|hit|-|3",
+			"sub-agent|-|first|-|1",
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			table, err := Cache(ctx, store, tt.filter, chatOf)
 			if err != nil {
 				t.Fatalf("Cache: %v", err)
 			}
-			wantHeader(t, table, "PARTY", "ENTRY TTL", "OUTCOME", "CAUSE", "BREAK", "REQUESTS")
+			wantHeader(t, table, "PARTY", "ENTRY TTL", "OUTCOME", "CAUSE", "REQUESTS")
 			wantRows(t, table, tt.rows...)
-			if !slices.Contains(table.Notes, tt.note) {
-				t.Errorf("notes = %q, want %q", table.Notes, tt.note)
-			}
-			if tt.failed != (len(table.Failures) == 1) || len(table.Failures) > 1 {
-				t.Errorf("failures = %v, want one: %v", table.Failures, tt.failed)
-			}
-			if tt.failed && !strings.Contains(table.Failures[0].Error(), tt.filter.Wire) {
-				t.Errorf("failure = %v, want it to name %s", table.Failures[0], tt.filter.Wire)
-			}
 		})
 	}
 }

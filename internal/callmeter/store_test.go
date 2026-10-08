@@ -1674,7 +1674,7 @@ func TestStoreWorksOpenedAlone(t *testing.T) {
 	if !strings.Contains(objects, "view request_cache") {
 		t.Errorf("objects = %s, want the request_cache view among them", objects)
 	}
-	if got := keys(t, plain, "SELECT name FROM sqlite_master WHERE sql LIKE '%wire%' OR sql LIKE '%archive.%' OR sql LIKE '%main.%'"); got != "" {
+	if got := keys(t, plain, "SELECT name FROM sqlite_master WHERE sql LIKE '%archive.%' OR sql LIKE '%main.%'"); got != "" {
 		t.Errorf("objects naming another database: %s", got)
 	}
 	// a SQLite before 3.25 cannot parse a window function, and a reader that

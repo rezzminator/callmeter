@@ -131,22 +131,6 @@ WHERE r.ts >= (strftime('%s','now') - 86400) * 1000
 GROUP BY 1, 2, 3, 4 ORDER BY requests DESC LIMIT 20;
 ```
 
-The last day's partial hits and misses beside the wire facts of `wire.db` ([schema.md § wire.db](schema.md#wiredb)), attached read-only; with no such file the `ATTACH` fails with `unable to open database`, which means no wire data, never "no break". Check `wire_version` is 1 before reading the rows:
-
-```sh
-CM_WIRE="$(dirname "$CM_DB")/wire.db"
-sqlite3 -readonly -cmd '.timeout 15000' -header -column "$CM_DB" <<SQL
-ATTACH 'file:$CM_WIRE?mode=ro' AS wire;
-SELECT user_version AS wire_version FROM wire.pragma_user_version;
-SELECT c.outcome, c.cause, CASE WHEN w.request_id IS NULL THEN '(no row)' ELSE coalesce(w.break_kind, '(unknown)') END AS break_kind,
-       w.ttl_sent, count(*) AS requests
-FROM request_cache c JOIN requests r USING (request_id)
-LEFT JOIN wire.wire_requests w ON w.request_id = c.request_id
-WHERE r.ts >= (strftime('%s','now') - 86400) * 1000 AND c.outcome IN ('partial', 'miss')
-GROUP BY 1, 2, 3, 4 ORDER BY requests DESC LIMIT 20;
-SQL
-```
-
 Cost per session, and per model inside it where Claude Code gave the split:
 
 ```sql

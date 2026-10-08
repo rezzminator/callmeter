@@ -1,6 +1,6 @@
 # callmeter store schema
 
-Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; On `calls`, `requests` and `agents`, `source` is `hook` for a row a hook wrote and `transcript` for one rebuilt from a transcript by a report run (`events.source` is something else, below). Contents: [calls](#calls) · [requests](#requests) · [request_iterations](#request_iterations) · [request_cache](#request_cache) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [wire.db](#wiredb) · [Joins](#joins)
+Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; On `calls`, `requests` and `agents`, `source` is `hook` for a row a hook wrote and `transcript` for one rebuilt from a transcript by a report run (`events.source` is something else, below). Contents: [calls](#calls) · [requests](#requests) · [request_iterations](#request_iterations) · [request_cache](#request_cache) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [Joins](#joins)
 
 A store gains newer tables and columns on its next open; `PRAGMA user_version` stays 1, so test for one with `SELECT 1 FROM pragma_table_info('requests') WHERE name = 'thinking_tokens'` or `sqlite_master`, never by version.
 
@@ -109,24 +109,12 @@ One row per session: Claude Code's latest cumulative cost snapshot. Key `session
 
 One row per turn wall time Claude Code measured. Key `entry_id`. `session_id`, `agent_id`, `prompt_id`, `ts`, `duration_ms`, `message_count`, `background_agents`. Join to prompts by `prompt_id`.
 
-## wire.db
-
-`{CALLMETER_HOME}/wire.db`, beside the store, exists only when a recording proxy the user runs opts in to write it; most stores have none. callmeter only reads it, read-only, at report time: nothing in `callmeter.db` refers to it, and it is never pruned or archived by callmeter. Open it the same way, `mode=ro`; reading it leaves SQLite's `-wal` and `-shm` beside it when no writer has them open.
-
-- `PRAGMA user_version = 1`, one table `wire_requests`, key `request_id`: the same API message id as `requests.request_id`. Absent file: no wire data, never "no break"; a file with another `user_version` or without the table is not this layout.
-- `ts`: when the response began. `agent_id`: NULL for the main chat.
-- `ttl_sent`: the TTL the request itself asked for on its cache breakpoints: `5m`, `1h`, `mixed`, NULL (no breakpoint); a breakpoint without a TTL counts as `5m`, another TTL is copied as sent, or `other`.
-- `advisor_ttl`: the TTL on the advisor tool entry as sent upstream, `5m`, `1h` or NULL (no advisor tool, or no caching on it). `advisor_added`: 1 the proxy added that caching, 0 it added none, NULL no advisor tool.
-- `break_kind`: where this request first stopped matching the party's previous one: `first` (no previous request), `none` (prefix intact), `tools`, `system`, `messages`, `thinking` (a thinking block, which Claude Code resends emptied); NULL is unknown, never `none`. `break_at`: the index of that first differing block; NULL when intact, first or unknown.
-- `rl_status`, `overage`: the response's `anthropic-ratelimit-unified-status` and `anthropic-ratelimit-unified-overage-status` headers; NULL when absent.
-
 ## Joins
 
 | From | To | On |
 | --- | --- | --- |
 | `calls` | `requests` | `calls.request_id = requests.request_id` |
 | `request_iterations`, `request_cache` | `requests` | `request_id` |
-| `wire.wire_requests` (attached read-only) | `requests`, `request_cache` | `request_id` |
 | `agents` | the Agent call that started it | `agents.parent_tool_use_id = calls.tool_use_id` (that call's `agent_id` is the parent agent, NULL for the main chat) |
 | `requests`, `calls`, `events`, `turns`, `compactions`, `turn_durations` | `agents` | `agent_id` |
 | any table with `session_id` | `sessions`, `session_costs` | `session_id` |

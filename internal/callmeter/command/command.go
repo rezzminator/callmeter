@@ -16,7 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
 	"github.com/rezzminator/callmeter/internal/clock"
@@ -211,15 +210,7 @@ func reportAction(
 	}
 	// An own seat that cannot be resolved stays empty: coverage names it in a note.
 	filter.OwnSeat, _ = paths.SeatDir(getenv)
-	filter.Wire = paths.Wire(home)
 	table, err := topic(ctx, db, filter, names.nameOf)
-	if err == nil {
-		// a file beside the store the topic could not read: its note shows a
-		// safe label, the log keeps the path and the cause
-		for _, failure := range table.Failures {
-			applog.Failure(stderr, paths.Log(home), "wire", "", "", failure)
-		}
-	}
 	if err == nil {
 		table.Notes = append(table.Notes, report.InapplicableNotes(positional[0], filter)...)
 		table.Notes = append(table.Notes, recovery...)

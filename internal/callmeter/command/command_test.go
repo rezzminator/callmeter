@@ -985,33 +985,3 @@ func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
 		})
 	}
 }
-
-// TestCallmeterCLIReportCacheStatesTheWireFile: the cache topic reads
-// {CALLMETER_HOME}/wire.db; absent, the coverage note says so and nothing is
-// logged; unreadable, the note shows the warning and callmeter.log holds it
-// with the file's path, never read as absence.
-func TestCallmeterCLIReportCacheStatesTheWireFile(t *testing.T) {
-	fixture := newLab(t)
-	fixture.seedEverything(t)
-	home := filepath.Dir(fixture.storePath)
-	code, stdout, stderr := fixture.run("report", "cache")
-	if code != 0 || stderr != "" || !strings.Contains(stdout, "note: wire data for 0 of 1 requests (wire.db: absent)\n") {
-		t.Fatalf("report cache without wire.db = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
-	}
-	if _, err := os.Stat(paths.Log(home)); err == nil {
-		t.Errorf("an absent wire.db wrote %s", paths.Log(home))
-	}
-	wire := filepath.Join(home, "wire.db")
-	if err := os.WriteFile(wire, []byte(strings.Repeat("not a database\n", 200)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, stderr = fixture.run("report", "cache")
-	if code != 0 || !strings.Contains(stdout, "note: wire data for 0 of 1 requests (wire.db: warning: unreadable, see callmeter.log)\n") ||
-		!strings.Contains(stderr, "callmeter: wire: ") {
-		t.Fatalf("report cache over an unreadable wire.db = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
-	}
-	logged, err := os.ReadFile(paths.Log(home))
-	if err != nil || !strings.Contains(string(logged), `"step":"wire"`) || !strings.Contains(string(logged), wire) {
-		t.Errorf("callmeter.log = %q, %v; want the wire step naming %s", logged, err, wire)
-	}
-}
