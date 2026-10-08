@@ -1500,7 +1500,9 @@ func (s *Store) lostTurnEnd(ctx context.Context, sessionID, transcript string, s
 
 // requestFills reports whether RecoverRequest of r would change the store: the
 // row is absent and not older than since (so it would be written), a column r
-// provides is NULL in the stored row, or a call of toolUseIDs names no request.
+// provides is NULL in the stored row, an iteration r carries has no
+// request_iterations row (on a store that has the table), or a call of
+// toolUseIDs names no request.
 // It reads outside the write transaction, so a fully settled request costs the
 // report no write at all.
 func (s *Store) requestFills(ctx context.Context, r Request, toolUseIDs []string, since int64) (bool, error) {
@@ -1523,6 +1525,18 @@ func (s *Store) requestFills(ctx context.Context, r Request, toolUseIDs []string
 	for _, value := range values {
 		if value == nil {
 			return true, nil
+		}
+	}
+	if s.complete {
+		for _, it := range r.Iterations {
+			var stored int
+			if err := s.db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM request_iterations WHERE request_id = ? AND seq = ?", r.RequestID, it.Seq).Scan(&stored); err != nil {
+				return false, fmt.Errorf("callmeter store %s: read iteration %d of request %q: %w", s.path, it.Seq, r.RequestID, err)
+			}
+			if stored == 0 {
+				return true, nil
+			}
 		}
 	}
 	for _, id := range toolUseIDs {

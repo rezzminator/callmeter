@@ -2,6 +2,7 @@ package callmeter
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -201,6 +202,8 @@ var storeColumns = map[string]string{
 	"stop_hooks":     "entry_id,session_id,agent_id,prompt_id,ts,hook_count,hook_errors,seat_dir",
 	"stop_hook_runs": "entry_id,seq,ts,name,command_bytes,duration_ms",
 	"turn_durations": "entry_id,session_id,agent_id,prompt_id,ts,duration_ms,message_count,background_agents,seat_dir",
+	"request_iterations": "request_id,seq,ts,type,model,input_tokens,cache_read_tokens,cache_creation_tokens," +
+		"cache_creation_5m_tokens,cache_creation_1h_tokens,output_tokens",
 }
 
 // TestOpenFreshStoreCreatesTheVersionOneTables pins the on-disk schema a new
@@ -214,17 +217,20 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 		}
 	}
 	gotTables := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-	if want := "agent_turns,agents,calls,command_parts,compactions,events,faults,requests,session_costs,sessions," +
-		"stop_hook_runs,stop_hooks,turn_durations,turns"; gotTables != want {
+	if want := "agent_turns,agents,calls,command_parts,compactions,events,faults,request_iterations,requests,session_costs," +
+		"sessions,stop_hook_runs,stop_hooks,turn_durations,turns"; gotTables != want {
 		t.Errorf("tables = %s, want %s", gotTables, want)
 	}
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_session_agent_pending,stop_hooks_session_ts,turn_durations_session_ts," +
-		"turns_session_ts"
+		"events_event_ts,events_session_ts,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
+	}
+	if got := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name"); got != "request_cache" {
+		t.Errorf("views = %s, want request_cache", got)
 	}
 	if got := keys(t, store.DB(), "SELECT CAST(user_version AS TEXT) FROM pragma_user_version"); got != "1" {
 		t.Errorf("user_version = %s, want 1", got)
@@ -589,7 +595,8 @@ func seedEveryTable(t *testing.T, store *Store, tag string, ts int64) {
 		if err := tx.ReplaceCommandParts(ctx, "toolu_"+tag, []CommandPart{{Seq: 0, Lang: "sh", Program: "cat"}}); err != nil {
 			return err
 		}
-		if err := tx.UpsertRequest(ctx, Request{RequestID: "msg_" + tag, TS: Ptr(ts), Model: Ptr("m")}, Overwrite); err != nil {
+		if err := tx.UpsertRequest(ctx, Request{RequestID: "msg_" + tag, TS: Ptr(ts), Model: Ptr("m"),
+			Iterations: []Iteration{{Seq: 1, Type: "fallback_message", OutputTokens: Ptr(int64(3))}}}, Overwrite); err != nil {
 			return err
 		}
 		if err := tx.UpsertAgent(ctx, Agent{AgentID: "agent_" + tag, Started: Ptr(ts)}, Overwrite); err != nil {
@@ -671,7 +678,7 @@ func TestPruneArchivesEveryTableBeforeDeleting(t *testing.T) {
 	perTable := map[string]int{
 		"calls": 1, "requests": 1, "turns": 1, "events": 3, "faults": 1, "agents": 1, "agent_turns": 1,
 		"sessions": 1, "command_parts": 1, "compactions": 1, "session_costs": 1, "stop_hooks": 1, "stop_hook_runs": 1,
-		"turn_durations": 1,
+		"turn_durations": 1, "request_iterations": 1,
 	}
 	want := 0
 	archive := openArchive(t, store)
@@ -753,6 +760,7 @@ func setPruneAfterArchive(t *testing.T, f func() error) {
 var seededRowsPerTable = map[string]int{
 	"calls": 1, "requests": 1, "turns": 1, "events": 3, "faults": 1, "agents": 1, "agent_turns": 1, "sessions": 1,
 	"command_parts": 1, "compactions": 1, "session_costs": 1, "stop_hooks": 1, "stop_hook_runs": 1, "turn_durations": 1,
+	"request_iterations": 1,
 }
 
 // stopPruneBetweenPhases seeds an expired row into every table and runs a
@@ -860,7 +868,7 @@ func TestPruneLeavesAnExpiredRowTheArchiveLacks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
-	if want := 14; int(removed) != want { // the 16 seeded rows less the call and its part
+	if want := 15; int(removed) != want { // the 17 seeded rows less the call and its part
 		t.Errorf("Prune removed %d rows, want %d", removed, want)
 	}
 	archive := openArchive(t, store)
@@ -1032,6 +1040,7 @@ func makeVersionOneStore(t *testing.T, path string) {
 	for _, statement := range []string{
 		"DROP TABLE IF EXISTS compactions", "DROP TABLE IF EXISTS session_costs", "DROP TABLE IF EXISTS stop_hooks",
 		"DROP TABLE IF EXISTS stop_hook_runs", "DROP TABLE IF EXISTS turn_durations", "DROP INDEX IF EXISTS calls_request",
+		"DROP VIEW IF EXISTS request_cache", "DROP TABLE IF EXISTS request_iterations", "DROP INDEX IF EXISTS requests_session_agent_ts",
 		"INSERT INTO requests (request_id, session_id, ts, model, output_tokens) VALUES ('msg_old', 'sess_old', 5, 'm', 9)",
 	} {
 		if _, err := old.DB().Exec(statement); err != nil {
@@ -1059,10 +1068,13 @@ func TestOpenCompletesAVersionOneStore(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_session_agent_pending,stop_hooks_session_ts,turn_durations_session_ts," +
-		"turns_session_ts"
+		"events_event_ts,events_session_ts,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes after the reopen = %s, want %s", gotIndexes, wantIndexes)
+	}
+	if got := keys(t, store.DB(), "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'request_cache'"); got != schemaViews["request_cache"] {
+		t.Errorf("request_cache after the reopen = %q, want the shipped view", got)
 	}
 	if got := keys(t, store.DB(), "SELECT CAST(user_version AS TEXT) FROM pragma_user_version"); got != "1" {
 		t.Errorf("user_version = %s, want 1", got)
@@ -1597,5 +1609,271 @@ func TestArchiveReplacesChangedAggregates(t *testing.T) {
 				t.Errorf("archive %s.%s = %q, want the updated aggregate", table, column, got)
 			}
 		})
+	}
+}
+
+// TestPruneMovesIterationsWithTheirRequest: an iteration ages with its
+// request, never by its own ts: those of an expiring request go to the archive
+// and leave the store with it, those of a recent request stay.
+func TestPruneMovesIterationsWithTheirRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	cutoff := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	old, recent := cutoff.Add(-time.Hour).UnixMilli(), cutoff.Add(time.Hour).UnixMilli()
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		for id, ts := range map[string]int64{"msg_old": old, "msg_recent": recent} {
+			if err := tx.UpsertRequest(ctx, Request{RequestID: id, TS: Ptr(ts),
+				Iterations: []Iteration{{Seq: 1, Type: "fallback_message"}, {Seq: 2, Type: "fallback_message"}}}, Overwrite); err != nil {
+				return err
+			}
+		}
+		// each iteration's own ts says the opposite of its request's
+		_, err := tx.tx.ExecContext(ctx, "UPDATE request_iterations SET ts = CASE request_id WHEN 'msg_old' THEN ? ELSE ? END", recent, old)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Prune(ctx, cutoff); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if got := keys(t, store.DB(), "SELECT request_id || ':' || seq FROM request_iterations ORDER BY 1"); got != "msg_recent:1,msg_recent:2" {
+		t.Errorf("store iterations = %s, want msg_recent's two", got)
+	}
+	if got := keys(t, openArchive(t, store), "SELECT request_id || ':' || seq FROM request_iterations ORDER BY 1"); got != "msg_old:1,msg_old:2" {
+		t.Errorf("archive iterations = %s, want msg_old's two", got)
+	}
+}
+
+// TestStoreWorksOpenedAlone: no table, view, index or trigger of the store
+// names another database, so the file opened alone, with no ATTACH, as a
+// person or a model opens it with sqlite3 or Python, reads every table and
+// view.
+func TestStoreWorksOpenedAlone(t *testing.T) {
+	store := openTestStore(t)
+	seedEveryTable(t, store, "now", time.Now().UnixMilli())
+	plain, err := sqlitedb.OpenReadWrite(store.path, time.Second)
+	if err != nil {
+		t.Fatalf("open the store alone: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := plain.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	objects := keys(t, plain, "SELECT type || ' ' || name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY 1")
+	for _, object := range strings.Split(objects, ",") {
+		kind, name, _ := strings.Cut(object, " ")
+		if kind != "table" && kind != "view" {
+			continue
+		}
+		var n int
+		if err := plain.QueryRow("SELECT COUNT(*) FROM " + name).Scan(&n); err != nil {
+			t.Errorf("%s %s opened alone: %v", kind, name, err)
+		}
+	}
+	if !strings.Contains(objects, "view request_cache") {
+		t.Errorf("objects = %s, want the request_cache view among them", objects)
+	}
+	if got := keys(t, plain, "SELECT name FROM sqlite_master WHERE sql LIKE '%wire%' OR sql LIKE '%archive.%' OR sql LIKE '%main.%'"); got != "" {
+		t.Errorf("objects naming another database: %s", got)
+	}
+	// a SQLite before 3.25 cannot parse a window function, and a reader that
+	// cannot parse one view cannot read any table of the file
+	if got := keys(t, plain, "SELECT name FROM sqlite_master WHERE type = 'view' AND (sql LIKE '% OVER %' OR sql LIKE '%WINDOW %')"); got != "" {
+		t.Errorf("views using a window function: %s", got)
+	}
+}
+
+// TestOpenWritesTheShippedViewAgain: an open finds the view of a store it
+// created exactly as shipped, with nothing to write; a store holding another
+// SQL under the view's name, with no version marker (an older binary's) or the
+// shipped one's, gets the shipped view back on its next open, version still 1.
+func TestOpenWritesTheShippedViewAgain(t *testing.T) {
+	ctx := context.Background()
+	shipped := viewVersion(schemaViews["request_cache"])
+	for _, stale := range []string{
+		"CREATE VIEW request_cache AS SELECT request_id, NULL AS gap_ms FROM requests",
+		fmt.Sprintf("CREATE VIEW request_cache AS -- version %d\n  SELECT request_id, NULL AS gap_ms FROM requests", shipped),
+	} {
+		path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+		fresh := openStoreAt(t, path)
+		alters, missing, err := missingFromSchema(ctx, fresh.DB())
+		if err != nil || len(alters) != 0 || missing {
+			t.Fatalf("missingFromSchema of a fresh store = %v, %v, %v; want nothing to write", alters, missing, err)
+		}
+		for _, statement := range []string{"DROP VIEW request_cache", stale} {
+			if _, err := fresh.DB().Exec(statement); err != nil {
+				t.Fatalf("%s: %v", statement, err)
+			}
+		}
+		if err := fresh.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store := openStoreAt(t, path)
+		if !store.SchemaComplete() {
+			t.Fatalf("SchemaComplete = false after the reopen over %q", stale)
+		}
+		if got := keys(t, store.DB(), "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'request_cache'"); got != schemaViews["request_cache"] {
+			t.Errorf("request_cache after the reopen over %q = %q, want the shipped view", stale, got)
+		}
+		if got := keys(t, store.DB(), "SELECT name FROM pragma_table_info('request_cache') ORDER BY cid"); got != "request_id,gap_ms,entry_ttl,expected_read,outcome,cause" {
+			t.Errorf("request_cache columns after the reopen over %q = %s", stale, got)
+		}
+	}
+}
+
+// TestOpenLeavesANewerViewAlone: seats running two releases share one store,
+// so an open replaces only a view whose version marker is older than the one
+// it ships, never a newer release's: the two binaries never drop each other's
+// view on every hook.
+func TestOpenLeavesANewerViewAlone(t *testing.T) {
+	ctx := context.Background()
+	shipped := viewVersion(schemaViews["request_cache"])
+	if shipped < 1 {
+		t.Fatalf("the shipped request_cache carries version %d, want a marker of 1 or more", shipped)
+	}
+	newer := fmt.Sprintf("CREATE VIEW request_cache AS -- version %d\n  SELECT request_id, NULL AS gap_ms FROM requests", shipped+1)
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	fresh := openStoreAt(t, path)
+	for _, statement := range []string{"DROP VIEW request_cache", newer} {
+		if _, err := fresh.DB().Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	alters, missing, err := missingFromSchema(ctx, fresh.DB())
+	if err != nil || len(alters) != 0 || missing {
+		t.Errorf("missingFromSchema under a newer view = %v, %v, %v; want nothing to write", alters, missing, err)
+	}
+	if err := fresh.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := openStoreAt(t, path)
+	if !store.SchemaComplete() {
+		t.Error("SchemaComplete = false under a newer view, want true")
+	}
+	if got := keys(t, store.DB(), "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'request_cache'"); got != newer {
+		t.Errorf("request_cache after the reopen = %q, want the newer release's view kept", got)
+	}
+}
+
+// TestViewVersion: the marker is the first line's `-- version N`, read the
+// same by every release whatever the spacing before it, 0 when absent; and
+// each shipped view's SQL is the one recorded for its version, so a change to
+// a view without a new version (two releases sharing one store would then drop
+// each other's view on every open) fails here.
+func TestViewVersion(t *testing.T) {
+	for _, c := range []struct {
+		sql  string
+		want int
+	}{
+		{"CREATE VIEW v AS SELECT 1", 0},
+		{"CREATE VIEW v AS -- version 1\n  SELECT 1", 1},
+		{"CREATE VIEW v AS  -- version 12\n  SELECT 1", 12},
+		{"CREATE VIEW v AS\n  -- version 3\n  SELECT 1", 0},
+	} {
+		if got := viewVersion(c.sql); got != c.want {
+			t.Errorf("viewVersion(%q) = %d, want %d", c.sql, got, c.want)
+		}
+	}
+	// a changed view raises its `-- version N` and records its sum here
+	recorded := map[string]map[int]string{
+		"request_cache": {1: "273afb523986dce2225859a17966c0f0c251f55f36fc23351d6120dfcc39fc6d"},
+	}
+	for name, text := range schemaViews {
+		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))
+		if version := viewVersion(text); recorded[name][version] != sum {
+			t.Errorf("view %s version %d has SQL sha256 %s, recorded %q: a changed view raises its version", name, version, sum, recorded[name][version])
+		}
+	}
+}
+
+// TestRequestCacheView: request_cache judges each settled request against the
+// previous request of its session and agent: the gap, the TTL of the latest
+// earlier cache write ('mixed' when it wrote both lifetimes), the previous
+// request's context as the read to expect, the outcome (first, hit at 95 %,
+// partial at 50 %, miss; NULL when a count is unknown) and, for a partial or a
+// miss, the cause the stored columns prove (model_changed, compacted, expired
+// past the entry's TTL, the shorter one when mixed), else unknown. A pending
+// request is no request here.
+func TestRequestCacheView(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	const minute = int64(60000)
+	base := int64(1790000000000)
+	type req struct {
+		id, agent, model string
+		ts               int64
+		context          int64
+		read             *int64
+		write5m, write1h *int64
+		pending          bool
+	}
+	n := func(v int64) *int64 { return &v }
+	requests := []req{
+		{id: "r1", model: "a", ts: base, context: 10000, read: n(0), write5m: n(0), write1h: n(10000)},
+		{id: "r2", model: "a", ts: base + minute, context: 12000, read: n(9600), write5m: n(0), write1h: n(2000)},
+		{id: "r3", model: "a", ts: base + minute + 120*minute, context: 13000, read: n(6000), write5m: n(7000), write1h: n(0)},
+		{id: "r4", model: "a", ts: base + 122*minute, context: 14000, read: n(1000), write5m: n(6000), write1h: n(7000)},
+		{id: "r5", model: "a", ts: base + 123*minute, context: 9000, read: n(0), write5m: n(9000), write1h: n(0)},
+		{id: "r6", model: "b", ts: base + 130*minute, context: 9500, read: n(0), write5m: n(9500), write1h: n(0)},
+		{id: "pending", model: "b", ts: base + 130*minute + 500, context: 0, pending: true},
+		{id: "r7", model: "b", ts: base + 131*minute, context: 9800, read: nil, write5m: n(0), write1h: n(0)},
+		{id: "s1", agent: "a1", model: "a", ts: base + minute, context: 500, read: n(0)},
+		{id: "s2", agent: "a1", model: "a", ts: base + 11*minute, context: 600, read: n(0)},
+		// each TTL's own expiry: 1 h not yet past at 30 minutes, mixed and 5m past at 6
+		{id: "u1", agent: "a2", model: "a", ts: base, context: 1000, read: n(0), write5m: n(0), write1h: n(1000)},
+		{id: "u2", agent: "a2", model: "a", ts: base + 30*minute, context: 1200, read: n(0), write5m: n(600), write1h: n(600)},
+		{id: "u3", agent: "a2", model: "a", ts: base + 36*minute, context: 1300, read: n(0), write5m: n(1300), write1h: n(0)},
+		{id: "u4", agent: "a2", model: "a", ts: base + 42*minute, context: 1400, read: n(0), write5m: n(0), write1h: n(0)},
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		for _, r := range requests {
+			row := Request{RequestID: r.id, SessionID: Ptr("sess-1"), TS: Ptr(r.ts), Model: Ptr(r.model), Pending: Ptr(r.pending),
+				ContextTokens: Ptr(r.context), CacheReadTokens: r.read, CacheCreation5mTokens: r.write5m, CacheCreation1hTokens: r.write1h}
+			if r.agent != "" {
+				row.AgentID = Ptr(r.agent)
+			}
+			if r.write5m != nil || r.write1h != nil {
+				var written int64
+				if r.write5m != nil {
+					written += *r.write5m
+				}
+				if r.write1h != nil {
+					written += *r.write1h
+				}
+				row.CacheCreationTokens = Ptr(written)
+			} else if r.agent != "" {
+				row.CacheCreationTokens = Ptr(int64(500)) // a write with no lifetime split
+			}
+			if err := tx.UpsertRequest(ctx, row, Overwrite); err != nil {
+				return err
+			}
+		}
+		_, err := tx.tx.ExecContext(ctx, "INSERT INTO compactions (entry_id, session_id, agent_id, ts) VALUES ('c1', 'sess-1', NULL, ?), ('c2', 'sess-1', 'a1', ?)",
+			base+122*minute+30000, base+122*minute+30000)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := keys(t, store.DB(), `SELECT request_id || '|' || COALESCE(gap_ms, '-') || '|' || COALESCE(entry_ttl, '-') || '|' ||
+		COALESCE(expected_read, '-') || '|' || COALESCE(outcome, '-') || '|' || COALESCE(cause, '-')
+		FROM request_cache ORDER BY request_id`)
+	want := strings.Join([]string{
+		"r1|-|-|-|first|-",
+		"r2|60000|1h|10000|hit|-",
+		"r3|7200000|1h|12000|partial|expired",
+		"r4|60000|5m|13000|miss|unknown",
+		"r5|60000|mixed|14000|miss|compacted",
+		"r6|420000|5m|9000|miss|model_changed",
+		"r7|60000|5m|9500|-|-",
+		"s1|-|-|-|first|-",
+		"s2|600000|-|500|miss|unknown",
+		"u1|-|-|-|first|-",
+		"u2|1800000|1h|1000|miss|unknown",
+		"u3|360000|mixed|1200|miss|expired",
+		"u4|360000|5m|1300|miss|expired",
+	}, ",")
+	if got != want {
+		t.Errorf("request_cache =\n%s\nwant\n%s", strings.ReplaceAll(got, ",", "\n"), strings.ReplaceAll(want, ",", "\n"))
 	}
 }

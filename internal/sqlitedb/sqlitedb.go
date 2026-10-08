@@ -1,6 +1,7 @@
 // Package sqlitedb is the one SQLite opener. callmeter's own database opens
 // through OpenStore with one pragma set; a database another program owns opens
-// through OpenReadWrite, which never changes its settings.
+// through OpenReadWrite, which never changes its settings, or through
+// OpenReadOnly when callmeter only reads it.
 package sqlitedb
 
 import (
@@ -77,6 +78,24 @@ func OpenReadWrite(path string, busy time.Duration) (*sql.DB, error) {
 	)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database %s: %w", path, err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	return database, nil
+}
+
+// OpenReadOnly opens a database another program writes and callmeter only
+// reads, on one connection: mode=ro, so no statement can write it and a missing
+// file is an error at the first statement, never created. busy bounds how long
+// a statement waits on the owner's writer. A reader of a WAL database shares
+// its -shm: SQLite creates it beside the file when the owner has not.
+func OpenReadOnly(path string, busy time.Duration) (*sql.DB, error) {
+	database, err := sql.Open(
+		driverName,
+		fileURI(path, fmt.Sprintf("mode=ro&_pragma=busy_timeout(%d)", busy.Milliseconds())),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite database %s read-only: %w", path, err)
 	}
 	database.SetMaxOpenConns(1)
 	database.SetMaxIdleConns(1)

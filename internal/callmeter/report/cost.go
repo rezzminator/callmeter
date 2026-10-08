@@ -24,7 +24,7 @@ func Cost(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) 
 	}
 	var err error
 	if !store.SchemaComplete() {
-		t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs")
+		t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs table")
 		return t, err
 	}
 	var sessions []*string
@@ -59,7 +59,7 @@ func Cost(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) 
 	).Scan(&count, &total); err != nil {
 		return nil, fmt.Errorf("callmeter report: total the session costs: %w", err)
 	}
-	if t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs"); err != nil {
+	if t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs table"); err != nil {
 		return nil, err
 	}
 	if count > 0 {

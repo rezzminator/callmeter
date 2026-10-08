@@ -21,7 +21,7 @@ func Turns(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	}
 	var err error
 	if !store.SchemaComplete() {
-		t.Notes, err = gainedNotes(ctx, store, f, n, "turn_durations")
+		t.Notes, err = gainedNotes(ctx, store, f, n, "turn_durations table")
 		return t, err
 	}
 	var sessions []*string
@@ -62,7 +62,7 @@ func Turns(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	if err != nil {
 		return nil, err
 	}
-	if t.Notes, err = gainedNotes(ctx, store, f, n, "turn_durations"); err != nil {
+	if t.Notes, err = gainedNotes(ctx, store, f, n, "turn_durations table"); err != nil {
 		return nil, err
 	}
 	if len(walls) > 0 {

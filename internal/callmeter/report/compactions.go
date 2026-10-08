@@ -21,7 +21,7 @@ func Compactions(ctx context.Context, store *callmeter.Store, f Filter, nameOf N
 	}
 	var err error
 	if !store.SchemaComplete() {
-		t.Notes, err = gainedNotes(ctx, store, f, n, "compactions")
+		t.Notes, err = gainedNotes(ctx, store, f, n, "compactions table")
 		return t, err
 	}
 	var sessions []*string
@@ -56,7 +56,7 @@ func Compactions(ctx context.Context, store *callmeter.Store, f Filter, nameOf N
 	).Scan(&count, &auto, &manual, &freed, &duration); err != nil {
 		return nil, fmt.Errorf("callmeter report: total the compactions: %w", err)
 	}
-	if t.Notes, err = gainedNotes(ctx, store, f, n, "compactions"); err != nil {
+	if t.Notes, err = gainedNotes(ctx, store, f, n, "compactions table"); err != nil {
 		return nil, err
 	}
 	if count > 0 {

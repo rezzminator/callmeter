@@ -45,6 +45,9 @@ type Filter struct {
 	// the coverage topic scans its projects/ beside every seat the store
 	// recorded. Empty when it could not be resolved.
 	OwnSeat string
+	// Wire is the wire.db path the cache topic reads (paths.Wire); empty
+	// reads none, the same as an absent file.
+	Wire string
 }
 
 // NameOf resolves a session id to its chat name; the CLI reads the title
@@ -99,6 +102,9 @@ type Table struct {
 	Rows   [][]string
 	Notes  []string // one line per named gap
 	Empty  string   // the body line when Rows is empty; "" is EmptyLine
+	// Failures are what the topic could not read beside the store, each shown
+	// in a note by a safe label; the run logs them with their full context.
+	Failures []error
 }
 
 // Render writes the heading, the fixed-width rows (or EmptyLine) and the

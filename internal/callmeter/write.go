@@ -102,6 +102,9 @@ type Request struct {
 	Source                *string
 	ConfigDir             *string
 	SeatDir               *string
+	// Iterations go to request_iterations, keyed by the request and each one's
+	// Seq, once the request's row is written; none for a provisional key.
+	Iterations []Iteration
 }
 
 // Agent is one agents row; a nil field is not provided.
@@ -340,12 +343,51 @@ func (t *Tx) UpsertCall(ctx context.Context, c Call, mode Mode) error {
 	return nil
 }
 
-// UpsertRequest writes r's provided columns by request_id.
+// UpsertRequest writes r's provided columns by request_id, then its
+// iterations (writeIterations).
 func (t *Tx) UpsertRequest(ctx context.Context, r Request, mode Mode) error {
 	if !t.complete {
 		r.ThinkingTokens = nil
 	}
-	return t.upsert(ctx, "requests", "request_id", r.RequestID, r.columns(), mode)
+	if err := t.upsert(ctx, "requests", "request_id", r.RequestID, r.columns(), mode); err != nil {
+		return err
+	}
+	return t.writeIterations(ctx, r.RequestID, r.Iterations, mode)
+}
+
+// iterationColumns are the request_iterations columns an iteration provides,
+// after its key and ts.
+var iterationColumns = []string{
+	"type", "model", "input_tokens", "cache_read_tokens", "cache_creation_tokens",
+	"cache_creation_5m_tokens", "cache_creation_1h_tokens", "output_tokens",
+}
+
+// writeIterations upserts each of iterations as the request_iterations row
+// (requestID, Seq), its ts the stored request's ts, after the request's own
+// row was written. Overwrite replaces the stored values and FillEmpty only
+// fills a NULL, as for the request; ts always follows the request. A
+// provisional key has no message id to carry iterations, and a store without
+// the table (Store.SchemaComplete false) gets none.
+func (t *Tx) writeIterations(ctx context.Context, requestID string, iterations []Iteration, mode Mode) error {
+	if len(iterations) == 0 || !t.complete || strings.HasPrefix(requestID, PendingPrefix) {
+		return nil
+	}
+	sets := []string{"ts = excluded.ts"}
+	for _, name := range iterationColumns {
+		sets = append(sets, mergeSet("request_iterations", name, mode, nil))
+	}
+	statement := `INSERT INTO request_iterations (request_id, seq, ts, ` + strings.Join(iterationColumns, ", ") + `)
+		VALUES (?, ?, (SELECT ts FROM requests WHERE request_id = ?), ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(request_id, seq) DO UPDATE SET ` + strings.Join(sets, ", ")
+	for _, it := range iterations {
+		if _, err := t.tx.ExecContext(ctx, statement,
+			requestID, it.Seq, requestID, nullString(it.Type), nullString(it.Model), it.InputTokens, it.CacheReadTokens,
+			it.CacheCreationTokens, it.CacheCreation5m, it.CacheCreation1h, it.OutputTokens,
+		); err != nil {
+			return fmt.Errorf("callmeter store %s: upsert iteration %d of request %q: %w", t.path, it.Seq, requestID, err)
+		}
+	}
+	return nil
 }
 
 // UpsertAgent writes a's provided columns by agent_id.
@@ -517,7 +559,8 @@ func (t *Tx) ResolvePendingFrom(ctx context.Context, pending []PendingRequest, f
 
 // SettleRequest writes r, a request read whole from its transcript at its
 // final usage, over its row: the model, stop reason and token columns the
-// transcript holds win; ts and the owner, prompt, source and seat columns only
+// transcript holds win, and so do its iterations (writeIterations), written
+// only once the row is; ts and the owner, prompt, source and seat columns only
 // fill, so a batch's values stand in whichever order the two land. Each call of toolUseIDs that names no request yet (its
 // batch never ran, as when its agent was interrupted) is pointed at it, and its
 // calls are recounted (RecountRequest), so a reply with no tool call holds 0.
@@ -594,6 +637,9 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		if updated == 0 {
 			return nil
 		}
+	}
+	if err := t.writeIterations(ctx, r.RequestID, r.Iterations, mode); err != nil {
+		return err
 	}
 	for _, id := range toolUseIDs {
 		if _, err := t.tx.ExecContext(ctx,

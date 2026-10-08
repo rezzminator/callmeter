@@ -208,12 +208,12 @@ func TestCallmeterCLIUnreadableTranscriptShowsAQuestionMarkAndOneNote(t *testing
 	}
 }
 
-// allTopics are the 20 report topics: the six ported, the eight of 5-b, then the
-// six over the transcript metrics.
+// allTopics are the 21 report topics: the six ported, the eight of 5-b, the six
+// over the transcript metrics, then cache.
 var allTopics = []string{
 	"files", "writes", "commands", "context", "sequences", "faults",
 	"sessions", "prompts", "effort", "tokens", "agents", "outcomes", "coverage", "events",
-	"compactions", "cost", "hooks", "turns", "resumes", "waiting",
+	"compactions", "cost", "hooks", "turns", "resumes", "waiting", "cache",
 }
 
 // seedEverything records something every one of the new topics reports, and an
@@ -347,7 +347,7 @@ func TestCallmeterCLIReportJSONOnEveryTopicMatchesTheText(t *testing.T) {
 	}
 }
 
-// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the fourteen new topics
+// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the fifteen new topics
 // each print the rows the seeded store holds.
 func TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows(t *testing.T) {
 	fixture := newLab(t)
@@ -485,7 +485,7 @@ func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 	}
 }
 
-func TestCallmeterCLIUnknownTopicListsAllTwenty(t *testing.T) {
+func TestCallmeterCLIUnknownTopicListsAllTwentyOne(t *testing.T) {
 	fixture := newLab(t)
 	code, stdout, stderr := fixture.run("report", "nope")
 	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "callmeter report: want one topic") {
@@ -551,7 +551,7 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 
 // TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic: a missed.log present
 // when a report runs is turned into faults first, so the note counts it on all
-// 20 topics, and the file is consumed.
+// 21 topics, and the file is consumed.
 func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
@@ -983,5 +983,35 @@ func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
 				t.Errorf("notes = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCallmeterCLIReportCacheStatesTheWireFile: the cache topic reads
+// {CALLMETER_HOME}/wire.db; absent, the coverage note says so and nothing is
+// logged; unreadable, the note shows the warning and callmeter.log holds it
+// with the file's path, never read as absence.
+func TestCallmeterCLIReportCacheStatesTheWireFile(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedEverything(t)
+	home := filepath.Dir(fixture.storePath)
+	code, stdout, stderr := fixture.run("report", "cache")
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "note: wire data for 0 of 1 requests (wire.db: absent)\n") {
+		t.Fatalf("report cache without wire.db = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if _, err := os.Stat(paths.Log(home)); err == nil {
+		t.Errorf("an absent wire.db wrote %s", paths.Log(home))
+	}
+	wire := filepath.Join(home, "wire.db")
+	if err := os.WriteFile(wire, []byte(strings.Repeat("not a database\n", 200)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr = fixture.run("report", "cache")
+	if code != 0 || !strings.Contains(stdout, "note: wire data for 0 of 1 requests (wire.db: warning: unreadable, see callmeter.log)\n") ||
+		!strings.Contains(stderr, "callmeter: wire: ") {
+		t.Fatalf("report cache over an unreadable wire.db = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	logged, err := os.ReadFile(paths.Log(home))
+	if err != nil || !strings.Contains(string(logged), `"step":"wire"`) || !strings.Contains(string(logged), wire) {
+		t.Errorf("callmeter.log = %q, %v; want the wire step naming %s", logged, err, wire)
 	}
 }

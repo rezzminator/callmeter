@@ -1191,3 +1191,104 @@ func TestPutMarksStoresNoCommandText(t *testing.T) {
 		}
 	}
 }
+
+// fallbackIteration is the fallback_message iteration of
+// testdata/transcript-iterations.jsonl as TestRequestIterations reads it.
+func fallbackIteration() Iteration {
+	return Iteration{
+		Seq: 1, Type: "fallback_message", Model: "claude-opus-4-8",
+		InputTokens: Ptr(int64(2)), CacheReadTokens: Ptr(int64(69945)), CacheCreationTokens: Ptr(int64(574)),
+		CacheCreation5m: Ptr(int64(0)), CacheCreation1h: Ptr(int64(574)), OutputTokens: Ptr(int64(4474)),
+	}
+}
+
+// TestRequestIterationsFollowTheirRequest: every write of a requests row a
+// transcript read fills (a batch's upsert, a provisional key's resolve, a
+// sweep's settle, recovery) writes its iterations under the request's id with
+// the request's ts, only once the request's own row was written: none under a
+// provisional key, none for another owner's row or a request older than the
+// session that was never stored, none on a store without the table. A settle
+// overwrites a stored iteration; recovery only fills.
+func TestRequestIterationsFollowTheirRequest(t *testing.T) {
+	ctx := context.Background()
+	stored := fallbackIteration()
+	stored.OutputTokens, stored.Model = Ptr(int64(99)), ""
+	want := map[string]any{
+		"request_id": "msg_1", "seq": int64(1), "ts": int64(1788019350229), "type": "fallback_message", "model": "claude-opus-4-8",
+		"input_tokens": int64(2), "cache_read_tokens": int64(69945), "cache_creation_tokens": int64(574),
+		"cache_creation_5m_tokens": int64(0), "cache_creation_1h_tokens": int64(574), "output_tokens": int64(4474),
+	}
+	request := func(id string) Request {
+		return Request{RequestID: id, SessionID: Ptr("sess-1"), TS: Ptr(int64(1788019350229)), Model: Ptr("claude-opus-4-8"),
+			Pending: Ptr(false), Iterations: []Iteration{fallbackIteration()}}
+	}
+	cases := []struct {
+		name  string
+		write func(tx *Tx) error
+		want  map[string]any // the msg_1 iteration row; nil: none
+	}{
+		{"batch upsert", func(tx *Tx) error { return tx.UpsertRequest(ctx, request("msg_1"), Overwrite) }, want},
+		{"provisional key", func(tx *Tx) error { return tx.UpsertRequest(ctx, request(ProvisionalKey("toolu_1")), Overwrite) }, nil},
+		{"resolve", func(tx *Tx) error {
+			if err := tx.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_1"), SessionID: Ptr("sess-1"),
+				TS: Ptr(int64(5)), Pending: Ptr(true)}, Overwrite); err != nil {
+				return err
+			}
+			return tx.ResolveRequest(ctx, ProvisionalKey("toolu_1"), request("msg_1"))
+		}, want},
+		{"settle", func(tx *Tx) error { return tx.SettleRequest(ctx, request("msg_1"), nil, 0) }, want},
+		{"settle over a stored iteration", func(tx *Tx) error {
+			old := request("msg_1")
+			old.Iterations = []Iteration{stored}
+			if err := tx.SettleRequest(ctx, old, nil, 0); err != nil {
+				return err
+			}
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 0)
+		}, want},
+		{"recover over a stored iteration", func(tx *Tx) error {
+			old := request("msg_1")
+			old.Iterations = []Iteration{stored}
+			if err := tx.SettleRequest(ctx, old, nil, 0); err != nil {
+				return err
+			}
+			return tx.RecoverRequest(ctx, request("msg_1"), nil, 0)
+		}, func() map[string]any {
+			kept := map[string]any{}
+			for k, v := range want {
+				kept[k] = v
+			}
+			kept["output_tokens"] = int64(99) // recovery never overwrites a stored value
+			return kept
+		}()},
+		{"another owner's row", func(tx *Tx) error {
+			if err := tx.UpsertRequest(ctx, Request{RequestID: "msg_1", SessionID: Ptr("sess-parent"), TS: Ptr(int64(1788019350229))},
+				Overwrite); err != nil {
+				return err
+			}
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 0)
+		}, nil},
+		{"older than the session, never stored", func(tx *Tx) error {
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 1788019350229+1)
+		}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := openTestStore(t)
+			if err := store.Batch(ctx, c.write); err != nil {
+				t.Fatal(err)
+			}
+			if got := row(t, store, "request_iterations", "request_id = ? AND seq = 1", "msg_1"); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("iteration row = %v\nwant %v", got, c.want)
+			}
+			if c.want == nil && count(t, store, "request_iterations") != 0 {
+				t.Errorf("request_iterations holds %d rows, want none", count(t, store, "request_iterations"))
+			}
+		})
+	}
+	t.Run("store without the table", func(t *testing.T) {
+		store := openIncompleteStore(t)
+		if err := store.Batch(ctx, func(tx *Tx) error { return tx.UpsertRequest(ctx, request("msg_1"), Overwrite) }); err != nil {
+			t.Fatalf("UpsertRequest on an incomplete store: %v", err)
+		}
+	})
+}

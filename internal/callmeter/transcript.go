@@ -39,6 +39,24 @@ type RequestUsage struct {
 	// (usage.output_tokens_details.thinking_tokens); nil when the usage carries
 	// none (an older Claude Code) — a missing count is never zero.
 	ThinkingTokens *int64
+	// Iterations are the entries of usage.iterations that are not the message
+	// itself (type "message"): a fallback model's answer, another model's call
+	// inside the request. nil when the usage carries none.
+	Iterations []Iteration
+}
+
+// Iteration is one entry of a request's usage.iterations, as the transcript
+// records it: its numbers copied, a number the entry did not carry nil.
+type Iteration struct {
+	Seq                 int    // its index in usage.iterations
+	Type                string // "" when the entry names none
+	Model               string // "" when the entry names none
+	InputTokens         *int64
+	CacheReadTokens     *int64
+	CacheCreationTokens *int64
+	CacheCreation5m     *int64 // the split of CacheCreationTokens by cache lifetime; nil without a cache_creation object
+	CacheCreation1h     *int64
+	OutputTokens        *int64
 }
 
 // SubagentTranscriptPath is the transcript of sub-agent agentID of the chat
@@ -112,8 +130,9 @@ func presentString(value string) *string {
 }
 
 // ApplyUsage copies a transcript request's usage into a requests row: its
-// time, model, stop reason and the token split. A cache-creation split the
-// usage did not carry stays NULL.
+// time, model, stop reason, the token split and the iterations that are not
+// the message itself. A cache-creation split the usage did not carry stays
+// NULL.
 func ApplyUsage(request *Request, usage RequestUsage) {
 	request.TS = Ptr(usage.TS)
 	request.Model = presentString(usage.Model)
@@ -126,6 +145,7 @@ func ApplyUsage(request *Request, usage RequestUsage) {
 	request.ContextTokens = Ptr(usage.ContextTokens)
 	request.OutputTokens = Ptr(usage.OutputTokens)
 	request.ThinkingTokens = usage.ThinkingTokens
+	request.Iterations = usage.Iterations
 }
 
 type transcriptEntry struct {
@@ -148,11 +168,54 @@ type assistantMessage struct {
 		OutputTokensDetails      *struct {
 			ThinkingTokens *int64 `json:"thinking_tokens"`
 		} `json:"output_tokens_details"`
-		CacheCreation *struct {
-			Ephemeral5mInputTokens *int64 `json:"ephemeral_5m_input_tokens"`
-			Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
-		} `json:"cache_creation"`
+		CacheCreation *cacheCreation   `json:"cache_creation"`
+		Iterations    []usageIteration `json:"iterations"`
 	} `json:"usage"`
+}
+
+// cacheCreation is a usage's split of its cache writes by cache lifetime.
+type cacheCreation struct {
+	Ephemeral5mInputTokens *int64 `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
+}
+
+// usageIteration is one entry of usage.iterations as Claude Code writes it.
+type usageIteration struct {
+	Type                     string         `json:"type"`
+	Model                    *string        `json:"model"`
+	InputTokens              *int64         `json:"input_tokens"`
+	CacheReadInputTokens     *int64         `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int64         `json:"cache_creation_input_tokens"`
+	OutputTokens             *int64         `json:"output_tokens"`
+	CacheCreation            *cacheCreation `json:"cache_creation"`
+}
+
+// messageIteration is the type of the iteration that is the message itself;
+// every other type is kept (Iteration).
+const messageIteration = "message"
+
+// iterationsOf keeps the entries of usage.iterations that are not the message
+// itself, each at its index in the array; nil when there is none.
+func iterationsOf(entries []usageIteration) []Iteration {
+	var kept []Iteration
+	for i, entry := range entries {
+		if entry.Type == messageIteration {
+			continue
+		}
+		iteration := Iteration{
+			Seq: i, Type: entry.Type, InputTokens: entry.InputTokens, CacheReadTokens: entry.CacheReadInputTokens,
+			CacheCreationTokens: entry.CacheCreationInputTokens, OutputTokens: entry.OutputTokens,
+		}
+		if entry.Model != nil {
+			iteration.Model = *entry.Model
+		}
+		if entry.CacheCreation != nil {
+			iteration.CacheCreation5m = entry.CacheCreation.Ephemeral5mInputTokens
+			iteration.CacheCreation1h = entry.CacheCreation.Ephemeral1hInputTokens
+		}
+		kept = append(kept, iteration)
+	}
+	return kept
 }
 
 // toolUse is both a content block type and the stop reason of a message that
@@ -366,6 +429,7 @@ func foldEntry(request *RequestUsage, message *assistantMessage) {
 		request.CacheCreation5m = usage.CacheCreation.Ephemeral5mInputTokens
 		request.CacheCreation1h = usage.CacheCreation.Ephemeral1hInputTokens
 	}
+	request.Iterations = iterationsOf(usage.Iterations)
 }
 
 // TranscriptRequest is one model request a transcript holds, at its final

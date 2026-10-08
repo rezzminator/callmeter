@@ -1,6 +1,6 @@
 # callmeter store schema
 
-Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; On `calls`, `requests` and `agents`, `source` is `hook` for a row a hook wrote and `transcript` for one rebuilt from a transcript by a report run (`events.source` is something else, below). Contents: [calls](#calls) · [requests](#requests) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [Joins](#joins)
+Every table, one row per what, and the columns whose meaning is not their name. Times are Unix milliseconds UTC; `seat_dir` is the Claude Code config dir the row came from, `config_dir` the home whose `projects/` holds the transcripts; On `calls`, `requests` and `agents`, `source` is `hook` for a row a hook wrote and `transcript` for one rebuilt from a transcript by a report run (`events.source` is something else, below). Contents: [calls](#calls) · [requests](#requests) · [request_iterations](#request_iterations) · [request_cache](#request_cache) · [agents](#agents) · [agent_turns](#agent_turns) · [turns](#turns) · [events](#events) · [sessions](#sessions) · [command_parts](#command_parts) · [faults](#faults) · [compactions](#compactions) · [session_costs](#session_costs) · [stop_hooks and stop_hook_runs](#stop_hooks-and-stop_hook_runs) · [turn_durations](#turn_durations) · [wire.db](#wiredb) · [Joins](#joins)
 
 A store gains newer tables and columns on its next open; `PRAGMA user_version` stays 1, so test for one with `SELECT 1 FROM pragma_table_info('requests') WHERE name = 'thinking_tokens'` or `sqlite_master`, never by version.
 
@@ -26,6 +26,26 @@ One row per model request (one assistant message). Key `request_id`: the API mes
 - `session_id`, `agent_id` (NULL: the main chat), `prompt_id`, `ts`, `model`, `stop_reason`.
 - `input_tokens` (uncached input), `cache_read_tokens`, `cache_creation_tokens` (split by cache lifetime into `cache_creation_5m_tokens` and `cache_creation_1h_tokens`), `context_tokens` (the sum of the first three: the request's whole prompt), `output_tokens`, `thinking_tokens` (part of output; NULL when not reported).
 - `calls`: how many tool calls the request issued. A request with none (a final text answer) has no `calls` row pointing at it, so a filter that goes through `calls` drops it.
+- A request whose usage lists `iterations` with a `type` other than `message` has a `request_iterations` row for each such entry. For a `fallback_message` (a fallback model answered) the request keeps the answering attempt's `input_tokens`, `cache_read_tokens`, `cache_creation_tokens` and `output_tokens`, never their sum over the attempts, and its 5 m / 1 h split can be the first attempt's, so the two split columns may not add up to `cache_creation_tokens`; for any other type the relation is unverified.
+
+## request_iterations
+
+One row per entry of a request's transcript usage `iterations` whose `type` is not `message` (the message itself). Key `request_id`, `seq`: the entry's index in that list (0 is the first attempt). Seen so far: `fallback_message`, the answer of a fallback model after the first model's attempt (`seq` 1). Other types are stored the same way; how their tokens relate to the request's columns is unverified.
+
+- `ts`: the request's. `type`, `model` (NULL when the entry names none).
+- `input_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `cache_creation_5m_tokens`, `cache_creation_1h_tokens`, `output_tokens`: the entry's own counts, copied, never derived; NULL when the entry lacks one.
+- A request with no such attempt has no row here: no row is not "no fallback" for a request recorded before this table existed.
+
+## request_cache
+
+A view, computed at read time: one row per request that is not pending and has a `ts`, judged against the previous request of its party, the same `session_id` and `agent_id` (the main chat, or one sub-agent).
+
+- `request_id`. `gap_ms`: this request's `ts` minus the previous one's; NULL for a party's first request.
+- `entry_ttl`: the lifetime of the cache this request could read, from the latest earlier request of the party that wrote cache (`cache_creation_tokens > 0`): `1h` or `5m` by its split, `mixed` when it wrote both; NULL when none wrote, or the writer carried no split.
+- `expected_read`: the previous request's `context_tokens`, what a full cache hit would read.
+- `outcome`: `first` (no previous request), `hit` (`cache_read_tokens` at least 95 % of `expected_read`), `partial` (at least 50 %), `miss`; NULL when either count is unknown, never a miss.
+- `cause`, for `partial` and `miss` only, the first the stored columns prove: `model_changed` (another model than the previous request's), `compacted` (a `compactions` row of the party between the two requests), `expired` (`gap_ms` past `entry_ttl`: 1 h, or 5 m for `5m` and `mixed`), else `unknown`. No stored column proves a changed thinking block or prompt prefix: those land in `unknown`.
+- Join it to `requests` on `request_id` for the party, model and time. It reads only this file; an open recreates it when its SQL differs from the shipped one, unless the stored view's `-- version N` marker is newer; a callmeter older than the stored view does not read it.
 
 ## agents
 
@@ -89,11 +109,24 @@ One row per session: Claude Code's latest cumulative cost snapshot. Key `session
 
 One row per turn wall time Claude Code measured. Key `entry_id`. `session_id`, `agent_id`, `prompt_id`, `ts`, `duration_ms`, `message_count`, `background_agents`. Join to prompts by `prompt_id`.
 
+## wire.db
+
+`{CALLMETER_HOME}/wire.db`, beside the store, exists only when a recording proxy the user runs opts in to write it; most stores have none. callmeter only reads it, read-only, at report time: nothing in `callmeter.db` refers to it, and it is never pruned or archived by callmeter. Open it the same way, `mode=ro`; reading it leaves SQLite's `-wal` and `-shm` beside it when no writer has them open.
+
+- `PRAGMA user_version = 1`, one table `wire_requests`, key `request_id`: the same API message id as `requests.request_id`. Absent file: no wire data, never "no break"; a file with another `user_version` or without the table is not this layout.
+- `ts`: when the response began. `agent_id`: NULL for the main chat.
+- `ttl_sent`: the TTL the request itself asked for on its cache breakpoints: `5m`, `1h`, `mixed`, NULL (no breakpoint); a breakpoint without a TTL counts as `5m`, another TTL is copied as sent, or `other`.
+- `advisor_ttl`: the TTL on the advisor tool entry as sent upstream, `5m`, `1h` or NULL (no advisor tool, or no caching on it). `advisor_added`: 1 the proxy added that caching, 0 it added none, NULL no advisor tool.
+- `break_kind`: where this request first stopped matching the party's previous one: `first` (no previous request), `none` (prefix intact), `tools`, `system`, `messages`, `thinking` (a thinking block, which Claude Code resends emptied); NULL is unknown, never `none`. `break_at`: the index of that first differing block; NULL when intact, first or unknown.
+- `rl_status`, `overage`: the response's `anthropic-ratelimit-unified-status` and `anthropic-ratelimit-unified-overage-status` headers; NULL when absent.
+
 ## Joins
 
 | From | To | On |
 | --- | --- | --- |
 | `calls` | `requests` | `calls.request_id = requests.request_id` |
+| `request_iterations`, `request_cache` | `requests` | `request_id` |
+| `wire.wire_requests` (attached read-only) | `requests`, `request_cache` | `request_id` |
 | `agents` | the Agent call that started it | `agents.parent_tool_use_id = calls.tool_use_id` (that call's `agent_id` is the parent agent, NULL for the main chat) |
 | `requests`, `calls`, `events`, `turns`, `compactions`, `turn_durations` | `agents` | `agent_id` |
 | any table with `session_id` | `sessions`, `session_costs` | `session_id` |

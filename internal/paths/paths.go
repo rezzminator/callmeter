@@ -50,6 +50,10 @@ func Store(home string) string { return filepath.Join(home, "callmeter.db") }
 // Log is the JSON-lines log file under home.
 func Log(home string) string { return filepath.Join(home, "callmeter.log") }
 
+// Wire is the optional wire-facts database under home: written by a recording
+// proxy that opts in, read-only to callmeter.
+func Wire(home string) string { return filepath.Join(home, "wire.db") }
+
 // Missed is the log the wrapper appends to when it could not run the binary.
 func Missed(home string) string { return filepath.Join(home, "missed.log") }
 

@@ -2308,3 +2308,32 @@ func TestRecoverQuietWritesTheMarksOfAQuietSession(t *testing.T) {
 		t.Errorf("session_costs.ts after a second pass = %v, want it unchanged", got)
 	}
 }
+
+// TestRequestFillsAMissingIteration: recovery rereads a request whose row is
+// complete but which lacks a row for an iteration its transcript carries (a
+// binary before request_iterations wrote it), and writes it; once written, the
+// request has nothing left to fill.
+func TestRequestFillsAMissingIteration(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	r := Request{RequestID: "msg_1", SessionID: Ptr("sess-1"), TS: Ptr(int64(1788019350229)), Model: Ptr("claude-opus-4-8"),
+		Pending: Ptr(false), Iterations: []Iteration{fallbackIteration()}}
+	stored := r
+	stored.Iterations = nil
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.SettleRequest(ctx, stored, nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	fills, err := store.requestFills(ctx, r, nil, 0)
+	if err != nil || !fills {
+		t.Fatalf("requestFills without the iteration row = %v, %v; want true", fills, err)
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.RecoverRequest(ctx, r, nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	if fills, err = store.requestFills(ctx, r, nil, 0); err != nil || fills {
+		t.Fatalf("requestFills with the iteration stored = %v, %v; want false", fills, err)
+	}
+	if got := count(t, store, "request_iterations"); got != 1 {
+		t.Errorf("request_iterations holds %d rows, want 1", got)
+	}
+}
