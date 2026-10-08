@@ -181,14 +181,23 @@ func latestPromptTS(session string) string {
 		` AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '')`
 }
 
+// latestPromptID is the SQL id of session's latest main-chat prompt, NULL
+// when absent; session is an SQL expression.
+func latestPromptID(session string) string {
+	return `(SELECT prompt_id FROM events WHERE session_id = ` + session +
+		` AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1)`
+}
+
 // turnEnded is the SQL condition that session's main chat has a turn end, a
-// Stop turn or a StopFailure event, at or after since; both are SQL
-// expressions.
-func turnEnded(session, since string) string {
+// Stop turn or a StopFailure event, at or after since and answering prompt.
+// Missing prompt ids retain the timestamp-only match; arguments are SQL expressions.
+func turnEnded(session, since, prompt string) string {
 	return `(EXISTS (SELECT 1 FROM events f WHERE f.session_id = ` + session + ` AND f.event = 'StopFailure'
-			AND COALESCE(f.agent_id, '') = '' AND f.ts >= ` + since + `)
+			AND COALESCE(f.agent_id, '') = '' AND f.ts >= ` + since + `
+			AND (f.prompt_id IS NULL OR ` + prompt + ` IS NULL OR f.prompt_id = ` + prompt + `))
 		OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = ` + session + ` AND t.event = 'Stop'
-			AND COALESCE(t.agent_id, '') = '' AND t.ts >= ` + since + `))`
+			AND COALESCE(t.agent_id, '') = '' AND t.ts >= ` + since + `
+			AND (t.prompt_id IS NULL OR ` + prompt + ` IS NULL OR t.prompt_id = ` + prompt + `)))`
 }
 
 // turnEndMissing is the SQL condition that session's latest main-chat prompt
@@ -196,7 +205,7 @@ func turnEnded(session, since string) string {
 func turnEndMissing(session string) string {
 	return `(EXISTS (SELECT 1 FROM events WHERE session_id = ` + session + ` AND event = 'UserPromptSubmit'
 			AND COALESCE(agent_id, '') = '')
-		AND NOT ` + turnEnded(session, latestPromptTS(session)) + `)`
+		AND NOT ` + turnEnded(session, latestPromptTS(session), latestPromptID(session)) + `)`
 }
 
 // RecoverTurnEnd inserts e, whose Event is EventStop or EventStopFailure, as
@@ -222,7 +231,7 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 	var asked int64
 	err := t.tx.QueryRowContext(ctx,
 		`SELECT prompt_id, ts FROM events WHERE session_id = ? AND event = 'UserPromptSubmit'
-		AND COALESCE(agent_id, '') = '' ORDER BY ts DESC LIMIT 1`, session).Scan(&promptID, &asked)
+		AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1`, session).Scan(&promptID, &asked)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("callmeter store %s: read the latest prompt of session %q: %w", t.path, session, err)
 	}
@@ -230,7 +239,7 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 		return false, nil
 	}
 	var answered int
-	if err := t.tx.QueryRowContext(ctx, `SELECT `+turnEnded("?1", "?2"), session, asked).Scan(&answered); err != nil {
+	if err := t.tx.QueryRowContext(ctx, `SELECT `+turnEnded("?1", "?2", "?3"), session, asked, promptID).Scan(&answered); err != nil {
 		return false, fmt.Errorf("callmeter store %s: read the turn end of session %q: %w", t.path, session, err)
 	}
 	if answered != 0 {
@@ -261,16 +270,19 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 // of the prompt a Stop or StopFailure hook delivered at hookTS answers, a
 // rebuilt Stop's turns row with its events row: the hook's own row replaces
 // them. Only a rebuilt main-chat row (RecoveredDetail) at or after that prompt
-// goes.
-func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS int64) error {
+// goes; a non-empty hook prompt id limits both the prompt and rebuilt row.
+// A rebuilt row with no prompt id matches by timestamp alone.
+func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS int64, hookPromptID string) error {
 	rebuilt := `SELECT event_id FROM events WHERE event IN ('Stop', 'StopFailure') AND session_id = ?1
-		AND COALESCE(agent_id, '') = '' AND detail = ?2 AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events
-			WHERE session_id = ?1 AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' AND ts <= ?3)`
+		AND COALESCE(agent_id, '') = '' AND detail = ?2 AND (?4 = '' OR prompt_id = ?4 OR prompt_id IS NULL)
+		AND ts >= COALESCE((SELECT ts FROM events
+			WHERE session_id = ?1 AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = ''
+			AND ts <= ?3 AND (?4 = '' OR prompt_id = ?4) ORDER BY ts DESC, event_id DESC LIMIT 1), 0)`
 	for _, statement := range []string{
 		`DELETE FROM turns WHERE event_id IN (` + rebuilt + `)`,
 		`DELETE FROM events WHERE event_id IN (` + rebuilt + `)`,
 	} {
-		if _, err := t.tx.ExecContext(ctx, statement, sessionID, RecoveredDetail, hookTS); err != nil {
+		if _, err := t.tx.ExecContext(ctx, statement, sessionID, RecoveredDetail, hookTS, hookPromptID); err != nil {
 			return fmt.Errorf("callmeter store %s: drop the rebuilt turn end of session %q: %w", t.path, sessionID, err)
 		}
 	}
@@ -299,8 +311,10 @@ func fromNull(n sql.NullString) *string {
 // RecoverAgentStop writes stop as the SubagentStop its hook would have, rebuilt
 // from the agent's transcript (RecoveredDetail) because the hook's event was
 // lost, and reports whether a row went in: an events row and a turns row under
-// one id, dated at the transcript entry that ended the turn and never before
-// the turn's start, the turns columns only a hook carries NULL; the agent's
+// one id, dated at the agent transcript's entry that ended the turn or, when
+// there is none, at the earliest qualifying main-transcript task notice
+// (agentStopsToMark), never before the turn's start, the turns columns only a
+// hook carries NULL; the agent's
 // turns rebuilt from its events, so the turn closes at it; the agent's stopped
 // kept at the latest, its session, type and prompt filled, and, as the hook
 // does at the agent's latest stop, its total_tokens and tool_uses from the
@@ -654,6 +668,8 @@ func nullID(id string) sql.NullString { return sql.NullString{String: id, Valid:
 // that carried it, with that run's ts in {column}_ts: a run's value replaces
 // the stored one when the stored one is NULL, when the run's ts is below the
 // stored {column}_ts, or when the ts are equal and the run's value is smaller.
+// A non-empty transcript_path instead keeps the latest run, and the larger
+// value at an equal ts, so a resumed session can move its transcript.
 // The result is the same whatever order the runs land in, and a column the run
 // does not carry is left to the others. A run dated after the stored last_ts
 // clears an EndReasonNever mark, since the quiet session runs again; a late
@@ -665,12 +681,16 @@ func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 	}
 	var own []column
 	own = add(own, "cwd", s.Cwd)
-	own = add(own, "transcript_path", s.TranscriptPath)
 	own = add(own, "seat_dir", s.SeatDir)
 	own = add(own, "config_dir", s.ConfigDir)
 	own = add(own, "host", s.Host)
 	own = add(own, "tz_name", s.TZName)
 	own = add(own, "tz_offset_minutes", s.TZOffsetMinutes)
+
+	var newest []column
+	if s.TranscriptPath != nil && *s.TranscriptPath != "" {
+		newest = add(newest, "transcript_path", s.TranscriptPath)
+	}
 
 	names := []string{"session_id", "first_ts", "last_ts", "engine"}
 	values := []any{s.SessionID, s.TS, s.TS, engineClaude}
@@ -681,14 +701,18 @@ func (t *Tx) TouchSession(ctx context.Context, s Session) error {
 		fmt.Sprintf("end_reason = CASE WHEN sessions.end_reason = '%s' AND excluded.last_ts > sessions.last_ts "+
 			"THEN NULL ELSE sessions.end_reason END", EndReasonNever),
 	}
-	for _, c := range own {
+	for _, c := range append(own, newest...) {
 		names = append(names, c.name, c.name+"_ts")
 		values = append(values, c.value, s.TS)
-		// The run's value wins on an empty column, an earlier ts, or the smaller
-		// value at an equal ts. Every SET expression reads the row as it was
+		// Earliest-run columns take the smaller pair; transcript_path the larger.
+		// Every SET expression reads the row as it was
 		// before this update, so the column and its ts both judge the stored pair.
-		wins := fmt.Sprintf("sessions.%[1]s IS NULL OR excluded.%[1]s_ts < sessions.%[1]s_ts OR "+
-			"(excluded.%[1]s_ts = sessions.%[1]s_ts AND excluded.%[1]s < sessions.%[1]s)", c.name)
+		order := "<"
+		if c.name == "transcript_path" {
+			order = ">"
+		}
+		wins := fmt.Sprintf("sessions.%[1]s IS NULL OR excluded.%[1]s_ts %[2]s sessions.%[1]s_ts OR "+
+			"(excluded.%[1]s_ts = sessions.%[1]s_ts AND excluded.%[1]s %[2]s sessions.%[1]s)", c.name, order)
 		sets = append(sets,
 			fmt.Sprintf("%[1]s = CASE WHEN %[2]s THEN excluded.%[1]s ELSE sessions.%[1]s END", c.name, wins),
 			fmt.Sprintf("%[1]s_ts = CASE WHEN %[2]s THEN excluded.%[1]s_ts ELSE sessions.%[1]s_ts END", c.name, wins))
@@ -723,6 +747,15 @@ func sessionModel(session string) string {
 	return `COALESCE(
 				(SELECT model FROM requests WHERE session_id = ` + session + ` AND agent_id IS NULL AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
 				(SELECT model FROM events WHERE session_id = ` + session + ` AND event = '` + EventSessionStart + `' AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))`
+}
+
+// SessionModel reads the latest main-chat request model, else SessionStart's.
+func (s *Store) SessionModel(ctx context.Context, sessionID string) (string, error) {
+	var model sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT `+sessionModel("?1"), sessionID).Scan(&model); err != nil {
+		return "", fmt.Errorf("callmeter store %s: read the model of session %q: %w", s.path, sessionID, err)
+	}
+	return model.String, nil
 }
 
 // RefreshSessionModel recomputes only the session's model (sessionModel),

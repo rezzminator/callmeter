@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -163,11 +164,67 @@ func TestNameOfErrorRendersQuestionMarkAndNote(t *testing.T) {
 		t.Errorf("fault row = %v, want chat column ?", faultRow)
 	}
 	out := render(t, table)
-	if !strings.Contains(out, "note: chat names could not be read: session s1: transcript unreadable") {
+	if !strings.Contains(out, "note: chat names could not be read for 1 sessions (first: unreadable)") ||
+		strings.Contains(out, "transcript unreadable") {
 		t.Errorf("report lacks the chat-name note:\n%s", out)
 	}
 	if !strings.Contains(out, "note: 1 calls not recorded") {
 		t.Errorf("report lacks the unrecorded-calls note:\n%s", out)
+	}
+}
+
+func TestNamesNoteCountsSessionsWithASafeLabel(t *testing.T) {
+	cases := []struct {
+		name     string
+		fn       NameOf
+		sessions []string
+		want     string
+	}{
+		{
+			name: "distinct failing sessions and first failure",
+			fn: func(session string) (string, error) {
+				if session == "b" {
+					return "", fmt.Errorf("lookup: %w", fs.ErrPermission)
+				}
+				return "", errNames
+			},
+			sessions: []string{"a", "b", "a"},
+			want:     "chat names could not be read for 2 sessions (first: unreadable)",
+		},
+		{
+			name:     "permission denied",
+			fn:       func(string) (string, error) { return "", fmt.Errorf("lookup: %w", fs.ErrPermission) },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: permission denied)",
+		},
+		{
+			name:     "not found",
+			fn:       func(string) (string, error) { return "", fmt.Errorf("lookup: %w", fs.ErrNotExist) },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: not found)",
+		},
+		{
+			name:     "other error",
+			fn:       func(string) (string, error) { return "", errNames },
+			sessions: []string{"a"},
+			want:     "chat names could not be read for 1 sessions (first: unreadable)",
+		},
+		{
+			name:     "no name source",
+			sessions: []string{"a", "b", "a"},
+			want:     "chat names could not be read for 2 sessions (first: unreadable)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			names := newNames(tc.fn)
+			for _, session := range tc.sessions {
+				names.of(session)
+			}
+			if got := names.notes(); len(got) != 1 || got[0] != tc.want {
+				t.Errorf("notes = %q, want [%q]", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -365,11 +422,17 @@ func TestTerminatedFaultsBecomeTheUnrecordedEventsNoteOnEveryTopic(t *testing.T)
 func TestInapplicableNotesNameEachFlagATopicCannotApply(t *testing.T) {
 	both := Filter{Project: "/w/p", AgentType: "Explore", Session: "s", Limit: 3}
 	for topic, want := range map[string]string{
-		"sessions": "--agent-type does not apply to sessions",
-		"coverage": "--project does not apply to coverage;--agent-type does not apply to coverage",
-		"faults":   "--project does not apply to faults;--agent-type does not apply to faults",
-		"tokens":   "",
-		"files":    "",
+		"sessions":    "--agent-type does not apply to sessions",
+		"coverage":    "--project does not apply to coverage;--agent-type does not apply to coverage",
+		"faults":      "--project does not apply to faults;--agent-type does not apply to faults",
+		"tokens":      "",
+		"files":       "",
+		"compactions": "--agent-type does not apply to compactions",
+		"cost":        "--agent-type does not apply to cost",
+		"hooks":       "--agent-type does not apply to hooks",
+		"turns":       "--agent-type does not apply to turns",
+		"resumes":     "--agent-type does not apply to resumes",
+		"waiting":     "--agent-type does not apply to waiting",
 	} {
 		if got := strings.Join(InapplicableNotes(topic, both), ";"); got != want {
 			t.Errorf("InapplicableNotes(%s) = %q, want %q", topic, got, want)
@@ -543,7 +606,7 @@ func TestLostCallsAreToolEventFaultsAloneOtherIdlessFaultsAreNamedApart(t *testi
 		{Stage: callmeter.StagePayload, Error: `"PreToolUse" payload carries no session_id`},
 		{Stage: callmeter.StagePayload, Error: "PostToolBatch call carries no tool_use_id"},
 		// Faults naming no call.
-		{Stage: callmeter.StagePayload, Error: "PostToolBatch payload carries no tool_calls"},
+		{Stage: callmeter.StagePayload, Error: callmeter.BatchWithoutCalls},
 		{Stage: callmeter.StageStore, Error: "ingest missed.log: database is locked"},
 		{Stage: callmeter.StageTranscript, Error: "SessionEnd spent its 1m0s budget: 2 transcript reads skipped, " +
 			"their requests and calls left as their hooks wrote them"},
@@ -721,5 +784,48 @@ func TestCallsWithoutTSAreNamedInANote(t *testing.T) {
 		if out := render(t, table); !strings.Contains(out, "note: 1 calls have no ts") {
 			t.Errorf("since %v: report does not name the call without a ts:\n%s", f.Since, out)
 		}
+	}
+}
+
+func TestEmptyTopicsNameWhatTheyFoundNone(t *testing.T) {
+	cases := []struct {
+		name  string
+		topic func(context.Context, *callmeter.Store, Filter, NameOf) (*Table, error)
+		want  string
+	}{
+		{"context", Context, "callmeter: no sized requests in window"},
+		{"tokens", Tokens, "callmeter: no requests in window"},
+		{"sessions", Sessions, "callmeter: no sessions in window"},
+		{"prompts", Prompts, "callmeter: no prompts in window"},
+		{"faults", Faults, "callmeter: no faults in window"},
+		{"agents", Agents, "callmeter: no sub-agents in window"},
+		{"events", Events, "callmeter: no events in window"},
+		{"effort", Effort, "callmeter: no effort recorded in window"},
+		{"compactions", Compactions, "callmeter: no compactions in window"},
+		{"cost", Cost, "callmeter: no cost-state recorded in window"},
+		{"hooks", Hooks, "callmeter: no Stop hook summaries in window"},
+		{"turns", Turns, "callmeter: no turn durations in window"},
+		{"resumes", Resumes, "callmeter: no resumes in window"},
+		{"waiting", Waiting, "callmeter: no waits in window"},
+		{"files", Files, EmptyLine},
+		{"writes", Writes, EmptyLine},
+		{"commands", Commands, EmptyLine},
+		{"sequences", Sequences, EmptyLine},
+		{"outcomes", Outcomes, EmptyLine},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStore(t)
+			// The window contains a call; the topic's filter finds no rows.
+			seed(t, store, mkCall("c", "recorded", time.Hour, "Read"))
+			table, err := tc.topic(context.Background(), store, Filter{Session: "empty"}, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(render(t, table)), "\n")
+			if len(table.Rows) != 0 || len(lines) < 2 || lines[1] != tc.want {
+				t.Errorf("empty body = %q, want %q", lines, tc.want)
+			}
+		})
 	}
 }

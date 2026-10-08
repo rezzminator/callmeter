@@ -7,7 +7,7 @@
 # Resolution order:
 #   1. $CALLMETER_BIN, when it names an executable file;
 #   2. {CALLMETER_HOME}/bin/{version}/callmeter, when executable;
-#   3. a download of $CALLMETER_RELEASE_BASE/callmeter--v{version}/callmeter_{version}_{os}_{arch},
+#   3. a download of $CALLMETER_RELEASE_BASE/v{version}/callmeter_{version}_{os}_{arch},
 #      under a lock, verified against libexec/SHA256SUMS, installed at 2 by an
 #      atomic rename, every other cached version unused for 7 days removed.
 #
@@ -142,7 +142,8 @@ payload_fields() {
   esac
 }
 
-# log_missed REASON appends the missed line for this hook. A line that cannot
+# log_missed REASON appends the missed line with reason `{reason} (pid $$)`
+# for this hook. A line that cannot
 # be appended (no home, a home that cannot be made, a missed.log that cannot be
 # opened or written) goes to stderr instead as
 # `callmeter: missed: {event} {reason}`, followed by ` {session}` when the
@@ -152,9 +153,9 @@ log_missed() {
   if [ -n "$home" ]; then
     if [ -d "$home" ] || mkdir -p "$home" 2>/dev/null; then
       if [ -n "$session" ]; then
-        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
+        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
       else
-        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1" >>"$home/missed.log"; } 2>/dev/null && return 0
+        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" >>"$home/missed.log"; } 2>/dev/null && return 0
       fi
     fi
   fi
@@ -310,7 +311,7 @@ if [ -z "$expected" ]; then
   fail "no checksum for $asset"
 fi
 release_base=${CALLMETER_RELEASE_BASE:-https://github.com/rezzminator/callmeter/releases/download}
-url=${release_base%/}/callmeter--v${version}/${asset}
+url=${release_base%/}/v${version}/${asset}
 
 mkdir -p "$bin_dir" 2>/dev/null || fail "cannot create $bin_dir"
 lock=$bin_dir/.lock-$version

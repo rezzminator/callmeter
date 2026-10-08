@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/sqlitedb"
 )
 
@@ -30,17 +31,22 @@ type sCall struct {
 	noTS                                           bool // ts IS NULL; ts reads 0
 	hasSize                                        bool
 	failed                                         int64 // -1: NULL
-	// batchOnly: only PostToolBatch wrote the row (a delivered size, no
-	// PostToolUse or PostToolUseFailure outcome, no refusal label). The Stop
-	// and SessionEnd sweep (resolveUnfinished) and report-time recovery fill
-	// failed=0 from the transcript result, and the real size only from its
-	// toolUseResult, so a result with none leaves failed 0 or NULL, both counted.
+	// batchOnly: a delivered size with no error label; real-output tools
+	// have no real size and no failure, including swept successes. Tools
+	// with no separate real output have no landed outcome (failed NULL).
 	batchOnly bool
 	// noCommand: the stored input keeps only command_bytes, the command the
 	// heredoc cutter could not cut safely (docs/design.md § Privacy).
 	noCommand bool
+	// absCwd: the stored cwd is absolute, as report.EnsureParsed requires of
+	// a call it parses.
+	absCwd bool
 	// delivered: bytes_delivered is set (PostToolBatch stored the size).
 	delivered bool
+}
+
+func (c *sCall) resultLanded() bool {
+	return c.hasSize || c.failed == 1 || (c.failed == 0 && !callmeter.HasRealOutput(c.tool))
 }
 
 type sRequest struct {
@@ -81,17 +87,18 @@ type sFault struct {
 }
 
 type storeData struct {
-	sessions  map[string]*sSession
-	calls     map[string]*sCall
-	requests  map[string]*sRequest
-	agents    map[string]*sAgent
-	turns     map[string][]sTurn
-	events    []sEvent
-	parts     map[string][]sPart
-	faults    []sFault
-	maxParser int64
-	latest    int64
-	earliest  int64 // the earliest session's first row; 0: no session
+	sessions     map[string]*sSession
+	calls        map[string]*sCall
+	requests     map[string]*sRequest
+	agents       map[string]*sAgent
+	turns        map[string][]sTurn
+	turnSessions map[string]bool
+	events       []sEvent
+	parts        map[string][]sPart
+	faults       []sFault
+	maxParser    int64
+	latest       int64
+	earliest     int64 // the earliest session's first row; 0: no session
 }
 
 type sPart struct {
@@ -112,6 +119,7 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 	d := &storeData{
 		sessions: map[string]*sSession{}, calls: map[string]*sCall{}, requests: map[string]*sRequest{},
 		agents: map[string]*sAgent{}, turns: map[string][]sTurn{}, parts: map[string][]sPart{},
+		turnSessions: map[string]bool{},
 	}
 	steps := []struct {
 		name, query string
@@ -129,11 +137,19 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				}
 				return nil
 			}},
-		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), bytes_delivered IS NOT NULL AND bytes_real IS NULL AND COALESCE(failed,0) = 0 AND error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL FROM calls`,
+		{"calls", `SELECT tool_use_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(agent_type,''), COALESCE(request_id,''), COALESCE(ts,0), ts IS NULL, COALESCE(tool,''), bytes_real IS NOT NULL, COALESCE(failed,-1), error IS NULL, COALESCE(json_valid(input) AND json_type(input,'$.command') IS NULL AND json_type(input,'$.command_bytes') IS NOT NULL, 0), bytes_delivered IS NOT NULL, COALESCE(cwd,'') FROM calls`,
 			func(r *sql.Rows) error {
 				c := &sCall{}
-				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &c.batchOnly, &c.noCommand, &c.delivered); err != nil {
+				var noError bool
+				var cwd string
+				if err := r.Scan(&c.id, &c.session, &c.agent, &c.agentType, &c.requestID, &c.ts, &c.noTS, &c.tool, &c.hasSize, &c.failed, &noError, &c.noCommand, &c.delivered, &cwd); err != nil {
 					return err
+				}
+				c.absCwd = filepath.IsAbs(cwd)
+				if callmeter.HasRealOutput(c.tool) {
+					c.batchOnly = c.delivered && noError && !c.hasSize && c.failed != 1
+				} else {
+					c.batchOnly = c.delivered && noError && c.failed == -1
 				}
 				d.calls[c.id] = c
 				d.latest = max(d.latest, c.ts)
@@ -167,6 +183,15 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 					return err
 				}
 				d.turns[id] = append(d.turns[id], t)
+				return nil
+			}},
+		{"turns", `SELECT DISTINCT session_id FROM turns WHERE session_id IS NOT NULL AND session_id != ''`,
+			func(r *sql.Rows) error {
+				var id string
+				if err := r.Scan(&id); err != nil {
+					return err
+				}
+				d.turnSessions[id] = true
 				return nil
 			}},
 		// A Stop's stop_hook_active lives on its turns row, keyed by the same event_id.
@@ -288,9 +313,9 @@ func loadScratch(ctx context.Context, root, snapshot string) (map[string]string,
 	return sessions, read, unreadable, nil
 }
 
-// scratchSessions lists a scratch store's session ids without writing to it:
-// read-only beside its -wal, else immutable (no WAL to miss, and no -shm to
-// create).
+// scratchSessions lists sessions recorded by a sessions row or a fault naming
+// them, without writing to the scratch store: read-only beside its -wal, else
+// immutable (no WAL to miss, and no -shm to create).
 func scratchSessions(ctx context.Context, path string) (ids []string, err error) {
 	query := "mode=ro&immutable=1"
 	if _, statErr := os.Stat(path + "-wal"); statErr == nil {
@@ -305,7 +330,7 @@ func scratchSessions(ctx context.Context, path string) (ids []string, err error)
 			err = fmt.Errorf("close: %w", cerr)
 		}
 	}()
-	err = queryEach(ctx, db, `SELECT session_id FROM sessions`, func(r *sql.Rows) error {
+	err = queryEach(ctx, db, `SELECT session_id FROM sessions UNION SELECT session_id FROM faults WHERE session_id IS NOT NULL AND session_id <> ''`, func(r *sql.Rows) error {
 		var id string
 		if err := r.Scan(&id); err != nil {
 			return err

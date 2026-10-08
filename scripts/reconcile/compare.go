@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/cmdparse"
 )
 
@@ -21,11 +22,13 @@ import (
 // out of cmdparse.StatusUnparsed for a python part.
 const scriptBodyParser = 6
 
-// The python parts the parse loop counts apart from their stored
-// parse_status (see scriptBodyParser); neither is a stored value.
+// The parts the parse loop counts apart from their stored parse_status: the
+// python ones (see scriptBodyParser) and a node one, which cmdparse never
+// parses (a node -e, --eval, -p or --print part); none is a stored value.
 const (
 	statusPythonUnparsedPre6   = "python-unparsed-pre6"
 	statusPythonCodeUnresolved = "python-code-unresolved"
+	statusNodeEval             = "node-eval"
 )
 
 // endReasonNever is the sessions.end_reason `callmeter report` writes for a
@@ -160,16 +163,6 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 	for _, r := range st.requests {
 		workFor[r.session] = true
 	}
-	mainEvents := map[string]map[string]int{} // a session's main-chat event counts
-	for _, e := range st.events {
-		if e.agent != "" {
-			continue
-		}
-		if mainEvents[e.session] == nil {
-			mainEvents[e.session] = map[string]int{}
-		}
-		mainEvents[e.session][e.event]++
-	}
 	for _, s := range compared {
 		path := ""
 		if s.transcriptPath != "" {
@@ -183,8 +176,8 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			path = index[s.id]
 		}
 		if path == "" {
-			if ev := mainEvents[s.id]; !workFor[s.id] && s.model == "" && s.startSource == "startup" && len(ev) == 2 && ev["SessionStart"] == 1 && ev["SessionEnd"] == 1 {
-				rep.expect("session-no-prompt", s.id, 0, reasonNoPrompt, promptlessDetail(s, st))
+			if ranNothing(s.id, *st) {
+				rep.expect("session-ran-nothing", s.id, 0, reasonRanNothing, promptlessDetail(s, st))
 				continue
 			}
 			// No transcript on disk: whether the session reached the model is
@@ -267,10 +260,12 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			rep.add("fault-"+f.stage, f.session, f.ts, lost[i].detail)
 		case lostEnd(st, f):
 			rep.expect("fault-"+f.stage, f.session, f.ts, reasonEndKilled, "event=SessionEnd end_reason=lost")
-		case f.stage == "binary" && f.session == "" && f.err == killedUnknown:
+		case f.stage == "binary" && f.session == "" && withoutPid(f.err) == killedUnknown:
 			unknown = append(unknown, f)
 		case f.stage == "transcript" && unfillable(st, w, f) != "":
 			rep.expect("fault-transcript-unfillable", f.session, f.ts, reasonUnfillable, unfillable(st, w, f))
+		case f.stage == callmeter.StageTranscript && f.session != "" && strings.HasPrefix(f.err, endBudgetPrefix) && !workMismatch(rep.mismatches, f.session):
+			rep.expect("fault-"+f.stage, f.session, f.ts, reasonEndBudget, "")
 		default:
 			rep.add("fault-"+f.stage, f.session, f.ts, "", nonEmpty(f.toolUseID)...)
 		}
@@ -297,7 +292,11 @@ var lostHookReason = map[string]string{
 }
 
 const (
-	reasonNoPrompt               = "a `claude -p` launch given no prompt: Claude Code fires SessionStart and SessionEnd, exits 1 and writes no transcript (no work rows, no other event, no model)"
+	reasonRanNothing             = "the session started and ran nothing: only idle lifecycle events, no calls, requests, agents or turns, and no fault or lost event that could hide work (internal/callmeter/report/sessions.go ranNothing)"
+	reasonIdleNotification       = "the session's only store rows are Notification events, with no SessionStart, and its transcript holds no assistant line: a chat already open when the hooks loaded (a /reload-plugins, a local command firing no SessionStart or UserPromptSubmit) whose first hook was an idle notification"
+	reasonBlockedPrompt          = "another UserPromptSubmit hook blocked the prompt: the store records every UserPromptSubmit that fired, and Claude Code wrote no prompt line, only a system line with preventContinuation within 2 s of it"
+	reasonEndBudget              = "SessionEnd spent its transcript-read budget and recorded the skipped reads as a fault by design (internal/hookentry/callmeter.go, sessionEndBudget); none of the session's calls, requests or agents mismatch, so the skipped reads hid nothing"
+	reasonKilledBeforeReply      = "the session was killed before the model's first reply: the store holds only its SessionStart, UserPromptSubmit and SessionEnd events, and its transcript holds a prompt and no assistant line (a launch killed or cleared mid-request)"
 	reasonUnfillable             = "report-time recovery read every transcript of the session in full and an agent turn, a Stop, a prompt's turn end, an open call or a sub-agent's open turn still had nothing to fill it, and it recorded that once; this check's own parse of the transcripts confirms they hold none at or after the session's first row (callmeter.RecoverQuiet)"
 	reasonKilledStopFailure      = "Claude Code killed the StopFailure hook at a headless exit; the StopFailure row of the session ending right after it (hook or rebuilt from its transcript at SessionEnd) stands for it"
 	reasonTerminatedFailureNamed = "the StopFailure hook of the session the fault names ended before it recorded (store busy, or a signal); that session's turn has a StopFailure row (hook or rebuilt from its transcript) no other fault paired"
@@ -311,12 +310,15 @@ const (
 	reasonScriptBody             = "a part whose program reads its script from a heredoc (python3 - <<EOF) leaves the script unparsed by design: the store keeps no quoted heredoc body and of an unquoted one only its command substitutions (cmdparse.StatusScriptBody)"
 	reasonPythonUnparsedPre6     = "a parser before 6 marked a python part unparsed both for a heredoc body the store cut and for code holding an unresolved expansion, by design; the next report run reparses it as script-body or unparsed"
 	reasonPythonCodeUnresolved   = "a python -c script or here-string holding an expansion with no known value is unparsed by design: the code the interpreter ran is unknown, so it is never parsed as written (docs/design.md § Parsing a command)"
+	reasonReloadedChat           = "the chat was already running when a /reload-plugins loaded the hooks into it: its transcript holds that command at or before the session's first store row, and Claude Code fires no SessionStart for a reload; a restart since would fire one, and a lost hook leaves its own fault row"
 	reasonNoEndHook              = "Claude Code ended the session without running its SessionEnd hooks: the transcript holds no SessionEnd hook entry, and report-time recovery settled the session and set end_reason never"
 	reasonEndKilled              = "the session's SessionEnd hook ran and was lost before it recorded (a headless exit or its timeout killed it, or the wrapper could not run the binary): its own missed.log line named the session, and report-time recovery set end_reason lost"
 	reasonAgentNeverStopped      = "the sub-agent's last turn never reached the SubagentStop that carries its tool count (killed mid-turn): report-time recovery read its quiet transcript and marked that turn open once, and this check's own parse confirms no turn end after its start (callmeter.UnfilledAgentStop)"
 	reasonStoppedAgent           = "TaskStop stopped the sub-agent while this call ran: Claude Code wrote the call's error result itself and the agent never spoke again, so no PostToolUse, PostToolBatch or SubagentStop fired to write its request, its size or the agent's tool count"
 	reasonScratchStore           = "the session ran with CALLMETER_HOME pointing at a scratch store, which records it"
 	reasonCommandNotStored       = "the heredoc cutter could not cut this command safely, so the store kept only command_bytes and no report can parse it (docs/design.md § Privacy)"
+	reasonNoCwd                  = "the call has no absolute cwd: no PreToolUse or PostToolUse recorded the directory it started in (Claude Code refused it before any PreToolUse, or both hooks were lost), and report.EnsureParsed never parses a command whose cd it cannot replay, counting it skipped"
+	reasonNodeEval               = "a node -e, --eval, -p or --print part is unparsed by design: no JavaScript parser runs, a named gap every report that counts commands counts (docs/design.md § Parsing a command)"
 )
 
 // The tails of the transcript faults report-time recovery records for an agent
@@ -513,7 +515,8 @@ func markedOpen(st *storeData, w *world, agent string, seq int64) bool {
 }
 
 // killedStopFailure is the wrapper's missed.log reason for a StopFailure hook
-// killed before its binary ran: no session_id, the ts in whole seconds.
+// killed before its binary ran: an optional trailing pid, no session_id, the ts
+// in whole seconds.
 const killedStopFailure = "StopFailure: killed by signal"
 
 // matchKilledStopFailures pairs each killedStopFailure fault, oldest first,
@@ -540,7 +543,7 @@ func matchKilledStopFailures(st *storeData) map[int]bool {
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].ts < rows[j].ts })
 	var faults []int
 	for i, f := range st.faults {
-		if f.stage == "binary" && f.session == "" && f.err == killedStopFailure {
+		if f.stage == "binary" && f.session == "" && withoutPid(f.err) == killedStopFailure {
 			faults = append(faults, i)
 		}
 	}
@@ -563,15 +566,30 @@ func matchKilledStopFailures(st *storeData) map[int]bool {
 	return matched
 }
 
-// terminatedStop prefixes the binary's fault for a Stop hook ended before it
-// recorded (`Stop: terminated by SIGTERM`, `Stop: terminated by store busy`),
-// the ts in whole seconds: no session_id when a signal ended it before it read
-// its payload, else the session it was recording.
-const terminatedStop = "Stop: terminated by "
+// withoutPid drops one trailing missed.log pid suffix, preserving every other reason.
+func withoutPid(text string) string {
+	start := strings.LastIndex(text, " (pid ")
+	if start < 0 || !strings.HasSuffix(text, ")") || start+6 >= len(text)-1 {
+		return text
+	}
+	for _, digit := range text[start+6 : len(text)-1] {
+		if digit < '0' || digit > '9' {
+			return text
+		}
+	}
+	return text[:start]
+}
 
-// terminatedFailure prefixes the binary's fault for a StopFailure hook ended
-// before it recorded; only one naming its session is judged (matchTerminatedStops).
-const terminatedFailure = "StopFailure: terminated by "
+// terminatedEvent recognises the binary's stored forms of a lost hook.
+func terminatedEvent(f sFault) (event string, ok bool) {
+	if f.stage != callmeter.StageTerminated {
+		return "", false
+	}
+	event, reason, found := strings.Cut(f.err, ": ")
+	return event, found && (strings.HasPrefix(reason, callmeter.TerminatedReason) ||
+		strings.HasPrefix(reason, callmeter.StoreUnavailableReason) || reason == callmeter.PanicReason ||
+		strings.HasPrefix(reason, callmeter.PanicReason+" ("))
+}
 
 // lostEnd reports whether f is a SessionEnd fault (the binary's `terminated`
 // line or the wrapper's `binary` one) naming a session whose latest run
@@ -579,7 +597,11 @@ const terminatedFailure = "StopFailure: terminated by "
 // second of its latest main-chat SessionStart, as callmeter's endLost reads
 // it): the lost hook session-end-killed explains.
 func lostEnd(st *storeData, f sFault) bool {
-	if f.session == "" || (f.stage != "terminated" && f.stage != "binary") || !strings.HasPrefix(f.err, "SessionEnd: ") {
+	event, ok := terminatedEvent(f)
+	if f.stage == "binary" {
+		event, _, ok = strings.Cut(f.err, ": ")
+	}
+	if f.session == "" || !ok || event != "SessionEnd" {
 		return false
 	}
 	s := st.sessions[f.session]
@@ -595,12 +617,12 @@ func lostEnd(st *storeData, f sFault) bool {
 	return f.ts >= start/1000*1000
 }
 
-// stopVerdict is a terminatedStop fault's pairing: the session whose cancelled
+// stopVerdict is a terminated Stop fault's pairing: the session whose cancelled
 // turn its Stop row closes, or empty with the detail naming why none does. A
 // fault naming its session is judged against that session alone.
 type stopVerdict struct{ session, event, detail string }
 
-// matchTerminatedStops judges each terminatedStop fault, oldest first. The
+// matchTerminatedStops judges each terminated Stop fault, oldest first. The
 // sessions its headless exit may have cancelled are the main sessions with a
 // SessionEnd in [fault, fault+killEndAfter) and a UserPromptSubmit before the
 // fault's second ends; the last such prompt opens the cancelled turn, which a
@@ -660,10 +682,16 @@ func matchTerminatedStops(st *storeData) map[int]stopVerdict {
 		prompt         int64
 	}
 	var faults []int
+	faultEvents := map[int]string{}
 	for i, f := range st.faults {
-		named := f.session != "" && (strings.HasPrefix(f.err, terminatedFailure) || (f.stage == "binary" && (strings.HasPrefix(f.err, "Stop: ") || strings.HasPrefix(f.err, "StopFailure: "))))
-		if (f.stage == "terminated" && strings.HasPrefix(f.err, terminatedStop)) || named {
+		event, ok := terminatedEvent(f)
+		if f.stage == "binary" {
+			event, _, ok = strings.Cut(f.err, ": ")
+		}
+		named := f.session != "" && ok && (event == "StopFailure" || (f.stage == "binary" && event == "Stop"))
+		if (f.stage == "terminated" && ok && event == "Stop") || named {
 			faults = append(faults, i)
+			faultEvents[i] = event
 		}
 	}
 	sort.SliceStable(faults, func(a, b int) bool { return st.faults[faults[a]].ts < st.faults[faults[b]].ts })
@@ -674,10 +702,7 @@ func matchTerminatedStops(st *storeData) map[int]stopVerdict {
 	for _, i := range faults {
 		f := st.faults[i]
 		if f.session != "" {
-			event := "Stop"
-			if strings.HasPrefix(f.err, "StopFailure: ") {
-				event = "StopFailure"
-			}
+			event := faultEvents[i]
 			evs, stored := per[f.session]
 			if _, ok := st.sessions[f.session]; !stored && !ok {
 				out[i] = stopVerdict{event: event, detail: "event=" + event + " session_in_store=false"}
@@ -836,7 +861,7 @@ func matchLostHooks(st *storeData, w *world) map[int]hookVerdict {
 	}
 	postSettled := func(id string) bool {
 		c := st.calls[id]
-		return (c != nil && (c.hasSize || c.failed == 1)) || marked[id]
+		return (c != nil && c.resultLanded()) || marked[id]
 	}
 	batchSettled := func(id string) bool {
 		c := st.calls[id]
@@ -856,7 +881,13 @@ func matchLostHooks(st *storeData, w *world) map[int]hookVerdict {
 	out := map[int]hookVerdict{}
 	for _, i := range faults {
 		f := st.faults[i]
-		event, _, _ := strings.Cut(f.err, ": ")
+		event, ok := terminatedEvent(f)
+		if f.stage == "binary" {
+			event, _, ok = strings.Cut(f.err, ": ")
+		}
+		if !ok {
+			continue
+		}
 		lo, hi := f.ts-lostHookWindow, f.ts+1000
 		v := hookVerdict{event: event}
 		var pool string
@@ -917,7 +948,7 @@ func matchLostHooks(st *storeData, w *world) map[int]hookVerdict {
 
 // killedUnknown is the wrapper's missed.log reason for a hook killed before it
 // read hook_event_name: neither the event nor the session is known, the ts in
-// whole seconds.
+// whole seconds, with an optional trailing pid.
 const killedUnknown = "unknown: killed by signal"
 
 // voucher is what the sessions beside a killedUnknown fault can say for it:
@@ -996,6 +1027,126 @@ func nonEmpty(ids ...string) []string {
 	return out
 }
 
+func promptOnly(id string, st storeData) bool {
+	found := false
+	for _, e := range st.events {
+		if e.session != id {
+			continue
+		}
+		found = true
+		switch e.event {
+		case callmeter.EventSessionStart, "UserPromptSubmit", callmeter.EventSessionEnd:
+		default:
+			return false
+		}
+	}
+	return found
+}
+
+// ranNothing mirrors the unexported SQL rule in internal/callmeter/report/sessions.go.
+func ranNothing(id string, st storeData) bool {
+	var firstStart int64
+	started := false
+	for _, e := range st.events {
+		if e.session != id {
+			continue
+		}
+		switch e.event {
+		case callmeter.EventSessionStart:
+			if !started || e.ts < firstStart {
+				firstStart = e.ts
+			}
+			started = true
+		case callmeter.EventSessionEnd, "InstructionsLoaded", "Notification":
+		default:
+			return false
+		}
+	}
+	if !started || st.turnSessions[id] {
+		return false
+	}
+	for _, c := range st.calls {
+		if c.session == id {
+			return false
+		}
+	}
+	for _, r := range st.requests {
+		if r.session == id {
+			return false
+		}
+	}
+	for _, a := range st.agents {
+		if a.session == id {
+			return false
+		}
+	}
+	for _, f := range st.faults {
+		if f.session == id || (f.session == "" && (f.stage == callmeter.StageBinary || f.stage == callmeter.StageTerminated) && f.ts >= firstStart) {
+			return false
+		}
+	}
+	return true
+}
+
+// endBudgetPrefix opens the fault SessionEnd records when its transcript-read
+// budget ran out (internal/hookentry/callmeter.go, sessionEndBudget).
+const endBudgetPrefix = "SessionEnd spent its "
+
+// workMismatch reports whether a call, request or agent of the session holds an
+// unexplained mismatch: work a skipped transcript read could have left unsettled.
+func workMismatch(ms []mismatch, session string) bool {
+	for _, m := range ms {
+		if m.session != session || m.reason != "" {
+			continue
+		}
+		for _, p := range []string{"call-", "request-", "agent-"} {
+			if strings.HasPrefix(m.class, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// notificationOnly reports whether the store's only rows for a session are
+// Notification events: no SessionStart, no prompt, no work, no fault.
+func notificationOnly(id string, st *storeData) bool {
+	found := false
+	for _, e := range st.events {
+		if e.session != id {
+			continue
+		}
+		if e.event != "Notification" {
+			return false
+		}
+		found = true
+	}
+	if !found || st.turnSessions[id] {
+		return false
+	}
+	for _, c := range st.calls {
+		if c.session == id {
+			return false
+		}
+	}
+	for _, r := range st.requests {
+		if r.session == id {
+			return false
+		}
+	}
+	for _, a := range st.agents {
+		if a.session == id {
+			return false
+		}
+	}
+	for _, f := range st.faults {
+		if f.session == id {
+			return false
+		}
+	}
+	return true
+}
+
 // promptlessDetail names what the store holds for a session that never
 // reached the model: its model, start source and lifecycle events.
 func promptlessDetail(s *sSession, st *storeData) string {
@@ -1021,11 +1172,20 @@ func compareSessions(rep *report, st *storeData, w *world, compared []*sSession,
 		}
 		// Model activity before the session's first store row: hooks were not
 		// yet delivered (a session already running when the plugin was enabled).
-		subLines, preAssistants, preTools := 0, t.preAssistants, len(t.preToolUses)
-		for _, a := range w.subagents[s.id] {
-			subLines += a.windowLines
-			preAssistants += a.preAssistants
-			preTools += len(a.preToolUses)
+		// A line whose message the store holds under another session is that
+		// session's (a fork's copied history), never back-filled into this one.
+		subLines, preAssistants, preTools := 0, 0, 0
+		for _, tr := range append([]*transcript{t}, w.subagents[s.id]...) {
+			if tr != t {
+				subLines += tr.windowLines
+			}
+			for id, c := range tr.preByMsg {
+				if r := st.requests[id]; id != "" && r != nil && r.session != "" && r.session != s.id {
+					continue
+				}
+				preAssistants += c.lines
+				preTools += c.tools
+			}
 		}
 		if preAssistants > 0 {
 			rep.add("session-pre-first-row", s.id, 0, fmt.Sprintf("first_row=%s assistant_lines=%d tool_uses=%d start_source=%s", msString(s.firstTS), preAssistants, preTools, orDash(s.startSource)))
@@ -1036,6 +1196,10 @@ func compareSessions(rep *report, st *storeData, w *world, compared []*sSession,
 		if t.assistants == 0 && subLines == 0 && t.apiErrors == 0 {
 			if workFor[s.id] {
 				rep.add("session-no-transcript", s.id, 0, fmt.Sprintf("window_lines=%d", t.windowLines))
+			} else if promptOnly(s.id, *st) && len(t.prompts) > 0 {
+				rep.expect("session-promptless", s.id, 0, reasonKilledBeforeReply, promptlessDetail(s, st))
+			} else if notificationOnly(s.id, st) {
+				rep.expect("session-promptless", s.id, 0, reasonIdleNotification, promptlessDetail(s, st))
 			} else {
 				rep.add("session-promptless", s.id, 0, promptlessDetail(s, st))
 			}
@@ -1084,7 +1248,7 @@ func compareCalls(rep *report, st *storeData, w *world) {
 			rep.add("call-request", u.session, c.ts, fmt.Sprintf("transcript_request=%s store_request=%s", u.msgID, c.requestID), u.id)
 		}
 		if r, ok := w.results[u.id]; ok && r.ts <= w.until {
-			if !c.hasSize && !c.batchOnly {
+			if !c.resultLanded() && !c.batchOnly {
 				if w.stopped(u.id) {
 					rep.expect("call-no-size", u.session, c.ts, reasonStoppedAgent, fmt.Sprintf("tool=%s agent=%s", u.name, u.agent), u.id)
 				} else {
@@ -1341,10 +1505,19 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 			rep.add("agent-type", t.session, 0, fmt.Sprintf("transcript=%s store=%s", t.meta.AgentType, orDash(a.agentType)), id)
 		}
 		if t.meta.ToolUseID != "" && a.parent != t.meta.ToolUseID {
-			rep.add("agent-parent", t.session, 0, fmt.Sprintf("transcript=%s store=%s", t.meta.ToolUseID, orDash(a.parent)), id)
+			detail := fmt.Sprintf("transcript=%s store=%s", t.meta.ToolUseID, orDash(a.parent))
+			s := st.sessions[t.session]
+			if a.parent == "" && s != nil && (s.lastTS > st.latest-quietAfterMS || w.writes[t.session] > st.latest-quietAfterMS) {
+				// The parent lands with the Agent PostToolUse or the meta fill.
+				rep.edge("agent-parent-open", t.session, 0, detail, id)
+			} else {
+				rep.add("agent-parent", t.session, 0, detail, id)
+			}
 		}
-		if a.toolUses >= 0 && a.toolUses != int64(len(t.toolUses)) {
-			detail := fmt.Sprintf("transcript=%d store=%d", len(t.toolUses), a.toolUses)
+		// Mirrors ReadAgentTotals, which counts the whole agent transcript.
+		toolUses := int64(len(t.toolUses) + len(t.preToolUses) + len(t.earlyToolUses))
+		if a.toolUses >= 0 && a.toolUses != toolUses {
+			detail := fmt.Sprintf("transcript=%d store=%d", toolUses, a.toolUses)
 			// The count is written at SubagentStop: a stopped agent's open last
 			// turn never gets one, so its stopped calls are the whole gap.
 			var cut int64
@@ -1353,11 +1526,11 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 					cut++
 				}
 			}
-			if turns := st.turns[id]; cut > 0 && int64(len(t.toolUses))-a.toolUses == cut && len(turns) > 0 && lastTurn(turns).noStop {
+			if turns := st.turns[id]; cut > 0 && toolUses-a.toolUses == cut && len(turns) > 0 && lastTurn(turns).noStop {
 				rep.expect("agent-tool-uses", t.session, 0, reasonStoppedAgent, detail, id)
-			} else if turns := st.turns[id]; len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && lastTurn(turns).noStop && markedOpen(st, w, id, lastTurn(turns).seq) {
+			} else if turns := st.turns[id]; len(turns) > 0 && a.toolUses < toolUses && lastTurn(turns).noStop && markedOpen(st, w, id, lastTurn(turns).seq) {
 				rep.expect("agent-tool-uses", t.session, 0, reasonAgentNeverStopped, detail, id)
-			} else if len(turns) > 0 && a.toolUses < int64(len(t.toolUses)) && turnOpen(st, t.session, lastTurn(turns)) && t.lastTS > st.latest-quietAfterMS {
+			} else if len(turns) > 0 && a.toolUses < toolUses && turnOpen(st, t.session, lastTurn(turns)) && t.lastTS > st.latest-quietAfterMS {
 				// Not due: the count lands at the SubagentStop of the turn
 				// still running, as recovery waits an hour for a quiet one.
 				rep.edge("agent-tool-uses-open", t.session, 0, detail, id)
@@ -1365,8 +1538,9 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 				rep.add("agent-tool-uses", t.session, 0, detail, id)
 			}
 		}
-		// Every turn ends in an end_turn message; a last turn cut short ends in none.
-		implied := len(t.endTurns)
+		// SubagentStop also ends a null-stop turn a later prompt woke again;
+		// a last turn cut short ends in none.
+		implied := len(t.endTurns) + len(t.nullEnds)
 		if t.assistants > 0 && t.lastStop != "end_turn" {
 			implied++
 		}
@@ -1401,7 +1575,10 @@ func compareAgents(rep *report, st *storeData, w *world, inCompared map[string]b
 // compareParts checks every Bash call's command_parts. The parse runs at
 // report time only (docs/design.md § Parsing a command), so a call newer than
 // every parsed call waits for the next report run: parts-pending-report. A call
-// older than a parsed one, still without parts, was skipped: parts-missing.
+// older than a parsed one, still without parts, was skipped: parts-missing,
+// unless report.EnsureParsed never parses it: a stored input without its
+// command (parts-command-not-stored) or a cwd that is not absolute
+// (parts-no-cwd).
 func compareParts(rep *report, st *storeData, w *world) {
 	var lastParsed int64
 	for id := range st.parts {
@@ -1417,6 +1594,10 @@ func compareParts(rep *report, st *storeData, w *world) {
 		parts := st.parts[u.id]
 		if len(parts) == 0 && c.noCommand {
 			rep.expect("parts-command-not-stored", u.session, c.ts, reasonCommandNotStored, "", u.id)
+			continue
+		}
+		if len(parts) == 0 && !c.absCwd {
+			rep.expect("parts-no-cwd", u.session, c.ts, reasonNoCwd, "", u.id)
 			continue
 		}
 		if len(parts) == 0 {
@@ -1440,6 +1621,8 @@ func compareParts(rep *report, st *storeData, w *world) {
 				counts[statusPythonUnparsedPre6]++
 			case p.status == cmdparse.StatusUnparsed && p.lang == cmdparse.LangPython:
 				counts[statusPythonCodeUnresolved]++
+			case p.status == cmdparse.StatusUnparsed && p.lang == cmdparse.LangNode:
+				counts[statusNodeEval]++
 			default:
 				counts[p.status]++
 			}
@@ -1455,6 +1638,8 @@ func compareParts(rep *report, st *storeData, w *world) {
 				rep.expect("parse-python-code-unresolved", u.session, c.ts, reasonPythonCodeUnresolved, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			case status == statusPythonUnparsedPre6:
 				rep.expect("parse-python-unparsed-pre6", u.session, c.ts, reasonPythonUnparsedPre6, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
+			case status == statusNodeEval:
+				rep.expect("parse-node-eval", u.session, c.ts, reasonNodeEval, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			case status != "ok":
 				rep.add("parse-"+orDash(status), u.session, c.ts, fmt.Sprintf("parts=%d of %d", n, len(parts)), u.id)
 			}
@@ -1476,8 +1661,9 @@ func compareParts(rep *report, st *storeData, w *world) {
 // UserPromptSubmit carrying its promptId, repeated once per queued command.
 func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 	type tally struct {
-		n       map[string]int
-		prompts map[string]bool
+		n        map[string]int
+		prompts  map[string]bool
+		promptTS map[string]int64 // a prompt's first UserPromptSubmit (unix ms)
 	}
 	per := map[string]*tally{}
 	for _, e := range st.events {
@@ -1486,7 +1672,7 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		}
 		t := per[e.session]
 		if t == nil {
-			t = &tally{n: map[string]int{}, prompts: map[string]bool{}}
+			t = &tally{n: map[string]int{}, prompts: map[string]bool{}, promptTS: map[string]int64{}}
 			per[e.session] = t
 		}
 		if e.agent != "" {
@@ -1506,6 +1692,9 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		}
 		if e.event == "UserPromptSubmit" && e.promptID != "" {
 			t.prompts[e.promptID] = true
+			if ts, ok := t.promptTS[e.promptID]; !ok || e.ts < ts {
+				t.promptTS[e.promptID] = e.ts
+			}
 		}
 	}
 	// A session's latest run ended when its main chat holds a SessionEnd at or
@@ -1554,7 +1743,12 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 			}
 		}
 		if c.n["SessionStart"] == 0 && t.assistants > 0 && t.preAssistants == 0 {
-			rep.add("event-no-sessionstart", s.id, 0, fmt.Sprintf("session_end=%d stop=%d", c.n["SessionEnd"], c.n["Stop"]))
+			detail := fmt.Sprintf("session_end=%d stop=%d", c.n["SessionEnd"], c.n["Stop"])
+			if at := t.reloadedBy(s.firstTS); at > 0 {
+				rep.expect("event-no-sessionstart", s.id, 0, reasonReloadedChat, fmt.Sprintf("%s reload_plugins=%s first_row=%s", detail, msString(at), msString(s.firstTS)))
+			} else {
+				rep.add("event-no-sessionstart", s.id, 0, detail)
+			}
 		}
 		subCompacts := 0
 		for _, a := range w.subagents[s.id] {
@@ -1572,11 +1766,13 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		if pre, post := c.n["PreCompact"]+c.n["agent:PreCompact"], c.n["PostCompact"]+c.n["agent:PostCompact"]; pre != post {
 			rep.add("event-precompact-unfinished", s.id, 0, fmt.Sprintf("pre=%d post=%d", pre, post))
 		}
-		if t.entrypoints["cli"] && len(t.entrypoints) == 1 && c.n["Stop"] != t.turnDurations {
-			detail := fmt.Sprintf("transcript_turns=%d store_stop=%d", t.turnDurations, c.n["Stop"])
+		// A turn ends in Stop or StopFailure: a turn_duration right after an
+		// API error ends a failed turn, which event-stopfailure checks.
+		if stopped := t.turnDurations - t.failedDurations; t.entrypoints["cli"] && len(t.entrypoints) == 1 && c.n["Stop"] != stopped {
+			detail := fmt.Sprintf("transcript_turns=%d store_stop=%d", stopped, c.n["Stop"])
 			// Stops within hookLag of the snapshot whose turn_duration line
 			// falls after --until: the turn's end is not yet on both sides.
-			if excess := c.n["Stop"] - t.turnDurations; excess > 0 && excess <= c.n["Stop:lag"] {
+			if excess := c.n["Stop"] - stopped; excess > 0 && excess <= c.n["Stop:lag"] {
 				rep.edge("event-stop-lag", s.id, 0, detail)
 			} else {
 				rep.add("event-stop", s.id, 0, detail)
@@ -1601,13 +1797,41 @@ func compareEvents(rep *report, st *storeData, w *world, compared []*sSession) {
 		if len(missing) > 0 {
 			rep.add("event-prompt-missing", s.id, 0, fmt.Sprintf("transcript_prompts=%d", len(t.prompts)), missing...)
 		}
-		if len(extra) > 0 {
-			rep.add("event-prompt-extra", s.id, 0, fmt.Sprintf("store_prompts=%d", len(c.prompts)), extra...)
+		// A prompt another UserPromptSubmit hook blocked: its hook fired, and
+		// the transcript holds only the warning that stopped it.
+		var blocked, unblocked []string
+		for _, p := range extra {
+			if blockedNear(t.blocks, c.promptTS[p]) {
+				blocked = append(blocked, p)
+			} else {
+				unblocked = append(unblocked, p)
+			}
+		}
+		if len(blocked) > 0 {
+			rep.expect("event-prompt-extra", s.id, 0, reasonBlockedPrompt, fmt.Sprintf("store_prompts=%d", len(c.prompts)), blocked...)
+		}
+		if len(unblocked) > 0 {
+			rep.add("event-prompt-extra", s.id, 0, fmt.Sprintf("store_prompts=%d", len(c.prompts)), unblocked...)
 		}
 		if repeats := c.n["UserPromptSubmit"] - len(c.prompts); repeats != t.queued {
 			rep.add("event-prompt-repeat", s.id, 0, fmt.Sprintf("store_repeats=%d transcript_queued=%d", repeats, t.queued))
 		}
 	}
+}
+
+// blockedWindow is how far a preventContinuation warning may sit from the
+// UserPromptSubmit it answers.
+const blockedWindow int64 = 2_000 // ms
+
+// blockedNear reports whether a preventContinuation warning lies within
+// blockedWindow of a UserPromptSubmit at ts.
+func blockedNear(blocks []int64, ts int64) bool {
+	for _, b := range blocks {
+		if b >= ts-blockedWindow && b <= ts+blockedWindow {
+			return true
+		}
+	}
+	return false
 }
 
 // allowlist entries: `class | scopes | reason`, scopes space-separated, any one
@@ -1755,8 +1979,14 @@ func lastTurn(turns []sTurn) sTurn {
 // shownEnd reports whether this check's own parse of the agent's transcript
 // holds the turn end a SubagentStop rebuilt by recovery is dated at: a message
 // of the agent whose turn-ending stop_reason (set, not tool_use) was written at
-// the stop's ts, at or after the turn's start.
+// the stop's ts, at or after the turn's start. Recovery also ends a background
+// agent's turn at its task-notification in the main transcript (agentStopsToMark).
 func shownEnd(w *world, agent, session string, turn sTurn) bool {
+	for _, ts := range w.notices[agent] {
+		if ts == turn.ts && ts >= turn.start {
+			return true
+		}
+	}
 	for _, msg := range w.messages {
 		if msg.agent == agent && msg.session == session && msg.endTS != 0 && msg.endTS == turn.ts && msg.endTS >= turn.start {
 			return true

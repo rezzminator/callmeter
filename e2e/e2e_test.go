@@ -1443,10 +1443,10 @@ func TestLiveDownloadPath(t *testing.T) {
 	asset := fmt.Sprintf("callmeter_%s_%s_%s", version, runtime.GOOS, runtime.GOARCH)
 	binary := readAll(t, bin)
 	srvRoot := filepath.Join(r.root, "srv")
-	if err := os.MkdirAll(filepath.Join(srvRoot, "callmeter--v"+version), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(srvRoot, "v"+version), 0o755); err != nil {
 		t.Fatalf("create the release directory: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(srvRoot, "callmeter--v"+version, asset), binary, 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(srvRoot, "v"+version, asset), binary, 0o755); err != nil {
 		t.Fatalf("write the release asset: %v", err)
 	}
 	var served atomic.Int64

@@ -182,7 +182,7 @@ func putCommand(out map[string]any, value json.RawMessage, size int) error {
 		out["command_bytes"] = size
 		return nil
 	}
-	if heredoc == 0 && operands == 0 {
+	if redacted == command {
 		out["command"] = value // as it arrived: a stored input sanitized again stays the same bytes
 		return nil
 	}

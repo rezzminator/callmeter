@@ -23,7 +23,7 @@ import (
 )
 
 // Usage is the report action's usage text.
-const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events} [--since D] [--project P]
+const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events|compactions|cost|hooks|turns|resumes|waiting} [--since D] [--project P]
                        [--agent-type T] [--session S] [--limit N] [--json]
   --since D         a duration (7d, 24h) or a date (2026-09-01); default and floor: the 30-day retention window
   --json            one JSON object on stdout instead of the text table`
@@ -35,6 +35,8 @@ var topics = map[string]topicFunc{
 	"context": report.Context, "sequences": report.Sequences, "faults": report.Faults,
 	"sessions": report.Sessions, "prompts": report.Prompts, "effort": report.Effort, "tokens": report.Tokens,
 	"agents": report.Agents, "outcomes": report.Outcomes, "coverage": report.Coverage, "events": report.Events,
+	"compactions": report.Compactions, "cost": report.Cost, "hooks": report.Hooks, "turns": report.Turns,
+	"resumes": report.Resumes, "waiting": report.Waiting,
 }
 
 // CLI is `callmeter {args}` for the report action: the reports over the call
@@ -181,7 +183,7 @@ func reportAction(
 			}
 		}
 	}()
-	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv}
+	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
 	if _, err := db.IngestMissed(ctx, paths.Missed(home)); err != nil {
 		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
 		return 1
@@ -198,6 +200,7 @@ func reportAction(
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: %v\n", err)
 		return 1
 	}
+	recovery := recoveryNotes(recovered.Skipped)
 	for _, skipped := range recovered.Skipped {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: skipped: %v\n", skipped)
 	}
@@ -210,6 +213,7 @@ func reportAction(
 	table, err := topic(ctx, db, filter, names.nameOf)
 	if err == nil {
 		table.Notes = append(table.Notes, report.InapplicableNotes(positional[0], filter)...)
+		table.Notes = append(table.Notes, recovery...)
 		var older []string
 		older, err = report.OlderRulesNotes(ctx, db)
 		table.Notes = append(table.Notes, older...)
@@ -226,6 +230,35 @@ func reportAction(
 		return 1
 	}
 	return 0
+}
+
+// recoveryNotes summarizes skipped transcripts without exposing paths or OS
+// errors, counting a transcript skipped by more than one read once.
+func recoveryNotes(skipped []error) []string {
+	if len(skipped) == 0 {
+		return nil
+	}
+	transcripts := 0
+	seen := map[callmeter.SkippedRead]bool{}
+	for _, err := range skipped {
+		var read *callmeter.SkippedRead
+		if errors.As(err, &read) {
+			key := callmeter.SkippedRead{Session: read.Session, Path: read.Path}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		transcripts++
+	}
+	label := "unreadable"
+	switch {
+	case errors.Is(skipped[0], fs.ErrPermission):
+		label = "permission denied"
+	case errors.Is(skipped[0], fs.ErrNotExist):
+		label = "not found"
+	}
+	return []string{fmt.Sprintf("%d transcripts could not be read by recovery (first: %s)", transcripts, label)}
 }
 
 // unrecordedWhy names each stage of a missed.log line as the store's own

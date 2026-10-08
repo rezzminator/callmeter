@@ -364,8 +364,7 @@ func missedRows(t *testing.T, store *Store) int {
 // TestIngestMissedReingestAddsNoDuplicate: a run killed after its ingest
 // committed but before it moved its claim leaves the claim as it was; the next
 // ingest of it writes no fault twice, an unparsed line's included, while two
-// identical lines of one file stay two faults, and so does a line of a later
-// missed.log identical to one already stored.
+// identical lines of one file stay two faults.
 func TestIngestMissedReingestAddsNoDuplicate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -394,16 +393,40 @@ func TestIngestMissedReingestAddsNoDuplicate(t *testing.T) {
 	if n := missedRows(t, store); n != 4 {
 		t.Errorf("faults from missed.log = %d, want 4: re-ingesting a committed claim duplicated its faults", n)
 	}
+}
 
-	// Parallel hooks of one session lose their events in the same second: a
-	// line identical to a stored one that reaches a later missed.log is a
-	// further loss of its own, never a re-ingest.
-	writeMissed(t, path, "1790000002\tStop\tterminated by SIGTERM\tsess-1\n")
-	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
-		t.Errorf("IngestMissed of a fresh identical line = %d, %v; want 1, nil", n, err)
+// TestIngestMissedUnmovedClaimAddsNoDuplicate: a claim left in place after its
+// ingest committed (the run killed, or its move failing, before the rename)
+// keeps its last write time, so the next ingest of it writes no unparsed line
+// twice: an unparsed line is stamped at that time.
+func TestIngestMissedUnmovedClaimAddsNoDuplicate(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missed.log")
+	writeMissed(t, path, "not a missed line\n")
+	written := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, written, written); err != nil {
+		t.Fatal(err)
 	}
-	if n := missedRows(t, store); n != 5 {
-		t.Errorf("faults from missed.log = %d, want 5: a fresh line identical to a stored one was dropped", n)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	n, err := store.IngestMissedHeld(ctx, path, func() func() {
+		if err := os.Chmod(dir, 0o500); err != nil { // the claim can no longer be renamed
+			t.Errorf("chmod %s: %v", dir, err)
+		}
+		return func() {}
+	})
+	if err == nil || n != 1 {
+		t.Fatalf("IngestMissedHeld with an unmovable claim = %d, %v; want 1 and the move's error", n, err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+		t.Errorf("IngestMissed of the committed, unmoved claim = %d, %v; want 0, nil", n, err)
+	}
+	if n := missedRows(t, store); n != 1 {
+		t.Errorf("faults from missed.log = %d, want 1: the unmoved claim's unparsed line was written again", n)
 	}
 }
 
@@ -480,4 +503,105 @@ func TestIngestMissedKeepsALateAppend(t *testing.T) {
 			t.Errorf("claims left after their grace period = %v, want none", done)
 		}
 	})
+}
+
+// TestIngestMissedKeepsTwinLostEventsOfLaterIngests: a headless exit cancels
+// the running hooks of one session within one second, and each leaves the
+// same line; a run that claims missed.log between two of those appends
+// ingests the first, and the next run's fresh claim holds its twin, a second
+// lost event that is still counted.
+func TestIngestMissedKeepsTwinLostEventsOfLaterIngests(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	line := "1790000001\tPostToolUse\tterminated by SIGTERM\tsess-1\n"
+	writeMissed(t, path, line)
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+		t.Fatalf("first IngestMissed = %d, %v; want 1, nil", n, err)
+	}
+	writeMissed(t, path, line)
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+		t.Errorf("IngestMissed of the twin's fresh claim = %d, %v; want 1, nil", n, err)
+	}
+	if n := missedRows(t, store); n != 2 {
+		t.Errorf("faults from missed.log = %d, want 2: a second lost event was read as a re-ingest", n)
+	}
+}
+
+// TestParseMissedLineWriterPid copies AppendMissed's timestamp, event, reason
+// and optional session fields, including old writers' reasons without a pid.
+func TestParseMissedLineWriterPid(t *testing.T) {
+	for _, tc := range []struct{ reason, stage string }{
+		{"panic (pid 7)", StageTerminated},
+		{"panic", StageTerminated},
+		{"panic later", StageBinary},
+		{"terminated by SIGTERM (pid 7)", StageTerminated},
+		{"store unavailable: open (pid 7)", StageTerminated},
+		{"terminated by SIGTERM", StageTerminated},
+		{"store unavailable: open", StageTerminated},
+		{"download failed", StageBinary},
+	} {
+		for _, session := range []string{"", "sess-1"} {
+			t.Run(tc.reason+"/"+session, func(t *testing.T) {
+				line := "1790000001\tSessionEnd\t" + tc.reason
+				if session != "" {
+					line += "\t" + session
+				}
+				got, ok := parseMissedLine(line)
+				if !ok || got.TS != 1790000001000 || got.SessionID != session || got.Stage != tc.stage || got.Error != "SessionEnd: "+tc.reason {
+					t.Errorf("parseMissedLine = %+v, %v; want timestamp 1790000001000, session %q, stage %s, error %q", got, ok, session, tc.stage, "SessionEnd: "+tc.reason)
+				}
+			})
+		}
+	}
+}
+
+// TestIngestMissedKeepsATwinOfAPreClaimFd copies AppendMissed's timestamp,
+// event, reason with writer pid and session fields. An fd opened before the
+// claim appends after its read; a second pid is a twin, the same pid a replay.
+func TestIngestMissedKeepsATwinOfAPreClaimFd(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pid  string
+		want int
+	}{
+		{"another writer", "8", 2},
+		{"identical replay", "7", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			path := missedPath(store)
+			writeMissed(t, path, "1790000001\tPostToolUse\tterminated by SIGTERM (pid 7)\tsess-1\n")
+			late, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = late.Close() })
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+				t.Fatalf("first IngestMissed = %d, %v; want 1, nil", n, err)
+			}
+			if _, err := late.WriteString("1790000001\tPostToolUse\tterminated by SIGTERM (pid " + tc.pid + ")\tsess-1\n"); err != nil {
+				t.Fatal(err)
+			}
+			if err := late.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+				t.Fatalf("IngestMissed within grace = %d, %v; want 0, nil", n, err)
+			}
+			if done := backdateDone(t, path, DoneGrace+time.Second); len(done) != 1 {
+				t.Fatalf("done claims = %v, want one", done)
+			}
+			if n, err := store.IngestMissed(ctx, path); err != nil || n != tc.want-1 {
+				t.Errorf("IngestMissed past grace = %d, %v; want %d, nil", n, err, tc.want-1)
+			}
+			if n := missedRows(t, store); n != tc.want {
+				t.Errorf("fault rows = %d, want %d", n, tc.want)
+			}
+			if done := backdateDone(t, path, 0); len(done) != 0 {
+				t.Errorf("done claims after grace = %v, want none", done)
+			}
+		})
+	}
 }

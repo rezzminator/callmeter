@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -191,21 +192,28 @@ func TestCallmeterCLINamesAChatFromItsTranscript(t *testing.T) {
 func TestCallmeterCLIUnreadableTranscriptShowsAQuestionMarkAndOneNote(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	if err := os.MkdirAll(filepath.Join(fixture.seat, "projects", "-work", "sess-1.jsonl"), 0o700); err != nil {
+	unreadable := filepath.Join(fixture.seat, "projects", "-work", "sess-1.jsonl")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	code, stdout, stderr := fixture.run("report", "files", "--session", "sess-1")
 	title, _, _ := strings.Cut(stdout, "\n")
+	stderrLines := strings.Split(strings.TrimSpace(stderr), "\n")
 	if code != 0 || !strings.Contains(title, "session=sess-1 (?)") ||
-		strings.Count(stdout, "note: chat names could not be read: session sess-1: ") != 1 {
+		strings.Count(stdout, "note: chat names could not be read for 1 sessions (first: unreadable)") != 1 ||
+		strings.Contains(stdout, unreadable) || len(stderrLines) != 1 ||
+		!strings.HasPrefix(stderrLines[0], "callmeter: chat name: session sess-1: ") ||
+		!strings.Contains(stderrLines[0], unreadable) {
 		t.Fatalf("report files --session = %d, want a ? chat and one note\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }
 
-// allTopics are the 14 report topics, the six ported then the eight of 5-b.
+// allTopics are the 20 report topics: the six ported, the eight of 5-b, then the
+// six over the transcript metrics.
 var allTopics = []string{
 	"files", "writes", "commands", "context", "sequences", "faults",
 	"sessions", "prompts", "effort", "tokens", "agents", "outcomes", "coverage", "events",
+	"compactions", "cost", "hooks", "turns", "resumes", "waiting",
 }
 
 // seedEverything records something every one of the new topics reports, and an
@@ -267,6 +275,20 @@ func (fixture lab) seedEverything(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed lifecycle rows: %v", err)
 	}
+	// rows of the transcript-metrics tables, by plain SQL: the topics read what is stored
+	for _, statement := range []string{
+		`INSERT INTO compactions (entry_id, session_id, ts, trigger, pre_tokens, post_tokens) VALUES ('cp1', 'sess-1', {ts}, 'auto', 9000, 1000)`,
+		`INSERT INTO session_costs (session_id, ts, cost_usd) VALUES ('sess-1', {ts}, 1.5)`,
+		`INSERT INTO stop_hooks (entry_id, session_id, ts, hook_count, hook_errors) VALUES ('sh1', 'sess-1', {ts}, 1, 0)`,
+		`INSERT INTO stop_hook_runs (entry_id, seq, name, command_bytes, duration_ms) VALUES ('sh1', 0, 'lint.sh', 20, 250)`,
+		`INSERT INTO turn_durations (entry_id, session_id, prompt_id, ts, duration_ms) VALUES ('td1', 'sess-1', 'p1', {ts}, 4000)`,
+		`INSERT INTO events (event_id, event, ts, session_id, source, detail) VALUES ('rs1', 'SessionStart', {ts}, 'sess-1', 'resume', '{}')`,
+		`INSERT INTO events (event_id, event, ts, session_id, detail) VALUES ('nt1', 'Notification', {ts}, 'sess-1', '{"notification_type":"idle_prompt"}')`,
+	} {
+		if _, err := store.DB().ExecContext(ctx, strings.ReplaceAll(statement, "{ts}", fmt.Sprint(ts))); err != nil {
+			t.Fatalf("seed %s: %v", statement, err)
+		}
+	}
 	writeTranscript(t, fixture.seat, "-work", "sess-unrecorded", `{"type":"user"}`)
 }
 
@@ -325,7 +347,7 @@ func TestCallmeterCLIReportJSONOnEveryTopicMatchesTheText(t *testing.T) {
 	}
 }
 
-// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the eight new topics
+// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the fourteen new topics
 // each print the rows the seeded store holds.
 func TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows(t *testing.T) {
 	fixture := newLab(t)
@@ -438,10 +460,22 @@ func TestCallmeterCLIReportWithoutStoreCountsMissedLines(t *testing.T) {
 func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	for _, topic := range []string{"prompts", "outcomes", "events", "agents", "tokens"} {
+	for topic, empty := range map[string]string{
+		"prompts":     "callmeter: no prompts in window",
+		"outcomes":    report.EmptyLine,
+		"events":      "callmeter: no events in window",
+		"agents":      "callmeter: no sub-agents in window",
+		"tokens":      "callmeter: no requests in window",
+		"compactions": "callmeter: no compactions in window",
+		"cost":        "callmeter: no cost-state recorded in window",
+		"hooks":       "callmeter: no Stop hook summaries in window",
+		"turns":       "callmeter: no turn durations in window",
+		"resumes":     "callmeter: no resumes in window",
+		"waiting":     "callmeter: no waits in window",
+	} {
 		code, stdout, stderr := fixture.run("report", topic)
 		lines := strings.Split(strings.TrimSpace(stdout), "\n")
-		if code != 0 || len(lines) < 2 || lines[1] != report.EmptyLine {
+		if code != 0 || len(lines) < 2 || lines[1] != empty {
 			t.Errorf("report %s over an empty window = %d\nstdout:\n%s\nstderr:\n%s", topic, code, stdout, stderr)
 		}
 		code, stdout, stderr = fixture.run("report", topic, "--json")
@@ -451,7 +485,7 @@ func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 	}
 }
 
-func TestCallmeterCLIUnknownTopicListsAllFourteen(t *testing.T) {
+func TestCallmeterCLIUnknownTopicListsAllTwenty(t *testing.T) {
 	fixture := newLab(t)
 	code, stdout, stderr := fixture.run("report", "nope")
 	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "callmeter report: want one topic") {
@@ -475,9 +509,15 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
 	cannot := map[string][]string{
-		"faults":   {"--project does not apply to faults", "--agent-type does not apply to faults"},
-		"sessions": {"--agent-type does not apply to sessions"},
-		"coverage": {"--project does not apply to coverage", "--agent-type does not apply to coverage"},
+		"faults":      {"--project does not apply to faults", "--agent-type does not apply to faults"},
+		"sessions":    {"--agent-type does not apply to sessions"},
+		"coverage":    {"--project does not apply to coverage", "--agent-type does not apply to coverage"},
+		"compactions": {"--agent-type does not apply to compactions"},
+		"cost":        {"--agent-type does not apply to cost"},
+		"hooks":       {"--agent-type does not apply to hooks"},
+		"turns":       {"--agent-type does not apply to turns"},
+		"resumes":     {"--agent-type does not apply to resumes"},
+		"waiting":     {"--agent-type does not apply to waiting"},
 	}
 	for _, topic := range allTopics {
 		code, stdout, stderr := fixture.run("report", topic, "--since", "7d", "--project", "/work", "--session", "sess-1",
@@ -511,7 +551,7 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 
 // TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic: a missed.log present
 // when a report runs is turned into faults first, so the note counts it on all
-// 14 topics, and the file is consumed.
+// 20 topics, and the file is consumed.
 func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
@@ -844,5 +884,104 @@ func TestCallmeterCLIReportNoOlderRulesNoteOverConformingCalls(t *testing.T) {
 		if code != 0 || strings.Contains(stdout, "older privacy rules") {
 			t.Errorf("report %s over conforming calls = %d, want no older-rules note\nstdout:\n%s\nstderr:\n%s", topic, code, stdout, stderr)
 		}
+	}
+}
+
+func TestCallmeterCLIReportNotesAnUnreadableQuietTranscript(t *testing.T) {
+	for _, tc := range []struct {
+		name, label string
+		directory   bool
+	}{
+		{"permission", "permission denied", false},
+		{"other-error", "unreadable", true},
+	} {
+		for _, asJSON := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/json=%t", tc.name, asJSON), func(t *testing.T) {
+				fixture := newLab(t)
+				transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-unreadable.jsonl")
+				fixture.seedQuiet(t, "sess-unreadable", "toolu_unreadable", transcript)
+				// This quiet session has no call in flight: recovery reads its requests once.
+				store, err := callmeter.OpenDB(context.Background(), fixture.storePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, deleteErr := store.DB().Exec("DELETE FROM calls WHERE tool_use_id = ?", "toolu_unreadable")
+				if err := errors.Join(deleteErr, store.Close()); err != nil {
+					t.Fatal(err)
+				}
+				if tc.directory {
+					if err := os.Remove(transcript); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(transcript, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					quiet := time.Now().Add(-2 * time.Hour)
+					if err := os.Chtimes(transcript, quiet, quiet); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if err := os.Chmod(transcript, 0o000); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = os.Chmod(transcript, 0o600) })
+				}
+				want := "1 transcripts could not be read by recovery (first: " + tc.label + ")"
+				args := []string{"report", "sessions"}
+				if asJSON {
+					args = append(args, "--json")
+				}
+				code, stdout, stderr := fixture.run(args...)
+				if code != 0 || !strings.Contains(stderr, "callmeter: recover quiet sessions: skipped: session sess-unreadable: "+transcript) {
+					t.Fatalf("report failed or lost the stderr skip line: code %d", code)
+				}
+				if asJSON {
+					if !slices.Contains(decodeReport(t, stdout).Notes, want) {
+						t.Errorf("JSON lacks recovery note %q", want)
+					}
+				} else if !strings.Contains(stdout, "\nnote: "+want+"\n") {
+					t.Errorf("text lacks recovery note %q", want)
+				}
+			})
+		}
+	}
+}
+
+// A quiet session with a call in flight has its one transcript read for its
+// requests and again for the call's result: both reads fail, and the note
+// still counts one transcript.
+func TestCallmeterCLIReportCountsAnUnreadableTranscriptOnce(t *testing.T) {
+	fixture := newLab(t)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-unreadable.jsonl")
+	fixture.seedQuiet(t, "sess-unreadable", "toolu_unreadable", transcript)
+	if err := os.Chmod(transcript, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(transcript, 0o600) })
+	code, stdout, stderr := fixture.run("report", "sessions")
+	if code != 0 || strings.Count(stderr, "callmeter: recover quiet sessions: skipped: session sess-unreadable: "+transcript) < 2 {
+		t.Fatalf("report = %d, want 0 and the transcript skipped by more than one read", code)
+	}
+	if want := "\nnote: 1 transcripts could not be read by recovery (first: permission denied)\n"; !strings.Contains(stdout, want) {
+		t.Errorf("stdout lacks %q", want)
+	}
+}
+
+func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		skipped []error
+		want    []string
+	}{
+		{"none", nil, nil},
+		{"permission", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrPermission)}, []string{"1 transcripts could not be read by recovery (first: permission denied)"}},
+		{"missing", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrNotExist)}, []string{"1 transcripts could not be read by recovery (first: not found)"}},
+		{"other-first", []error{fmt.Errorf("session demo: /tmp/demo-home/transcript.jsonl: %w", fs.ErrInvalid), fs.ErrPermission}, []string{"2 transcripts could not be read by recovery (first: unreadable)"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := recoveryNotes(tc.skipped); !slices.Equal(got, tc.want) {
+				t.Errorf("notes = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

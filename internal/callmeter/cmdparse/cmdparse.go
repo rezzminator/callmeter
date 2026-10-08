@@ -8,6 +8,7 @@ package cmdparse
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -31,6 +32,8 @@ const (
 	StatusError             = "error"
 	StatusUnparsed          = "unparsed"
 	StatusPythonUnavailable = "python-unavailable"
+	// StatusPythonError means Python ran but its scan failed (exit, output, count, id or missing snippet).
+	StatusPythonError = "python-error"
 	// StatusScriptBody is a part whose program reads its script from a
 	// heredoc in another language (python3 - <<EOF): the shell parsed it, and
 	// the script itself is left unparsed (its body is not stored, or holds an
@@ -70,8 +73,8 @@ const errCodeUnresolved = "code holds an unresolved expansion"
 // shell parser; a literal -c string nested deeper than maxShellDepth is one
 // unparsed part in place of its parse; the globs of one call share
 // maxGlobLookups directory reads and stats, maxGlobEntries directory entries
-// read and maxGlobTime from their first lookup, past any of which a glob
-// stays as written.
+// read, past either of which a glob stays as written. Glob reads and file
+// stats share maxGlobTime spent parsing since their first IO.
 const (
 	maxCommandBytes = 65536
 	maxShellDepth   = 8
@@ -112,7 +115,7 @@ type FileRef struct {
 // nothing nameable (`command -v X`) stays the Program with its own Args and
 // attributes no file. Program is empty for a part that only carries the
 // redirections of a compound command or a bare `> file`. Error holds the
-// parser's message for StatusError, the cause for StatusPythonUnavailable,
+// parser's message for StatusError, the cause for either Python failure status,
 // and any file-stat failure met while attributing (the part stays ok).
 // Conditional is true for a part inside an if/elif/else branch or a case
 // arm, or on the right-hand side of && or ||; an if's own condition is not.
@@ -130,15 +133,17 @@ type Part struct {
 // ParseBatch parses every call and returns its parts keyed by Call.ID. The
 // shell pass runs per call; every Python snippet of the batch goes to py in
 // one Analyze. A nil py is Python3{} (python3 on PATH). When py fails, every
-// Python part of the batch is StatusPythonUnavailable with the cause in
-// Error. The error return is for a malformed batch (duplicate id, relative
-// cwd) or a cancelled ctx, never for a command that did not parse.
+// Python part is StatusPythonUnavailable for ErrNoPython, otherwise
+// StatusPythonError, with the cause in Error. The error return is for a
+// malformed batch (duplicate id, relative cwd) or a cancelled ctx, never for
+// a command that did not parse.
 func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string][]Part, error) {
 	if py == nil {
 		py = Python3{}
 	}
 	out := make(map[string][]Part, len(calls))
 	parsers := make(map[string]*callParser, len(calls))
+	pausedAt := make(map[string]time.Time, len(calls))
 	var snippets []Snippet
 	for _, call := range calls {
 		if _, dup := out[call.ID]; dup {
@@ -148,6 +153,7 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 			return nil, fmt.Errorf("cmdparse: call %q: cwd %q is not absolute", call.ID, call.Cwd)
 		}
 		p := parseCall(call)
+		pausedAt[call.ID] = time.Now()
 		parsers[call.ID] = p
 		out[call.ID] = p.parts
 		snippets = append(snippets, p.snippets...)
@@ -165,16 +171,24 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 	}
 	for _, call := range calls {
 		p := parsers[call.ID]
+		// Time spent on other calls or Python analysis is outside this call's
+		// IO budget. A deadline already spent in the shell phase stays spent.
+		if !p.globDeadline.IsZero() && p.globDeadline.After(pausedAt[call.ID]) {
+			p.globDeadline = p.globDeadline.Add(time.Since(pausedAt[call.ID]))
+		}
 		for snipID, pp := range p.pyParts {
 			part := &p.parts[pp.idx]
 			if err != nil {
-				part.Status = StatusPythonUnavailable
+				part.Status = StatusPythonError
+				if errors.Is(err, ErrNoPython) {
+					part.Status = StatusPythonUnavailable
+				}
 				part.Error = err.Error()
 				continue
 			}
 			res, ok := byID[snipID]
 			if !ok {
-				part.Status = StatusPythonUnavailable
+				part.Status = StatusPythonError
 				part.Error = fmt.Sprintf("cmdparse: %s: %v", snipID, errNoResult)
 				continue
 			}
@@ -220,8 +234,9 @@ type callParser struct {
 	// shellDepth counts the literal -c strings the walk is inside, up to
 	// maxShellDepth; globLookups the directory reads and stats the call's
 	// globs have spent, up to maxGlobLookups; globEntries the directory
-	// entries they read, up to maxGlobEntries; globDeadline maxGlobTime past
-	// their first lookup (zero before it).
+	// entries they read, up to maxGlobEntries. globDeadline bounds the call's
+	// glob reads and file stats together, maxGlobTime past their first IO
+	// (zero before it), paused while the call is not being parsed.
 	shellDepth   int
 	globLookups  int
 	globEntries  int

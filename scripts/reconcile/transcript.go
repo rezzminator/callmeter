@@ -71,21 +71,32 @@ type transcript struct {
 	assistants           int // non-synthetic assistant lines
 	toolUses             map[string]bool
 	endTurns             map[string]bool // message ids that ended with end_turn
+	nullEnds             map[string]bool // message ids whose null stop_reason a later prompt closed
 	entrypoints          map[string]bool
 	lastStop             string // the latest message's stop_reason, "" while it has none
 	lastMsg              string // the latest message's id
 	lastAssistant        int64  // the latest assistant line (unix ms)
 	lastTS               int64
-	prompt               string // the latest user line's promptId, whatever the window
-	endHook              bool   // any line is a SessionEnd hook attachment, in or out of the window
+	prompt               string  // the latest user line's promptId, whatever the window
+	endHook              bool    // any line is a SessionEnd hook attachment, in or out of the window
+	reloads              []int64 // each typed /reload-plugins (unix ms), in or out of the window
 	preLines             int
 	preAssistants        int
 	preToolUses          map[string]bool
+	preByMsg             map[string]*preCount // pre-row assistant lines and tool uses, by message id
+	earlyToolUses        map[string]bool      // an agent transcript's tool uses before --since
+	failedDurations      int                  // turn_duration lines ending a turn an API error ended
+	afterAPIError        bool                 // the latest assistant line is an API error
+	blocks               []int64              // system lines with preventContinuation (unix ms)
 }
+
+// preCount is one message's lines before its session's first store row.
+type preCount struct{ lines, tools int }
 
 // world is everything the transcripts say, inside the window.
 type world struct {
 	since, until int64
+	notices      map[string][]int64 // agent id -> ts of each task-notification naming it, main transcripts only
 	taskStops    map[string][]int64 // agent id -> each TaskStop naming it (unix ms)
 	writes       map[string]int64   // session -> its newest transcript file's mtime (unix ms)
 	uses         map[string]*use
@@ -104,7 +115,7 @@ func newWorld(since, until int64) *world {
 		uses: map[string]*use{}, results: map[string]result{}, messages: map[string]*message{},
 		mains: map[string]*transcript{}, agents: map[string]*transcript{}, subagents: map[string][]*transcript{},
 		read: map[string]bool{}, from: map[string]int64{},
-		taskStops: map[string][]int64{}, writes: map[string]int64{},
+		notices: map[string][]int64{}, taskStops: map[string][]int64{}, writes: map[string]int64{},
 	}
 }
 
@@ -198,20 +209,32 @@ func (w *world) readSession(session, path string) error {
 }
 
 type line struct {
-	Type          string `json:"type"`
-	Subtype       string `json:"subtype"`
-	Timestamp     string `json:"timestamp"`
-	PromptID      string `json:"promptId"`
-	IsMeta        bool   `json:"isMeta"`
-	IsCompactSumm bool   `json:"isCompactSummary"`
-	IsAPIError    bool   `json:"isApiErrorMessage"`
-	Entrypoint    string `json:"entrypoint"`
-	Origin        *struct {
+	Type       string `json:"type"`
+	Subtype    string `json:"subtype"`
+	Timestamp  string `json:"timestamp"`
+	PromptID   string `json:"promptId"`
+	IsMeta     bool   `json:"isMeta"`
+	TurnOrigin string `json:"turnOrigin"`
+	// QueueTranscriptOnly: a queued line written to the transcript and never
+	// submitted (a pending task notification on resume); no UserPromptSubmit.
+	QueueTranscriptOnly bool `json:"queueTranscriptOnly"`
+	// PreventContinuation: a system warning that a hook stopped the prompt.
+	PreventContinuation bool   `json:"preventContinuation"`
+	IsCompactSumm       bool   `json:"isCompactSummary"`
+	IsAPIError          bool   `json:"isApiErrorMessage"`
+	Entrypoint          string `json:"entrypoint"`
+	Origin              *struct {
 		Kind string `json:"kind"`
 	} `json:"origin"`
 	Attachment *struct {
 		Type      string `json:"type"`
 		HookEvent string `json:"hookEvent"`
+		Origin    *struct {
+			Kind string `json:"kind"`
+		} `json:"origin"`
+		// Prompt is a string, or a content-block array when the queued prompt
+		// carries an image (promptText).
+		Prompt json.RawMessage `json:"prompt"`
 	} `json:"attachment"`
 	Message *struct {
 		ID         string          `json:"id"`
@@ -258,8 +281,8 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	w.writes[session] = max(w.writes[session], info.ModTime().UnixMilli())
 	t := &transcript{
 		path: real, session: session, agent: agent,
-		prompts: map[string]bool{}, toolUses: map[string]bool{}, endTurns: map[string]bool{},
-		entrypoints: map[string]bool{}, preToolUses: map[string]bool{},
+		prompts: map[string]bool{}, toolUses: map[string]bool{}, endTurns: map[string]bool{}, nullEnds: map[string]bool{},
+		entrypoints: map[string]bool{}, preToolUses: map[string]bool{}, preByMsg: map[string]*preCount{}, earlyToolUses: map[string]bool{},
 	}
 	lower := w.lower(session)
 	sc := bufio.NewScanner(f)
@@ -304,6 +327,20 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 				w.results[b.ToolUseID] = result{ts: ms, isError: b.IsError}
 			}
 		}
+		// A typed /reload-plugins counts whenever it landed: the check on it
+		// compares it with the session's first store row.
+		if isReloadPlugins(&l) {
+			t.reloads = append(t.reloads, ms)
+		}
+		// ReadAgentTotals counts every tool use of the whole agent transcript,
+		// one dated before --since too.
+		if t.agent != "" && ms < w.since && l.Type == "assistant" {
+			for _, b := range blocks {
+				if b.Type == "tool_use" && b.ID != "" {
+					t.earlyToolUses[b.ID] = true
+				}
+			}
+		}
 		if !w.inWindow(ms) {
 			continue
 		}
@@ -311,8 +348,21 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 			t.preLines++
 			if l.Type == "assistant" {
 				t.preAssistants++
+				id := ""
+				if l.Message != nil {
+					id = l.Message.ID
+				}
+				c := t.preByMsg[id]
+				if c == nil {
+					c = &preCount{}
+					t.preByMsg[id] = c
+				}
+				c.lines++
 				for _, b := range blocks {
 					if b.Type == "tool_use" {
+						if !t.preToolUses[b.ID] {
+							c.tools++
+						}
 						t.preToolUses[b.ID] = true
 					}
 				}
@@ -328,26 +378,57 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 		}
 		switch l.Type {
 		case "assistant":
+			t.afterAPIError = l.IsAPIError
 			if err := w.assistant(t, &l, blocks, ms); err != nil {
 				return nil, fmt.Errorf("transcript %s line %d: %w", real, n, err)
 			}
 		case "user":
-			if (l.IsMeta && !peerMessage(&l)) || l.IsCompactSumm || l.Message == nil {
+			if t.agent == "" {
+				w.notice(&l, ms)
+			}
+			// A queued line written transcript-only was never submitted: it
+			// fires no UserPromptSubmit and starts no turn.
+			if l.QueueTranscriptOnly {
+				continue
+			}
+			// A sub-agent woken by a task notification gets the wake as a meta
+			// user line: Claude Code fired SubagentStop for the turn before it,
+			// whose final message may keep a null stop_reason.
+			if t.agent != "" && l.IsMeta && taskNotification(&l) && t.lastMsg != "" && t.lastStop == "" {
+				t.nullEnds[t.lastMsg] = true
+			}
+			if (l.IsMeta && !peerMessage(&l) && !scheduledPrompt(&l)) || l.IsCompactSumm || l.Message == nil {
 				continue
 			}
 			if l.PromptID != "" && isPrompt(l.Message.Content, blocks) {
 				t.prompts[l.PromptID] = true
+				t.afterAPIError = false
+				// The hook's SubagentStop ends the turn whatever the stop_reason.
+				if t.lastMsg != "" && t.lastStop == "" {
+					t.nullEnds[t.lastMsg] = true
+				}
 			}
 		case "attachment":
+			if t.agent == "" {
+				w.notice(&l, ms)
+			}
 			if l.Attachment != nil && l.Attachment.Type == "queued_command" {
 				t.queued++
 			}
 		case "system":
+			if l.PreventContinuation {
+				t.blocks = append(t.blocks, ms)
+			}
 			switch l.Subtype {
 			case "compact_boundary":
 				t.compacts++
 			case "turn_duration":
 				t.turnDurations++
+				// A turn an API error ended fires StopFailure, not Stop.
+				if t.afterAPIError {
+					t.failedDurations++
+					t.afterAPIError = false
+				}
 			}
 		}
 	}
@@ -357,16 +438,119 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	return t, nil
 }
 
+// notice collects only the agent id and timestamp of a main-transcript notice.
+func (w *world) notice(l *line, ms int64) {
+	var body string
+	switch l.Type {
+	case "user":
+		if l.Origin == nil || l.Origin.Kind != "task-notification" || l.Message == nil {
+			return
+		}
+		body = promptText(l.Message.Content)
+	case "attachment":
+		a := l.Attachment
+		if a == nil || a.Type != "queued_command" || a.Origin == nil || a.Origin.Kind != "task-notification" {
+			return
+		}
+		body = promptText(a.Prompt)
+	}
+	if agent, ok := noticeAgent(body); ok {
+		w.notices[agent] = append(w.notices[agent], ms)
+	}
+}
+
+// promptText is a prompt's text: a string as it is, a content-block array's
+// "text" blocks joined (a queued prompt carrying an image), any other shape "".
+func promptText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var joined strings.Builder
+	for _, b := range blocks {
+		if b.Type == "text" {
+			joined.WriteString(b.Text)
+		}
+	}
+	return joined.String()
+}
+
+// noticeAgent reads only the task id and the presence of a non-empty status.
+func noticeAgent(body string) (agentID string, ok bool) {
+	_, task, found := strings.Cut(body, "<task-id>")
+	if !found {
+		return "", false
+	}
+	agentID, _, found = strings.Cut(task, "</task-id>")
+	if !found || agentID == "" {
+		return "", false
+	}
+	_, status, found := strings.Cut(body, "<status>")
+	if !found {
+		return "", false
+	}
+	status, _, found = strings.Cut(status, "</status>")
+	if !found || status == "" {
+		return "", false
+	}
+	return agentID, true
+}
+
 // peerMessage reports whether a user line is a message another agent sent the
 // chat (SendMessage to the main chat): Claude Code writes it isMeta, with
 // origin.kind "peer" and a promptId, and fires UserPromptSubmit for it, so it
-// is a model-bound prompt like a typed one. Every other isMeta line (a
+// is a model-bound prompt like a typed one. A plain isMeta line (a
 // system-reminder, a local-command caveat) fires none.
 func peerMessage(l *line) bool { return l.Origin != nil && l.Origin.Kind == "peer" }
+
+// taskNotification reports whether a user line is a task notification's
+// delivery (origin.kind "task-notification").
+func taskNotification(l *line) bool { return l.Origin != nil && l.Origin.Kind == "task-notification" }
+
+// scheduledPrompt reports whether a scheduled task's prompt is written isMeta
+// with turnOrigin "scheduled" and fires UserPromptSubmit.
+func scheduledPrompt(l *line) bool { return l.TurnOrigin == "scheduled" }
 
 // localCommand marks the lines of a local slash command (`/model`, `/effort`):
 // they carry a promptId but never reach the model, so no UserPromptSubmit.
 var localCommand = []string{"<command-name>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"}
+
+// reloadPlugins opens a typed /reload-plugins as Claude Code writes it (2.1.283
+// to 2.1.287): a user line whose string content starts with this tag, then a
+// system local_command line. The reload loads the hooks into the running chat
+// and fires no SessionStart.
+const reloadPlugins = "<command-name>/reload-plugins</command-name>"
+
+// isReloadPlugins reports whether a line is a typed /reload-plugins. The text
+// is inspected, never kept.
+func isReloadPlugins(l *line) bool {
+	if l.Type != "user" || l.Message == nil || len(l.Message.Content) == 0 || l.Message.Content[0] != '"' {
+		return false
+	}
+	var text string
+	if err := json.Unmarshal(l.Message.Content, &text); err != nil {
+		return false
+	}
+	return strings.HasPrefix(text, reloadPlugins)
+}
+
+// reloadedBy is the latest typed /reload-plugins at or before ts, 0 when none.
+func (t *transcript) reloadedBy(ts int64) int64 {
+	var at int64
+	for _, r := range t.reloads {
+		if r <= ts {
+			at = max(at, r)
+		}
+	}
+	return at
+}
 
 // isPrompt reports whether a user line is a prompt bound for the model: not a
 // tool result, not a local command. The text is inspected, never kept.

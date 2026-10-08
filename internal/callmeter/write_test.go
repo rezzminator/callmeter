@@ -2,9 +2,15 @@ package callmeter
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // postToolUse and batch are the two events that write one call: the hook's
@@ -92,6 +98,98 @@ func TestFillEmptyNeverOverwrites(t *testing.T) {
 	}
 	if inserted := row(t, store, "calls", "tool_use_id = ?", "toolu_2"); inserted == nil || inserted["tool"] != "Grep" {
 		t.Errorf("FillEmpty did not insert the missing row: %v", inserted)
+	}
+}
+
+func TestUpsertCallChangingCwdDropsItsParts(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		initial Call
+		change  Call
+		mode    Mode
+		want    int
+	}{
+		{"changed cwd", postToolUse(), Call{Cwd: Ptr("/tmp/demo-proj/start")}, Overwrite, 0},
+		{"changed input", postToolUse(), Call{Input: Ptr(`{"command":"true"}`)}, Overwrite, 0},
+		{"same cwd and input", postToolUse(), Call{Cwd: postToolUse().Cwd, Input: postToolUse().Input}, Overwrite, 1},
+		{"fill nothing", postToolUse(), Call{Cwd: Ptr("/tmp/demo-proj/start"), Input: Ptr(`{"command":"true"}`)}, FillEmpty, 1},
+		{"fill cwd", Call{ToolUseID: "toolu_1"}, Call{Cwd: Ptr("/tmp/demo-proj/start")}, FillEmpty, 0},
+		{"fill input", Call{ToolUseID: "toolu_1"}, Call{Input: Ptr(`{"command":"true"}`)}, FillEmpty, 0},
+		{"unrelated update", postToolUse(), Call{BytesDelivered: Ptr(int64(42))}, Overwrite, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			if err := store.UpsertCall(ctx, tc.initial, Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			parts := []CommandPart{{Seq: 0, Lang: "sh", Program: "cat", ParseStatus: "ok"}}
+			if err := store.ReplaceCommandParts(ctx, "toolu_1", parts); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AddFault(ctx, Fault{ToolUseID: "toolu_1", Stage: StageParse, Error: "old parse"}); err != nil {
+				t.Fatal(err)
+			}
+			tc.change.ToolUseID = "toolu_1"
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				if err := tx.UpsertCall(ctx, tc.change, tc.mode); err != nil {
+					return err
+				}
+				var got int
+				if err := tx.tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM command_parts WHERE tool_use_id = ?", "toolu_1").Scan(&got); err != nil {
+					return err
+				}
+				if got != tc.want {
+					t.Errorf("parts inside upsert transaction = %d, want %d", got, tc.want)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := count(t, store, "command_parts"); got != tc.want {
+				t.Errorf("parts after upsert = %d, want %d", got, tc.want)
+			}
+			if got := count(t, store, "faults"); got != 1 {
+				t.Errorf("parse faults = %d, want the old fault kept until re-parse", got)
+			}
+		})
+	}
+}
+
+func TestUpsertCallInvalidationErrorsRollBack(t *testing.T) {
+	for _, tc := range []struct {
+		name, setup, want string
+	}{
+		{"read", "ALTER TABLE calls RENAME TO hidden_calls", "read parse inputs"},
+		{"upsert", `CREATE TRIGGER refuse_call BEFORE UPDATE ON calls BEGIN SELECT RAISE(ABORT, 'test upsert failure'); END`, "test upsert failure"},
+		{"delete", `CREATE TRIGGER refuse_parts BEFORE DELETE ON command_parts BEGIN SELECT RAISE(ABORT, 'test invalidation failure'); END`, "invalidate command parts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			original := postToolUse()
+			if err := store.UpsertCall(ctx, original, Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.ReplaceCommandParts(ctx, original.ToolUseID, []CommandPart{{Seq: 0, Lang: "sh", ParseStatus: "ok"}}); err != nil {
+				t.Fatal(err)
+			}
+			err := store.Batch(ctx, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, tc.setup); err != nil {
+					return err
+				}
+				return tx.UpsertCall(ctx, Call{ToolUseID: original.ToolUseID, Cwd: Ptr("/tmp/demo-proj/start")}, Overwrite)
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("upsert error = %v, want %s", err, tc.want)
+			}
+			if got := row(t, store, "calls", "tool_use_id = ?", original.ToolUseID)["cwd"]; got != *original.Cwd {
+				t.Error("failed invalidation changed the stored cwd")
+			}
+			if got := count(t, store, "command_parts"); got != 1 {
+				t.Errorf("parts after rollback = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -576,6 +674,520 @@ func TestCallTSKeepsTheEarliest(t *testing.T) {
 			if got := row(t, store, "calls", "tool_use_id = ?", "toolu_1")["ts"]; got != int64(1000) {
 				t.Errorf("mode %d, %s: ts = %v, want 1000", mode, name, got)
 			}
+		}
+	}
+}
+
+func TestUnfinishedCallsSkipsALandedEdit(t *testing.T) {
+	ctx := context.Background()
+	for _, response := range noRealOutputResponses(t) {
+		t.Run(response.name, func(t *testing.T) {
+			store := openTestStore(t)
+			real, err := RealBytes(response.tool, response.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, call := range []Call{
+				{ToolUseID: "landed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: real, Source: Ptr(SourceHook)},
+				{ToolUseID: "rebuilt", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: real, BytesDelivered: Ptr(int64(7)), Source: Ptr(SourceTranscript)},
+				{ToolUseID: "failed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(true)},
+				{ToolUseID: "not-landed", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main")},
+				{ToolUseID: "old", SessionID: Ptr("sess-1"), Tool: Ptr(response.tool), RequestID: Ptr("msg_main"), Failed: Ptr(false), BytesReal: Ptr(int64(42))},
+			} {
+				if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls, err := store.UnfinishedCalls(ctx, "sess-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ids []string
+			for _, call := range calls {
+				ids = append(ids, call.ToolUseID)
+			}
+			if !reflect.DeepEqual(ids, []string{"not-landed"}) {
+				t.Errorf("UnfinishedCalls ids = %v, want only not-landed", ids)
+			}
+			var open int
+			if err := store.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM calls c WHERE "+callOpen("c")).Scan(&open); err != nil {
+				t.Fatal(err)
+			}
+			if open != 1 {
+				t.Errorf("callOpen count = %d, want only not-landed", open)
+			}
+			if got := row(t, store, "calls", "tool_use_id = 'old'")["bytes_real"]; got != int64(42) {
+				t.Errorf("old bytes_real = %v, want 42", got)
+			}
+		})
+	}
+}
+
+// TestSettleRequestLeavesAnotherOwnersRow: a forked session starts with a copy
+// of its parent's history under the same message ids, one of them written with
+// all-zero usage. The fork's sweep (SettleRequest, Overwrite) must leave the
+// parent's row as it stands, whether the copy is older than the fork's first
+// run (the UPDATE) or not (the upsert); so must a sub-agent's sweep over a
+// main-chat row. The owner's own sweep still overwrites.
+func TestSettleRequestLeavesAnotherOwnersRow(t *testing.T) {
+	ctx := context.Background()
+	parent := func() Request {
+		return Request{
+			RequestID: "msg_m", SessionID: Ptr("sess-a"), TS: Ptr(int64(100)), Model: Ptr("claude-opus-4-1"),
+			StopReason: Ptr("tool_use"), InputTokens: Ptr(int64(2)), CacheReadTokens: Ptr(int64(331235)),
+			CacheCreationTokens: Ptr(int64(344)), ContextTokens: Ptr(int64(331581)), OutputTokens: Ptr(int64(583)),
+		}
+	}
+	zeroed := func(session string, agent *string) Request {
+		return Request{
+			RequestID: "msg_m", SessionID: Ptr(session), AgentID: agent, TS: Ptr(int64(100)),
+			Model: Ptr("claude-opus-4-1"), StopReason: Ptr("tool_use"), Pending: Ptr(false), Source: Ptr(SourceHook),
+			InputTokens: Ptr(int64(0)), CacheReadTokens: Ptr(int64(0)), CacheCreationTokens: Ptr(int64(0)),
+			ContextTokens: Ptr(int64(0)), OutputTokens: Ptr(int64(0)),
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		sweep Request
+		since int64
+		want  int64 // output_tokens after the sweep
+	}{
+		{"fork older than its first run", zeroed("sess-b", nil), 200, 583},
+		{"fork at or after its first run", zeroed("sess-b", nil), 50, 583},
+		{"sub-agent over a main-chat row", zeroed("sess-a", Ptr("agent-1")), 200, 583},
+		{"owner older than its first run", zeroed("sess-a", nil), 200, 0},
+		{"owner at or after its first run", zeroed("sess-a", nil), 50, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStore(t)
+			if err := store.UpsertRequest(ctx, parent(), Overwrite); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				return tx.SettleRequest(ctx, tc.sweep, nil, tc.since)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got := row(t, store, "requests", "request_id = ?", "msg_m")
+			if got["output_tokens"] != tc.want || got["session_id"] != "sess-a" || got["agent_id"] != nil {
+				t.Errorf("msg_m output %v session %v agent %v, want %d sess-a <nil>",
+					got["output_tokens"], got["session_id"], got["agent_id"], tc.want)
+			}
+			if tc.want != 0 && (got["input_tokens"] != int64(2) || got["cache_read_tokens"] != int64(331235) ||
+				got["cache_creation_tokens"] != int64(344)) {
+				t.Errorf("msg_m tokens %v/%v/%v, want 2/331235/344 unchanged",
+					got["input_tokens"], got["cache_read_tokens"], got["cache_creation_tokens"])
+			}
+		})
+	}
+}
+
+// TestSettleSweepLeavesTheStoreToConcurrentHooks reproduces the Stop hook's
+// request sweep over a store of many calls: one transaction settles every
+// transcript request (SettleRequest, each recounting its calls), while async
+// hooks of other chats write. Without an index on calls(request_id) each
+// recount scans calls, the sweep holds the write lock past the writers' wait,
+// and they drop their events busy.
+func TestSettleSweepLeavesTheStoreToConcurrentHooks(t *testing.T) {
+	const (
+		requests      = 800
+		callsPerReq   = 1
+		storedCalls   = 30000 // calls rows of the session, most of them no request's
+		writers       = 8
+		writerWait    = time.Second
+		session       = "sess-sweep"
+		since         = int64(1000)
+		sweepSettleTS = int64(2000)
+	)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	store := openStoreAt(t, path)
+
+	// Seed in one transaction: storedCalls calls of the session, none pointing
+	// at a request yet; the first callsPerReq of each request's are its own.
+	seed, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin seed: %v", err)
+	}
+	insert, err := seed.PrepareContext(ctx, "INSERT INTO calls (tool_use_id, session_id, ts, tool, source) VALUES (?, ?, ?, 'Bash', ?)")
+	if err != nil {
+		t.Fatalf("prepare seed: %v", err)
+	}
+	callIDs := make([][]string, requests)
+	for n := 0; n < storedCalls; n++ {
+		id := fmt.Sprintf("toolu_%d", n)
+		if r := n / callsPerReq; r < requests {
+			callIDs[r] = append(callIDs[r], id)
+		}
+		if _, err := insert.ExecContext(ctx, id, session, sweepSettleTS, SourceHook); err != nil {
+			t.Fatalf("seed call %s: %v", id, err)
+		}
+	}
+	if err := insert.Close(); err != nil {
+		t.Fatalf("close seed statement: %v", err)
+	}
+	if err := seed.Commit(); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	handles := make([]*Store, writers)
+	for i := range handles {
+		handle, err := OpenDBWaiting(ctx, path, writerWait)
+		if err != nil {
+			t.Fatalf("open writer %d: %v", i, err)
+		}
+		handles[i] = handle
+	}
+
+	start := make(chan struct{})
+	waits := make([]time.Duration, writers)
+	errs := make([]error, writers)
+	var group sync.WaitGroup
+	for i := range handles {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			begun := time.Now()
+			errs[i] = handles[i].UpsertCall(ctx, Call{
+				ToolUseID: fmt.Sprintf("toolu_writer_%d", i),
+				SessionID: Ptr("sess-other"),
+				TS:        Ptr(sweepSettleTS),
+				Tool:      Ptr("Read"),
+				Source:    Ptr(SourceHook),
+			}, Overwrite)
+			waits[i] = time.Since(begun)
+		}()
+	}
+
+	var heldAt time.Time
+	sweepErr := store.BatchHeld(ctx, func() {
+		heldAt = time.Now()
+		close(start)
+	}, func(tx *Tx) error {
+		for r := 0; r < requests; r++ {
+			err := tx.SettleRequest(ctx, Request{
+				RequestID: fmt.Sprintf("msg_%d", r),
+				SessionID: Ptr(session),
+				Pending:   Ptr(false),
+				Source:    Ptr(SourceHook),
+				TS:        Ptr(sweepSettleTS),
+			}, callIDs[r], since)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	hold := time.Since(heldAt)
+	group.Wait()
+	for i, handle := range handles {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close writer %d: %v", i, err)
+		}
+	}
+
+	t.Logf("the sweep held the write lock %v (writers wait %v)", hold, writerWait)
+	if sweepErr != nil {
+		t.Fatalf("the sweep: %v", sweepErr)
+	}
+	for i, err := range errs {
+		t.Logf("writer %d waited %v", i, waits[i])
+		switch {
+		case err == nil:
+		case IsBusy(err):
+			t.Errorf("writer %d dropped its event, SQLITE_BUSY after %v: %v", i, waits[i], err)
+		default:
+			t.Errorf("writer %d: %v", i, err)
+		}
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_0"); got == nil || got["calls"] != int64(callsPerReq) {
+		t.Errorf("request msg_0 = %v, want %d calls", got, callsPerReq)
+	}
+}
+
+// openIncompleteStore opens a store whose schema the open could not complete:
+// a version-1 store opened while another connection holds the write lock.
+func openIncompleteStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state", "callmeter.db")
+	makeVersionOneStore(t, path)
+	holderDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := holderDB.Close(); err != nil {
+			t.Errorf("close holder: %v", err)
+		}
+	})
+	holder, err := holderDB.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := holder.Close(); err != nil {
+			t.Errorf("close holder connection: %v", err)
+		}
+	})
+	if _, err := holder.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenDBWaiting(ctx, path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("OpenDBWaiting while the write lock is held: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if _, err := holder.ExecContext(ctx, "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if store.SchemaComplete() {
+		t.Fatal("SchemaComplete = true although the open could not write")
+	}
+	return store
+}
+
+func putMarks(t *testing.T, store *Store, agentID string, now int64, marks TranscriptMarks) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		return tx.PutMarks(ctx, "sess-demo", agentID, "/tmp/demo-home/.claude", now, marks)
+	}); err != nil {
+		t.Fatalf("PutMarks: %v", err)
+	}
+}
+
+func TestPutMarksWritesTheRowsOnce(t *testing.T) {
+	store := openTestStore(t)
+	marks := readMarksFixture(t).Marks
+	putMarks(t, store, "", 5000, marks)
+	putMarks(t, store, "", 5000, marks)
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 1, "session_costs": 1} {
+		if got := count(t, store, table); got != want {
+			t.Errorf("%s rows after a write and an identical write = %d, want %d", table, got, want)
+		}
+	}
+	for table, want := range map[string]map[string]any{
+		"compactions": {
+			"entry_id": "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7", "session_id": "sess-demo", "agent_id": nil, "ts": int64(1791113158553),
+			"trigger": "auto", "pre_tokens": int64(333677), "post_tokens": int64(18677), "cumulative_dropped_tokens": int64(315000),
+			"duration_ms": int64(72119), "seat_dir": "/tmp/demo-home/.claude",
+		},
+		"stop_hooks": {
+			"entry_id": "8b7a2d0e-b849-4d10-a191-b1cd766d87f3", "session_id": "sess-demo", "agent_id": nil, "prompt_id": marksPrompt1,
+			"ts": int64(1791065682790), "hook_count": int64(4), "hook_errors": int64(0), "seat_dir": "/tmp/demo-home/.claude",
+		},
+		"turn_durations": {
+			"entry_id": "463cc8cc-6d27-4c84-b49d-06fa061a443b", "session_id": "sess-demo", "agent_id": nil, "prompt_id": marksPrompt1,
+			"ts": int64(1791065682814), "duration_ms": int64(81557), "message_count": int64(60), "background_agents": int64(4),
+			"seat_dir": "/tmp/demo-home/.claude",
+		},
+		"session_costs": {
+			"session_id": "sess-demo", "ts": int64(5000), "started": int64(1791065248155), "cost_usd": 59.30682170000001,
+			"api_ms": int64(9190688), "api_no_retry_ms": int64(9181361), "tool_ms": int64(3682088), "wall_ms": int64(53062358),
+			"model_costs": `{"claude-opus-5-5":45.53485040000004,"claude-sonnet-5-5":13.771971300000002}`, "seat_dir": "/tmp/demo-home/.claude",
+		},
+	} {
+		got := row(t, store, table, "1 = 1")
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s row = %v\nwant %v", table, got, want)
+		}
+	}
+	runs := row(t, store, "stop_hook_runs", "entry_id = ? AND seq = 4", "8b7a2d0e-b849-4d10-a191-b1cd766d87f3")
+	if runs["name"] != "callmeter" || runs["duration_ms"] != nil || runs["ts"] != int64(1791065682790) ||
+		runs["command_bytes"] != int64(len("${CLAUDE_PLUGIN_ROOT}/libexec/callmeter hook")) {
+		t.Errorf("async hook run = %v, want callmeter, NULL duration, the summary's ts", runs)
+	}
+	// The cost-state is cumulative: a later one replaces the stored one, an
+	// earlier one that lands after it (async hooks arrive in any order) does not.
+	later := TranscriptMarks{Cost: &CostState{CostUSD: Ptr(60.5), WallMS: Ptr(int64(53062359))}}
+	putMarks(t, store, "", 7000, later)
+	if got := row(t, store, "session_costs", "session_id = ?", "sess-demo"); got["cost_usd"] != 60.5 || got["ts"] != int64(7000) ||
+		got["wall_ms"] != int64(53062359) || got["started"] != nil || got["model_costs"] != nil {
+		t.Errorf("session_costs after a later cost-state = %v", got)
+	}
+	putMarks(t, store, "", 9000, marks)
+	if got := row(t, store, "session_costs", "session_id = ?", "sess-demo"); got["cost_usd"] != 60.5 || got["wall_ms"] != int64(53062359) || got["ts"] != int64(7000) {
+		t.Errorf("session_costs after an earlier cost-state landed late = %v, want the later state kept, ts 7000", got)
+	}
+}
+
+func TestPutMarksOfAnAgentKeepsItsIdAndNoCost(t *testing.T) {
+	store := openTestStore(t)
+	putMarks(t, store, "agent-1", 5000, readMarksFixture(t).Marks)
+	if got := count(t, store, "session_costs"); got != 0 {
+		t.Errorf("session_costs rows after an agent's marks = %d, want 0", got)
+	}
+	if got := row(t, store, "turn_durations", "1 = 1"); got["agent_id"] != "agent-1" {
+		t.Errorf("turn_durations.agent_id = %v, want agent-1", got["agent_id"])
+	}
+	if got := row(t, store, "compactions", "1 = 1"); got["agent_id"] != "agent-1" {
+		t.Errorf("compactions.agent_id = %v, want agent-1", got["agent_id"])
+	}
+}
+
+func TestPutMarksIsANoOpOnAnIncompleteStore(t *testing.T) {
+	ctx := context.Background()
+	store := openIncompleteStore(t)
+	putMarks(t, store, "", 5000, readMarksFixture(t).Marks)
+	known, err := store.KnownMarks(ctx, "sess-demo")
+	if err != nil || len(known) != 0 {
+		t.Errorf("KnownMarks on an incomplete store = %v, %v; want empty, nil", known, err)
+	}
+	var tables int
+	if err := store.DB().QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('compactions','session_costs','stop_hooks','stop_hook_runs','turn_durations')").Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Errorf("an incomplete store holds %d mark tables after PutMarks, want none", tables)
+	}
+	// The request still lands, without the column it cannot hold.
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		return tx.SettleRequest(ctx, Request{
+			RequestID: "msg_think", SessionID: Ptr("sess-demo"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(7)),
+		}, nil, 0)
+	}); err != nil {
+		t.Fatalf("SettleRequest with thinking tokens on an incomplete store: %v", err)
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_think"); got["output_tokens"] != int64(50) {
+		t.Errorf("request row = %v, want output_tokens 50", got)
+	}
+}
+
+func TestSettleRequestStoresThinkingTokens(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.Batch(ctx, func(tx *Tx) error {
+		for _, r := range []Request{
+			{RequestID: "msg_think", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(0))},
+			{RequestID: "msg_plain", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50))},
+			{RequestID: "msg_more", SessionID: Ptr("sess-1"), TS: Ptr(int64(9)), OutputTokens: Ptr(int64(50)), ThinkingTokens: Ptr(int64(31))},
+		} {
+			if err := tx.SettleRequest(ctx, r, nil, 0); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]any{"msg_think": int64(0), "msg_plain": nil, "msg_more": int64(31)} {
+		if got := row(t, store, "requests", "request_id = ?", id)["thinking_tokens"]; got != want {
+			t.Errorf("%s.thinking_tokens = %v, want %v", id, got, want)
+		}
+	}
+}
+
+// TestResolveRequestCarriesThinkingTokens: the merge of a provisional request
+// into its message row keeps the stored thinking count and fills it where NULL.
+func TestResolveRequestCarriesThinkingTokens(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_1"), SessionID: Ptr("sess-1"), TS: Ptr(int64(5)),
+		Pending: Ptr(true), ThinkingTokens: Ptr(int64(12))}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResolveRequest(ctx, ProvisionalKey("toolu_1"), Request{RequestID: "msg_1", Model: Ptr("m")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := row(t, store, "requests", "request_id = ?", "msg_1")["thinking_tokens"]; got != int64(12) {
+		t.Errorf("resolved thinking_tokens = %v, want 12", got)
+	}
+}
+
+func TestKnownMarksAndSince(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	marks := readMarksFixture(t).Marks
+	putMarks(t, store, "", 5000, marks)
+	known, err := store.KnownMarks(ctx, "sess-demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7": true, "8b7a2d0e-b849-4d10-a191-b1cd766d87f3": true, "463cc8cc-6d27-4c84-b49d-06fa061a443b": true,
+	}
+	if !reflect.DeepEqual(known, want) {
+		t.Errorf("KnownMarks = %v, want %v", known, want)
+	}
+	if other, err := store.KnownMarks(ctx, "sess-other"); err != nil || len(other) != 0 {
+		t.Errorf("KnownMarks of another session = %v, %v; want none", other, err)
+	}
+	left := marks.Since(0, known)
+	if len(left.Compactions)+len(left.StopHooks)+len(left.TurnDurations) != 0 || left.Cost != marks.Cost {
+		t.Errorf("Since with every id known = %+v, want only the cost", left)
+	}
+	// Older than since is not back-filled: the stop hook and turn duration
+	// (1791065682xxx) go, the compaction (1791113158553) stays.
+	young := marks.Since(1791100000000, nil)
+	if len(young.Compactions) != 1 || len(young.StopHooks) != 0 || len(young.TurnDurations) != 0 || young.Cost == nil {
+		t.Errorf("Since(1791100000000) = %+v", young)
+	}
+}
+
+// TestPutMarksStoresNoCommandText: a hook's command and arguments never reach
+// the store: only its derived name and its length.
+func TestPutMarksStoresNoCommandText(t *testing.T) {
+	store := openTestStore(t)
+	read, err := readMarksVariant(t,
+		"$CLAUDE_PROJECT_DIR/.claude/scripts/notify.sh stop", "/srv/PRIVATEPATH/hook.sh --token=PRIVATEARG",
+		"Conversation compacted", "PRIVATECONTENT",
+		"Summarize the notes.", "PRIVATEPROMPT",
+		"Done.", "PRIVATEREPLY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	putMarks(t, store, "", 5000, read.Marks)
+	runs := row(t, store, "stop_hook_runs", "seq = 1")
+	if runs["name"] != "hook.sh" || runs["command_bytes"] != int64(len("/srv/PRIVATEPATH/hook.sh --token=PRIVATEARG")) {
+		t.Fatalf("hook run = %v, want name hook.sh and the command's length", runs)
+	}
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for tables.Next() {
+		var name string
+		if err := tables.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := errors.Join(tables.Err(), tables.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		rows, err := store.DB().Query("SELECT * FROM " + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			values := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			for i, v := range values {
+				if text, ok := v.(string); ok && strings.Contains(text, "PRIVATE") {
+					t.Errorf("%s.%s holds %q", name, columns[i], text)
+				}
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

@@ -95,7 +95,83 @@ func TestContextEmptyWindow(t *testing.T) {
 		t.Fatalf("Context: %v", err)
 	}
 	lines := strings.Split(strings.TrimSpace(render(t, table)), "\n")
-	if len(lines) != 2 || lines[1] != EmptyLine {
-		t.Errorf("empty report = %q, want heading plus %q", lines, EmptyLine)
+	if len(lines) != 2 || lines[1] != "callmeter: no sized requests in window" {
+		t.Errorf("empty report = %q, want heading plus %q", lines, "callmeter: no sized requests in window")
+	}
+}
+
+func TestContextKeepsARequestWithoutACall(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		filter         Filter
+		requests, peak string
+		rows           int
+	}{
+		{"all", Filter{}, "2", "150", 2},
+		{"since", Filter{Since: testNow.Add(-90 * time.Minute)}, "1", "150", 2},
+		{"session", Filter{Session: "s"}, "2", "150", 1},
+		{"since-and-session", Filter{Since: testNow.Add(-90 * time.Minute), Session: "s"}, "1", "150", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStore(t)
+			sizedRequest(t, store, "tool-use", "s", "A", ms(2*time.Hour), 100)
+			sizedRequest(t, store, "final-text", "s", "A", ms(time.Hour), 150)
+			sizedRequest(t, store, "other-session", "other", "B", ms(time.Hour), 500)
+			sizedRequest(t, store, "pending", "s", "A", ms(time.Minute), -1)
+			seedRequest(t, store, callmeter.Request{RequestID: "pending-sized", SessionID: callmeter.Ptr("s"), AgentID: callmeter.Ptr("A"), TS: callmeter.Ptr(ms(time.Minute)), Pending: callmeter.Ptr(true), ContextTokens: callmeter.Ptr(int64(900))})
+			seedRequest(t, store, callmeter.Request{RequestID: "unsized", SessionID: callmeter.Ptr("s"), AgentID: callmeter.Ptr("A"), TS: callmeter.Ptr(ms(time.Minute)), Pending: callmeter.Ptr(false)})
+			// The request timestamp, rather than the call timestamp, narrows context.
+			seed(t, store, inRequest(mkCall("c", "s", 10*time.Hour, "Read"), "tool-use", "A", "general"))
+			table, err := Context(context.Background(), store, tc.filter, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(table.Rows) != tc.rows {
+				t.Errorf("rows = %d, want %d", len(table.Rows), tc.rows)
+			}
+			var row []string
+			for _, candidate := range table.Rows {
+				if candidate[1] == "s" {
+					row = candidate
+				}
+			}
+			if len(row) == 0 || row[4] != tc.requests || row[6] != tc.peak {
+				t.Errorf("target row = %v, want REQUESTS %s PEAK %s", row, tc.requests, tc.peak)
+			}
+		})
+	}
+}
+
+func TestContextCallFilterKeepsOnlyFilteredRequests(t *testing.T) {
+	store := openStore(t)
+	dir := workDir(t)
+	sizedRequest(t, store, "tool-use", "s", "A", ms(2*time.Hour), 100)
+	sizedRequest(t, store, "final-text", "s", "A", ms(time.Hour), 150)
+	call := inRequest(mkCall("c", "s", 2*time.Hour, "Read"), "tool-use", "A", "general")
+	call.Cwd = &dir
+	seed(t, store, call)
+	for _, tc := range []struct {
+		name   string
+		filter Filter
+		rows   int
+	}{
+		{"project", Filter{Project: dir}, 1},
+		{"agent-type", Filter{AgentType: "general"}, 1},
+		{"both", Filter{Project: dir, AgentType: "general", Session: "s", Since: testNow.Add(-3 * time.Hour)}, 1},
+		{"other-project", Filter{Project: dir + "/other"}, 0},
+		{"other-agent-type", Filter{AgentType: "other"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			table, err := Context(context.Background(), store, tc.filter, chatOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(table.Rows) != tc.rows {
+				t.Fatalf("rows = %v, want %d", table.Rows, tc.rows)
+			}
+			if tc.rows == 1 && (table.Rows[0][4] != "1" || table.Rows[0][6] != "100") {
+				t.Errorf("row = %v, want REQUESTS 1 PEAK 100", table.Rows[0])
+			}
+		})
 	}
 }

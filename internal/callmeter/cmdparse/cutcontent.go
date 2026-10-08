@@ -26,7 +26,9 @@ const CutPlaceholder = "'[cut]'"
 //     any target but a non-file device), into `tee` or into a pipe whose
 //     output goes to a file, the redirect inherited from an enclosing block,
 //     subshell, list, loop or branch, or from a bare `exec` before it (one
-//     in a `{ … }` block included); standard output and error are followed
+//     in a `{ … }` block, a `&&` or `||` list or an `if` branch included);
+//     a pipe into a block or loop writing a file goes to a file; standard
+//     output and error are followed
 //     apart (`>&2`, `/dev/stdout`: redirected), and a `>&N` to a descriptor
 //     the script opened (3 and up) is a file;
 //   - every here-string (`<<< word`): a body, as a heredoc's is.
@@ -38,9 +40,9 @@ const CutPlaceholder = "'[cut]'"
 // bytes. The script string of `bash -c` is code and is not entered.
 //
 // ok is false when the command cannot be cut safely and the caller must then
-// store none of it: it names `commit`, `echo` or `printf` yet parses as
-// neither bash nor zsh, or a backquoted substitution anywhere in it holds one
-// of those names (a backquoted text is not cut in place).
+// store none of it: it names `commit`, `echo` or `printf` or holds a `<<<`
+// yet parses as neither bash nor zsh, or a backquoted substitution anywhere in
+// it holds one of those (a backquoted text is not cut in place).
 func CutContent(command string) (cut string, removed int, ok bool) {
 	if !mayHoldContent(command) {
 		return command, 0, true
@@ -101,26 +103,59 @@ func (c *contentCutter) stmts(list []*syntax.Stmt, in streams) {
 }
 
 // execRedirect is where a bare `exec` (no command) sends the shell's streams
-// from then on, given in: set when s is one, or a `{ … }` block, which runs in
-// the same shell, holding one (each applied in turn).
+// from then on, given in: set when s is one, or holds one in a statement that
+// runs in the same shell: a `{ … }` block (each applied in turn), either side
+// of a `&&` or `||` list, or an `if` branch. One that may not run (the right
+// side of a list, a branch) leaves each stream reaching a file when either
+// way does.
 func execRedirect(s *syntax.Stmt, in streams) (dest streams, set bool) {
 	if s == nil {
 		return in, false
 	}
-	if block, isBlock := s.Cmd.(*syntax.Block); isBlock {
+	switch x := s.Cmd.(type) {
+	case *syntax.Block:
+		return execRedirects(x.Stmts, in)
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			return in, false // each side of a pipe runs in a subshell
+		}
+		dest, set = execRedirect(x.X, in)
+		if d, ySet := execRedirect(x.Y, dest); ySet {
+			dest, set = either(dest, d), true
+		}
+		return dest, set
+	case *syntax.IfClause:
 		dest = in
-		for _, inner := range block.Stmts {
-			if d, innerSet := execRedirect(inner, dest); innerSet {
-				dest, set = d, true
+		for clause := x; clause != nil; clause = clause.Else {
+			for _, list := range [][]*syntax.Stmt{clause.Cond, clause.Then} {
+				if d, listSet := execRedirects(list, in); listSet {
+					dest, set = either(dest, d), true
+				}
 			}
 		}
 		return dest, set
+	case *syntax.CallExpr:
+		if len(x.Args) == 1 && literalWord(x.Args[0]) == "exec" {
+			return redirected(s.Redirs, in), true
+		}
 	}
-	x, isCall := s.Cmd.(*syntax.CallExpr)
-	if !isCall || len(x.Args) != 1 || literalWord(x.Args[0]) != "exec" {
-		return in, false
+	return in, false
+}
+
+// execRedirects is execRedirect over a list run in turn.
+func execRedirects(list []*syntax.Stmt, in streams) (dest streams, set bool) {
+	dest = in
+	for _, s := range list {
+		if d, sSet := execRedirect(s, dest); sSet {
+			dest, set = d, true
+		}
 	}
-	return redirected(s.Redirs, in), true
+	return dest, set
+}
+
+// either is where streams go when they go to a or to b.
+func either(a, b streams) streams {
+	return streams{out: a.out || b.out, err: a.err || b.err}
 }
 
 // stmt walks one statement; in is where its streams go when its own redirects
@@ -196,17 +231,41 @@ func (c *contentCutter) stmt(s *syntax.Stmt, in streams) {
 }
 
 // outToFile is whether s's standard output reaches a file, given in: its own
-// redirects, then a pipeline's last command. Whatever a pipe carries may reach
-// that file, so its left side writes there too.
+// redirects, then a pipeline's last command, and of a compound command (a
+// block, a loop) any file one of its commands writes or tees into. Whatever a
+// pipe carries may reach that file, so its left side writes there too.
 func outToFile(s *syntax.Stmt, in streams) bool {
 	if s == nil {
 		return in.out
 	}
 	st := redirected(s.Redirs, in)
-	if x, isBinary := s.Cmd.(*syntax.BinaryCmd); isBinary && (x.Op == syntax.Pipe || x.Op == syntax.PipeAll) {
-		return outToFile(x.Y, st)
+	switch x := s.Cmd.(type) {
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			return outToFile(x.Y, st)
+		}
+	case *syntax.CallExpr, nil:
+		return st.out
 	}
-	return st.out
+	return st.out || writesFile(s.Cmd, st)
+}
+
+// writesFile is whether a compound command may write what it reads to a file:
+// one of the statements in it sends its standard output to a file, or runs
+// tee, given in.
+func writesFile(cmd syntax.Command, in streams) bool {
+	found := false
+	syntax.Walk(cmd, func(node syntax.Node) bool {
+		switch x := node.(type) {
+		case *syntax.Stmt:
+			found = found || redirected(x.Redirs, in).out
+		case *syntax.CallExpr:
+			p := programAt(x.Args)
+			found = found || (p < len(x.Args) && path.Base(literalWord(x.Args[p])) == "tee")
+		}
+		return !found
+	})
+	return found
 }
 
 // redirected is where a statement's streams go after its own redirects of fd
@@ -312,28 +371,41 @@ func intoTee(s *syntax.Stmt) bool {
 }
 
 // programAt is the index in words of the program a simple command runs, past
-// every wrapper and its options as the parser strips them (wrappers, `sudo
-// git commit`, `env A=1 echo`, `timeout 30 git commit`); len(words) when it
-// runs none (`command -v X`, a bare `env`). A word that is not literal is
-// never a wrapper.
+// every wrapper and its options as the parser strips them (unwrapProgram:
+// `sudo git commit`, `env A=1 echo`, `timeout 30 git commit`, `xargs -I{}
+// git commit`); len(words) when it runs none (`command -v X`, a bare `env`).
+// A word read as "" (wrapperArgText) is never a wrapper.
 func programAt(words []*syntax.Word) int {
+	if len(words) == 0 {
+		return 0
+	}
 	args := make([]arg, len(words))
 	for i, w := range words {
-		args[i] = arg{text: literalWord(w), word: w}
+		args[i] = arg{text: wrapperArgText(w), word: w}
 	}
-	i := 0
-	for i < len(args) {
-		w, isWrapper := wrappers[path.Base(args[i].text)]
-		if !isWrapper {
-			return i
-		}
-		skip, lookup := w.skip(args[i+1:])
-		if lookup {
-			return len(args)
-		}
-		i += 1 + skip
+	program, runs := unwrapProgram(args)
+	if !runs {
+		return len(words)
 	}
-	return i
+	return len(words) - len(program)
+}
+
+// wrapperArgText is a word as programAt reads it: its literal value, or the
+// text of a word of unquoted text only (`-I{}`), which the parser reads as
+// written too; any other word is "".
+func wrapperArgText(w *syntax.Word) string {
+	if text := literalWord(w); text != "" {
+		return text
+	}
+	var b strings.Builder
+	for _, part := range w.Parts {
+		lit, isLit := part.(*syntax.Lit)
+		if !isLit {
+			return ""
+		}
+		b.WriteString(lit.Value)
+	}
+	return b.String()
 }
 
 // literalWord is a word's value when it is literal, else "".
@@ -515,14 +587,14 @@ var simpleParam = regexp.MustCompile(`^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A
 
 // cutWord replaces a content word with prefix, the placeholder and the word's
 // command substitutions, unless it holds no literal text beyond prefix or is
-// already that text. The bytes it counts as cut are the word's own beyond
-// prefix and its substitutions as written (each double-quoted one with its
-// quotes), plus what was cut inside those substitutions.
+// already that text.
 func (c *contentCutter) cutWord(w *syntax.Word, prefix string) {
 	start, end := int(w.Pos().Offset()), int(w.End().Offset())
 	var substs strings.Builder
-	literal, content := 0, false
-	kept, inner := 0, 0 // the substitutions' bytes as written, and the bytes cut inside them
+	// kept: the bytes the cut form keeps of the word, prefix, substitutions as
+	// written and the quotes of a double-quoted piece holding any; inner: the
+	// bytes cut inside those substitutions.
+	literal, content, kept, inner, substCount := 0, false, len(prefix), 0, 0
 	var piece func(part syntax.WordPart, inDouble bool)
 	piece = func(part syntax.WordPart, inDouble bool) {
 		switch x := part.(type) {
@@ -531,16 +603,20 @@ func (c *contentCutter) cutWord(w *syntax.Word, prefix string) {
 		case *syntax.SglQuoted:
 			literal += len(x.Value)
 		case *syntax.DblQuoted:
+			before := substCount
 			for _, inner := range x.Parts {
 				piece(inner, true)
+			}
+			if substCount > before {
+				kept += 2 // its quotes, written again around each substitution
 			}
 		case *syntax.CmdSubst, *syntax.ProcSubst:
 			text, cut := c.substText(x)
 			kept += int(x.End().Offset() - x.Pos().Offset())
 			inner += cut
+			substCount++
 			if inDouble {
 				text = `"` + text + `"`
-				kept += 2
 			}
 			substs.WriteString(text)
 		case *syntax.ParamExp:
@@ -566,11 +642,12 @@ func (c *contentCutter) cutWord(w *syntax.Word, prefix string) {
 		return
 	}
 	c.edits = append(c.edits, edit{start: start, end: end, text: text})
-	c.removed += end - start - len(prefix) - kept + inner
+	// Never below one byte: a word that is cut held literal text or content.
+	c.removed += max(end-start-kept+inner, 1)
 }
 
 // substText is a command substitution's text with its own content cut, and
-// the bytes cut there.
+// the bytes that cut removed.
 func (c *contentCutter) substText(node syntax.Node) (string, int) {
 	start, end := int(node.Pos().Offset()), int(node.End().Offset())
 	text := c.src[start:end]

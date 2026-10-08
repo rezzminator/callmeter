@@ -1,6 +1,6 @@
 # callmeter
 
-**Every tool call, model request, sub-agent turn and lifecycle event of every Claude Code chat, recorded into one local SQLite store, with reports that show where the context went.**
+**Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 ## What it records
 
@@ -12,7 +12,11 @@ Each tool call with its sanitized input, duration, failure, the bytes it produce
 /callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--json]
 ```
 
-Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`.
+Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`, `compactions`, `cost`, `hooks`, `turns`, `resumes`, `waiting`.
+
+## Your own questions
+
+`/callmeter:callmeter` teaches Claude to read the store directly, read-only, with SQL or Python: the schema, units, joins and tested recipes for questions no report answers.
 
 ## Where the store lives
 

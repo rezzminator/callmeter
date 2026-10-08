@@ -505,6 +505,107 @@ func TestLifecycleCompactionStop(t *testing.T) {
 	}
 }
 
+func TestCallmeterEffortFollowsThePayloadAndTheSessionModel(t *testing.T) {
+	t.Run("opus tool payload", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		lab.env["CLAUDE_EFFORT"] = "high"
+		lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": "claude-opus-4-6"}),
+			toolPayload(t, "PostToolUse", "toolu_effort", "Bash", map[string]any{"command": "true"}, map[string]any{
+				"effort": map[string]any{"level": "max"}, "tool_response": map[string]any{"stdout": ""},
+			}))
+		expect(t, "call", lab.call("toolu_effort"), map[string]any{"effort": "max"})
+	})
+	for _, event := range []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Stop", "SubagentStop", "StopFailure"} {
+		t.Run("no payload effort/"+event, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			lab.env["CLAUDE_EFFORT"] = "high"
+			lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": "claude-opus-4-6"}))
+			var payload string
+			switch event {
+			case "PreToolUse", "PostToolUse", "PostToolUseFailure":
+				payload = toolPayload(t, event, "toolu_effort", "Bash", map[string]any{"command": "true"}, map[string]any{
+					"effort": dropKey, "tool_response": map[string]any{"stdout": ""},
+				})
+			case "PostToolBatch":
+				transcript := filepath.Join(lab.root, "main.jsonl")
+				lab.write(transcript, []byte(requestEntry("msg_effort", "toolu_effort", "claude-opus-4-6", "tool_use", flatUsage)))
+				batch := decoded(t, batchPayload(t, transcript, "toolu_effort"))
+				delete(batch, "effort")
+				encoded, err := json.Marshal(batch)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload = string(encoded)
+			default:
+				payload = hookPayload(t, event, map[string]any{"effort": dropKey})
+			}
+			lab.feed(payload)
+			switch event {
+			case "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch":
+				expect(t, "call", lab.call("toolu_effort"), map[string]any{"effort": nil})
+			default:
+				expect(t, "event", lab.event(event), map[string]any{"effort": nil})
+				if event != "StopFailure" {
+					expect(t, "turn", lab.row("SELECT effort FROM turns WHERE event = ?", event), map[string]any{"effort": nil})
+				}
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, model string
+		want        any
+	}{
+		{name: "haiku", model: "claude-haiku-4-5-20251001"},
+		{name: "opus", model: "claude-opus-4-6", want: "high"},
+		{name: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			lab.env["CLAUDE_EFFORT"] = "high"
+			if tc.model != "" {
+				lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": tc.model, "effort": dropKey}))
+				expect(t, "start", lab.event("SessionStart"), map[string]any{"effort": tc.want})
+			}
+			lab.feed(hookPayload(t, "UserPromptSubmit", map[string]any{"effort": dropKey}))
+			expect(t, "prompt", lab.event("UserPromptSubmit"), map[string]any{"effort": tc.want})
+		})
+	}
+	for _, tc := range []struct {
+		name, start, request string
+		want                 any
+	}{
+		{name: "main request enables effort", start: "claude-haiku-4-5-20251001", request: "claude-opus-4-6", want: "high"},
+		{name: "main request disables effort", start: "claude-opus-4-6", request: "claude-haiku-4-5-20251001"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			lab.env["CLAUDE_EFFORT"] = "high"
+			lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": tc.start}))
+			transcript := filepath.Join(lab.root, "main.jsonl")
+			lab.write(transcript, []byte(requestEntry("msg_effort", "toolu_effort", tc.request, "tool_use", flatUsage)))
+			lab.feed(batchPayload(t, transcript, "toolu_effort"), hookPayload(t, "UserPromptSubmit", map[string]any{"effort": dropKey}))
+			expect(t, "prompt", lab.event("UserPromptSubmit"), map[string]any{"effort": tc.want})
+		})
+	}
+	t.Run("model read error still records the event", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		lab.env["CLAUDE_EFFORT"] = "high"
+		lab.feed(hookPayload(t, "SessionStart", map[string]any{"model": "claude-opus-4-6"}))
+		// A dropped table would be added back by the next open (completeSchema);
+		// a view of that name whose table is gone keeps the read failing.
+		for _, statement := range []string{"DROP TABLE requests", "CREATE VIEW requests AS SELECT * FROM requests_gone"} {
+			if _, err := lab.db().DB().Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := lab.db().SessionModel(lab.ctx, cmSessionA); err == nil {
+			t.Fatal("model read succeeded without requests")
+		}
+		lab.feed(hookPayload(t, "UserPromptSubmit", map[string]any{"effort": dropKey}))
+		expect(t, "prompt", lab.event("UserPromptSubmit"), map[string]any{"effort": nil})
+	})
+}
+
 func TestLifecycleSessionStart(t *testing.T) {
 	t.Run("startup", func(t *testing.T) {
 		lab := newCallmeterLab(t)

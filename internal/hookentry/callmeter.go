@@ -71,30 +71,28 @@ type callmeterPayload struct {
 	SessionCrons         json.RawMessage `json:"session_crons"`
 }
 
-// calls names the tool calls this payload is about, for a failure that loses
-// its whole record: the tool_use_id, or a batch's ids joined by commas.
-func (p callmeterPayload) calls() string {
+// callIDs names each lost call separately; a payload without calls still
+// gets one fault with an empty id.
+func (p callmeterPayload) callIDs() []string {
 	if p.ToolUseID != "" || len(p.ToolCalls) == 0 {
-		return p.ToolUseID
+		return []string{p.ToolUseID}
 	}
 	ids := make([]string, 0, len(p.ToolCalls))
 	for _, call := range p.ToolCalls {
 		ids = append(ids, call.ToolUseID)
 	}
-	return strings.Join(ids, ",")
+	return ids
 }
 
 // callmeterResponse is the part of a PostToolUse tool_response callmeter
-// reads for itself: the persisted path and an Agent call's sub-agent totals.
+// reads for itself: the persisted path and the agent an Agent call spawned.
 // The output size is callmeter.RealBytes's and the file columns
 // callmeter.FileColumnsFromResult's.
 type callmeterResponse struct {
-	PersistedOutputPath *string  `json:"persistedOutputPath"`
-	AgentID             string   `json:"agentId"`
-	AgentType           string   `json:"agentType"`
-	TotalTokens         *float64 `json:"totalTokens"`
-	TotalToolUseCount   *float64 `json:"totalToolUseCount"`
-	ResolvedModel       *string  `json:"resolvedModel"`
+	PersistedOutputPath *string `json:"persistedOutputPath"`
+	AgentID             string  `json:"agentId"`
+	AgentType           string  `json:"agentType"`
+	ResolvedModel       *string `json:"resolvedModel"`
 }
 
 // callmeterRun is one `callmeter hook` invocation: one payload, one store, one
@@ -134,6 +132,15 @@ type callmeterRun struct {
 	gaveUp    bool
 }
 
+// AccountedPanic carries a panic after the run's event was accounted for.
+type AccountedPanic struct{ Value any }
+
+// afterEventCommit is a test seam, nil in production.
+var afterEventCommit func()
+
+// closeStore closes the run's store; a variable so a test can make the close fail.
+var closeStore = func(s *callmeter.Store) error { return s.Close() }
+
 // Callmeter is the hook entry: it records each hook event into the callmeter
 // store under $CALLMETER_HOME. It exits 0 on every path and writes nothing to
 // stdout — it changes nothing the model sees — and a failure to record is said
@@ -155,6 +162,11 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	}
 	logPath := paths.Log(home)
 	state := &terminationState{}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			state.repanic(recovered)
+		}
+	}()
 	signals := make(chan os.Signal, 1)
 	// A signal ignored on entry (`nohup`, a background job of a non-interactive
 	// shell) stays ignored: Notify would install a handler in its place and
@@ -174,11 +186,6 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		close(done)
 	}()
 	go terminateOnSignal(signals, done, state, paths.Missed(home), logPath, stderr, os.Exit)
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			panic(state.panicked(recovered, debug.Stack()))
-		}
-	}()
 	seat, err := resolveCallmeterSeat(getenv)
 	if err != nil {
 		// The rows still land, without their seat; the gap is said, not hidden.
@@ -188,18 +195,6 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		store: paths.Store(home), log: logPath, missed: paths.Missed(home),
 	}, clock.Real, seat, getenv)
 }
-
-// Panic is the value Callmeter panics with again when its run panicked: the
-// panic's own value and stack, and whether the run's event was already
-// accounted for (a committed batch, a fault row or the run's own missed.log
-// line), in which case the panic leaves no missed.log line of its own.
-type Panic struct {
-	Value     any
-	Stack     []byte
-	Accounted bool
-}
-
-func (p Panic) String() string { return fmt.Sprint(p.Value) }
 
 // terminationState is what a `callmeter hook` run shares with the goroutine
 // that handles its termination signal: the event name and session id once the
@@ -217,6 +212,20 @@ type terminationState struct {
 	accounted bool
 }
 
+// repanic panics again with a run's recovered panic, for the caller to say:
+// as an AccountedPanic when the run's event is accounted for. An unaccounted
+// one keeps the state's lock, so the signal handler, which would add its own
+// missed.log line beside the panic's, never takes it; the process ends with
+// the panic's line alone.
+func (state *terminationState) repanic(recovered any) {
+	state.mu.Lock()
+	if state.accounted {
+		state.mu.Unlock()
+		panic(AccountedPanic{Value: recovered})
+	}
+	panic(recovered)
+}
+
 // terminationKey carries the terminationState in the ctx runCallmeter gets;
 // without it (tests, the fuzz target) a run behaves as if no handler existed.
 type terminationKey struct{}
@@ -228,17 +237,6 @@ func withTerminationState(ctx context.Context, state *terminationState) context.
 func terminationStateOf(ctx context.Context) *terminationState {
 	state, _ := ctx.Value(terminationKey{}).(*terminationState)
 	return state
-}
-
-// panicked is the Panic a run's recovered panic becomes: whether the run's
-// event was accounted for, read under the state's lock, which then marks it
-// accounted so the signal handler leaves no line beside the panic's own.
-func (state *terminationState) panicked(value any, stack []byte) Panic {
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	accounted := state.accounted
-	state.accounted = true
-	return Panic{Value: value, Stack: stack, Accounted: accounted}
 }
 
 // setPayload records the decoded hook_event_name and session_id for the
@@ -299,6 +297,8 @@ func (hold termHold) release() {
 // the log, never a non-zero exit. done ends the wait without a signal. The
 // line's reason is `terminated by {SIGNAL}`; a run whose store stays locked
 // leaves `terminated by store busy` itself (giveUpBusy).
+// A handler panic logs its stack and exits 0 with the lock held; it appends
+// one panic line only when neither the run nor this handler accounted for it.
 func terminateOnSignal(
 	signals <-chan os.Signal,
 	done <-chan struct{},
@@ -307,6 +307,22 @@ func terminateOnSignal(
 	stderr io.Writer,
 	exit func(int),
 ) {
+	wrote := false
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			stack := debug.Stack()
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if !state.accounted && !wrote {
+				if err := AppendMissed(missed, state.event, state.session, callmeter.PanicReason, clock.Real.Now()); err != nil {
+					applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "", err)
+				}
+			}
+			applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "",
+				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack))
+			exit(0)
+		}
+	}()
 	var sig os.Signal
 	select {
 	case sig = <-signals:
@@ -319,13 +335,16 @@ func terminateOnSignal(
 		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
 			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
+		} else {
+			wrote = true
 		}
 	}
 	exit(0)
 }
 
 // AppendMissed appends the binary's own missed.log line,
-// `{unix seconds}\t{event}\t{reason}` (reason opens callmeter.TerminatedReason
+// `{unix seconds}\t{event}\t{reason} (pid N)` with this process's pid
+// (reason opens callmeter.TerminatedReason
 // or callmeter.StoreUnavailableReason, or is callmeter.PanicReason), to the
 // missed.log at path, followed by `\t{session_id}` when session is one
 // (callmeter.MissedSessionID), the wrapper's own layout, so recovery ties a
@@ -340,7 +359,7 @@ func AppendMissed(path, event, session, reason string, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
-	line := fmt.Sprintf("%d\t%s\t%s", now.Unix(), missedEvent(event), reason)
+	line := fmt.Sprintf("%d\t%s\t%s (pid %d)", now.Unix(), missedEvent(event), reason, os.Getpid())
 	if callmeter.MissedSessionID(session) {
 		line += "\t" + session
 	}
@@ -411,19 +430,25 @@ func runCallmeter(
 	}
 	store, err := callmeter.OpenDBWaiting(ctx, files.store, storeWait(run.payload.HookEventName))
 	if err != nil {
-		run.fault(callmeter.StageStore, run.payload.calls(), errors.Join(payloadErr, err))
+		for _, id := range run.payload.callIDs() {
+			run.fault(callmeter.StageStore, id, errors.Join(payloadErr, err))
+		}
 		return 0
 	}
 	run.store = store
 	defer func() {
-		if err := store.Close(); err != nil {
+		if err := closeStore(store); err != nil {
 			run.store = nil // closed: the fault is said, never written
-			run.fault(callmeter.StageStore, run.payload.calls(), err)
+			for _, id := range run.payload.callIDs() {
+				run.fault(callmeter.StageStore, id, err)
+			}
 		}
 	}()
 	// The wrapper's own failures (no binary, a bad checksum) land as binary
 	// faults on the next run that reaches the store; failing to ingest them
-	// is one store fault and never stops this run's record. The signal handler
+	// is one store fault, except on a busy store: there the run gives up
+	// (faultHeld, giveUpBusy) and leaves its own line in missed.log, since a
+	// second wait could outlast a sync hook's timeout. The signal handler
 	// is held off from the commit until the claim is moved, so a signal there
 	// leaves no committed claim in place to be ingested again.
 	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
@@ -436,7 +461,12 @@ func runCallmeter(
 		run.fault(callmeter.StagePayload, run.payload.ToolUseID, payloadErr)
 		return 0
 	}
-	run.effort = effortOf(run.payload.Effort, getenv)
+	run.effort = effortOf(run.payload.Effort, run.payload.HookEventName, getenv, func() (string, error) {
+		if run.payload.HookEventName == callmeter.EventSessionStart {
+			return run.payload.Model, nil
+		}
+		return run.store.SessionModel(run.ctx, run.payload.SessionID)
+	})
 	run.record()
 	return 0
 }
@@ -633,9 +663,14 @@ func (run *callmeterRun) recordCall(failed bool) {
 	}
 	call := run.base(p.ToolUseID)
 	run.tier1(&call)
+	prompt := call.PromptID
+	call.PromptID = nil
 	call.TS = callmeter.Ptr(run.now)
 	call.Tool = callmeter.Ptr(p.ToolName)
 	call.DurationMS = wholeNumber(p.DurationMS)
+	if call.DurationMS != nil && *call.DurationMS >= 0 {
+		call.TS = callmeter.Ptr(run.now - *call.DurationMS)
+	}
 	call.Failed = callmeter.Ptr(failed)
 	call.IsInterrupt = p.IsInterrupt
 	run.inputColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
@@ -644,6 +679,10 @@ func (run *callmeterRun) recordCall(failed bool) {
 	if failed {
 		if p.Error != nil {
 			call.Error = callmeter.Ptr(callmeter.SanitizeError(*p.Error))
+			if p.ToolName == "Bash" {
+				command, _ := callmeter.BashCommand(p.ToolInput) // inputColumns already reports malformed input
+				callmeter.CommitFromText(&call, command, *p.Error)
+			}
 		}
 		// A failure's output reaches the model as this text: it is the size.
 		if p.Error != nil {
@@ -658,21 +697,14 @@ func (run *callmeterRun) recordCall(failed bool) {
 		}
 		// This cwd is where the command left the shell; PreToolUse's, the
 		// directory it started in, wins whenever it lands (recordStartCwd).
-		after := callmeter.Call{ToolUseID: p.ToolUseID, Cwd: presentString(p.Cwd)}
+		after := callmeter.Call{ToolUseID: p.ToolUseID, Cwd: presentString(p.Cwd), PromptID: prompt}
 		if err := tx.UpsertCall(run.ctx, after, callmeter.FillEmpty); err != nil {
 			return err
 		}
 		if agent == nil {
 			return nil
 		}
-		// The totals only fill: the agent's own transcript, summed at its
-		// stop, holds every turn (recordAgent).
-		totals := callmeter.Agent{AgentID: agent.AgentID, TotalTokens: agent.TotalTokens, ToolUses: agent.ToolUses}
-		agent.TotalTokens, agent.ToolUses = nil, nil
-		if err := tx.UpsertAgent(run.ctx, *agent, callmeter.Overwrite); err != nil {
-			return err
-		}
-		return tx.UpsertAgent(run.ctx, totals, callmeter.FillEmpty)
+		return tx.UpsertAgent(run.ctx, *agent, callmeter.Overwrite)
 	})
 }
 
@@ -681,7 +713,7 @@ func (run *callmeterRun) recordCall(failed bool) {
 // stored cwd, so only PreToolUse's is right; it overwrites whatever PostToolUse
 // filled, and PostToolUse never overwrites it, in either landing order. ts is
 // set so a call that never finishes still ages out of the store; the earliest
-// hook's ts wins (Call.TS). The command's
+// start wins, including PostToolUse's duration estimate (Call.TS). The command's
 // input and test runner only fill, so a call whose PostToolUse is lost still
 // has them, and a PostToolUse landing in either order overwrites them.
 func (run *callmeterRun) recordStartCwd() {
@@ -700,9 +732,11 @@ func (run *callmeterRun) recordStartCwd() {
 	}
 	call := run.base(p.ToolUseID)
 	call.Cwd = callmeter.Ptr(p.Cwd)
-	// The start only fills: PostToolUse's prompt, effort and mode win.
+	call.PromptID = presentString(p.PromptID)
+	// The issuing prompt wins; PostToolUse's effort and mode still win.
 	start := callmeter.Call{ToolUseID: p.ToolUseID, TS: callmeter.Ptr(run.now), Tool: presentString(p.ToolName)}
 	run.tier1(&start)
+	start.PromptID = nil
 	run.inputColumns(&start, p.ToolUseID, p.ToolName, p.ToolInput)
 	run.write(p.ToolUseID, func(tx *callmeter.Tx) error {
 		if err := tx.UpsertCall(run.ctx, call, callmeter.Overwrite); err != nil {
@@ -775,7 +809,13 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 	p := run.payload
 	trimmed := bytes.TrimSpace(p.ToolResponse)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		size, err := callmeter.RealBytes(trimmed)
+		if !callmeter.HasRealOutput(p.ToolName) {
+			if _, err := callmeter.DeliveredBytes(trimmed); err != nil {
+				run.fault(callmeter.StagePayload, p.ToolUseID, err)
+				return nil
+			}
+		}
+		size, err := callmeter.RealBytes(p.ToolName, trimmed)
 		if err != nil {
 			run.fault(callmeter.StagePayload, p.ToolUseID, err)
 			return nil
@@ -790,7 +830,7 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 	}
 	// The size is callmeter.RealBytes's, the one path a transcript's
 	// toolUseResult is measured by too.
-	size, err := callmeter.RealBytes(trimmed)
+	size, err := callmeter.RealBytes(p.ToolName, trimmed)
 	if err != nil {
 		run.fault(callmeter.StagePayload, p.ToolUseID, err)
 	} else {
@@ -813,8 +853,6 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 		SessionID:       callmeter.Ptr(p.SessionID),
 		AgentType:       presentString(response.AgentType),
 		ParentToolUseID: callmeter.Ptr(p.ToolUseID),
-		TotalTokens:     wholeNumber(response.TotalTokens),
-		ToolUses:        wholeNumber(response.TotalToolUseCount),
 		Model:           response.ResolvedModel,
 		Source:          callmeter.Ptr(callmeter.SourceHook),
 		ConfigDir:       run.seat.configDir,
@@ -829,7 +867,7 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 func (run *callmeterRun) recordBatch() {
 	p := run.payload
 	if len(p.ToolCalls) == 0 {
-		run.fault(callmeter.StagePayload, "", errors.New("PostToolBatch payload carries no tool_calls"))
+		run.fault(callmeter.StagePayload, "", errors.New(callmeter.BatchWithoutCalls))
 		return
 	}
 	transcript := p.TranscriptPath
@@ -859,6 +897,7 @@ func (run *callmeterRun) recordBatch() {
 			return
 		}
 		call := run.base(toolCall.ToolUseID)
+		call.PromptID = presentString(p.PromptID)
 		size, err := callmeter.DeliveredBytes(toolCall.ToolResponse)
 		if err != nil {
 			run.fault(callmeter.StagePayload, toolCall.ToolUseID, err)
@@ -871,6 +910,7 @@ func (run *callmeterRun) recordBatch() {
 		// ever lands (a refused call); an earlier one wins (Call.TS).
 		fill := callmeter.Call{ToolUseID: toolCall.ToolUseID, TS: callmeter.Ptr(run.now), Tool: presentString(toolCall.ToolName)}
 		run.tier1(&fill)
+		fill.PromptID = nil
 		if len(toolCall.ToolInput) > 0 {
 			run.inputColumns(&fill, toolCall.ToolUseID, toolCall.ToolName, toolCall.ToolInput)
 			run.fileColumns(&fill, toolCall.ToolUseID, toolCall.ToolName, toolCall.ToolInput)
@@ -991,12 +1031,22 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 		ConfigDir: run.seat.configDir,
 		SeatDir:   run.seat.dir,
 	}
+	meta := callmeter.Agent{AgentID: p.AgentID}
+	readMeta := func() {
+		if p.TranscriptPath != "" {
+			if agentType, parent, err := callmeter.SubagentMeta(p.TranscriptPath, p.AgentID); err == nil {
+				meta.ParentToolUseID = presentString(parent)
+				meta.AgentType = presentString(agentType)
+			}
+		}
+	}
 	if !stopped {
 		// An agent woken for another turn starts again: started keeps the
 		// earliest start, whatever order the starts land in, and the prompt
 		// follows that start.
 		start := callmeter.Agent{AgentID: p.AgentID, Started: callmeter.Ptr(run.now)}
 		prompt := callmeter.Agent{AgentID: p.AgentID, PromptID: presentString(p.PromptID)}
+		readMeta()
 		run.agentTurns = true
 		run.write("", func(tx *callmeter.Tx) error {
 			if err := tx.UpsertAgent(run.ctx, agent, callmeter.Overwrite); err != nil {
@@ -1015,6 +1065,11 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 			if err := tx.UpsertAgent(run.ctx, start, callmeter.KeepMin); err != nil {
 				return err
 			}
+			if meta.ParentToolUseID != nil || meta.AgentType != nil {
+				if err := tx.UpsertAgent(run.ctx, meta, callmeter.FillEmpty); err != nil {
+					return err
+				}
+			}
 			return tx.UpsertAgent(run.ctx, prompt, promptMode)
 		})
 		return
@@ -1031,6 +1086,7 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 	if callmeter.UntypedAgentMissingTranscript(p.AgentID, p.AgentType, transcript) {
 		return
 	}
+	readMeta()
 	agent.TranscriptPath = callmeter.Ptr(transcript)
 	stop := callmeter.Agent{AgentID: p.AgentID, Stopped: callmeter.Ptr(run.now)}
 	prompt := callmeter.Agent{AgentID: p.AgentID, PromptID: presentString(p.PromptID)}
@@ -1066,6 +1122,11 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 		}
 		if err := tx.UpsertAgent(run.ctx, prompt, callmeter.FillEmpty); err != nil {
 			return err
+		}
+		if meta.ParentToolUseID != nil || meta.AgentType != nil {
+			if err := tx.UpsertAgent(run.ctx, meta, callmeter.FillEmpty); err != nil {
+				return err
+			}
 		}
 		if totals == nil || !latest {
 			return nil // no totals read, or an earlier stop than the one stored
@@ -1218,7 +1279,9 @@ func (run *callmeterRun) sweepSession(allAgents bool) {
 }
 
 // sweepRequests writes every request of one chat's or sub-agent's transcript
-// (callmeter.ReadRequests) through Tx.SettleRequest. settle waits, as
+// (callmeter.ReadTranscript) through Tx.SettleRequest, and the marks of the
+// same read the store lacks through Tx.PutMarks. Every transcript and store
+// read happens before the write closure, which only writes. settle waits, as
 // SubagentStop does, until the last message is on disk: Claude Code fires the
 // hook before flushing it. A path holding no transcript file is skipped, as
 // resolveAgentsPending skips one: an untyped internal agent and a session run
@@ -1232,12 +1295,13 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 	if info, err := os.Stat(transcript); errors.Is(err, fs.ErrNotExist) || (err == nil && !info.Mode().IsRegular()) {
 		return
 	}
-	requests, err := run.transcriptRequests(transcript, settle)
+	read, err := run.transcriptRequests(transcript, settle)
 	if err != nil {
 		run.fault(callmeter.StageTranscript, "", fmt.Errorf("requests of %s: %w", transcript, err))
 		return
 	}
-	if len(requests) == 0 {
+	requests := read.Requests
+	if len(requests) == 0 && read.Marks.Empty() {
 		return
 	}
 	// A session with no run recorded yet back-fills nothing older than now:
@@ -1249,6 +1313,25 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 	}
 	if !ok {
 		since = run.now
+	}
+	// The marks the store lacks, filtered before the write like the requests:
+	// a store that cannot say what it holds loses the marks, not the requests.
+	marks := read.Marks
+	if !marks.Empty() {
+		known, err := run.store.KnownMarks(run.ctx, p.SessionID)
+		if err != nil {
+			run.fault(callmeter.StageStore, "", err)
+			marks = callmeter.TranscriptMarks{}
+		} else {
+			marks = marks.Since(since, known)
+		}
+	}
+	if len(requests) == 0 && marks.Empty() {
+		return
+	}
+	seatDir := ""
+	if run.seat.dir != nil {
+		seatDir = *run.seat.dir
 	}
 	run.write("", func(tx *callmeter.Tx) error {
 		for _, read := range requests {
@@ -1269,25 +1352,25 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 				return err
 			}
 		}
-		return nil
+		return tx.PutMarks(run.ctx, p.SessionID, agentID, seatDir, run.now, marks)
 	})
 }
 
-// transcriptRequests reads the transcript's requests; settle re-reads until
+// transcriptRequests reads the transcript's requests and marks; settle re-reads until
 // its last assistant entry ends the turn of the hook's prompt_id, no user
-// entry of that turn after it (callmeter.ReadTurnRequests' final), or
+// entry of that turn after it (callmeter.TranscriptRead's Final), or
 // agentSettle has passed (a turn
 // interrupted mid-call never writes one), on the wall clock as
 // settledAgentTotals does. A transcript with no request is not waited on.
-func (run *callmeterRun) transcriptRequests(transcript string, settle bool) ([]callmeter.TranscriptRequest, error) {
+func (run *callmeterRun) transcriptRequests(transcript string, settle bool) (callmeter.TranscriptRead, error) {
 	deadline := clock.Real.Now().Add(agentSettle)
 	for {
-		requests, final, err := callmeter.ReadTurnRequests(transcript, run.payload.PromptID)
-		if err != nil || !settle || final || len(requests) == 0 || !clock.Real.Now().Before(deadline) {
-			return requests, err
+		read, err := callmeter.ReadTranscript(transcript, run.payload.PromptID)
+		if err != nil || !settle || read.Final || len(read.Requests) == 0 || !clock.Real.Now().Before(deadline) {
+			return read, err
 		}
 		if err := clock.Real.Sleep(run.ctx, 25*time.Millisecond); err != nil {
-			return requests, fmt.Errorf("wait for the final message of %s: %w", transcript, err)
+			return read, fmt.Errorf("wait for the final message of %s: %w", transcript, err)
 		}
 	}
 }
@@ -1420,8 +1503,9 @@ func (run *callmeterRun) resolveUnfinished() {
 // them (runRows); a failure is a store fault. fn nil writes the run's rows only.
 // While the run's event is not accounted for, the signal handler is held off
 // from the moment the batch holds the store's write lock until it committed
-// or, failed, until its fault row was written; never across the wait for a
-// busy store, so a signal during that wait is decided at once.
+// or, failed, until its fault row was written when the store is free at once
+// (faultHeld); never across the wait for a busy store, the fault's included,
+// so a signal during that wait is decided at once.
 func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	run.batches++
 	if run.gaveUp {
@@ -1444,6 +1528,9 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	}
 	hold.account()
 	run.accounted = true
+	if afterEventCommit != nil {
+		afterEventCommit()
+	}
 }
 
 // fault says a failure to record: stderr and callmeter.log always, and a
@@ -1490,17 +1577,19 @@ func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID s
 		// is free at once, so a signal that waited on the batch is judged by
 		// that row. A writer that took the store since the rollback is waited
 		// out without the hold, a signal meanwhile decided at once.
-		busy, err := run.store.AddFaultIfFree(run.ctx, fault)
+		written, err := run.store.AddFaultIfFree(run.ctx, fault)
+		if err != nil {
+			applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		}
 		switch {
-		case err == nil && !busy:
+		case written: // the row stands, whatever failed after its commit
 			hold.account()
 			run.accounted = true
 			return
-		case err == nil:
+		case err == nil: // busy
 			hold.release()
 			*hold, held = termHold{}, false
 		default:
-			applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
 			run.giveUp(*hold, toolUseID, err)
 			return
 		}

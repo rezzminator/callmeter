@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,7 +146,7 @@ func newRig(t *testing.T, opts rigOpts) *rig {
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/callmeter--v"+version+"/"+r.asset {
+		if req.URL.Path != "/v"+version+"/"+r.asset {
 			http.NotFound(w, req)
 			return
 		}
@@ -402,21 +401,26 @@ func (r *rig) wantMissed(event, reason string) {
 }
 
 // wantMissedSession asserts missed.log holds exactly one line for event,
-// reason and session, stamped with unix seconds near now; an empty session is
-// a line without the session field.
-func (r *rig) wantMissedSession(event, reason, session string) {
+// reason with its writer pid and session, stamped with unix seconds near now;
+// an empty session is a line without the session field. A known pid is exact.
+func (r *rig) wantMissedSession(event, reason, session string, pid ...int) {
 	r.t.Helper()
 	lines := r.missed()
 	if len(lines) != 1 {
 		r.t.Fatalf("missed.log lines = %q, want exactly one", lines)
 	}
-	want := []string{event, reason}
-	if session != "" {
-		want = append(want, session)
+	writer := `[1-9][0-9]*`
+	if len(pid) != 0 {
+		writer = strconv.Itoa(pid[0])
 	}
+	want := `^[0-9]+\t` + regexp.QuoteMeta(event) + `\t` + regexp.QuoteMeta(reason) + ` \(pid ` + writer + `\)`
+	if session != "" {
+		want += `\t` + regexp.QuoteMeta(session)
+	}
+	want += `$`
 	fields := strings.Split(lines[0], "\t")
-	if !regexp.MustCompile(`^[0-9]+$`).MatchString(fields[0]) || !slices.Equal(fields[1:], want) {
-		r.t.Fatalf("missed line = %q, want {unix seconds}\\t%s", lines[0], strings.Join(want, "\\t"))
+	if !regexp.MustCompile(want).MatchString(lines[0]) {
+		r.t.Fatalf("missed line = %q, want %s", lines[0], want)
 	}
 	var seconds int64
 	if _, err := fmt.Sscan(fields[0], &seconds); err != nil || time.Now().Unix()-seconds > 30 || seconds-time.Now().Unix() > 30 {
@@ -971,7 +975,7 @@ func TestHookKilledBeforeTheBinaryIsMissed(t *testing.T) {
 		t.Fatalf("a killed hook must exit 0, got %d", res.code)
 	}
 	assertEqual(t, "stdout", res.stdout, "")
-	r.wantMissedSession("SessionEnd", "killed by signal", "s-killed")
+	r.wantMissedSession("SessionEnd", "killed by signal", "s-killed", p.pid())
 }
 
 // hangingBase is a release base on a local listener that accepts every
@@ -1051,7 +1055,7 @@ func TestHookKilledDuringAHangingDownloadIsMissedAtOnce(t *testing.T) {
 					t.Fatalf("the wrapper under %s ended %v, want exit 0", shell, err)
 				}
 				assertEqual(t, "stdout", p.stdout.String(), "")
-				r.wantMissedSession("SessionEnd", "killed by signal", "s-dl")
+				r.wantMissedSession("SessionEnd", "killed by signal", "s-dl", p.pid())
 				if err := syscall.Kill(-p.pid(), 0); !errors.Is(err, syscall.ESRCH) {
 					t.Fatalf("a process of the wrapper's group (curl) outlived it: kill -0 = %v", err)
 				}
@@ -1157,9 +1161,6 @@ func TestVersionCleanupRemovesOnlyVersionNames(t *testing.T) {
 		"1.2.3-rc+b", "1.2.3_x", "1.2.3 x", "a.b.c", "1.2.x"}
 	for _, shell := range []string{"sh", "dash", "bash"} {
 		t.Run(shell, func(t *testing.T) {
-			if _, err := exec.LookPath(shell); err != nil {
-				t.Skipf("%s not installed", shell)
-			}
 			r := newRig(t, rigOpts{})
 			bin := filepath.Join(r.home, "bin")
 			for _, name := range append(append([]string{}, removed...), kept...) {
@@ -1303,7 +1304,7 @@ func TestMissedLinesAppend(t *testing.T) {
 	r.run(`{"hook_event_name":"Stop"}`, nil, "hook")
 	r.run(`{"hook_event_name":"SubagentStop"}`, nil, "hook")
 	lines := r.missed()
-	if len(lines) != 2 || !strings.Contains(lines[0], "\tStop\t") || !strings.Contains(lines[1], "\tSubagentStop\t") {
+	if len(lines) != 2 || !regexp.MustCompile(`^[0-9]+\tStop\tdownload failed \(pid [1-9][0-9]*\)$`).MatchString(lines[0]) || !regexp.MustCompile(`^[0-9]+\tSubagentStop\tdownload failed \(pid [1-9][0-9]*\)$`).MatchString(lines[1]) {
 		t.Fatalf("missed.log = %q, want a Stop line then a SubagentStop line", lines)
 	}
 }
@@ -1367,7 +1368,7 @@ func TestHookBinaryFailureIsMissed(t *testing.T) {
 			t.Fatalf("exit %d stdout %q, want 0 and empty", res.code, res.stdout)
 		}
 		lines := r.missed()
-		if len(lines) != 1 || !regexp.MustCompile(`^[0-9]+\tunknown\tbinary exited (126|127|1)$`).MatchString(lines[0]) {
+		if len(lines) != 1 || !regexp.MustCompile(`^[0-9]+\tunknown\tbinary exited (126|127|1) \(pid [1-9][0-9]*\)$`).MatchString(lines[0]) {
 			t.Fatalf("missed.log = %q, want one `binary exited` line", lines)
 		}
 	})

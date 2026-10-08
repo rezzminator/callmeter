@@ -13,6 +13,7 @@ import (
 func Agents(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty:  "callmeter: no sub-agents in window",
 		Title:  f.title("agents", n),
 		Header: []string{"AGENT", "TYPE", "CHAT", "TURN", "STARTED", "STOPPED", "SECONDS", "PROMPT"},
 	}

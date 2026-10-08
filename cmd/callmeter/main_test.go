@@ -138,78 +138,79 @@ func TestHookGarbageStdinIsAPayloadFault(t *testing.T) {
 	}
 }
 
-// TestHookPanicAfterItsEventIsAccountedLeavesNoLine: a hook run that panics
-// once its event is accounted for (hookentry.Panic.Accounted: its batch
-// committed, its fault row or its own missed.log line written) still exits 0
-// and logs the panic, but leaves no `panic` line: the event is not lost, and
-// the next report counts nothing unrecorded.
-func TestHookPanicAfterItsEventIsAccountedLeavesNoLine(t *testing.T) {
-	c := newCLI(t)
-	c.seed()
-	previous := hook
-	hook = func(input io.Reader, _ io.Writer, _ paths.Getenv) int {
-		if _, err := io.ReadAll(input); err != nil {
-			t.Errorf("read stdin: %v", err)
-		}
-		panic(hookentry.Panic{Value: "boom", Stack: []byte("the stack\n"), Accounted: true})
-	}
-	t.Cleanup(func() { hook = previous })
-	code, stdout, stderr := c.run(scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0], "hook")
-	hook = previous
-	if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") {
-		t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
-	}
-	if missed, err := os.ReadFile(paths.Missed(c.state)); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("missed.log = %q (%v), want none for an accounted event", missed, err)
-	}
-	logged, err := os.ReadFile(paths.Log(c.state))
-	if err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
-		t.Errorf("callmeter.log = %q (%v), want one line saying the panic", logged, err)
-	}
-	code, stdout, stderr = c.run("", "report", "files")
-	if code != 0 || strings.Contains(stdout, "events unrecorded") {
-		t.Errorf("report files = %d, want no unrecorded event\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
-	}
-}
-
 // TestHookPanicStillExitsZero: a hook exits 0 on every path; a panic would
 // exit 2, which Claude Code reads as a blocking error. The panic still leaves
-// its trace: one missed.log line with reason `panic`, the event and session
+// its trace: a stack on stderr and, unless accounted for, one missed.log line
+// with reason `panic`, the event and session
 // the payload named (`unknown` and no session when it named none), one log
 // line, and the next report counts the line as an unrecorded event.
 func TestHookPanicStillExitsZero(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		payload func(c cli) string
-		line    string // the missed.log line after its seconds field
+		name       string
+		payload    func(c cli) string
+		line       string // the missed.log line after its seconds field
+		accounted  bool
+		unwritable bool
 	}{
 		{
 			name: "captured payload",
 			payload: func(c cli) string {
 				return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
 			},
-			line: "\tPostToolUse\tpanic\tb2c7b094-91c1-4b76-8621-258b240b695a\n",
+			line: fmt.Sprintf("\tPostToolUse\tpanic (pid %d)\tb2c7b094-91c1-4b76-8621-258b240b695a\n", os.Getpid()),
 		},
-		{name: "no event", payload: func(cli) string { return "{}" }, line: "\tunknown\tpanic\n"},
+		{name: "no event", payload: func(cli) string { return "{}" }, line: fmt.Sprintf("\tunknown\tpanic (pid %d)\n", os.Getpid())},
+		{name: "accounted", payload: func(c cli) string {
+			return scriptedPayloads(t, c.user, filepath.Join(filepath.Dir(c.state), "proj"))[0]
+		}, accounted: true},
+		{name: "unwritable missed log", payload: func(cli) string { return "{}" }, unwritable: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := newCLI(t)
 			c.seed() // a store for the report to read, through the real hook
+			if tc.unwritable {
+				if err := os.Mkdir(paths.Missed(c.state), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
 			stdin := tc.payload(c)
 			previous := hook
 			hook = func(input io.Reader, _ io.Writer, _ paths.Getenv) int {
 				if read, err := io.ReadAll(input); err != nil || string(read) != stdin {
 					t.Errorf("the hook read %d bytes (%v), want the %d of stdin", len(read), err, len(stdin))
 				}
+				if tc.accounted {
+					panic(hookentry.AccountedPanic{Value: "boom"})
+				}
 				panic("boom")
 			}
 			t.Cleanup(func() { hook = previous })
 			code, stdout, stderr := c.run(stdin, "hook")
 			hook = previous
-			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") {
+			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") || !strings.Contains(stderr, "goroutine ") {
 				t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
 			}
 			missed, err := os.ReadFile(paths.Missed(c.state))
+			if tc.unwritable {
+				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.state)) {
+					t.Errorf("unwritable missed.log: read error %v, append error said %v", err, strings.Contains(stderr, "open "+paths.Missed(c.state)))
+				}
+				return
+			}
+			if tc.accounted {
+				if !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
+					t.Fatalf("accounted panic left %d bytes in missed.log (%v), want no line", len(missed), err)
+				}
+				if logged, err := os.ReadFile(paths.Log(c.state)); err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
+					t.Errorf("callmeter.log = %q (%v), want one line saying the accounted panic", logged, err)
+				}
+				code, stdout, stderr = c.run("", "report", "files")
+				if code != 0 || strings.Contains(stdout, "events unrecorded: hook terminated before recording") {
+					t.Errorf("accounted panic report = %d, unrecorded event note %v; stderr %q", code,
+						strings.Contains(stdout, "events unrecorded: hook terminated before recording"), stderr)
+				}
+				return
+			}
 			if err != nil || !regexp.MustCompile(`^[0-9]+`+regexp.QuoteMeta(tc.line)+`$`).Match(missed) {
 				t.Fatalf("missed.log = %q (%v), want exactly one line {secs}%q", missed, err, tc.line)
 			}
@@ -220,6 +221,63 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			code, stdout, stderr = c.run("", "report", "files")
 			if code != 0 || !strings.Contains(stdout, "1 events unrecorded: hook terminated before recording") {
 				t.Errorf("report files = %d, want the panic counted as an unrecorded event\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestReportPanicExitsOne(t *testing.T) {
+	previous := report
+	report = func(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
+		if strings.Join(args, " ") != "report files" {
+			t.Error("report did not receive the dispatched arguments")
+		}
+		panic("boom")
+	}
+	t.Cleanup(func() { report = previous })
+	for _, noHome := range []bool{false, true} {
+		name := "with home"
+		if noHome {
+			name = "no home"
+		}
+		t.Run(name, func(t *testing.T) {
+			c := newCLI(t)
+			getenv := func(name string) string {
+				if !noHome && name == paths.EnvHome {
+					return c.state
+				}
+				return ""
+			}
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"report", "files"}, strings.NewReader(""), &stdout, &stderr, getenv)
+			if code != 1 || stdout.Len() != 0 {
+				t.Errorf("report panic exit = %d, stdout bytes = %d; want 1 and 0", code, stdout.Len())
+			}
+			if !strings.HasPrefix(stderr.String(), "callmeter: report panicked: boom\ngoroutine ") ||
+				strings.Count(stderr.String(), "callmeter: report: session \"\" call \"\": report panicked: boom\ngoroutine ") != 1 {
+				t.Error("stderr lacks the report panic prefix, stack or single report failure")
+			}
+			logged, err := os.ReadFile(paths.Log(c.state))
+			if noHome {
+				if !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("no-home panic created a log or returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+			if len(lines) != 1 {
+				t.Fatalf("report panic log has %d lines, want 1", len(lines))
+			}
+			var record map[string]string
+			if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+				t.Fatal(err)
+			}
+			if record["step"] != "report" || record["session"] != "" || record["target"] != "" ||
+				!strings.HasPrefix(record["err"], "report panicked: boom\ngoroutine ") {
+				t.Error("report panic log lacks the stage, panic value or stack")
 			}
 		})
 	}

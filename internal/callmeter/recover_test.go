@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -285,7 +286,12 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 	if summary := q.recover(t); summary.Calls != 2 {
 		t.Fatalf("RecoverQuiet = %+v, want 2 calls settled before the scan means anything", summary)
 	}
-	tables, err := q.store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
+	assertNoTranscriptText(t, q.store)
+}
+
+func assertNoTranscriptText(t *testing.T, store *Store) {
+	t.Helper()
+	tables, err := store.DB().Query("SELECT name FROM sqlite_master WHERE type = 'table'")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +307,7 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, table := range names {
-		rows, err := q.store.DB().Query("SELECT * FROM " + table)
+		rows, err := store.DB().Query("SELECT * FROM " + table)
 		if err != nil {
 			t.Fatalf("scan %s: %v", table, err)
 		}
@@ -325,7 +331,7 @@ func TestRecoverQuietStoresNoTranscriptText(t *testing.T) {
 				}
 				for _, secret := range []string{secretResult, secretMessage, secretPrompt} {
 					if strings.Contains(text, secret) {
-						t.Errorf("%s.%s holds transcript text %q", table, columns[i], secret)
+						t.Errorf("%s.%s holds transcript text", table, columns[i])
 					}
 				}
 			}
@@ -718,13 +724,312 @@ func TestRecoverQuietSizesAnEarlierRebuiltCall(t *testing.T) {
 	})
 }
 
+func TestRecoverQuietFillsAgentMetaWithoutWaiting(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		meta       string
+		directory  bool
+		parent     any
+		agentType  any
+		transcript *string
+		moved      bool
+		wantParent any
+		wantType   any
+		wantCount  int
+	}{
+		{name: "live session", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
+		{name: "meta absent"},
+		{name: "meta directory", directory: true},
+		{name: "meta bad JSON", meta: `{`},
+		{name: "meta empty", meta: `{}`},
+		{name: "parent kept type filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, parent: "toolu_kept", wantParent: "toolu_kept", wantType: "Explore", wantCount: 1},
+		{name: "type kept parent filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, agentType: "general-purpose", wantParent: "toolu_meta", wantType: "general-purpose", wantCount: 1},
+		{name: "transcript NULL", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("NULL")},
+		{name: "transcript empty", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("")},
+		{name: "moved transcript", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, moved: true, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			q := newQuietStore(t, time.Minute, 0)
+			ctx := context.Background()
+			meta := strings.TrimSuffix(q.sub, ".jsonl") + ".meta.json"
+			if test.directory {
+				if err := os.Mkdir(meta, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if test.meta != "" {
+				// Claude Code's gym S2 meta shape: agentType and toolUseId.
+				if err := os.WriteFile(meta, []byte(test.meta), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := q.store.Batch(ctx, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id, parent_tool_use_id, agent_type) VALUES('a1', 'sess-1', ?1, ?2)`, test.parent, test.agentType); err != nil {
+					return err
+				}
+				if test.transcript != nil {
+					var path any = *test.transcript
+					if *test.transcript == "NULL" {
+						path = nil
+					}
+					_, err := tx.tx.ExecContext(ctx, `UPDATE sessions SET transcript_path = ?1, seat_dir = ?2 WHERE session_id = 'sess-1'`, path, filepath.Dir(filepath.Dir(filepath.Dir(q.main))))
+					return err
+				}
+				if test.moved {
+					_, err := tx.tx.ExecContext(ctx, `UPDATE sessions SET transcript_path = ?1, seat_dir = ?2 WHERE session_id = 'sess-1'`, filepath.Join(t.TempDir(), "missing", "sess-1.jsonl"), filepath.Dir(filepath.Dir(filepath.Dir(q.main))))
+					return err
+				}
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO sessions(session_id, transcript_path) VALUES('sess-no-path', '')`); err != nil {
+					return err
+				}
+				_, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id) VALUES('a2', 'sess-no-path')`)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first := q.recover(t)
+			if first.Parents != test.wantCount || first.Sessions != 0 {
+				t.Errorf("RecoverQuiet Parents = %d, Sessions = %d; want %d, 0", first.Parents, first.Sessions, test.wantCount)
+			}
+			agent := row(t, q.store, "agents", "agent_id = 'a1'")
+			if agent["parent_tool_use_id"] != test.wantParent || agent["agent_type"] != test.wantType {
+				t.Errorf("agent parent = %v, type = %v; want %v, %v", agent["parent_tool_use_id"], agent["agent_type"], test.wantParent, test.wantType)
+			}
+			if n := count(t, q.store, "faults"); n != 0 {
+				t.Errorf("faults = %d, want 0", n)
+			}
+			if test.transcript == nil && !test.moved {
+				unread := row(t, q.store, "agents", "agent_id = 'a2'")
+				if unread["parent_tool_use_id"] != nil || unread["agent_type"] != nil {
+					t.Errorf("transcript-less agent parent = %v, type = %v; want NULL, NULL", unread["parent_tool_use_id"], unread["agent_type"])
+				}
+			}
+			if again := q.recover(t); again.Parents != 0 || again.Sessions != 0 {
+				t.Errorf("second RecoverQuiet Parents = %d, Sessions = %d; want 0, 0", again.Parents, again.Sessions)
+			}
+		})
+	}
+}
+
+func TestRecoverQuietAgentMetaStoreErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "scan", sql: `INSERT INTO agents(agent_id, session_id) VALUES(NULL, 'sess-1')`, want: "scan an agent missing meta"},
+		{name: "upsert", sql: `CREATE TRIGGER refuse_agent_meta BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'test meta fill failure'); END`, want: "test meta fill failure"},
+		{name: "query", sql: `DROP TABLE agents`, want: "list agents missing meta"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			q := newQuietStore(t, time.Minute, 0)
+			ctx := context.Background()
+			if _, err := q.store.DB().ExecContext(ctx, `INSERT INTO agents(agent_id, session_id) VALUES('a1', 'sess-1')`); err != nil {
+				t.Fatal(err)
+			}
+			// Claude Code's gym S2 meta shape: agentType and toolUseId.
+			if err := os.WriteFile(strings.TrimSuffix(q.sub, ".jsonl")+".meta.json", []byte(`{"agentType":"Explore","toolUseId":"toolu_meta"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := q.store.DB().ExecContext(ctx, test.sql); err != nil {
+				t.Fatal(err)
+			}
+			summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("RecoverQuiet error = %v, want %s", err, test.want)
+			}
+			if summary.Parents != 0 || summary.Sessions != 0 || len(summary.Skipped) != 0 {
+				t.Errorf("RecoverQuiet Parents = %d, Sessions = %d, Skipped = %d; want 0, 0, 0", summary.Parents, summary.Sessions, len(summary.Skipped))
+			}
+			if test.name == "upsert" {
+				agent := row(t, q.store, "agents", "agent_id = 'a1'")
+				if agent["parent_tool_use_id"] != nil || agent["agent_type"] != nil {
+					t.Errorf("failed fill parent = %v, type = %v; want NULL, NULL", agent["parent_tool_use_id"], agent["agent_type"])
+				}
+			}
+		})
+	}
+}
+
+// taskNoticeLine copies gym S2 main-transcript lines 38 (attachment.type,
+// attachment.origin.kind, attachment.prompt) and 50 (origin.kind,
+// message.content): both have a top-level timestamp and string notice body.
+func taskNoticeLine(kind, agentID, status string, at time.Time) string {
+	body := "<task-notification><task-id>" + agentID + "</task-id><status>" + status +
+		"</status><summary>" + secretPrompt + "</summary><result>" + secretResult +
+		"</result><usage><total_tokens>999999</total_tokens><tool_uses>999</tool_uses></usage></task-notification>"
+	if kind == "attachment" {
+		return fmt.Sprintf(`{"type":"attachment","timestamp":%q,"attachment":{"type":"queued_command","origin":{"kind":"task-notification"},"prompt":%q,"usage":{"totalTokens":999999,"toolUses":999}}}`, stamp(at), body)
+	}
+	return fmt.Sprintf(`{"type":"user","timestamp":%q,"origin":{"kind":"task-notification"},"message":{"role":"user","content":%q}}`, stamp(at), body)
+}
+
+func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
+	start := time.Now().Add(-2 * time.Hour).Truncate(time.Millisecond)
+	notice := start.Add(20 * time.Second)
+	for _, test := range []struct {
+		name, kind, agent, status                                 string
+		offset                                                    time.Duration
+		woken, several, ended, live, noID, noStatus, noTranscript bool
+	}{
+		{name: "attachment notice", kind: "attachment"},
+		{name: "user-entry notice", kind: "user"},
+		{name: "failed status", status: "failed"},
+		{name: "killed status", status: "killed"},
+		{name: "woken agent", woken: true},
+		{name: "several notices after the start", several: true},
+		{name: "notice exactly at the start", offset: -20 * time.Second},
+		{name: "notice before the start only", offset: -time.Second * 21},
+		{name: "another agent", agent: "a2"},
+		{name: "without task-id", noID: true},
+		{name: "without status", noStatus: true},
+		{name: "transcript turn end exists", ended: true, offset: -18 * time.Second},
+		{name: "notice usage differs"},
+		{name: "privacy"},
+		{name: "live session", live: true},
+		// A background agent failing before it wrote its transcript still gets
+		// a notice: no totals to read, so the turn is marked once, as before.
+		{name: "no agent transcript", noTranscript: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kind, agent, status := test.kind, test.agent, test.status
+			if kind == "" {
+				kind = "attachment"
+			}
+			if agent == "" {
+				agent = "a1"
+			}
+			if status == "" {
+				status = "completed"
+			}
+			noticeAt := notice.Add(test.offset)
+			line := taskNoticeLine(kind, agent, status, noticeAt)
+			if test.noID {
+				line = strings.Replace(line, "<task-id>a1</task-id>", "", 1)
+			}
+			if test.noStatus {
+				line = strings.Replace(line, "<status>completed</status>", "", 1)
+			}
+			mainLines := []string{line}
+			if test.woken {
+				mainLines = append(mainLines, taskNoticeLine(kind, "a1", status, start.Add(-time.Second)))
+			}
+			if test.several {
+				// Deliberately out of time order: choose the earliest, not first.
+				mainLines = append([]string{taskNoticeLine(kind, "a1", status, noticeAt.Add(time.Second))}, mainLines...)
+			}
+			subLines := []string{toolUseLine("msg_sub", "toolu_sub", 31, start.Add(time.Second)),
+				quietResultLine("toolu_sub", secretResult, true, start.Add(1500*time.Millisecond)),
+				strings.Replace(textLine("msg_sub", secretMessage, 77, start.Add(2*time.Second)), `"role":"assistant",`, `"role":"assistant","stop_reason":null,`, 1)}
+			if test.offset == -20*time.Second {
+				for i := range subLines {
+					for _, offset := range []time.Duration{time.Second, 1500 * time.Millisecond, 2 * time.Second} {
+						subLines[i] = strings.ReplaceAll(subLines[i], stamp(start.Add(offset)), stamp(start))
+					}
+				}
+			}
+			if test.woken {
+				subLines = append([]string{endTurnLine("msg_old", 3, start.Add(-2*time.Second))}, subLines...)
+			}
+			wantEnd := noticeAt.UnixMilli()
+			if test.ended {
+				wantEnd = start.Add(3 * time.Second).UnixMilli()
+				subLines = append(subLines, endTurnLine("msg_sub", 77, start.Add(3*time.Second)))
+			}
+			ctx := context.Background()
+			q := newUnfilledStore(t, 2*time.Hour, start.Add(-time.Minute), mainLines, subLines, func(tx *Tx) error {
+				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id, started) VALUES('a1', 'sess-1', ?)`, start.UnixMilli()); err != nil {
+					return err
+				}
+				events := []Event{{EventID: "agent-start", Event: EventSubagentStart, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.UnixMilli()}}
+				if test.woken {
+					events = append(events,
+						Event{EventID: "old-start", Event: EventSubagentStart, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.Add(-3 * time.Second).UnixMilli()},
+						Event{EventID: "old-stop", Event: EventSubagentStop, SessionID: Ptr("sess-1"), AgentID: Ptr("a1"), TS: start.Add(-2 * time.Second).UnixMilli()})
+				}
+				for _, event := range events {
+					if _, err := tx.InsertEvent(ctx, event); err != nil {
+						return err
+					}
+				}
+				return tx.RebuildAgentTurns(ctx, "a1")
+			})
+			if test.live {
+				if err := q.store.Batch(ctx, func(tx *Tx) error {
+					return tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: q.now.Add(-time.Minute).UnixMilli()})
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.noTranscript {
+				if err := os.Remove(q.sub); err != nil {
+					t.Fatal(err)
+				}
+			}
+			summary := q.recover(t)
+			unfilled := test.offset < -20*time.Second || test.agent == "a2" || test.noID || test.noStatus || test.noTranscript
+			if len(summary.Skipped) != 0 {
+				t.Fatalf("RecoverQuiet skipped %v, want nothing skipped", summary.Skipped)
+			}
+			if test.live || unfilled {
+				wantFaults := 0
+				if unfilled {
+					wantFaults = 1
+				}
+				if summary.AgentStops != 0 || summary.Unfillable != wantFaults || count(t, q.store, "faults") != wantFaults {
+					t.Fatalf("RecoverQuiet = %+v, want no stops and %d unfillable faults", summary, wantFaults)
+				}
+				if turn := row(t, q.store, "agent_turns", "agent_id = 'a1' AND stopped IS NULL"); turn == nil {
+					t.Fatal("open turn was closed")
+				}
+				if unfilled {
+					if fault := row(t, q.store, "faults", "stage = 'transcript'"); fault["error"] != "agent a1 turn 1 open: "+UnfilledAgentStop {
+						t.Fatal("unfilled stop fault text changed")
+					}
+					if again := q.recover(t); again.Unfillable != 0 || count(t, q.store, "faults") != 1 {
+						t.Fatal("unfillable turn was marked again")
+					}
+				}
+				return
+			}
+			if summary.AgentStops != 1 || summary.Unfillable != 0 || count(t, q.store, "faults") != 0 {
+				t.Fatalf("RecoverQuiet = %+v, want 1 stop and no faults", summary)
+			}
+			stop := row(t, q.store, "events", "event = 'SubagentStop' AND detail = ?", RecoveredDetail)
+			if stop == nil || stop["ts"] != wantEnd || stop["detail"] != RecoveredDetail {
+				t.Fatalf("stop = %v, want recovered stop at %d", stop, wantEnd)
+			}
+			seq := 1
+			if test.woken {
+				seq = 2
+			}
+			turn := row(t, q.store, "agent_turns", "agent_id = 'a1' AND seq = ?", seq)
+			if turn["stopped"] != wantEnd || turn["stop_event_id"] != stop["event_id"] {
+				t.Fatal("agent turn did not close at the recovered stop")
+			}
+			if test.woken && row(t, q.store, "agent_turns", "agent_id = 'a1' AND seq = 1")["stopped"] != start.Add(-2*time.Second).UnixMilli() {
+				t.Fatal("earlier turn changed")
+			}
+			totals, err := ReadAgentTotals(q.sub, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			agentRow := row(t, q.store, "agents", "agent_id = 'a1'")
+			if agentRow["total_tokens"] != totals.TotalTokens || agentRow["tool_uses"] != totals.ToolUses {
+				t.Fatal("agent totals differ from its own transcript")
+			}
+			assertNoTranscriptText(t, q.store)
+			if again := q.recover(t); again.AgentStops != 0 || again.Unfillable != 0 {
+				t.Fatal("recovery repeated the stop")
+			}
+		})
+	}
+}
+
 // TestRecoverQuietMarksAnOpenAgentTurnOnce: a sub-agent's latest turn with no
-// SubagentStop whose quiet transcript shows no turn end after its start (the
-// agent was killed mid-turn) is marked once by one transcript fault, and the
-// agent row takes its parent Agent call and type from the meta file beside its
-// transcript. Any later hook reopens the turn; a transcript showing the turn's
-// end is no open turn to mark: its SubagentStop was lost, and recovery rebuilds
-// it at that end line's own ts, once.
+// SubagentStop, transcript turn end or qualifying task notice is marked once
+// by one transcript fault. Its parent Agent call and type come from the meta
+// file. A later hook reopens the turn; a transcript turn end rebuilds its
+// missing SubagentStop at that end line's own ts, once.
 func TestRecoverQuietMarksAnOpenAgentTurnOnce(t *testing.T) {
 	want := "agent a1 turn 1 open: " + UnfilledAgentStop
 	open := func(t *testing.T, subLines ...string) quietStore {
@@ -1619,5 +1924,387 @@ func TestRecoverQuietSizesAHookCallFromItsToolUseResult(t *testing.T) {
 				t.Errorf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
 			}
 		})
+	}
+}
+
+// Walker C: a long-lived session whose early rows were pruned gets them back
+// from recovery, which reads from sessions.first_ts.
+func TestRecoverQuietNeverResurrectsPrunedRows(t *testing.T) {
+	ctx := context.Background()
+	q := quietStore{store: openTestStore(t), now: time.Now()}
+	dir := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj")
+	q.main = filepath.Join(dir, "sess-1.jsonl")
+	old := q.now.Add(-40 * 24 * time.Hour)
+	recent := q.now.Add(-2 * time.Hour)
+	q.writeTranscript(t, q.main,
+		promptLine("prompt-old", secretPrompt, old),
+		toolUseLine("msg_old", "toolu_old", 5, old.Add(time.Second)),
+		quietResultLine("toolu_old", "ok", false, old.Add(2*time.Second)),
+		promptLine("prompt-new", secretPrompt, recent),
+		toolUseLine("msg_new", "toolu_new", 5, recent.Add(time.Second)),
+		quietResultLine("toolu_new", "ok", false, recent.Add(2*time.Second)),
+	)
+	if err := os.Chtimes(q.main, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+	err := q.store.Batch(ctx, func(tx *Tx) error {
+		if err := tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: old.UnixMilli(), TranscriptPath: Ptr(q.main)}); err != nil {
+			return err
+		}
+		if err := tx.TouchSession(ctx, Session{SessionID: "sess-1", TS: recent.Add(3 * time.Second).UnixMilli()}); err != nil {
+			return err
+		}
+		for _, c := range []Call{
+			{ToolUseID: "toolu_old", SessionID: Ptr("sess-1"), TS: Ptr(old.Add(time.Second).UnixMilli()), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
+				RequestID: Ptr("msg_old"), BytesReal: Ptr(int64(2)), BytesDelivered: Ptr(int64(2)), Failed: Ptr(false)},
+			{ToolUseID: "toolu_new", SessionID: Ptr("sess-1"), TS: Ptr(recent.Add(time.Second).UnixMilli()), Tool: Ptr("Bash"), Source: Ptr(SourceHook),
+				RequestID: Ptr("msg_new"), BytesReal: Ptr(int64(2)), BytesDelivered: Ptr(int64(2)), Failed: Ptr(false)},
+		} {
+			if err := tx.UpsertCall(ctx, c, Overwrite); err != nil {
+				return err
+			}
+		}
+		for _, r := range []Request{
+			{RequestID: "msg_old", SessionID: Ptr("sess-1"), TS: Ptr(old.Add(time.Second).UnixMilli()), Pending: Ptr(false), Source: Ptr(SourceHook), Model: Ptr("m"), StopReason: Ptr("tool_use"), InputTokens: Ptr(int64(1)), CacheReadTokens: Ptr(int64(1)), CacheCreationTokens: Ptr(int64(1)), ContextTokens: Ptr(int64(3)), OutputTokens: Ptr(int64(5)), Calls: Ptr(int64(1))},
+			{RequestID: "msg_new", SessionID: Ptr("sess-1"), TS: Ptr(recent.Add(time.Second).UnixMilli()), Pending: Ptr(false), Source: Ptr(SourceHook), Model: Ptr("m"), StopReason: Ptr("tool_use"), Calls: Ptr(int64(1))},
+		} {
+			if err := tx.UpsertRequest(ctx, r, Overwrite); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := q.store.Prune(ctx, q.now.Add(-30*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prune 1 removed %d rows; calls=%d requests=%d", removed, count(t, q.store, "calls"), count(t, q.store, "requests"))
+	if row(t, q.store, "calls", "tool_use_id = 'toolu_old'") != nil {
+		t.Fatalf("prune kept toolu_old")
+	}
+	summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Skipped) != 0 {
+		t.Fatalf("RecoverQuiet skipped %v", summary.Skipped)
+	}
+	c := row(t, q.store, "calls", "tool_use_id = 'toolu_old'")
+	r := row(t, q.store, "requests", "request_id = 'msg_old'")
+	t.Logf("after recovery: toolu_old=%v", c != nil)
+	t.Logf("after recovery: msg_old=%v", r != nil)
+	if c != nil {
+		t.Logf("resurrected call source=%v ts=%v", c["source"], c["ts"])
+	}
+	cutoff := q.now.Add(-30 * 24 * time.Hour).UnixMilli()
+	for _, table := range []string{"calls", "requests"} {
+		var expired int
+		if err := q.store.DB().QueryRow("SELECT COUNT(*) FROM "+table+" WHERE ts < ?", cutoff).Scan(&expired); err != nil {
+			t.Fatal(err)
+		}
+		if expired != 0 {
+			t.Errorf("recovery resurrected pruned rows: %s has %d expired rows", table, expired)
+		}
+	}
+	if row(t, q.store, "requests", "request_id = 'msg_new'") == nil {
+		t.Error("recovery lost the recent request")
+	}
+	if c != nil || r != nil {
+		t.Errorf("recovery resurrected pruned rows: call %v request %v", c != nil, r != nil)
+	}
+}
+
+// Walker C: a session row pruned and archived, then the session resumed and
+// pruned again: the newer row is deleted while the archive keeps the old copy.
+
+func TestRecoverQuietResolvedPendingRefreshesSessionModel(t *testing.T) {
+	q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+	ctx := context.Background()
+	key := ProvisionalKey(q.toolMain)
+	if err := q.store.Batch(ctx, func(tx *Tx) error {
+		if err := tx.UpsertRequest(ctx, Request{RequestID: key, SessionID: Ptr("sess-1"), TS: Ptr(q.callTS), Pending: Ptr(true),
+			Calls: Ptr(int64(1)), Source: Ptr(SourceHook)}, Overwrite); err != nil {
+			return err
+		}
+		return tx.UpsertCall(ctx, Call{ToolUseID: q.toolMain, RequestID: Ptr(key), BytesDelivered: Ptr(int64(5))}, Overwrite)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q.recover(t)
+	req := row(t, q.store, "requests", "request_id = 'msg_main'")
+	sess := row(t, q.store, "sessions", "session_id = 'sess-1'")
+	t.Logf("resolved main request model=%v agent=%v; sessions.model=%v", req["model"], req["agent_id"], sess["model"])
+	if req["model"] == nil || sess["model"] != req["model"] {
+		t.Errorf("sessions.model stays NULL after recovery resolved the session's only main-chat request to model %v", req["model"])
+	}
+}
+
+func TestRecoverQuietReadsTheNewestTranscriptPath(t *testing.T) {
+	for i, reverse := range []bool{false, true} {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			start := time.UnixMilli(q.firstTS).Add(time.Minute)
+			q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), endTurnLine("msg_end", 9, start.Add(time.Second)))
+			if err := os.Chtimes(q.main, start, start); err != nil {
+				t.Fatal(err)
+			}
+			// A second run names the current file; the first run's root is gone.
+			if _, err := q.store.DB().Exec("DELETE FROM sessions"); err != nil {
+				t.Fatal(err)
+			}
+			runs := []Session{
+				{SessionID: "sess-1", TS: q.firstTS, TranscriptPath: Ptr(filepath.Join(t.TempDir(), "gone", "sess-1.jsonl"))},
+				{SessionID: "sess-1", TS: start.UnixMilli(), TranscriptPath: Ptr(q.main)},
+			}
+			if reverse {
+				runs[0], runs[1] = runs[1], runs[0]
+			}
+			touchSessionRuns(t, q.store, runs)
+			putRows(t, q.store, []Event{promptEvent("u1", "sess-1", start.UnixMilli())}, nil)
+			q.recover(t)
+			if n := countWhere(t, q.store, "SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND session_id = 'sess-1'"); n != 1 {
+				t.Errorf("rebuilt Stop rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestRecoverQuietFindsAMovedTranscript(t *testing.T) {
+	for _, viaSeat := range []bool{false, true} {
+		t.Run(fmt.Sprintf("seat=%v", viaSeat), func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			start := time.UnixMilli(q.firstTS).Add(time.Minute)
+			q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), endTurnLine("msg_end", 9, start.Add(time.Second)))
+			if err := os.Chtimes(q.main, start, start); err != nil {
+				t.Fatal(err)
+			}
+			projects := filepath.Dir(filepath.Dir(q.main))
+			if err := os.Rename(filepath.Dir(q.main), filepath.Join(projects, "-tmp-moved-proj")); err != nil {
+				t.Fatal(err)
+			}
+			if viaSeat {
+				dead := filepath.Join(t.TempDir(), "gone", "sess-1.jsonl")
+				if _, err := q.store.DB().Exec("UPDATE sessions SET transcript_path = ?, seat_dir = ?", dead, filepath.Dir(projects)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			putRows(t, q.store, []Event{promptEvent("u1", "sess-1", start.UnixMilli())}, nil)
+			q.recover(t)
+			if n := countWhere(t, q.store, "SELECT COUNT(*) FROM turns WHERE event = 'Stop' AND session_id = 'sess-1'"); n != 1 {
+				t.Errorf("rebuilt Stop rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+func TestResolveTranscriptKeepsTheStoredPathOrFindsTheFirstMatch(t *testing.T) {
+	root := t.TempDir()
+	stored := filepath.Join(root, "old-projects", "old", "s1.jsonl")
+	first := filepath.Join(root, "old-projects", "a", "s1.jsonl")
+	second := filepath.Join(root, "old-projects", "z", "s1.jsonl")
+	seat := filepath.Join(root, "seat")
+	seatPath := filepath.Join(seat, "projects", "a", "s1.jsonl")
+	for _, path := range []string{stored, second, first, seatPath} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(name, path, seatDir, session, want string) {
+		t.Helper()
+		if got := ResolveTranscript(path, seatDir, session); got != want {
+			t.Errorf("%s: resolved path = %q, want %q", name, got, want)
+		}
+	}
+	check("existing stored path wins", stored, seat, "s1", stored)
+	if err := os.Remove(stored); err != nil {
+		t.Fatal(err)
+	}
+	check("stored root first sorted match", stored, seat, "s1", first)
+	dead := filepath.Join(root, "gone-projects", "old", "s1.jsonl")
+	check("seat root fallback", dead, seat, "s1", seatPath)
+	check("empty stored path", "", seat, "s1", seatPath)
+	check("no match preserves stored path", stored, seat, "absent", stored)
+	check("no recorded roots", "", "", "s1", "")
+}
+
+func TestRecoverQuietSettlesAnEditWithoutARealSize(t *testing.T) {
+	for _, response := range noRealOutputResponses(t) {
+		for _, state := range []string{"lost PostToolUse", "batch only", "rebuilt", "landed"} {
+			t.Run(response.name+"/"+state, func(t *testing.T) {
+				q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+				start := time.UnixMilli(q.callTS)
+				use := strings.Replace(toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)), `"name":"Bash"`, `"name":"`+response.tool+`"`, 1)
+				use = strings.Replace(use, `"input":{"command":"false","description":"Fail"}`, `"input":`+string(response.input), 1)
+				q.writeTranscript(t, q.main,
+					promptLine("prompt-1", secretPrompt, start), use,
+					textLine("msg_main", secretMessage, 77, start.Add(2*time.Second)),
+					resultWithUseResult(q.toolMain, secretResult, string(response.raw), start.Add(3*time.Second)),
+				)
+				if err := os.Chtimes(q.main, start, start); err != nil {
+					t.Fatal(err)
+				}
+				call := Call{ToolUseID: q.toolMain, Tool: Ptr(response.tool)}
+				if state == "batch only" {
+					call.BytesDelivered = Ptr(int64(len(secretResult)))
+				}
+				if state == "landed" {
+					call.Failed = Ptr(false)
+					call.RequestID = Ptr("msg_main")
+				}
+				if state == "rebuilt" {
+					if _, err := q.store.DB().Exec("DELETE FROM calls WHERE tool_use_id = ?", q.toolMain); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := q.store.UpsertCall(context.Background(), call, Overwrite); err != nil {
+					t.Fatal(err)
+				}
+				first := q.recover(t)
+				main := row(t, q.store, "calls", "tool_use_id = ?", q.toolMain)
+				if main["bytes_real"] != nil || main["failed"] != int64(0) {
+					t.Errorf("real=%v failed=%v, want NULL, 0", main["bytes_real"], main["failed"])
+				}
+				if state != "landed" && main["bytes_delivered"] != int64(len(secretResult)) {
+					t.Errorf("delivered=%v, want %d", main["bytes_delivered"], len(secretResult))
+				}
+				if first.Unfillable != 0 {
+					t.Errorf("RecoverQuiet unfillable=%d, want 0", first.Unfillable)
+				}
+				var n int
+				if err := q.store.DB().QueryRow("SELECT COUNT(*) FROM faults WHERE tool_use_id = ? AND error LIKE ?", q.toolMain, "%"+UnfilledCall+"%").Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				if n != 0 {
+					t.Errorf("call markers=%d, want 0", n)
+				}
+				if calls, err := q.store.UnfinishedCalls(context.Background(), "sess-1"); err != nil {
+					t.Fatal(err)
+				} else {
+					for _, c := range calls {
+						if c.ToolUseID == q.toolMain {
+							t.Error("landed call remains unfinished")
+						}
+					}
+				}
+				if candidates := q.candidates(t); len(candidates) != 0 {
+					t.Errorf("quietCandidates = %d, want 0", len(candidates))
+				}
+				before := q.snapshot(t)
+				if again := q.recover(t); again.Sessions != 0 || again.Calls != 0 || again.Requests != 0 || again.Rebuilt != 0 || again.Unfillable != 0 {
+					t.Errorf("second RecoverQuiet=%+v, want nothing to do", again)
+				}
+				if !reflect.DeepEqual(before, q.snapshot(t)) {
+					t.Error("second recovery changed stored rows")
+				}
+				for _, r := range q.snapshot(t) {
+					for _, value := range r {
+						text := fmt.Sprint(value)
+						if strings.Contains(text, secretResult) || strings.Contains(text, secretMessage) || strings.Contains(text, secretPrompt) {
+							t.Fatal("transcript text stored")
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// appendMarkLines appends the fixture's real mark lines (testdata/transcript-marks.jsonl)
+// to a transcript, each restamped at `at` + its position and with its uuid
+// suffixed by tag, so two transcripts hold distinct entries; the mtime is kept.
+func (q quietStore) appendMarkLines(t *testing.T, path, tag string, at time.Time, kinds ...string) {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/transcript-marks.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamped := regexp.MustCompile(`"timestamp":"[^"]*"`)
+	uuid := regexp.MustCompile(`"uuid":"([^"]*)"`)
+	var add []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		for _, kind := range kinds {
+			if !strings.Contains(line, kind) {
+				continue
+			}
+			line = stamped.ReplaceAllString(line, `"timestamp":"`+stamp(at.Add(time.Duration(len(add))*time.Second))+`"`)
+			line = uuid.ReplaceAllString(line, `"uuid":"${1}-`+tag+`"`)
+			add = append(add, line)
+			break
+		}
+	}
+	if len(add) < len(kinds) {
+		t.Fatalf("fixture holds %d lines for the %d kinds %v", len(add), len(kinds), kinds)
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(strings.Join(add, "\n") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverQuietWritesTheMarksOfAQuietSession(t *testing.T) {
+	q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+	at := q.now.Add(-2*time.Hour + time.Minute)
+	q.appendMarkLines(t, q.main, "main", at, `"stop_hook_summary"`, `"turn_duration"`, `"compact_boundary"`, `"cost-state"`)
+	q.appendMarkLines(t, q.sub, "sub", at, `"turn_duration"`)
+	q.recover(t)
+
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 2, "session_costs": 1} {
+		if got := count(t, q.store, table); got != want {
+			t.Errorf("%s rows = %d, want %d", table, got, want)
+		}
+	}
+	hook := row(t, q.store, "stop_hooks", "1 = 1")
+	if hook["session_id"] != "sess-1" || hook["agent_id"] != nil || hook["prompt_id"] != "prompt-1" || hook["hook_count"] != int64(4) ||
+		hook["seat_dir"] != "/tmp/demo-seat" {
+		t.Errorf("stop_hooks row = %v", hook)
+	}
+	main := row(t, q.store, "turn_durations", "agent_id IS NULL")
+	if main["prompt_id"] != "prompt-1" || main["duration_ms"] != int64(81557) {
+		t.Errorf("main turn_durations row = %v, want prompt-1 and 81557 ms", main)
+	}
+	if sub := row(t, q.store, "turn_durations", "agent_id = 'a1'"); sub == nil || sub["duration_ms"] != int64(81557) {
+		t.Errorf("sub-agent turn_durations row = %v", sub)
+	}
+	cost := row(t, q.store, "session_costs", "session_id = 'sess-1'")
+	if cost["cost_usd"] != 59.30682170000001 || cost["wall_ms"] != int64(53062358) || cost["ts"] != q.now.UnixMilli() {
+		t.Errorf("session_costs row = %v, want the last cost-state stamped now", cost)
+	}
+	if row(t, q.store, "compactions", "pre_tokens = 333677 AND post_tokens = 18677") == nil {
+		t.Errorf("no compaction row of the real numbers")
+	}
+
+	// Read again, the same marks write nothing and the stored cost stands.
+	again, err := q.store.RecoverQuiet(context.Background(), q.now.Add(time.Hour), QuietAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Sessions != 0 {
+		t.Errorf("second RecoverQuiet = %+v, want nothing written", again)
+	}
+	for table, want := range map[string]int{"compactions": 1, "stop_hooks": 1, "stop_hook_runs": 4, "turn_durations": 2, "session_costs": 1} {
+		if got := count(t, q.store, table); got != want {
+			t.Errorf("%s rows after a second pass = %d, want %d", table, got, want)
+		}
+	}
+	if got := row(t, q.store, "session_costs", "session_id = 'sess-1'")["ts"]; got != q.now.UnixMilli() {
+		t.Errorf("session_costs.ts after a second pass = %v, want it unchanged", got)
 	}
 }

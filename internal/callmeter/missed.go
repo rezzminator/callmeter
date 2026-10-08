@@ -37,9 +37,11 @@ const unparsedLimit = 200
 
 // IngestMissed turns the wrapper's missed.log into `binary` faults, and the
 // lines the binary wrote itself (a reason opening TerminatedReason or
-// StoreUnavailableReason) into `terminated` faults, and returns how many it wrote. Each line is
+// StoreUnavailableReason, or PanicReason) into `terminated` faults, and
+// returns how many it wrote. Each line is
 // `{unix seconds}\t{event}\t{reason}`, optionally followed by
-// `\t{session_id}`, and becomes a fault stamped seconds × 1000 whose error is
+// `\t{session_id}`; the writer's pid sits at the reason's end as ` (pid N)`.
+// It becomes a fault stamped seconds × 1000 whose error is
 // `{event}: {reason}` and whose session is that session_id;
 // a line that does not parse becomes a fault `unparsed missed.log line: …` of
 // its first 200 bytes stamped at its file's last write, never a dropped line.
@@ -49,12 +51,13 @@ const unparsedLimit = 200
 // run left is ingested with it. Hooks run in parallel, so a claim is ingested
 // only by the run holding its exclusive flock: a claim another live run holds
 // is left to that run, and a claim whose run died has no lock left. All the
-// faults go in one transaction, which writes every line of the claim this run
-// made, and a line of any other claim or of an ingested claim's tail only
-// beyond the identical rows (ts, stage, session_id, tool_use_id, error) the
-// store already holds: a claim whose run died after its commit is ingested
-// again with no fault twice, identical lines of one ingest stay as many
-// faults, and a fresh line identical to a stored one is a fault of its own. After the commit,
+// faults go in one transaction. The claim this run just made has never been
+// ingested, so each of its lines is a fault, a line identical to a stored fault
+// included (two hooks of one session cancelled in one second, ingested by two
+// runs). From every other file a fault is written only beyond the identical
+// rows (ts, stage, session_id, tool_use_id, error) the store already holds: a
+// claim whose run died after its commit is ingested again with no fault twice,
+// and identical lines of one ingest stay as many faults. After the commit,
 // still under its lock, each claim is renamed {path}.done-{bytes read}-… and
 // kept until DoneGrace has passed since its last write: a line appended through
 // a handle opened before the claim's rename lands there, and the first ingest
@@ -70,7 +73,7 @@ func (s *Store) IngestMissed(ctx context.Context, path string) (int, error) {
 // the files are moved or removed: a hook holds its signal handler off across
 // commit and move, so a signal there waits for both.
 func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (release func())) (n int, err error) {
-	ours, err := claimMissed(path)
+	own, err := claimMissed(path)
 	if err != nil {
 		return 0, err
 	}
@@ -84,7 +87,8 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 	}
 	now := clock.Real.Now()
 	var taken []takenClaim
-	var faults []missedFault
+	var faults []Fault // from files a dead run may already have ingested
+	var fresh []Fault  // from own: never ingested
 	var locks []*os.File
 	defer func() {
 		for _, held := range locks {
@@ -103,9 +107,11 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 		locks = append(locks, held)
 		taken = append(taken, takenClaim{file: file, read: len(data)})
-		// The claim this run made was never ingested; any other one a run left
-		// may have been, its commit made before that run died.
-		faults = appendMissed(faults, parseMissed(data, info.ModTime().UnixMilli()), file != ours)
+		if file == own {
+			fresh = append(fresh, parseMissed(data, info.ModTime().UnixMilli())...)
+		} else {
+			faults = append(faults, parseMissed(data, info.ModTime().UnixMilli())...)
+		}
 	}
 	for _, file := range dones {
 		if named, err := os.Lstat(file); err == nil && now.Sub(named.ModTime()) < DoneGrace {
@@ -124,7 +130,7 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 		taken = append(taken, takenClaim{file: file, done: true})
 		if read := doneRead(path, file); read < len(data) {
-			faults = appendMissed(faults, parseMissed(data[read:], info.ModTime().UnixMilli()), true)
+			faults = append(faults, parseMissed(data[read:], info.ModTime().UnixMilli())...)
 		}
 	}
 	if len(taken) == 0 {
@@ -133,9 +139,16 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 	release := func() {}
 	defer func() { release() }()
 	if err := s.Batch(ctx, func(tx *Tx) error {
+		// The other files first: their check counts only rows stored before this ingest.
 		written, err := tx.addMissedFaults(ctx, faults)
 		if err != nil {
 			return err
+		}
+		for _, fault := range fresh {
+			if err := tx.AddFault(ctx, fault); err != nil {
+				return err
+			}
+			written++
 		}
 		n = written
 		if hold != nil {
@@ -143,7 +156,7 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("callmeter store %s: ingest %d missed.log faults: %w", s.path, len(faults), err)
+		return 0, fmt.Errorf("callmeter store %s: ingest %d missed.log faults: %w", s.path, len(faults)+len(fresh), err)
 	}
 	var moveErr error
 	for _, claim := range taken {
@@ -169,9 +182,9 @@ type takenClaim struct {
 }
 
 // keepDone renames an ingested claim {path}.done-{bytes read}-{claim suffix},
-// never over another file, then stamps its grace from now: renamed first, so a
-// run dying between the two leaves a done file, never a claim whose changed
-// stamp would date its unparsed lines anew when it is ingested again.
+// never over another file, and then stamps its grace from now: a claim left
+// unrenamed keeps its last write time, which its unparsed lines are stamped
+// at, so the next ingest of it finds them stored.
 func keepDone(path string, claim takenClaim, now time.Time) error {
 	suffix := strings.TrimPrefix(filepath.Base(claim.file), filepath.Base(path)+ingestInfix)
 	base := path + doneInfix + strconv.Itoa(claim.read) + "-" + suffix
@@ -207,31 +220,12 @@ func doneRead(path, file string) int {
 	return read
 }
 
-// missedFault is one line's fault and whether an earlier ingest may already
-// have written it (maybe): a line of a claim this run did not make, or of an
-// ingested claim's tail.
-type missedFault struct {
-	Fault
-	maybe bool
-}
-
-func appendMissed(to []missedFault, faults []Fault, maybe bool) []missedFault {
-	for _, fault := range faults {
-		to = append(to, missedFault{fault, maybe})
-	}
-	return to
-}
-
-// addMissedFaults writes the faults of one ingest and returns how many it
-// wrote: a line of this run's own claim always, a line that may have been
-// ingested before only beyond the identical rows the store already holds, so a
-// fresh line identical to a stored one (parallel hooks losing their events in
-// one second) is never taken for a re-ingest.
-func (t *Tx) addMissedFaults(ctx context.Context, faults []missedFault) (int, error) {
+// addMissedFaults writes the faults of one ingest, each only beyond the
+// identical rows the store already holds, and returns how many it wrote.
+func (t *Tx) addMissedFaults(ctx context.Context, faults []Fault) (int, error) {
 	stored := map[Fault]int{}
-	for _, missed := range faults {
-		fault := missed.Fault
-		if _, seen := stored[fault]; seen || !missed.maybe {
+	for _, fault := range faults {
+		if _, seen := stored[fault]; seen {
 			continue
 		}
 		var n int
@@ -244,9 +238,8 @@ func (t *Tx) addMissedFaults(ctx context.Context, faults []missedFault) (int, er
 		stored[fault] = n
 	}
 	written := 0
-	for _, missed := range faults {
-		fault := missed.Fault
-		if missed.maybe && stored[fault] > 0 {
+	for _, fault := range faults {
+		if stored[fault] > 0 {
 			stored[fault]--
 			continue
 		}
@@ -259,9 +252,8 @@ func (t *Tx) addMissedFaults(ctx context.Context, faults []missedFault) (int, er
 }
 
 // claimMissed renames path to a file nothing appends to and returns that
-// claim's name; an absent path is no claim ("") and not an error. An existing
-// claim of the same pid (a crashed run's, its pid reused) is never
-// overwritten: the new claim takes a numbered name beside it.
+// file's path; an absent path is "", not an error. An existing claim of the same pid (a crashed run's, its pid reused)
+// is never overwritten: the new claim takes a numbered name beside it.
 func claimMissed(path string) (string, error) {
 	target := path + ingestInfix + strconv.Itoa(os.Getpid())
 	for n := 1; ; n++ {
@@ -416,10 +408,13 @@ func parseMissed(data []byte, written int64) []Fault {
 const TerminatedReason = "terminated by "
 
 // PanicReason is the reason of the binary's own line when its hook run
-// panicked: `callmeter hook` recovers, exits 0 and leaves this line, with the
-// event and session its payload named so far. parseMissedLine turns it into a
-// StageTerminated fault, as a `terminated by` line.
+// panicked before being accounted for: `callmeter hook` recovers, exits 0 and
+// leaves this line, with the event and session its payload named so far.
+// parseMissedLine turns it into a StageTerminated fault, as a `terminated by` line.
 const PanicReason = "panic"
+
+// BatchWithoutCalls is the payload fault for a PostToolBatch naming no calls.
+const BatchWithoutCalls = "PostToolBatch payload carries no tool_calls"
 
 // TerminatedByStoreBusy is the reason of the binary's own line when its store
 // wait hit its event's bound before it recorded: the store stayed locked, and
@@ -498,7 +493,8 @@ const (
 )
 
 // parseMissedLine reads `{unix seconds}\t{event}\t{reason}[\t{session_id}]`;
-// false when the line has not that shape. The session is the reason's last tab
+// the writer's pid sits at the reason's end. False when the line has not that
+// shape. The session is the reason's last tab
 // field only when it is a session id (MissedSessionID), so a line written
 // before the field existed, its reason holding a tab, keeps its reason whole.
 func parseMissedLine(line string) (Fault, bool) {
@@ -516,7 +512,7 @@ func parseMissedLine(line string) (Fault, bool) {
 	}
 	stage := StageBinary
 	if strings.HasPrefix(reason, TerminatedReason) || strings.HasPrefix(reason, StoreUnavailableReason) ||
-		reason == PanicReason {
+		reason == PanicReason || strings.HasPrefix(reason, PanicReason+" (") {
 		stage = StageTerminated // the binary's own line: a signal, a busy or an unavailable store, or a panic cut its run short
 	}
 	return Fault{TS: seconds * 1000, SessionID: session, Stage: stage, Error: fields[1] + ": " + reason}, true

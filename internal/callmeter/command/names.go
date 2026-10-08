@@ -45,14 +45,30 @@ type titles struct{ custom, ai, summary string }
 // answer is the last customTitle, else the last aiTitle, else the
 // last summary, else the session id's first characters. A transcript that is
 // absent names nothing; one that exists but cannot be read returns its error,
-// so the table prints "?" and one note.
+// so the table prints "?" and a count with a safe label in its note; the full
+// error, including the path, is written to stderr once per session.
 type transcriptNames struct {
 	ctx    context.Context
 	db     *sql.DB
 	getenv paths.Getenv
+	stderr io.Writer
+	told   map[string]bool
 }
 
-func (names *transcriptNames) nameOf(sessionID string) (string, error) {
+func (names *transcriptNames) nameOf(sessionID string) (name string, err error) {
+	defer func() {
+		if err == nil || names.stderr == nil {
+			return
+		}
+		if names.told == nil {
+			names.told = make(map[string]bool)
+		}
+		if names.told[sessionID] {
+			return
+		}
+		names.told[sessionID] = true
+		fmt.Fprintf(names.stderr, "callmeter: chat name: session %s: %v\n", sessionID, err)
+	}()
 	fallback := sessionID
 	if runes := []rune(sessionID); len(runes) > idLen {
 		fallback = string(runes[:idLen])

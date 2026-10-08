@@ -96,6 +96,7 @@ type Request struct {
 	CacheCreation1hTokens *int64
 	ContextTokens         *int64 // input + cache read + cache creation
 	OutputTokens          *int64
+	ThinkingTokens        *int64 // the share of OutputTokens spent thinking; NULL when the usage carries none
 	Calls                 *int64
 	Pending               *bool
 	Source                *string
@@ -218,6 +219,7 @@ func (r Request) columns() []column {
 	cs = add(cs, "cache_creation_1h_tokens", r.CacheCreation1hTokens)
 	cs = add(cs, "context_tokens", r.ContextTokens)
 	cs = add(cs, "output_tokens", r.OutputTokens)
+	cs = add(cs, "thinking_tokens", r.ThinkingTokens)
 	cs = add(cs, "calls", r.Calls)
 	cs = add(cs, "pending", r.Pending)
 	cs = add(cs, "source", r.Source)
@@ -253,8 +255,9 @@ func cut(s string, limit int) string {
 
 // Tx is one write transaction: every write of one event goes through one Tx.
 type Tx struct {
-	tx   *sql.Tx
-	path string
+	tx       *sql.Tx
+	path     string
+	complete bool // the store has every table and column of its schema (Store.SchemaComplete)
 }
 
 // Batch runs fn in one transaction, committed when fn returns nil and rolled
@@ -278,7 +281,7 @@ func (s *Store) BatchHeld(ctx context.Context, held func(), fn func(*Tx) error) 
 	if held != nil {
 		held()
 	}
-	if err := fn(&Tx{tx: tx, path: s.path}); err != nil {
+	if err := fn(&Tx{tx: tx, path: s.path, complete: s.SchemaComplete()}); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 	if err := tx.Commit(); err != nil {
@@ -316,11 +319,32 @@ func (s *Store) ReplaceCommandParts(ctx context.Context, toolUseID string, parts
 
 // UpsertCall writes c's provided columns by tool_use_id.
 func (t *Tx) UpsertCall(ctx context.Context, c Call, mode Mode) error {
-	return t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode)
+	if c.Cwd == nil && c.Input == nil {
+		return t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode)
+	}
+	var cwd, input sql.NullString
+	err := t.tx.QueryRowContext(ctx, "SELECT cwd, input FROM calls WHERE tool_use_id = ?", c.ToolUseID).Scan(&cwd, &input)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("callmeter store %s: read parse inputs of %q: %w", t.path, c.ToolUseID, err)
+	}
+	if err := t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode); err != nil {
+		return err
+	}
+	// Compare the stored values after merging, including NULL: FillEmpty may
+	// leave both unchanged. Parse faults stay until ReplaceCommandParts.
+	if _, err := t.tx.ExecContext(ctx, `DELETE FROM command_parts WHERE tool_use_id = ?
+		AND EXISTS (SELECT 1 FROM calls WHERE tool_use_id = ? AND (cwd IS NOT ? OR input IS NOT ?))`,
+		c.ToolUseID, c.ToolUseID, cwd, input); err != nil {
+		return fmt.Errorf("callmeter store %s: invalidate command parts of %q: %w", t.path, c.ToolUseID, err)
+	}
+	return nil
 }
 
 // UpsertRequest writes r's provided columns by request_id.
 func (t *Tx) UpsertRequest(ctx context.Context, r Request, mode Mode) error {
+	if !t.complete {
+		r.ThinkingTokens = nil
+	}
 	return t.upsert(ctx, "requests", "request_id", r.RequestID, r.columns(), mode)
 }
 
@@ -349,8 +373,19 @@ func mergeSet(table, name string, mode Mode, own *Mode) string {
 }
 
 func (t *Tx) upsert(ctx context.Context, table, keyName, key string, columns []column, mode Mode) error {
+	_, err := t.upsertWhere(ctx, table, keyName, key, columns, mode, "")
+	return err
+}
+
+// upsertWhere is upsert whose update of a stored row runs only where guard (a
+// condition over the stored row, its columns named table.column) holds, with
+// guardArgs bound in order; an empty guard always updates. It returns the rows
+// written: 0 when the guard kept a stored row as it stands.
+func (t *Tx) upsertWhere(
+	ctx context.Context, table, keyName, key string, columns []column, mode Mode, guard string, guardArgs ...any,
+) (int64, error) {
 	if key == "" {
-		return fmt.Errorf("callmeter store %s: upsert into %s without a %s", t.path, table, keyName)
+		return 0, fmt.Errorf("callmeter store %s: upsert into %s without a %s", t.path, table, keyName)
 	}
 	names := []string{keyName}
 	marks := []string{"?"}
@@ -365,13 +400,22 @@ func (t *Tx) upsert(ctx context.Context, table, keyName, key string, columns []c
 	conflict := "DO NOTHING"
 	if len(sets) > 0 {
 		conflict = "DO UPDATE SET " + strings.Join(sets, ", ")
+		if guard != "" {
+			conflict += " WHERE " + guard
+			values = append(values, guardArgs...)
+		}
 	}
 	statement := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT(%s) %s",
 		table, strings.Join(names, ", "), strings.Join(marks, ", "), keyName, conflict)
-	if _, err := t.tx.ExecContext(ctx, statement, values...); err != nil {
-		return fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
+	result, err := t.tx.ExecContext(ctx, statement, values...)
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
 	}
-	return nil
+	written, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("callmeter store %s: upsert %s %s=%q: %w", t.path, table, keyName, key, err)
+	}
+	return written, nil
 }
 
 // ResolveRequest merges the provisional row provisionalID into the row keyed
@@ -391,8 +435,8 @@ func (t *Tx) ResolveRequest(ctx context.Context, provisionalID string, r Request
 			r.RequestID,
 		)
 	}
-	merge := `INSERT INTO requests (request_id, session_id, agent_id, prompt_id, ts, model, stop_reason, input_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, context_tokens, output_tokens, calls, pending, source, config_dir, seat_dir)
-		SELECT ?, session_id, agent_id, prompt_id, ts, model, stop_reason, input_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, context_tokens, output_tokens, calls, pending, source, config_dir, seat_dir
+	merge := `INSERT INTO requests (request_id, session_id, agent_id, prompt_id, ts, model, stop_reason, input_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, context_tokens, output_tokens, %[1]scalls, pending, source, config_dir, seat_dir)
+		SELECT ?, session_id, agent_id, prompt_id, ts, model, stop_reason, input_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, context_tokens, output_tokens, %[1]scalls, pending, source, config_dir, seat_dir
 		FROM requests WHERE request_id = ?
 		ON CONFLICT(request_id) DO UPDATE SET
 			session_id = COALESCE(requests.session_id, excluded.session_id),
@@ -407,10 +451,16 @@ func (t *Tx) ResolveRequest(ctx context.Context, provisionalID string, r Request
 			cache_creation_5m_tokens = COALESCE(requests.cache_creation_5m_tokens, excluded.cache_creation_5m_tokens),
 			cache_creation_1h_tokens = COALESCE(requests.cache_creation_1h_tokens, excluded.cache_creation_1h_tokens),
 			context_tokens = COALESCE(requests.context_tokens, excluded.context_tokens),
-			output_tokens = COALESCE(requests.output_tokens, excluded.output_tokens),
+			output_tokens = COALESCE(requests.output_tokens, excluded.output_tokens),%[2]s
 			source = COALESCE(requests.source, excluded.source),
 			config_dir = COALESCE(requests.config_dir, excluded.config_dir),
 			seat_dir = COALESCE(requests.seat_dir, excluded.seat_dir)`
+	thinkingColumn, thinkingMerge := "", ""
+	if t.complete {
+		thinkingColumn = "thinking_tokens, "
+		thinkingMerge = "\n\t\t\tthinking_tokens = COALESCE(requests.thinking_tokens, excluded.thinking_tokens),"
+	}
+	merge = fmt.Sprintf(merge, thinkingColumn, thinkingMerge)
 	if _, err := t.tx.ExecContext(ctx, merge, r.RequestID, provisionalID); err != nil {
 		return fmt.Errorf("callmeter store %s: merge request %q into %q: %w", t.path, provisionalID, r.RequestID, err)
 	}
@@ -474,15 +524,18 @@ func (t *Tx) ResolvePendingFrom(ctx context.Context, pending []PendingRequest, f
 // A request older than since (the session's first recorded run) is written
 // only over a row a batch already stored: the transcript lines before callmeter
 // first saw the session (enabled mid-session, or a resumed history) are not
-// back-filled.
+// back-filled. Only a row r's session and agent own is written (ownedBy): a
+// forked session's transcript opens with a copy of its parent's history under
+// the same message ids, and the copy's usage (Claude Code wrote one all zero)
+// never overwrites the parent's.
 func (t *Tx) SettleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
 	return t.settleRequest(ctx, r, toolUseIDs, since, Overwrite)
 }
 
 // RecoverRequest is SettleRequest for a request read from the transcript of a
 // session gone quiet (RecoverQuiet): every column only fills, so a value a
-// hook stored is never overwritten, and the calls pointing, the since rule and
-// the recount are SettleRequest's.
+// hook stored is never overwritten, and the calls pointing, the since rule, the
+// owner rule and the recount are SettleRequest's.
 func (t *Tx) RecoverRequest(ctx context.Context, r Request, toolUseIDs []string, since int64) error {
 	return t.settleRequest(ctx, r, toolUseIDs, since, FillEmpty)
 }
@@ -491,6 +544,9 @@ func (t *Tx) RecoverRequest(ctx context.Context, r Request, toolUseIDs []string,
 // columns (the ones SettleRequest overwrites) merge; the owner, prompt, ts,
 // source and seat columns only fill in both.
 func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64, mode Mode) error {
+	if !t.complete {
+		r.ThinkingTokens = nil
+	}
 	columns := r.columns()
 	for i := range columns {
 		switch columns[i].name {
@@ -499,8 +555,13 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		}
 	}
 	if r.TS != nil && *r.TS >= since {
-		if err := t.upsert(ctx, "requests", "request_id", r.RequestID, columns, mode); err != nil {
+		written, err := t.upsertWhere(ctx, "requests", "request_id", r.RequestID, columns, mode,
+			ownedBy("requests."), r.SessionID, r.AgentID)
+		if err != nil {
 			return err
+		}
+		if written == 0 {
+			return nil
 		}
 	} else {
 		// An UPDATE, never a read before the write: a transaction that reads
@@ -521,7 +582,8 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 			values = append(values, c.value)
 		}
 		result, err := t.tx.ExecContext(ctx,
-			"UPDATE requests SET "+strings.Join(sets, ", ")+" WHERE request_id = ?", append(values, r.RequestID)...)
+			"UPDATE requests SET "+strings.Join(sets, ", ")+" WHERE request_id = ? AND "+ownedBy(""),
+			append(values, r.RequestID, r.SessionID, r.AgentID)...)
 		if err != nil {
 			return fmt.Errorf("callmeter store %s: settle stored request %q: %w", t.path, r.RequestID, err)
 		}
@@ -541,6 +603,15 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		}
 	}
 	return t.RecountRequest(ctx, r.RequestID)
+}
+
+// ownedBy is the condition that a stored requests row belongs to the writing
+// session and agent, its columns named with prefix ("requests." inside an
+// upsert): session_id NULL (not yet known) or the session's, and agent_id the
+// agent's, NULL being the main chat. Its two arguments are the session id and
+// the agent id, a nil one binding NULL.
+func ownedBy(prefix string) string {
+	return fmt.Sprintf("(%[1]ssession_id IS NULL OR %[1]ssession_id = ?) AND %[1]sagent_id IS ?", prefix)
 }
 
 // RecountRequest sets requestID's calls to the number of calls rows carrying
@@ -615,26 +686,28 @@ func jsonList(values []string) (string, error) {
 // UnfinishedCall is a call with neither an outcome nor a delivered size: its
 // PreToolUse alone landed.
 type UnfinishedCall struct {
+	Tool      string
 	ToolUseID string
 	AgentID   *string
 	AgentType *string
 	NoTS      bool // ts IS NULL: stored before every hook set one
 	// Delivered: bytes_delivered is set, so the batch already stored the call's
-	// size; RecoverQuiet fills only its real size, from a result that has one.
+	// size; RecoverQuiet fills its real size, or its no-real-output outcome.
 	Delivered bool
 	// Rebuilt: a call recovery rebuilt from a transcript (source transcript)
 	// that did not fail, so its real size is its result's toolUseResult.
 	Rebuilt bool
 }
 
-// UnfinishedCalls lists the session's calls with no real size: running, ended
+// UnfinishedCalls lists calls still needing a real size or, for a tool with
+// no separate output, an outcome: running, ended
 // with no PostToolUse or PostToolUseFailure (the user interrupted a sub-agent),
 // or refused by Claude Code before any PostToolUse, its batch alone landed.
 func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]UnfinishedCall, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL,
+		`SELECT COALESCE(tool, ''), tool_use_id, agent_id, agent_type, ts IS NULL, bytes_delivered IS NOT NULL,
 		COALESCE(source, '') = `+sqlText(SourceTranscript)+` AND COALESCE(failed, 0) = 0 FROM calls
-		WHERE session_id = ? AND bytes_real IS NULL
+		WHERE session_id = ? AND `+realSizeOpen("")+`
 		ORDER BY ts, tool_use_id`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("callmeter store %s: list unfinished calls of session %q: %w", s.path, sessionID, err)
@@ -642,7 +715,7 @@ func (s *Store) UnfinishedCalls(ctx context.Context, sessionID string) ([]Unfini
 	var calls []UnfinishedCall
 	for rows.Next() {
 		var c UnfinishedCall
-		if err := rows.Scan(&c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered, &c.Rebuilt); err != nil {
+		if err := rows.Scan(&c.Tool, &c.ToolUseID, &c.AgentID, &c.AgentType, &c.NoTS, &c.Delivered, &c.Rebuilt); err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("callmeter store %s: scan unfinished call: %w", s.path, err),
 				rows.Close(),
@@ -816,4 +889,181 @@ func (s *Store) callIDs(ctx context.Context, requestID string) ([]string, error)
 		ids = append([]string{first}, ids...)
 	}
 	return ids, nil
+}
+
+// nullable is s as a bound value: NULL when it is empty.
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// KnownMarks is the set of entry ids of sessionID's compactions, Stop-hook
+// summaries and turn durations already stored: the marks a transcript pass
+// need not write again (TranscriptMarks.Since). It reads outside any
+// transaction; a store whose schema is incomplete holds no mark, so its set is
+// empty.
+func (s *Store) KnownMarks(ctx context.Context, sessionID string) (map[string]bool, error) {
+	known := map[string]bool{}
+	if !s.complete {
+		return known, nil
+	}
+	for _, table := range []string{"compactions", "stop_hooks", "turn_durations"} {
+		rows, err := s.db.QueryContext(ctx, "SELECT entry_id FROM "+table+" WHERE session_id = ?", sessionID)
+		if err != nil {
+			return nil, fmt.Errorf("callmeter store %s: read known %s of %q: %w", s.path, table, sessionID, err)
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return nil, errors.Join(fmt.Errorf("callmeter store %s: read known %s of %q: %w", s.path, table, sessionID, err), rows.Close())
+			}
+			known[id] = true
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, fmt.Errorf("callmeter store %s: read known %s of %q: %w", s.path, table, sessionID, err)
+		}
+	}
+	return known, nil
+}
+
+// Since is the marks a sweep with first-run time since writes: the compactions,
+// Stop-hook summaries and turn durations older than since are dropped (the
+// requests sweep's rule: what predates callmeter's first sight of the session
+// is not back-filled), and so is each whose entry id is known (KnownMarks).
+// The cost-state stays: it is cumulative, so the last one read is the one to
+// write whenever it is read.
+func (m TranscriptMarks) Since(since int64, known map[string]bool) TranscriptMarks {
+	keep := func(ts int64, id string) bool { return ts >= since && !known[id] }
+	out := TranscriptMarks{Cost: m.Cost}
+	for _, c := range m.Compactions {
+		if keep(c.TS, c.EntryID) {
+			out.Compactions = append(out.Compactions, c)
+		}
+	}
+	for _, h := range m.StopHooks {
+		if keep(h.TS, h.EntryID) {
+			out.StopHooks = append(out.StopHooks, h)
+		}
+	}
+	for _, d := range m.TurnDurations {
+		if keep(d.TS, d.EntryID) {
+			out.TurnDurations = append(out.TurnDurations, d)
+		}
+	}
+	return out
+}
+
+// Empty reports whether m holds nothing to write.
+func (m TranscriptMarks) Empty() bool {
+	return len(m.Compactions) == 0 && len(m.StopHooks) == 0 && len(m.TurnDurations) == 0 && m.Cost == nil
+}
+
+// PutMarks writes the marks a transcript pass read (Since having filtered
+// them): each compaction, Stop-hook summary with its hook runs, and turn
+// duration once by its entry id, and, for the main chat (agentID ""), the
+// session's cost-state over the stored one, stamped now (Unix ms): the
+// cost-state is cumulative and async hooks land in any order, so an arrival
+// that read an earlier state (a smaller wall_ms) leaves the stored one, and
+// among equal states ts keeps the latest stamp. agentID is
+// NULL for the main chat. A store whose schema is incomplete holds none of the
+// tables: PutMarks writes nothing there.
+func (t *Tx) PutMarks(ctx context.Context, sessionID, agentID, seatDir string, now int64, m TranscriptMarks) error {
+	if !t.complete || sessionID == "" {
+		return nil
+	}
+	fail := func(what string, err error) error {
+		return fmt.Errorf("callmeter store %s: write %s of %q: %w", t.path, what, sessionID, err)
+	}
+	prepare := func(query string) (*sql.Stmt, error) { return t.tx.PrepareContext(ctx, query) }
+	if len(m.Compactions) > 0 {
+		stmt, err := prepare(`INSERT OR IGNORE INTO compactions
+			(entry_id, session_id, agent_id, ts, trigger, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, seat_dir)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return fail("compactions", err)
+		}
+		for _, c := range m.Compactions {
+			_, err := stmt.ExecContext(ctx, c.EntryID, sessionID, nullable(agentID), c.TS, nullable(c.Trigger),
+				c.PreTokens, c.PostTokens, c.CumulativeDroppedTokens, c.DurationMS, nullable(seatDir))
+			if err != nil {
+				return errors.Join(fail("compactions", err), stmt.Close())
+			}
+		}
+		if err := stmt.Close(); err != nil {
+			return fail("compactions", err)
+		}
+	}
+	if len(m.StopHooks) > 0 {
+		hooks, err := prepare(`INSERT OR IGNORE INTO stop_hooks
+			(entry_id, session_id, agent_id, prompt_id, ts, hook_count, hook_errors, seat_dir)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return fail("stop hooks", err)
+		}
+		runs, err := prepare(`INSERT OR IGNORE INTO stop_hook_runs (entry_id, seq, ts, name, command_bytes, duration_ms)
+			VALUES (?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return errors.Join(fail("stop hooks", err), hooks.Close())
+		}
+		writeAll := func() error {
+			for _, h := range m.StopHooks {
+				if _, err := hooks.ExecContext(ctx, h.EntryID, sessionID, nullable(agentID), nullable(h.PromptID), h.TS,
+					h.HookCount, h.HookErrors, nullable(seatDir)); err != nil {
+					return err
+				}
+				for i, run := range h.Hooks {
+					if _, err := runs.ExecContext(ctx, h.EntryID, i+1, h.TS, run.Name, run.CommandBytes, run.DurationMS); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		if err := errors.Join(writeAll(), runs.Close(), hooks.Close()); err != nil {
+			return fail("stop hooks", err)
+		}
+	}
+	if len(m.TurnDurations) > 0 {
+		stmt, err := prepare(`INSERT OR IGNORE INTO turn_durations
+			(entry_id, session_id, agent_id, prompt_id, ts, duration_ms, message_count, background_agents, seat_dir)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return fail("turn durations", err)
+		}
+		for _, d := range m.TurnDurations {
+			_, err := stmt.ExecContext(ctx, d.EntryID, sessionID, nullable(agentID), nullable(d.PromptID), d.TS,
+				d.DurationMS, d.MessageCount, d.BackgroundAgents, nullable(seatDir))
+			if err != nil {
+				return errors.Join(fail("turn durations", err), stmt.Close())
+			}
+		}
+		if err := stmt.Close(); err != nil {
+			return fail("turn durations", err)
+		}
+	}
+	if m.Cost != nil && agentID == "" {
+		var modelCosts any
+		if len(m.Cost.ModelCosts) > 0 {
+			encoded, err := json.Marshal(m.Cost.ModelCosts)
+			if err != nil {
+				return fail("session cost", err)
+			}
+			modelCosts = string(encoded)
+		}
+		if _, err := t.tx.ExecContext(ctx, `INSERT INTO session_costs
+			(session_id, ts, started, cost_usd, api_ms, api_no_retry_ms, tool_ms, wall_ms, model_costs, seat_dir)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(session_id) DO UPDATE SET ts = MAX(session_costs.ts, excluded.ts), started = excluded.started,
+				cost_usd = excluded.cost_usd, api_ms = excluded.api_ms, api_no_retry_ms = excluded.api_no_retry_ms,
+				tool_ms = excluded.tool_ms, wall_ms = excluded.wall_ms, model_costs = excluded.model_costs,
+				seat_dir = COALESCE(excluded.seat_dir, session_costs.seat_dir)
+			WHERE excluded.wall_ms IS NULL OR session_costs.wall_ms IS NULL OR excluded.wall_ms >= session_costs.wall_ms`,
+			sessionID, now, m.Cost.Started, m.Cost.CostUSD, m.Cost.APIMS, m.Cost.APINoRetryMS, m.Cost.ToolMS, m.Cost.WallMS,
+			modelCosts, nullable(seatDir)); err != nil {
+			return fail("session cost", err)
+		}
+	}
+	return nil
 }

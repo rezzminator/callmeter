@@ -2,7 +2,7 @@ name: release
 
 on:
   push:
-    tags: ['callmeter--v*']
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -21,7 +21,7 @@ jobs:
           go-version-file: go.mod
       - name: the tag names plugin.json's version
         run: |
-          version="${GITHUB_REF_NAME#callmeter--v}"
+          version="${GITHUB_REF_NAME#v}"
           manifest="$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' plugins/callmeter/.claude-plugin/plugin.json | head -n 1 | sed 's/^"version"[[:space:]]*:[[:space:]]*"//; s/"$//')"
           if [ "$version" != "$manifest" ]; then
             echo "tag $GITHUB_REF_NAME names $version, plugin.json says $manifest" >&2

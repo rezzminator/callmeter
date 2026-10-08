@@ -17,14 +17,19 @@ type promptRow struct {
 
 // Prompts lists one row per prompt, most calls first: the prompt's first and
 // last call, its calls (and how many failed), the sub-agents and the model
-// requests it caused, and their context and output tokens. A prompt is listed
-// when any of its calls, requests or sub-agents is in the window.
+// requests it caused, and their context and output tokens, and WALL S, the
+// seconds Claude Code measured for the prompt's turns (the sum of its turn
+// durations, one decimal), "-" when none was recorded or the store has not
+// gained the turn_durations table yet. A prompt is listed when any of its
+// calls, requests or sub-agents is in the window; its wall time is the whole
+// prompt's, whatever --since and --agent-type narrow.
 func Prompts(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty: "callmeter: no prompts in window",
 		Title: f.title("prompts", n),
 		Header: []string{
-			"PROMPT", "CHAT", "FIRST", "LAST", "CALLS", "FAILED", "AGENTS", "REQUESTS", "CONTEXT TOKENS", "OUTPUT TOKENS",
+			"PROMPT", "CHAT", "FIRST", "LAST", "CALLS", "FAILED", "AGENTS", "REQUESTS", "CONTEXT TOKENS", "OUTPUT TOKENS", "WALL S",
 		},
 	}
 	byID := map[string]*promptRow{}
@@ -97,6 +102,26 @@ func Prompts(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	if err != nil {
 		return nil, err
 	}
+	walls := map[[2]string]int64{}
+	if store.SchemaComplete() {
+		wallWhere, wallArgs := f.scoped(scope{session: "d.session_id"})
+		err = query(ctx, store, "prompt wall time",
+			`SELECT d.session_id, d.prompt_id, SUM(d.duration_ms) FROM turn_durations d
+			WHERE d.prompt_id IS NOT NULL AND d.prompt_id != '' AND d.duration_ms IS NOT NULL AND `+wallWhere+`
+			GROUP BY d.session_id, d.prompt_id`, wallArgs,
+			func(r rowSource) error {
+				var session, id string
+				var wall int64
+				if err := r.Scan(&session, &id, &wall); err != nil {
+					return err
+				}
+				walls[[2]string{session, id}] = wall
+				return nil
+			})
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows := make([]*promptRow, 0, len(byID))
 	for _, p := range byID {
 		rows = append(rows, p)
@@ -117,13 +142,22 @@ func Prompts(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	for _, p := range rows {
 		t.Rows = append(t.Rows, []string{
 			p.id, n.of(p.session), stampCell(p.first), stampCell(p.last), itoa(p.calls), itoa(p.failed),
-			itoa(p.agents), itoa(p.requests), itoa(p.context), itoa(p.output),
+			itoa(p.agents), itoa(p.requests), itoa(p.context), itoa(p.output), wallCell(walls, p),
 		})
 	}
 	if t.Notes, err = topicNotes(ctx, store, f, n, true); err != nil {
 		return nil, err
 	}
 	return t, nil
+}
+
+// wallCell is the prompt's summed turn duration in seconds; "-" when it has none.
+func wallCell(walls map[[2]string]int64, p *promptRow) string {
+	ms, ok := walls[[2]string{p.session, p.id}]
+	if !ok {
+		return "-"
+	}
+	return tenths(&ms)
 }
 
 func orZero(n *int64) int64 {

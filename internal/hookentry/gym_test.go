@@ -16,9 +16,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
+	"github.com/rezzminator/callmeter/internal/clock"
 	"github.com/rezzminator/callmeter/internal/runner"
 )
 
@@ -288,9 +290,72 @@ func TestReplayCwdPersistence(t *testing.T) {
 	}
 }
 
-// TestReplayAgents: S2's background agent B ran two turns, its foreground
-// agent A spawned a nested agent whose stop lands after A's, and the harness's
-// task-notification prompts are marked.
+// TestReplayAgentTotalsWaitForTheStop: totals wait for SubagentStop hooks;
+// quiet recovery rebuilds missing stops from turn ends or task notifications.
+func TestReplayAgentTotalsWaitForTheStop(t *testing.T) {
+	full := newReplay(t, "gym/S2")
+	full.feedInOrder()
+	r := newReplay(t, "gym/S2")
+	for i, payload := range r.payloads {
+		if eventName(t, payload) == callmeter.EventSubagentStop {
+			continue
+		}
+		r.feedIndex(i, payload)
+		if n := r.lab.count("SELECT COUNT(*) FROM agents WHERE total_tokens IS NOT NULL OR tool_uses IS NOT NULL"); n != 0 {
+			t.Errorf("hook %d: %d agents have totals before their stop", i, n)
+		}
+	}
+	// Recover through the replay's real store, after both hook times and
+	// the copied transcripts' real mtimes have been quiet for QuietAfter.
+	if _, err := r.lab.db().RecoverQuiet(r.lab.ctx, clock.Real.Now().Add(2*callmeter.QuietAfter), callmeter.QuietAfter); err != nil {
+		t.Fatalf("recover agent stops: %v", err)
+	}
+	rows, err := r.lab.db().DB().QueryContext(r.lab.ctx,
+		"SELECT DISTINCT agent_id FROM events WHERE event = ? AND detail = ?", callmeter.EventSubagentStop, callmeter.RecoveredDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	recovered := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		recovered[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for id := range recovered {
+		want := full.lab.row("SELECT total_tokens, tool_uses FROM agents WHERE agent_id = ?", id)
+		expect(t, "recovered agent "+id, r.lab.row("SELECT * FROM agents WHERE agent_id = ?", id),
+			map[string]any{"total_tokens": want["total_tokens"], "tool_uses": want["tool_uses"]})
+	}
+	for _, id := range []string{"a17591d0a08cc3b13", "a88a0d95598144e27", "a8a1da5926e2e3168"} {
+		if !recovered[id] {
+			t.Errorf("agent %s: no recovered SubagentStop", id)
+		}
+	}
+	// S2's nested background agent has no turn end; its attachment notice
+	// supplies the stop time, while its own transcript supplies the totals.
+	const nested = "a8a1da5926e2e3168"
+	notice, err := time.Parse(time.RFC3339Nano, "2026-10-01T00:52:21.292Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, "notice stop "+nested,
+		r.lab.row("SELECT ts FROM events WHERE event = ? AND agent_id = ? AND detail = ?", callmeter.EventSubagentStop, nested, callmeter.RecoveredDetail),
+		map[string]any{"ts": notice.UnixMilli()})
+	if n := r.lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE ? AND error LIKE ?", callmeter.StageTranscript,
+		"agent "+nested+" turn % open: %", "%"+callmeter.UnfilledAgentStop); n != 0 {
+		t.Errorf("agent %s: %d unfilled stop faults, want 0", nested, n)
+	}
+}
+
 func TestReplayAgents(t *testing.T) {
 	const background, parent, nested = "a88a0d95598144e27", "a17591d0a08cc3b13", "a8a1da5926e2e3168"
 	r := newReplay(t, "gym/S2")

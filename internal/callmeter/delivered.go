@@ -69,14 +69,40 @@ type realResponse struct {
 	} `json:"file"`
 }
 
+// NoRealOutputTools return no output distinct from the delivered result.
+var NoRealOutputTools = []string{"Edit", "Write", "Agent"}
+
+// HasRealOutput reports whether a tool's response has a real output size.
+func HasRealOutput(tool string) bool {
+	return !slices.Contains(NoRealOutputTools, tool)
+}
+
+// realSizeOpen is the SQL condition that a call still needs a real size.
+// A landed outcome settles tools that have no separate real output.
+func realSizeOpen(c string) string {
+	prefix := ""
+	if c != "" {
+		prefix = c + "."
+	}
+	tools := make([]string, len(NoRealOutputTools))
+	for i, tool := range NoRealOutputTools {
+		tools[i] = sqlText(tool)
+	}
+	return fmt.Sprintf("(%[1]sbytes_real IS NULL AND NOT (COALESCE(%[1]stool, '') IN (%[2]s) AND %[1]sfailed IS NOT NULL))", prefix, strings.Join(tools, ","))
+}
+
 // RealBytes is the real output size of a tool's response: the size PostToolUse
 // stores in bytes_real, and the transcript's toolUseResult is the same object.
+// Edit, Write and Agent have no separate real output and return nil.
 // A response that is not an object is measured as DeliveredBytes measures it;
 // an object is the first of persistedOutputSize, the length of stdout, of
 // file.content, DeliveredBytes of content, else the length of the response
 // JSON itself. A response that does not decode, or whose content cannot be
 // measured, is an error, never a guess.
-func RealBytes(response json.RawMessage) (*int64, error) {
+func RealBytes(tool string, response json.RawMessage) (*int64, error) {
+	if !HasRealOutput(tool) {
+		return nil, nil
+	}
 	trimmed := bytes.TrimSpace(response)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		size, err := DeliveredBytes(trimmed)
@@ -128,6 +154,7 @@ const toolUseError = "<tool_use_error>"
 var outcomeOpenings = []struct{ prefix, outcome string }{
 	{"PreToolUse:", OutcomeDeniedByHook},
 	{"Claude requested permissions to ", OutcomeDeniedByPermission},
+	{"Permission for this action was denied", OutcomeDeniedByPermission},
 	{"The user doesn't want to ", OutcomeRejectedByUser},
 }
 
@@ -163,8 +190,8 @@ type Result struct {
 	// harness refusal, a denial, a rejection), so that text is the whole output.
 	Refused bool
 	// Real is the real output size (RealBytes) of the line's toolUseResult;
-	// nil for a failed call (its text is its whole output), and when the line
-	// carries none or holds more than one tool_result.
+	// nil for a no-real-output tool, a failed call (its text is its whole
+	// output), or a line with none or more than one tool_result.
 	Real *int64
 }
 
@@ -193,8 +220,9 @@ func SettledCall(toolUseID string, r Result) Call {
 
 // FindResults reads a transcript for the tool_result of each wanted call; a
 // call with no result on disk is absent from the map. A line is decoded only
-// when it names a tool_result and a wanted id, and such a line that does not
-// decode is an error at its line number. A missing transcript is an error
+// when it names a wanted tool_use or tool_result; tool names are collected
+// in the same pass. A decode failure names its line. A missing transcript
+// is an error
 // wrapping fs.ErrNotExist.
 func FindResults(path string, ids []string) (map[string]Result, error) {
 	file, err := os.Open(path)
@@ -202,11 +230,12 @@ func FindResults(path string, ids []string) (map[string]Result, error) {
 		return nil, fmt.Errorf("open transcript %s: %w", path, err)
 	}
 	found := map[string]Result{}
+	tools := map[string]string{}
 	reader := bufio.NewReader(file)
 	for n := 1; ; n++ {
 		line, readErr := reader.ReadBytes('\n')
-		if bytes.Contains(line, []byte(`"tool_result"`)) && namesAny(line, ids) {
-			if err := resultsOf(line, ids, found); err != nil {
+		if (bytes.Contains(line, []byte(`"tool_result"`)) || bytes.Contains(line, []byte(`"tool_use"`))) && namesAny(line, ids) {
+			if err := resultsOf(line, ids, tools, found); err != nil {
 				return nil, errors.Join(fmt.Errorf("transcript %s line %d: %w", path, n, err), file.Close())
 			}
 		}
@@ -232,9 +261,9 @@ func namesAny(line []byte, ids []string) bool {
 	return false
 }
 
-// resultsOf adds the line's tool_result blocks for the wanted ids to found; a
-// message whose content is a string holds no tool_result.
-func resultsOf(line []byte, ids []string, found map[string]Result) error {
+// resultsOf remembers wanted tool_use names and adds tool_result blocks to
+// found; a message whose content is a string holds no tool_result.
+func resultsOf(line []byte, ids []string, tools map[string]string, found map[string]Result) error {
 	var entry struct {
 		Message struct {
 			Content json.RawMessage `json:"content"`
@@ -250,6 +279,8 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 	}
 	var blocks []struct {
 		Type      string          `json:"type"`
+		ID        string          `json:"id"`
+		Name      string          `json:"name"`
 		ToolUseID string          `json:"tool_use_id"`
 		Content   json.RawMessage `json:"content"`
 		IsError   bool            `json:"is_error"`
@@ -261,6 +292,9 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 	// is that call's; a line holding several results has no way to say whose.
 	results := 0
 	for _, block := range blocks {
+		if block.Type == toolUse && slices.Contains(ids, block.ID) {
+			tools[block.ID] = block.Name
+		}
 		if block.Type == "tool_result" {
 			results++
 		}
@@ -282,7 +316,7 @@ func resultsOf(line []byte, ids []string, found map[string]Result) error {
 		}
 		result := Result{Bytes: int64(len(text)), Failed: failed, Outcome: outcome, Refused: refused}
 		if hasUseResult && !failed { // a failed call's whole output is its text
-			if result.Real, err = RealBytes(useResult); err != nil {
+			if result.Real, err = RealBytes(tools[block.ToolUseID], useResult); err != nil {
 				return fmt.Errorf("tool_result %s: toolUseResult: %w", block.ToolUseID, err)
 			}
 		}

@@ -23,6 +23,7 @@ var stages = []string{
 func Faults(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	t := &Table{
+		Empty:  "callmeter: no faults in window",
 		Title:  f.title("faults", n),
 		Header: []string{"KIND", "STAGE/STATUS", "COUNT", "WHEN", "CHAT", "CALL", "ERROR"},
 	}
@@ -197,23 +198,27 @@ func refusalsOf(ctx context.Context, store *callmeter.Store, f Filter) ([]refusa
 		args = append(args, f.Session)
 	}
 	type openTurn struct {
-		ts                  int64
-		session, transcript string
+		ts                           int64
+		session, transcript, seatDir string
 	}
 	var open []openTurn
+	prompt := `(SELECT prompt_id FROM events WHERE session_id = s.session_id
+		AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1)`
 	err = query(ctx, store, "sessions ending on an unanswered prompt",
-		`SELECT s.session_id, COALESCE(s.last_ts, 0), COALESCE(s.transcript_path, '') FROM sessions s
+		`SELECT s.session_id, COALESCE(s.last_ts, 0), COALESCE(s.transcript_path, ''), COALESCE(s.seat_dir, '') FROM sessions s
 		JOIN (SELECT session_id, MAX(ts) AS asked FROM events
 			WHERE event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' GROUP BY session_id) u
 			ON u.session_id = s.session_id
 		WHERE `+conds+`
 		AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.session_id AND t.event = 'Stop'
-			AND COALESCE(t.agent_id, '') = '' AND t.ts >= u.asked)
+			AND COALESCE(t.agent_id, '') = '' AND t.ts >= u.asked
+			AND (t.prompt_id IS NULL OR `+prompt+` IS NULL OR t.prompt_id = `+prompt+`))
 		AND NOT EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.session_id AND e.event = 'StopFailure'
-			AND e.ts >= u.asked)`, args,
+			AND COALESCE(e.agent_id, '') = '' AND e.ts >= u.asked
+			AND (e.prompt_id IS NULL OR `+prompt+` IS NULL OR e.prompt_id = `+prompt+`))`, args,
 		func(r rowSource) error {
 			var row openTurn
-			if err := r.Scan(&row.session, &row.ts, &row.transcript); err != nil {
+			if err := r.Scan(&row.session, &row.ts, &row.transcript, &row.seatDir); err != nil {
 				return err
 			}
 			open = append(open, row)
@@ -225,6 +230,7 @@ func refusalsOf(ctx context.Context, store *callmeter.Store, f Filter) ([]refusa
 	// The store holds one connection: transcripts are read after the scan closes.
 	var unchecked *uncheckedRefusals
 	for _, turn := range open {
+		turn.transcript = callmeter.ResolveTranscript(turn.transcript, turn.seatDir, turn.session)
 		kind, err := "", errors.New("no transcript path recorded for session "+turn.session)
 		if turn.transcript != "" {
 			kind, err = callmeter.TranscriptAPIError(turn.transcript)

@@ -8,8 +8,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -23,12 +25,12 @@ import (
 
 // Retention is the store's window: rows older than this are pruned before
 // every report, and it is the default --since.
-const Retention = 30 * 24 * time.Hour
+const Retention = callmeter.Retention
 
 // DefaultLimit is the rows per table when Filter.Limit is not positive.
 const DefaultLimit = 25
 
-// EmptyLine is the only body line of a table with no rows.
+// EmptyLine is the default body line of a table with no rows.
 const EmptyLine = "callmeter: no calls recorded in window"
 
 // Filter narrows every topic. A zero Since covers the whole retention window
@@ -96,6 +98,7 @@ type Table struct {
 	Header []string
 	Rows   [][]string
 	Notes  []string // one line per named gap
+	Empty  string   // the body line when Rows is empty; "" is EmptyLine
 }
 
 // Render writes the heading, the fixed-width rows (or EmptyLine) and the
@@ -105,7 +108,11 @@ func (t *Table) Render(w io.Writer) error {
 		return fmt.Errorf("callmeter report: write heading: %w", err)
 	}
 	if len(t.Rows) == 0 {
-		if _, err := fmt.Fprintln(w, EmptyLine); err != nil {
+		empty := t.Empty
+		if empty == "" {
+			empty = EmptyLine
+		}
+		if _, err := fmt.Fprintln(w, empty); err != nil {
 			return fmt.Errorf("callmeter report: write empty line: %w", err)
 		}
 	} else {
@@ -175,11 +182,7 @@ func (f Filter) limit() int {
 // title names the topic, the active filters and the window.
 func (f Filter) title(topic string, names *names) string {
 	parts := []string{"callmeter " + topic}
-	if f.Since.IsZero() {
-		parts = append(parts, "window: last 30 days")
-	} else {
-		parts = append(parts, "window: since "+f.Since.UTC().Format("2006-01-02 15:04")+" UTC")
-	}
+	parts = append(parts, "window: since "+f.Since.UTC().Format("2006-01-02 15:04")+" UTC")
 	if f.Project != "" {
 		parts = append(parts, "project="+f.Project)
 	}
@@ -267,6 +270,9 @@ var inapplicable = map[string][]string{
 	"faults":   {"project", "agent-type"},
 	"sessions": {"agent-type"},
 	"coverage": {"project", "agent-type"},
+	// the six topics over the transcript metrics carry no agent type
+	"compactions": {"agent-type"}, "cost": {"agent-type"}, "hooks": {"agent-type"},
+	"turns": {"agent-type"}, "resumes": {"agent-type"}, "waiting": {"agent-type"},
 }
 
 // InapplicableNotes names every flag set on the command line that topic
@@ -306,11 +312,12 @@ func intCell(n *int64) string {
 	return itoa(*n)
 }
 
-// names caches chat names; the first lookup error becomes one note line.
+// names caches chat names; lookup failures become a count and safe label note.
 type names struct {
-	fn    NameOf
-	cache map[string]string
-	err   error
+	fn             NameOf
+	cache          map[string]string
+	err            error
+	failedSessions int
 }
 
 func newNames(fn NameOf) *names { return &names{fn: fn, cache: map[string]string{}} }
@@ -324,10 +331,12 @@ func (n *names) of(session string) string {
 	}
 	name := "?"
 	if n.fn == nil {
+		n.failedSessions++
 		if n.err == nil {
 			n.err = fmt.Errorf("no chat-name source was given")
 		}
 	} else if got, err := n.fn(session); err != nil {
+		n.failedSessions++
 		if n.err == nil {
 			n.err = fmt.Errorf("session %s: %w", session, err)
 		}
@@ -342,7 +351,14 @@ func (n *names) notes() []string {
 	if n.err == nil {
 		return nil
 	}
-	return []string{"chat names could not be read: " + n.err.Error()}
+	label := "unreadable"
+	switch {
+	case errors.Is(n.err, fs.ErrPermission):
+		label = "permission denied"
+	case errors.Is(n.err, fs.ErrNotExist):
+		label = "not found"
+	}
+	return []string{fmt.Sprintf("chat names could not be read for %d sessions (first: %s)", n.failedSessions, label)}
 }
 
 // row scanning without naming database/sql: the store's rows satisfy this.
@@ -395,10 +411,6 @@ func readRows(rows rowSource, what string, scan func(rowSource) error) error {
 // of one names a lost call even when it carries no tool_use_id.
 var toolEvents = []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"}
 
-// batchWithoutCalls is the payload fault hookentry's recordBatch writes for a
-// PostToolBatch listing no calls: a tool event's fault that names no call.
-const batchWithoutCalls = "PostToolBatch payload carries no tool_calls"
-
 // unsettledMarkers are the tails of the transcript faults recovery writes for a
 // turn or agent turn it read in full and could not settle (callmeter's
 // UnfilledTurnEnd, UnfilledAgentStop, UnfilledAgentTurn, UnfilledStopReply):
@@ -417,7 +429,7 @@ func idlessLostCall(t string) string {
 		names = append(names, fmt.Sprintf(`COALESCE(%[1]s.error, '') GLOB '%[2]s *' OR COALESCE(%[1]s.error, '') GLOB '"%[2]s" *'`, t, event))
 	}
 	return fmt.Sprintf(`(%[1]s.stage IN ('%[2]s', '%[3]s') AND (%[4]s) AND COALESCE(%[1]s.error, '') <> '%[5]s')`,
-		t, callmeter.StagePayload, callmeter.StageStore, strings.Join(names, " OR "), batchWithoutCalls)
+		t, callmeter.StagePayload, callmeter.StageStore, strings.Join(names, " OR "), callmeter.BatchWithoutCalls)
 }
 
 // unsettledMarker is the SQL condition that the id-less fault row aliased t is
