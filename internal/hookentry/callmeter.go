@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -125,11 +126,12 @@ type callmeterRun struct {
 	endsTurn   bool // a Stop or StopFailure: its row replaces a rebuilt turn end
 	batches    int  // writes tried: a run that tried none writes its rows alone
 	// accounted: the run's event is accounted for, by a committed batch, a
-	// fault row or the store-busy line, whatever the signal state. storeBusy:
-	// the store stayed locked past the run's wait and the run gave up on it
-	// (giveUpBusy), so it writes nothing more.
+	// fault row or the run's own missed.log line, whatever the signal state.
+	// gaveUp: the store stayed locked past the run's wait (giveUpBusy) or
+	// could take neither the event nor its fault (giveUp), the run left that
+	// line, and it writes nothing more.
 	accounted bool
-	storeBusy bool
+	gaveUp    bool
 }
 
 // Callmeter is the hook entry: it records each hook event into the callmeter
@@ -141,7 +143,9 @@ type callmeterRun struct {
 // before the run's event is accounted for leaves one missed.log line instead
 // (terminateOnSignal); one of them ignored on entry stays ignored. A store that
 // stays locked past the run's wait (storeWait, inside its event's hook timeout)
-// leaves the line `terminated by store busy` the same way (giveUpBusy).
+// leaves the line `terminated by store busy` the same way (giveUpBusy), and one
+// that can take neither the event nor its fault the line `store unavailable:
+// {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	home, err := paths.Home(getenv)
 	if err != nil {
@@ -170,6 +174,11 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		close(done)
 	}()
 	go terminateOnSignal(signals, done, state, paths.Missed(home), logPath, stderr, os.Exit)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panic(state.panicked(recovered, debug.Stack()))
+		}
+	}()
 	seat, err := resolveCallmeterSeat(getenv)
 	if err != nil {
 		// The rows still land, without their seat; the gap is said, not hidden.
@@ -180,12 +189,27 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	}, clock.Real, seat, getenv)
 }
 
+// Panic is the value Callmeter panics with again when its run panicked: the
+// panic's own value and stack, and whether the run's event was already
+// accounted for (a committed batch, a fault row or the run's own missed.log
+// line), in which case the panic leaves no missed.log line of its own.
+type Panic struct {
+	Value     any
+	Stack     []byte
+	Accounted bool
+}
+
+func (p Panic) String() string { return fmt.Sprint(p.Value) }
+
 // terminationState is what a `callmeter hook` run shares with the goroutine
 // that handles its termination signal: the event name and session id once the
 // payload decoded, and whether the run's event is accounted for, meaning its first
 // write batch committed or its first fault row was written. mu is held, from
-// the start of a write that can account for the run until that write's
-// outcome is known, so a signal landing mid-commit waits for the outcome.
+// the moment a write that can account for the run holds the store's write lock
+// until that write's outcome is known, so a signal landing mid-commit waits for
+// the outcome; never across a wait for a busy store, so a signal landing there
+// is decided at once, well inside the 1.5 s Claude Code gives a cancelled hook
+// before its SIGKILL.
 type terminationState struct {
 	mu        sync.Mutex
 	event     string
@@ -204,6 +228,17 @@ func withTerminationState(ctx context.Context, state *terminationState) context.
 func terminationStateOf(ctx context.Context) *terminationState {
 	state, _ := ctx.Value(terminationKey{}).(*terminationState)
 	return state
+}
+
+// panicked is the Panic a run's recovered panic becomes: whether the run's
+// event was accounted for, read under the state's lock, which then marks it
+// accounted so the signal handler leaves no line beside the panic's own.
+func (state *terminationState) panicked(value any, stack []byte) Panic {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	accounted := state.accounted
+	state.accounted = true
+	return Panic{Value: value, Stack: stack, Accounted: accounted}
 }
 
 // setPayload records the decoded hook_event_name and session_id for the
@@ -256,9 +291,11 @@ func (hold termHold) release() {
 // rule: a run whose event is not accounted for appends one missed.log line
 // (event `unknown` until the payload decoded), a run whose event is accounted
 // for appends none, and either way the process exits 0 through exit. It takes
-// the state's lock first, so a write in flight finishes and is judged by its
-// outcome; the lock is not released before exit, so the run writes nothing
-// after the decision. A failure to append the line is said on stderr and in
+// the state's lock first, so a write in flight, one holding the store's write
+// lock, finishes and is judged by its outcome, while a write still waiting on
+// a busy store never got the lock and leaves the decision to the signal; the
+// lock is not released before exit, so the run writes nothing after the
+// decision. A failure to append the line is said on stderr and in
 // the log, never a non-zero exit. done ends the wait without a signal. The
 // line's reason is `terminated by {SIGNAL}`; a run whose store stays locked
 // leaves `terminated by store busy` itself (giveUpBusy).
@@ -279,7 +316,7 @@ func terminateOnSignal(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if !state.accounted {
-		if err := appendTerminated(
+		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
 			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
 		}
@@ -287,12 +324,15 @@ func terminateOnSignal(
 	exit(0)
 }
 
-// appendTerminated appends `{unix seconds}\t{event}\t{reason}` (reason opens
-// callmeter.TerminatedReason) to the missed.log at path, followed by `\t{session_id}` when session is one
+// AppendMissed appends the binary's own missed.log line,
+// `{unix seconds}\t{event}\t{reason}` (reason opens callmeter.TerminatedReason
+// or callmeter.StoreUnavailableReason, or is callmeter.PanicReason), to the
+// missed.log at path, followed by `\t{session_id}` when session is one
 // (callmeter.MissedSessionID), the wrapper's own layout, so recovery ties a
-// lost SessionEnd to its session; it creates the file and its directory when
+// lost SessionEnd to its session; event is `unknown` when it is empty or would
+// break the line (missedEvent). It creates the file and its directory when
 // absent: one write, so concurrent appenders never interleave a line.
-func appendTerminated(path, event, session, reason string, now time.Time) error {
+func AppendMissed(path, event, session, reason string, now time.Time) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create the directory of %s: %w", path, err)
 	}
@@ -383,11 +423,13 @@ func runCallmeter(
 	}()
 	// The wrapper's own failures (no binary, a bad checksum) land as binary
 	// faults on the next run that reaches the store; failing to ingest them
-	// is one store fault and never stops this run's record.
-	if _, err := store.IngestMissed(ctx, files.missed); err != nil {
+	// is one store fault and never stops this run's record. The signal handler
+	// is held off from the commit until the claim is moved, so a signal there
+	// leaves no committed claim in place to be ingested again.
+	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
 		run.fault(callmeter.StageStore, "", fmt.Errorf("ingest %s: %w", files.missed, err))
 	}
-	if run.storeBusy {
+	if run.gaveUp {
 		return 0
 	}
 	if payloadErr != nil {
@@ -507,7 +549,7 @@ func (run *callmeterRun) record() {
 			// running SessionEnd; report-time recovery settles that session
 			// once it is quiet (callmeter.RecoverQuiet).
 			run.write(p.ToolUseID, nil)
-			if run.storeBusy {
+			if run.gaveUp {
 				return
 			}
 			run.deadline = clock.Real.Now().Add(sessionEndBudget)
@@ -1292,8 +1334,9 @@ func (run *callmeterRun) awaitResults(
 // call of the session with no real size — its PreToolUse alone landed, as when
 // the user interrupts a sub-agent mid-call, or Claude Code refused it before
 // any PostToolUse — from the tool_result its transcript holds: the delivered
-// size, failed and the outcome label, each only filling, and for a failed
-// call the real size too (callmeter.SettledCall). A call with no result on disk (still running, or its
+// size, failed, the outcome label and the real size (a failure's text, else
+// RealBytes of the result's toolUseResult, as PostToolUse stores it), each
+// only filling (callmeter.SettledCall). A call with no result on disk (still running, or its
 // session killed) stays unknown, as does one whose typed agent's transcript is
 // missing: that absence is already a transcript fault at its batch or stop. At
 // Stop a call with no result is left alone: a background call may still be
@@ -1376,15 +1419,18 @@ func (run *callmeterRun) resolveUnfinished() {
 // write runs one event's writes in one transaction, the run's own rows with
 // them (runRows); a failure is a store fault. fn nil writes the run's rows only.
 // While the run's event is not accounted for, the signal handler is held off
-// until the batch committed or, failed, until its fault row was written.
+// from the moment the batch holds the store's write lock until it committed
+// or, failed, until its fault row was written; never across the wait for a
+// busy store, so a signal during that wait is decided at once.
 func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	run.batches++
-	if run.storeBusy {
+	if run.gaveUp {
 		return
 	}
-	hold := run.state.hold()
-	defer hold.release()
-	err := run.store.Batch(run.ctx, func(tx *callmeter.Tx) error {
+	var hold termHold
+	held := false
+	defer func() { hold.release() }()
+	err := run.store.BatchHeld(run.ctx, func() { hold, held = run.state.hold(), true }, func(tx *callmeter.Tx) error {
 		if fn != nil {
 			if err := fn(tx); err != nil {
 				return err
@@ -1393,7 +1439,7 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 		return run.runRows(tx)
 	})
 	if err != nil {
-		run.faultHeld(hold, callmeter.StageStore, toolUseID, err)
+		run.faultHeld(&hold, held, callmeter.StageStore, toolUseID, err)
 		return
 	}
 	hold.account()
@@ -1401,56 +1447,115 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 }
 
 // fault says a failure to record: stderr and callmeter.log always, and a
-// faults row when the store is open. A fault the store refuses is logged only,
-// and so is every fault of a run that gave up on a busy store.
+// faults row when the store is open. While the run's event is not accounted
+// for, a fault with no store or one the store refuses leaves the run's
+// missed.log line instead (giveUp); after it, such a fault is logged only, and
+// so is every fault of a run that gave up.
 func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
-	if run.storeBusy {
+	if run.gaveUp {
 		applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
-	hold := run.state.hold()
-	defer hold.release()
-	run.faultHeld(hold, stage, toolUseID, cause)
+	var hold termHold
+	defer func() { hold.release() }()
+	run.faultHeld(&hold, false, stage, toolUseID, cause)
 }
 
-// faultHeld is fault for a caller that already holds the signal handler off
-// (write, after its batch failed): hold is that caller's, released by it.
-func (run *callmeterRun) faultHeld(hold termHold, stage, toolUseID string, cause error) {
+// faultHeld is fault with the caller's hold on the signal handler, released by
+// the caller: held is true when the caller already took it (write, after its
+// batch failed), otherwise faultHeld takes it into hold, for a fault row once
+// that row's transaction holds the store's write lock (AddFaultHeld), never
+// across the wait for a busy store.
+func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID string, cause error) {
+	take := func() {
+		if !held {
+			*hold, held = run.state.hold(), true
+		}
+	}
 	if callmeter.IsBusy(cause) && !run.accounted {
-		run.giveUpBusy(hold, stage, toolUseID, cause)
+		take()
+		run.giveUpBusy(*hold, stage, toolUseID, cause)
 		return
 	}
 	session := run.payload.SessionID
 	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
-	if run.store == nil {
+	if run.store == nil { // no store opened (OpenDBWaiting), or it closed
+		take()
+		run.giveUp(*hold, toolUseID, cause)
 		return
 	}
-	err := run.store.AddFault(run.ctx, callmeter.Fault{
-		TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error(),
-	})
+	fault := callmeter.Fault{TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error()}
+	if held && hold.locked {
+		// A failed batch's hold: its fault row goes in under it when the store
+		// is free at once, so a signal that waited on the batch is judged by
+		// that row. A writer that took the store since the rollback is waited
+		// out without the hold, a signal meanwhile decided at once.
+		busy, err := run.store.AddFaultIfFree(run.ctx, fault)
+		switch {
+		case err == nil && !busy:
+			hold.account()
+			run.accounted = true
+			return
+		case err == nil:
+			hold.release()
+			*hold, held = termHold{}, false
+		default:
+			applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+			run.giveUp(*hold, toolUseID, err)
+			return
+		}
+	}
+	err := run.store.AddFaultHeld(run.ctx, fault, take)
 	if err != nil {
 		applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		take()
+		run.giveUp(*hold, toolUseID, err)
 		return
 	}
 	hold.account()
 	run.accounted = true
+}
+
+// giveUp ends a run whose store could take neither its event nor the fault
+// saying so, before that event was accounted for: one missed.log line
+// `store unavailable: {class}` (callmeter.StoreFailureClass of cause, never
+// its text; `terminated by store busy` when cause is a busy store) carries the
+// event and session to the next run that reaches the store (IngestMissed), and
+// the run is accounted for and writes nothing more. A run already accounted
+// for leaves no line. cause is already said; hold is the caller's, as in
+// faultHeld.
+func (run *callmeterRun) giveUp(hold termHold, toolUseID string, cause error) {
+	if run.accounted {
+		return
+	}
+	reason := callmeter.StoreUnavailableReason + callmeter.StoreFailureClass(cause)
+	if callmeter.IsBusy(cause) {
+		reason = callmeter.TerminatedByStoreBusy
+	}
+	run.leaveMissedLine(hold, toolUseID, reason)
+}
+
+// leaveMissedLine appends the run's own missed.log line with reason, accounts
+// the run for and stops its store work (gaveUp); a failed append is said.
+func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string) {
+	session := run.payload.SessionID
+	err := AppendMissed(run.missed, run.payload.HookEventName, session, reason, clock.Real.Now())
+	if err != nil {
+		applog.Failure(run.stderr, run.logPath, callmeter.StageTerminated, session, toolUseID, err)
+	}
+	hold.account()
+	run.accounted = true
+	run.gaveUp = true
 }
 
 // giveUpBusy ends a run whose store stayed locked for its whole wait before
 // its event was accounted for: the failure is said, one missed.log line
 // `terminated by store busy` carries the event and session so report-time
 // recovery still sees them (IngestMissed, endLost), and the run is accounted
-// for and writes nothing more (storeBusy). hold is the caller's, as in faultHeld.
+// for and writes nothing more (gaveUp). hold is the caller's, as in faultHeld.
 func (run *callmeterRun) giveUpBusy(hold termHold, stage, toolUseID string, cause error) {
-	session := run.payload.SessionID
-	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
-	err := appendTerminated(run.missed, run.payload.HookEventName, session, callmeter.TerminatedByStoreBusy, clock.Real.Now())
-	if err != nil {
-		applog.Failure(run.stderr, run.logPath, callmeter.StageTerminated, session, toolUseID, err)
-	}
-	hold.account()
-	run.accounted = true
-	run.storeBusy = true
+	applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
+	run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
 }
 
 func presentString(value string) *string {

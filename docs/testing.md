@@ -5,7 +5,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 ## Tiers
 
 - Unit: a package test beside its package, in-process. The store is a real SQLite file, the filesystem real, under the package's jail.
-- Process: a test that builds `./cmd/callmeter` into `t.TempDir()`, or runs the sh wrapper, and spawns it as a separate process: `internal/wrappertest` (resolution, download, lock, checksum, `missed.log`), a signalled hook binary (SIGTERM, SIGINT or SIGHUP before and after its event is recorded) and the concurrency gymnastics (many hooks writing one store at once). Still hermetic: no network beyond a local `httptest` server, no Claude Code.
+- Process: a test that builds `./cmd/callmeter` into `t.TempDir()`, or runs the sh wrapper, and spawns it as a separate process: `internal/wrappertest` (resolution, download, lock, checksum, `missed.log`), a signalled hook binary (SIGTERM, SIGINT or SIGHUP before and after its event is recorded, and Claude Code's cancel, SIGTERM then SIGKILL 1.47 s later, of a hook waiting on a busy store) and the concurrency gymnastics (many hooks writing one store at once). Still hermetic: no network beyond a local `httptest` server, no Claude Code.
 - e2e: `CALLMETER_E2E=1 go test ./e2e/...` runs a real `claude -p --model haiku --setting-sources project,local` with the plugin loaded through `--plugin-dir`, then reads the store it wrote. It costs tokens, needs the host's Claude Code login, and is run once by the lander, never by an executor.
 
 ## Where a test lives
@@ -53,6 +53,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 
 - A test calling `t.Setenv` or `t.Chdir` stays serial; any other test may use `t.Parallel`.
 - Isolation is one temp root per test, never a shared store.
+- A write in flight, holding the store's write lock, is held open by a trigger calling the test-only SQL function `callmeter_test_stall` (`process_test.go`), never by locking the store from a second connection: a run waiting on a locked store is still before its write, and a signal there is decided at once.
 - The `SubagentStop` and `Stop` settle waits run on the real clock (up to 3 s, until the transcript holds the answer to the payload's `prompt_id`); a test fakes only `now`, never the wait.
   - One exception: a fuzz target zeroes the settle wait through the `agentSettle` seam, because a fuzz target tests input handling, not timing, and a real 3 s settle per `SubagentStop` or `Stop` input starves the engine and would mask a real hang. Every other test keeps the rule.
 

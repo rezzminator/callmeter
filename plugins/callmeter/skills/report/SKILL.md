@@ -24,4 +24,4 @@ The topics are `files`, `writes`, `commands`, `context`, `sequences`, `faults`, 
 4. Show its stdout unchanged.
 5. On exit code 1 or 2, show its stderr verbatim and stop.
 
-Never open, query or modify the store file directly: the report runs through the command above only.
+Never open, query or modify the store file directly: the report runs through the command above only. A `note:` line naming `callmeter redact` is for the user to act on: never run that command yourself.

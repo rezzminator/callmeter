@@ -391,21 +391,67 @@ func readRows(rows rowSource, what string, scan func(rowSource) error) error {
 	return nil
 }
 
+// toolEvents are the hook events that record a call: a payload or store fault
+// of one names a lost call even when it carries no tool_use_id.
+var toolEvents = []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"}
+
+// batchWithoutCalls is the payload fault hookentry's recordBatch writes for a
+// PostToolBatch listing no calls: a tool event's fault that names no call.
+const batchWithoutCalls = "PostToolBatch payload carries no tool_calls"
+
+// unsettledMarkers are the tails of the transcript faults recovery writes for a
+// turn or agent turn it read in full and could not settle (callmeter's
+// UnfilledTurnEnd, UnfilledAgentStop, UnfilledAgentTurn, UnfilledStopReply):
+// no tool_use_id, no call. UnfilledCall is not among them: it names its call,
+// whose row exists.
+var unsettledMarkers = []string{
+	callmeter.UnfilledTurnEnd, callmeter.UnfilledAgentStop, callmeter.UnfilledAgentTurn, callmeter.UnfilledStopReply,
+}
+
+// idlessLostCall is the SQL condition that the id-less fault row aliased t
+// names a lost call: a payload or store fault whose error opens with a tool
+// event's name, bare or quoted, as every such fault hookentry writes does.
+func idlessLostCall(t string) string {
+	var names []string
+	for _, event := range toolEvents {
+		names = append(names, fmt.Sprintf(`COALESCE(%[1]s.error, '') GLOB '%[2]s *' OR COALESCE(%[1]s.error, '') GLOB '"%[2]s" *'`, t, event))
+	}
+	return fmt.Sprintf(`(%[1]s.stage IN ('%[2]s', '%[3]s') AND (%[4]s) AND COALESCE(%[1]s.error, '') <> '%[5]s')`,
+		t, callmeter.StagePayload, callmeter.StageStore, strings.Join(names, " OR "), batchWithoutCalls)
+}
+
+// unsettledMarker is the SQL condition that the id-less fault row aliased t is
+// one of recovery's unsettledMarkers: a transcript fault ending in its text.
+func unsettledMarker(t string) string {
+	var tails []string
+	for _, marker := range unsettledMarkers {
+		tails = append(tails, fmt.Sprintf(`substr(COALESCE(%s.error, ''), -%d) = '%s'`,
+			t, len(marker), strings.ReplaceAll(marker, "'", "''")))
+	}
+	return fmt.Sprintf(`(%s.stage = '%s' AND (%s))`, t, callmeter.StageTranscript, strings.Join(tails, " OR "))
+}
+
 // recordingNotes names what the hook never recorded: calls (payload, store or
-// transcript faults) and events (a binary the wrapper could not run, a hook a
-// signal ended before it recorded). A call counts once however many faults
-// name it, and not at all when its row was written anyway; a fault naming no
-// call counts as one.
+// transcript faults), turns recovery could not settle, the other faults naming
+// no call, and events (a binary the wrapper could not run, a hook a signal, a
+// busy store or an unavailable one ended before it recorded). A call counts
+// once however many faults name it, and not at all when its row was written
+// anyway; a fault with no tool_use_id counts as one lost call only when it is a
+// tool event's payload or store fault (idlessLostCall), else in the
+// unsettled-turns note (unsettledMarker) or the note of faults naming no call.
 func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, error) {
 	var notes []string
 	faultWhere, faultArgs := faultFilter(f, "faults")
-	var unrecorded sql.NullInt64
+	var unrecorded, unsettled, other sql.NullInt64
 	if err := store.DB().QueryRowContext(ctx,
-		`SELECT COUNT(DISTINCT NULLIF(tool_use_id, '')) + SUM(COALESCE(tool_use_id, '') = '')
-		FROM faults WHERE stage IN (?, ?, ?)
-		AND NOT EXISTS (SELECT 1 FROM calls WHERE calls.tool_use_id = faults.tool_use_id) AND `+faultWhere,
+		`SELECT COUNT(DISTINCT CASE WHEN COALESCE(tool_use_id, '') <> ''
+			AND NOT EXISTS (SELECT 1 FROM calls WHERE calls.tool_use_id = faults.tool_use_id) THEN tool_use_id END)
+			+ SUM(COALESCE(tool_use_id, '') = '' AND `+idlessLostCall("faults")+`),
+			SUM(COALESCE(tool_use_id, '') = '' AND `+unsettledMarker("faults")+`),
+			SUM(COALESCE(tool_use_id, '') = '' AND NOT `+idlessLostCall("faults")+` AND NOT `+unsettledMarker("faults")+`)
+		FROM faults WHERE stage IN (?, ?, ?) AND `+faultWhere,
 		append([]any{callmeter.StagePayload, callmeter.StageStore, callmeter.StageTranscript}, faultArgs...)...,
-	).Scan(&unrecorded); err != nil {
+	).Scan(&unrecorded, &unsettled, &other); err != nil {
 		return nil, fmt.Errorf("callmeter report: count unrecorded calls: %w", err)
 	}
 	if unrecorded.Int64 > 0 {
@@ -416,6 +462,14 @@ func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]st
 				unrecorded.Int64,
 			),
 		)
+	}
+	if unsettled.Int64 > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d turns or agent turns recovery could not settle from transcripts; see the faults topic", unsettled.Int64))
+	}
+	if other.Int64 > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d other payload, store or transcript faults, naming no call (see the faults topic)", other.Int64))
 	}
 	for _, lost := range []struct{ stage, why string }{
 		{callmeter.StageBinary, "binary unavailable"},
@@ -643,3 +697,15 @@ func faultFilter(f Filter, table string) (string, []any) {
 func requestFilter(f Filter) (string, []any) { return faultFilter(f, "r") }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// OlderRulesNotes is the note every topic ends with while the store holds
+// calls written under older privacy rules (Store.UnredactedCalls, over the
+// whole store, not the window): their count and the command that rewrites
+// them, never their text. None when every call is in the current form.
+func OlderRulesNotes(ctx context.Context, store *callmeter.Store) ([]string, error) {
+	n, err := store.UnredactedCalls(ctx)
+	if err != nil || n == 0 {
+		return nil, err
+	}
+	return []string{fmt.Sprintf("%d calls hold text stored under older privacy rules; run `callmeter redact` to scrub them", n)}, nil
+}

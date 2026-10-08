@@ -1533,3 +1533,91 @@ func TestRecoverQuietMarksNothingForALiveOrUnreadSession(t *testing.T) {
 		}
 	})
 }
+
+// TestRecoverQuietSizesAHookCallFromItsToolUseResult: a hook-written call whose
+// PostToolUse was lost (store busy) and that no Stop or SessionEnd sweep
+// settled, its row the PreToolUse's alone or the batch's too, gets the real
+// size PostToolUse would have stored: RealBytes of its result line's
+// toolUseResult, not the delivered text's length. With no result on disk the
+// call marker stands for it. A batch row with no ts (stored before every hook
+// set one) keeps its batch size alone: recovery has no hook time to give it a
+// ts, and sizing it would leave a sized call with none. Only sizes are stored,
+// and a second pass writes nothing.
+func TestRecoverQuietSizesAHookCallFromItsToolUseResult(t *testing.T) {
+	stdout := secretResult + strings.Repeat("-", 40) // the delivered text is cut short of it
+	for _, c := range []struct {
+		name                string
+		batch, noTS, result bool
+	}{
+		{name: "PreToolUse row only", result: true},
+		{name: "batch row", batch: true, result: true},
+		{name: "batch row with no ts", batch: true, noTS: true, result: true},
+		{name: "no result on disk"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			start := time.UnixMilli(q.callTS)
+			lines := []string{
+				promptLine("prompt-1", secretPrompt, start),
+				toolUseLine("msg_main", q.toolMain, 5, start.Add(time.Second)),
+				textLine("msg_main", secretMessage, 77, start.Add(2*time.Second)),
+			}
+			if c.result {
+				lines = append(lines, fmt.Sprintf(`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":%q,"tool_use_id":%q}]},"toolUseResult":{"stdout":%q,"stderr":"","interrupted":false,"isImage":false},"timestamp":%q,"cwd":"/tmp/demo-proj","sessionId":"sess-1"}`,
+					secretResult, q.toolMain, stdout, stamp(start.Add(3*time.Second))))
+			}
+			q.writeTranscript(t, q.main, lines...)
+			mtime := q.now.Add(-2 * time.Hour)
+			if err := os.Chtimes(q.main, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+			if c.batch {
+				if err := q.store.UpsertCall(context.Background(), Call{ToolUseID: q.toolMain,
+					BytesDelivered: Ptr(int64(len(secretResult))), RequestID: Ptr("msg_main")}, Overwrite); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.noTS {
+				if _, err := q.store.DB().Exec("UPDATE calls SET ts = NULL WHERE tool_use_id = ?", q.toolMain); err != nil {
+					t.Fatal(err)
+				}
+			}
+			q.recover(t)
+
+			main := row(t, q.store, "calls", "tool_use_id = ?", q.toolMain)
+			marks := row(t, q.store, "faults", "tool_use_id = ? AND stage = ? AND error LIKE ?", q.toolMain, StageTranscript, "call "+q.toolMain+": %")
+			switch {
+			case c.noTS:
+				if main["bytes_real"] != nil || main["ts"] != nil || main["bytes_delivered"] != int64(len(secretResult)) {
+					t.Errorf("ts-less batch call = bytes_real %v ts %v bytes_delivered %v, want NULL, NULL, %d: its batch size alone",
+						main["bytes_real"], main["ts"], main["bytes_delivered"], len(secretResult))
+				}
+			case c.result:
+				if main["bytes_real"] != int64(len(stdout)) || main["bytes_delivered"] != int64(len(secretResult)) || main["failed"] != int64(0) {
+					t.Errorf("main call = bytes_real %v bytes_delivered %v failed %v, want %d (its toolUseResult's stdout), %d, 0",
+						main["bytes_real"], main["bytes_delivered"], main["failed"], len(stdout), len(secretResult))
+				}
+				if marks != nil {
+					t.Errorf("a sized call was marked: %v", marks)
+				}
+			default:
+				if main["bytes_real"] != nil || marks == nil {
+					t.Errorf("main call with no result = bytes_real %v, marker %v: want NULL and the call marker", main["bytes_real"], marks)
+				}
+			}
+			for _, column := range []string{"input", "error"} {
+				if text := fmt.Sprint(main[column]); strings.Contains(text, secretResult) {
+					t.Errorf("calls.%s holds the result text", column)
+				}
+			}
+
+			before := q.snapshot(t)
+			if again := q.recover(t); again.Calls != 0 {
+				t.Errorf("second RecoverQuiet = %+v, want 0 calls", again)
+			}
+			if after := q.snapshot(t); !reflect.DeepEqual(before, after) {
+				t.Errorf("second RecoverQuiet changed the store:\nbefore %v\nafter  %v", before, after)
+			}
+		})
+	}
+}

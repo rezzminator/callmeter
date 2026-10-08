@@ -577,19 +577,25 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 	if err != nil {
 		return err
 	}
-	var unknown []UnfinishedCall
-	rebuiltOf := map[string]UnfinishedCall{}
+	// A call with no real size is looked up when it is one only its
+	// PreToolUse wrote, one whose batch stored its delivered size while its
+	// PostToolUse was lost (store busy, a signal) and no Stop or SessionEnd
+	// sweep settled it, or a rebuilt one still missing its real size. A batch
+	// row with no ts (stored before every hook set one) is not: the sweep gives
+	// such a call the hook's time, recovery has none to give, and a real size
+	// alone would leave a sized call with no ts.
+	var lookup []UnfinishedCall
+	unfinishedOf := map[string]UnfinishedCall{}
 	for _, call := range unfinished {
-		// A call whose size the batch stored is settled only when it is a
-		// rebuilt one still missing its real size.
-		if !call.Delivered || call.Rebuilt {
-			unknown = append(unknown, call)
-			rebuiltOf[call.ToolUseID] = call
+		if call.Delivered && call.NoTS && !call.Rebuilt {
+			continue
 		}
+		lookup = append(lookup, call)
+		unfinishedOf[call.ToolUseID] = call
 	}
 	var settled []Call
 	settledIDs := map[string]bool{}
-	transcripts, idsOf := CallTranscripts(session.transcript, unknown)
+	transcripts, idsOf := CallTranscripts(session.transcript, lookup)
 	for _, transcript := range transcripts {
 		ids := idsOf[transcript]
 		found, err := FindResults(transcript, ids)
@@ -605,22 +611,19 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, cutoff
 			if !ok {
 				continue
 			}
-			call := rebuiltOf[id]
-			switch {
-			case call.Delivered:
-				// Only its real size is unknown: fill that and nothing else. A
-				// result with none leaves the call for the call marker.
-				if !result.Failed && result.Real != nil {
-					settled = append(settled, Call{ToolUseID: id, BytesReal: result.Real})
+			sized := SettledCall(id, result)
+			if unfinishedOf[id].Delivered {
+				// Its delivered size is stored, so only its real size is
+				// open: a result with none leaves the call as it is (a rebuilt
+				// one for the call marker), and one with it fills the empty
+				// columns only.
+				if sized.BytesReal != nil {
+					settled = append(settled, sized)
 				}
-			default:
-				sized := SettledCall(id, result)
-				if call.Rebuilt && !result.Failed {
-					sized.BytesReal = result.Real
-				}
-				settled = append(settled, sized)
-				settledIDs[id] = true
+				continue
 			}
+			settled = append(settled, sized)
+			settledIDs[id] = true
 		}
 	}
 
@@ -1037,12 +1040,7 @@ func sizeRebuilt(session quietSession, uses []rebuildUse, calls []Call, skip fun
 		for id, result := range found {
 			sized := SettledCall(id, result)
 			call := &calls[byID[id]]
-			call.BytesDelivered, call.Failed, call.Error = sized.BytesDelivered, sized.Failed, sized.Error
-			if result.Failed {
-				call.BytesReal = sized.BytesReal
-			} else {
-				call.BytesReal = result.Real
-			}
+			call.BytesDelivered, call.Failed, call.Error, call.BytesReal = sized.BytesDelivered, sized.Failed, sized.Error, sized.BytesReal
 		}
 	}
 }

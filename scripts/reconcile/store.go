@@ -32,8 +32,9 @@ type sCall struct {
 	failed                                         int64 // -1: NULL
 	// batchOnly: only PostToolBatch wrote the row (a delivered size, no
 	// PostToolUse or PostToolUseFailure outcome, no refusal label). The Stop
-	// and SessionEnd sweep (resolveUnfinished) may fill failed=0 from the
-	// transcript result, never the real size, so failed 0 or NULL both count.
+	// and SessionEnd sweep (resolveUnfinished) and report-time recovery fill
+	// failed=0 from the transcript result, and the real size only from its
+	// toolUseResult, so a result with none leaves failed 0 or NULL, both counted.
 	batchOnly bool
 	// noCommand: the stored input keeps only command_bytes, the command the
 	// heredoc cutter could not cut safely (docs/design.md § Privacy).

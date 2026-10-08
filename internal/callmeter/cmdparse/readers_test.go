@@ -305,6 +305,53 @@ func TestGlobOverFilesystemRootReturnsInBound(t *testing.T) {
 	}
 }
 
+// A glob whose directory read blocks (macOS holding a stat behind a privacy
+// prompt or an automount) stays as written once the call's maxGlobTime is
+// spent, its part naming the bound; the parse never waits on the read. Not
+// parallel: it replaces globReadDir.
+func TestGlobOverTimeBoundStaysAsWritten(t *testing.T) {
+	cwd := fixture(t, "top.txt")
+	held := filepath.Join(cwd, "held")
+	if err := os.Mkdir(held, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", held, err)
+	}
+	release := make(chan struct{})
+	defer close(release)
+	orig := globReadDir
+	t.Cleanup(func() { globReadDir = orig })
+	globReadDir = func(dir string) ([]string, bool) {
+		if dir == held {
+			<-release
+		}
+		return orig(dir)
+	}
+	parts := parseWithin(t, cwd, "cat *.txt held/*", time.Second)
+	if len(parts) != 1 {
+		t.Fatalf("parts = %+v, want one cat part", parts)
+	}
+	got := parts[0]
+	if !reflect.DeepEqual(got.Args, []string{"top.txt", "held/*"}) || !strings.Contains(got.Error, "glob held/* over "+maxGlobTime.String()) {
+		t.Errorf("part = %+v, want top.txt expanded, held/* as written, the time bound named in Error", got)
+	}
+}
+
+// A glob reading more than maxGlobEntries directory entries stays as
+// written, its part naming the bound. Not parallel: it shrinks
+// maxGlobEntries.
+func TestGlobOverEntryBoundStaysAsWritten(t *testing.T) {
+	cwd := fixture(t, "a1", "a2", "a3", "b1", "b2")
+	orig := maxGlobEntries
+	t.Cleanup(func() { maxGlobEntries = orig })
+	maxGlobEntries = 4
+	parts := parseWithin(t, cwd, "cat a*", time.Second)
+	if len(parts) != 1 {
+		t.Fatalf("parts = %+v, want one cat part", parts)
+	}
+	if got := parts[0]; !reflect.DeepEqual(got.Args, []string{"a*"}) || !strings.Contains(got.Error, "glob a* over 4 directory entries") {
+		t.Errorf("part = %+v, want a* as written, the entry bound named in Error", got)
+	}
+}
+
 // The globs of one call share maxGlobLookups directory reads and stats: a
 // glob whose expansion needs more stays as written, like a pattern that
 // matched nothing, and its part names the gap in Error; a glob earlier in the

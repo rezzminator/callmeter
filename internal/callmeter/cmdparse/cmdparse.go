@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -68,12 +69,20 @@ const errCodeUnresolved = "code holds an unresolved expansion"
 // command over maxCommandBytes is one unparsed part, never handed to the
 // shell parser; a literal -c string nested deeper than maxShellDepth is one
 // unparsed part in place of its parse; the globs of one call share
-// maxGlobLookups directory reads and stats, past which a glob stays as
-// written.
+// maxGlobLookups directory reads and stats, maxGlobEntries directory entries
+// read and maxGlobTime from their first lookup, past any of which a glob
+// stays as written.
 const (
 	maxCommandBytes = 65536
 	maxShellDepth   = 8
 	maxGlobLookups  = 4096
+)
+
+// maxGlobEntries and maxGlobTime are variables only so a test can shrink
+// them; nothing else writes them.
+var (
+	maxGlobEntries = 1 << 17
+	maxGlobTime    = 250 * time.Millisecond
 )
 
 // Call is one Bash tool call: its tool_use_id, its command string, the
@@ -210,9 +219,13 @@ type callParser struct {
 	existingOnly bool
 	// shellDepth counts the literal -c strings the walk is inside, up to
 	// maxShellDepth; globLookups the directory reads and stats the call's
-	// globs have spent, up to maxGlobLookups.
-	shellDepth  int
-	globLookups int
+	// globs have spent, up to maxGlobLookups; globEntries the directory
+	// entries they read, up to maxGlobEntries; globDeadline maxGlobTime past
+	// their first lookup (zero before it).
+	shellDepth   int
+	globLookups  int
+	globEntries  int
+	globDeadline time.Time
 }
 
 // pyPart is a Python part awaiting its scan: where it sits among the parts

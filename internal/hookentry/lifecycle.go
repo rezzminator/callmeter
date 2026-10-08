@@ -55,6 +55,7 @@ var detailNamed = map[string][]string{
 	"StopFailure":               {"error"},
 	"InstructionsLoaded":        {"load_reason", "memory_type", "file_path"},
 	"PermissionRequest":         {"tool_name"},
+	"PermissionDenied":          {"tool_name"},
 	"UserPromptSubmit":          {"prompt"},
 	"UserPromptExpansion":       {"command_name", "prompt"},
 	"TaskCreated":               {"task_id"},
@@ -96,7 +97,7 @@ func (run *callmeterRun) eventOf() *callmeter.Event {
 		}
 	case "InstructionsLoaded":
 		e.LoadReason, e.MemoryType, e.FilePath = presentString(p.LoadReason), presentString(p.MemoryType), presentString(p.FilePath)
-	case "PermissionRequest":
+	case "PermissionRequest", "PermissionDenied":
 		e.ToolName = presentString(p.ToolName)
 	case "UserPromptSubmit":
 		e.PromptBytes = run.stringBytes("prompt", p.Prompt)

@@ -2,12 +2,16 @@ package callmeter
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // missedPath is a missed.log beside the store, as the wrapper writes it.
@@ -62,8 +66,9 @@ func TestIngestMissedTurnsEachLineIntoABinaryFault(t *testing.T) {
 }
 
 // TestIngestMissedTerminatedLinesAreTerminatedFaults: a line the binary wrote
-// itself (reason `terminated by …`) becomes a terminated fault and every other
-// line stays a binary fault; both keep the `{event}: {reason}` text.
+// itself (reason `terminated by …`, `store unavailable: …` or `panic`) becomes
+// a terminated fault and every other line stays a binary fault; both keep the
+// `{event}: {reason}` text.
 func TestIngestMissedTerminatedLinesAreTerminatedFaults(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -72,15 +77,21 @@ func TestIngestMissedTerminatedLinesAreTerminatedFaults(t *testing.T) {
 		"1790000001\tSubagentStop\tterminated by SIGTERM\n"+
 			"1790000002\tStop\tdownload failed\n"+
 			"1790000003\tunknown\tterminated by SIGHUP\n"+
-			"1790000004\tStop\tbinary exited terminated by signal\n")
-	if n, err := store.IngestMissed(ctx, path); err != nil || n != 4 {
-		t.Fatalf("IngestMissed = %d, %v; want 4, nil", n, err)
+			"1790000004\tStop\tbinary exited terminated by signal\n"+
+			"1790000005\tPreToolUse\tstore unavailable: full\n"+
+			"1790000006\tPostToolUse\tpanic\n"+
+			"1790000007\tStop\tpanic of another kind\n")
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 7 {
+		t.Fatalf("IngestMissed = %d, %v; want 7, nil", n, err)
 	}
 	got := keys(t, store.DB(), "SELECT stage || '|' || ts || '|' || error FROM faults ORDER BY ts")
 	want := "terminated|1790000001000|SubagentStop: terminated by SIGTERM," +
 		"binary|1790000002000|Stop: download failed," +
 		"terminated|1790000003000|unknown: terminated by SIGHUP," +
-		"binary|1790000004000|Stop: binary exited terminated by signal"
+		"binary|1790000004000|Stop: binary exited terminated by signal," +
+		"terminated|1790000005000|PreToolUse: store unavailable: full," +
+		"terminated|1790000006000|PostToolUse: panic," +
+		"binary|1790000007000|Stop: panic of another kind"
 	if got != want {
 		t.Errorf("faults = %s\nwant %s", got, want)
 	}
@@ -175,7 +186,7 @@ func TestIngestMissedAbsentFileIsZero(t *testing.T) {
 
 // TestIngestMissedPicksUpACrashLeftover: a run that claimed the file and died
 // before it committed left missed.log.ingest-*; the next call ingests it with
-// the fresh missed.log and removes both.
+// the fresh missed.log and leaves no claim behind (each is kept as .done-*).
 func TestIngestMissedPicksUpACrashLeftover(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -282,4 +293,191 @@ func TestIngestMissedLeavesAClaimAnotherRunHolds(t *testing.T) {
 	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
 		t.Errorf("IngestMissed after the holder ended = %d, %v; want 1, nil", n, err)
 	}
+}
+
+// TestStoreFailureClass: each store failure a hook can meet reads as its fixed
+// label; a real store refusing a newer schema, a file that is no database and
+// a trigger's abort among them, and an error joined to another keeps its class.
+func TestStoreFailureClass(t *testing.T) {
+	ctx := context.Background()
+	newer := filepath.Join(t.TempDir(), "callmeter.db")
+	store, err := OpenDB(ctx, newer)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(SchemaVersion+1)); err != nil {
+		t.Fatalf("raise user_version: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_, newerErr := OpenDB(ctx, newer)
+	notADB := filepath.Join(t.TempDir(), "callmeter.db")
+	if err := os.WriteFile(notADB, []byte(strings.Repeat("not a database ", 100)), 0o600); err != nil {
+		t.Fatalf("write %s: %v", notADB, err)
+	}
+	_, notADBErr := OpenDB(ctx, notADB)
+	refusing := openTestStore(t)
+	if _, err := refusing.DB().ExecContext(ctx,
+		"CREATE TRIGGER refuse_faults BEFORE INSERT ON faults BEGIN SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+		t.Fatalf("create the refusing trigger: %v", err)
+	}
+	refusedErr := refusing.AddFault(ctx, Fault{TS: 1, Stage: StageStore, Error: "x"})
+	var syntax *json.SyntaxError
+	payloadErr := json.Unmarshal([]byte("{"), &syntax)
+	pathErr := func(errno syscall.Errno) error { return &fs.PathError{Op: "open", Path: "callmeter.db", Err: errno} }
+	for name, c := range map[string]struct {
+		err  error
+		want string
+	}{
+		"newer schema":               {newerErr, StoreClassNewerSchema},
+		"newer schema, joined":       {errors.Join(payloadErr, newerErr), StoreClassNewerSchema},
+		"not a database":             {notADBErr, StoreClassCorrupt},
+		"a trigger's abort":          {refusedErr, StoreClassOther},
+		"no space":                   {pathErr(syscall.ENOSPC), StoreClassFull},
+		"read-only file system":      {pathErr(syscall.EROFS), StoreClassReadonly},
+		"permission denied":          {pathErr(syscall.EACCES), StoreClassReadonly},
+		"I/O error":                  {pathErr(syscall.EIO), StoreClassIO},
+		"a directory that is a file": {pathErr(syscall.ENOTDIR), StoreClassOpen},
+		"anything else":              {errors.New("x"), StoreClassOther},
+	} {
+		if c.err == nil {
+			t.Errorf("%s: no error to classify", name)
+			continue
+		}
+		if got := StoreFailureClass(c.err); got != c.want {
+			t.Errorf("StoreFailureClass(%s: %v) = %q, want %q", name, c.err, got, c.want)
+		}
+	}
+}
+
+// missedRows counts the binary and terminated faults, the rows missed.log gives.
+func missedRows(t *testing.T, store *Store) int {
+	t.Helper()
+	var n int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM faults WHERE stage IN ('binary', 'terminated')`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestIngestMissedReingestAddsNoDuplicate: a run killed after its ingest
+// committed but before it moved its claim leaves the claim as it was; the next
+// ingest of it writes no fault twice, an unparsed line's included, while two
+// identical lines of one file stay two faults, and so does a line of a later
+// missed.log identical to one already stored.
+func TestIngestMissedReingestAddsNoDuplicate(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	content := "1790000001\tPreToolUse\tbinary exited 1\tsess-1\n" +
+		"1790000001\tPreToolUse\tbinary exited 1\tsess-1\n" +
+		"1790000002\tStop\tterminated by SIGTERM\tsess-1\n" +
+		"not a missed line\n"
+	writeMissed(t, path, content)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 4 {
+		t.Fatalf("IngestMissed = %d, %v; want 4, nil", n, err)
+	}
+	// The crash: the claim is still there, unchanged, after the commit.
+	claim := path + ingestInfix + "4242"
+	writeMissed(t, claim, content)
+	if err := os.Chtimes(claim, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+		t.Errorf("IngestMissed of the committed claim = %d, %v; want 0, nil", n, err)
+	}
+	if n := missedRows(t, store); n != 4 {
+		t.Errorf("faults from missed.log = %d, want 4: re-ingesting a committed claim duplicated its faults", n)
+	}
+
+	// Parallel hooks of one session lose their events in the same second: a
+	// line identical to a stored one that reaches a later missed.log is a
+	// further loss of its own, never a re-ingest.
+	writeMissed(t, path, "1790000002\tStop\tterminated by SIGTERM\tsess-1\n")
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+		t.Errorf("IngestMissed of a fresh identical line = %d, %v; want 1, nil", n, err)
+	}
+	if n := missedRows(t, store); n != 5 {
+		t.Errorf("faults from missed.log = %d, want 5: a fresh line identical to a stored one was dropped", n)
+	}
+}
+
+// backdateDone ages every ingested claim kept for its grace period by age.
+func backdateDone(t *testing.T, path string, age time.Duration) []string {
+	t.Helper()
+	done, err := filepath.Glob(path + doneInfix + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	then := time.Now().Add(-age)
+	for _, file := range done {
+		if err := os.Chtimes(file, then, then); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return done
+}
+
+// TestIngestMissedKeepsALateAppend: an appender (the wrapper's `>>`,
+// AppendMissed) that opened missed.log before the ingest's rename but writes
+// after its read writes into the claimed file; the claim is kept for its
+// grace period and the next ingest after it takes only the late line.
+func TestIngestMissedKeepsALateAppend(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	writeMissed(t, path, "1790000000\tPostToolUse\tbinary exited 1\n")
+	late, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644) // opened before the claim
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+		t.Fatalf("IngestMissed = %d, %v; want 1, nil", n, err)
+	}
+	if _, err := late.WriteString("1790000001\tStop\tterminated by SIGTERM\tsess-1\n"); err != nil { // written after the read
+		t.Fatal(err)
+	}
+	if err := late.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Inside the grace period the claim stays and nothing is taken from it.
+	if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+		t.Errorf("IngestMissed inside the grace period = %d, %v; want 0, nil", n, err)
+	}
+	if done := backdateDone(t, path, 3*time.Second); len(done) != 1 {
+		t.Errorf("claims kept for the grace period = %v, want one", done)
+	}
+	if _, err := store.IngestMissed(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	if n := missedRows(t, store); n != 2 {
+		t.Errorf("faults from missed.log = %d, want 2: the line appended through an fd opened before the claim is gone", n)
+	}
+	if done := backdateDone(t, path, 3*time.Second); len(done) != 0 {
+		t.Errorf("claims left after their grace period = %v, want none", done)
+	}
+
+	t.Run("no late line", func(t *testing.T) {
+		store := openTestStore(t)
+		path := missedPath(store)
+		writeMissed(t, path, "1790000000\tPostToolUse\tbinary exited 1\n")
+		if n, err := store.IngestMissed(ctx, path); err != nil || n != 1 {
+			t.Fatalf("IngestMissed = %d, %v; want 1, nil", n, err)
+		}
+		backdateDone(t, path, 3*time.Second)
+		if n, err := store.IngestMissed(ctx, path); err != nil || n != 0 {
+			t.Errorf("IngestMissed after the grace period = %d, %v; want 0, nil", n, err)
+		}
+		if n := missedRows(t, store); n != 1 {
+			t.Errorf("faults from missed.log = %d, want 1", n)
+		}
+		if done := backdateDone(t, path, 0); len(done) != 0 {
+			t.Errorf("claims left after their grace period = %v, want none", done)
+		}
+	})
 }

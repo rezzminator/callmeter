@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
@@ -154,7 +155,14 @@ func reportAction(
 	}
 	path := paths.Store(home)
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
-		if err := printNoStore(stdout, values.json, positional[0], path); err != nil {
+		// No store to ingest into: the lines still waiting in missed.log and its
+		// claims are lost events, counted read-only and named as a failure.
+		counts, err := callmeter.CountMissed(paths.Missed(home))
+		if err != nil {
+			fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", err)
+			return 1
+		}
+		if err := printNoStore(stdout, values.json, positional[0], path, missedNotes(counts)); err != nil {
 			fmt.Fprintf(stderr, "callmeter: report %s: %v\n", positional[0], err)
 			return 1
 		}
@@ -202,6 +210,11 @@ func reportAction(
 	table, err := topic(ctx, db, filter, names.nameOf)
 	if err == nil {
 		table.Notes = append(table.Notes, report.InapplicableNotes(positional[0], filter)...)
+		var older []string
+		older, err = report.OlderRulesNotes(ctx, db)
+		table.Notes = append(table.Notes, older...)
+	}
+	if err == nil {
 		if values.json {
 			err = table.RenderJSON(stdout, positional[0])
 		} else {
@@ -215,12 +228,48 @@ func reportAction(
 	return 0
 }
 
+// unrecordedWhy names each stage of a missed.log line as the store's own
+// "events unrecorded" notes do (report.recordingNotes), in their order.
+var unrecordedWhy = []struct{ stage, why string }{
+	{callmeter.StageBinary, "binary unavailable"},
+	{callmeter.StageTerminated, "hook terminated before recording"},
+}
+
+// missedNotes is the one failure note over missed lines counted with no store,
+// `{n} events unrecorded: {why}: {n}, …`; none when no line waits.
+func missedNotes(counts map[string]int) []string {
+	total, parts := 0, []string{}
+	for _, lost := range unrecordedWhy {
+		if n := counts[lost.stage]; n > 0 {
+			total += n
+			parts = append(parts, fmt.Sprintf("%s: %d", lost.why, n))
+		}
+	}
+	if total == 0 {
+		return []string{}
+	}
+	return []string{fmt.Sprintf("%d events unrecorded: %s", total, strings.Join(parts, ", "))}
+}
+
 // printNoStore says no store file exists: a line on stdout, or with --json the
-// object whose `store` is "absent".
-func printNoStore(stdout io.Writer, asJSON bool, topic, path string) error {
+// object whose `store` is "absent". With notes (events lost before any store
+// existed) the line names only the absence and each note follows it as a
+// `note:` line, never "nothing recorded yet".
+func printNoStore(stdout io.Writer, asJSON bool, topic, path string, notes []string) error {
 	if !asJSON {
-		_, err := fmt.Fprintf(stdout, "callmeter: no store at %s: nothing recorded yet\n", path)
-		return err
+		if len(notes) == 0 {
+			_, err := fmt.Fprintf(stdout, "callmeter: no store at %s: nothing recorded yet\n", path)
+			return err
+		}
+		if _, err := fmt.Fprintf(stdout, "callmeter: no store at %s\n", path); err != nil {
+			return err
+		}
+		for _, note := range notes {
+			if _, err := fmt.Fprintln(stdout, "note: "+note); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	encoder := json.NewEncoder(stdout)
 	encoder.SetEscapeHTML(false)
@@ -231,7 +280,7 @@ func printNoStore(stdout io.Writer, asJSON bool, topic, path string) error {
 		Columns []string   `json:"columns"`
 		Rows    [][]string `json:"rows"`
 		Notes   []string   `json:"notes"`
-	}{topic, "absent", path, []string{}, [][]string{}, []string{}})
+	}{topic, "absent", path, []string{}, [][]string{}, notes})
 }
 
 // buildFilter turns the flags into a report.Filter: --since clamped to the

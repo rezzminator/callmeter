@@ -4,12 +4,17 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"runtime/debug"
 
+	"github.com/rezzminator/callmeter/internal/applog"
+	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/command"
+	"github.com/rezzminator/callmeter/internal/clock"
 	"github.com/rezzminator/callmeter/internal/hookentry"
 	"github.com/rezzminator/callmeter/internal/paths"
 )
@@ -59,13 +64,95 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.
 }
 
 // runHook is the hook entry with a net under it: a hook exits 0 on every path,
-// and a panic would exit 2, which Claude Code reads as a blocking error.
+// and a panic would exit 2, which Claude Code reads as a blocking error. A
+// recovered panic still leaves its trace: one missed.log line with reason
+// callmeter.PanicReason, naming the event and session of the payload the hook
+// read so far (panicIDs), and one log line with the stack, so the next run
+// counts the lost event as a `terminated` fault. A run whose event was already
+// accounted for (hookentry.Panic) leaves the log line alone: its event is not
+// lost.
 func runHook(stdin io.Reader, stderr io.Writer, getenv paths.Getenv) (code int) {
+	read := &payloadPrefix{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			fmt.Fprintf(stderr, "callmeter: hook panicked: %v\n%s", recovered, debug.Stack())
+			stack, accounted := debug.Stack(), false
+			if p, ok := recovered.(hookentry.Panic); ok {
+				recovered, stack, accounted = p.Value, p.Stack, p.Accounted
+			}
+			fmt.Fprintf(stderr, "callmeter: hook panicked: %v\n%s", recovered, stack)
+			leavePanicLine(read.data, recovered, stack, accounted, stderr, getenv)
 			code = 0
 		}
 	}()
-	return hook(stdin, stderr, getenv)
+	return hook(io.TeeReader(stdin, read), stderr, getenv)
+}
+
+// leavePanicLine appends the missed.log line, unless the run's event was
+// accounted for, and the log line of a recovered hook panic; with no home
+// resolvable, stderr is all there is.
+func leavePanicLine(prefix []byte, recovered any, stack []byte, accounted bool, stderr io.Writer, getenv paths.Getenv) {
+	home, err := paths.Home(getenv)
+	if err != nil {
+		applog.Failure(stderr, "", callmeter.StageTerminated, "", "", fmt.Errorf("resolve callmeter home: %w", err))
+		return
+	}
+	event, session := panicIDs(prefix)
+	logPath := paths.Log(home)
+	if !accounted {
+		if err := hookentry.AppendMissed(
+			paths.Missed(home), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
+			applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "", err)
+		}
+	}
+	applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "",
+		fmt.Errorf("hook panicked: %v\n%s", recovered, stack))
+}
+
+// payloadPrefixLimit bounds what runHook keeps of the payload for panicIDs:
+// Claude Code writes session_id and hook_event_name among the first fields,
+// before any tool input or response.
+const payloadPrefixLimit = 64 << 10
+
+// payloadPrefix keeps the first payloadPrefixLimit bytes written to it and
+// drops the rest, never failing the write, so the tee under the hook never
+// changes what the hook reads.
+type payloadPrefix struct{ data []byte }
+
+func (p *payloadPrefix) Write(b []byte) (int, error) {
+	if room := payloadPrefixLimit - len(p.data); room > 0 {
+		p.data = append(p.data, b[:min(room, len(b))]...)
+	}
+	return len(b), nil
+}
+
+// panicIDs reads hook_event_name and session_id from the top-level object of a
+// payload prefix, as far as it decodes: a truncated or broken payload yields
+// what came before the break, and an empty name for what never came.
+func panicIDs(prefix []byte) (event, session string) {
+	decoder := json.NewDecoder(bytes.NewReader(prefix))
+	if open, err := decoder.Token(); err != nil || open != json.Delim('{') {
+		return "", ""
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return event, session
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return event, session
+		}
+		var text string
+		switch key {
+		case "hook_event_name":
+			if json.Unmarshal(value, &text) == nil {
+				event = text
+			}
+		case "session_id":
+			if json.Unmarshal(value, &text) == nil {
+				session = text
+			}
+		}
+	}
+	return event, session
 }

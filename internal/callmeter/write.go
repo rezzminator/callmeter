@@ -258,11 +258,25 @@ type Tx struct {
 }
 
 // Batch runs fn in one transaction, committed when fn returns nil and rolled
-// back otherwise.
+// back otherwise. The transaction takes the store's write lock at its BEGIN
+// (sqlitedb.OpenStore), so a concurrent writer is waited out there, before fn
+// runs.
 func (s *Store) Batch(ctx context.Context, fn func(*Tx) error) error {
+	return s.BatchHeld(ctx, nil, fn)
+}
+
+// BatchHeld is Batch with held, when not nil, called once the transaction
+// holds the store's write lock, before fn: a caller holding something off
+// until the batch's outcome is known (the hook's signal handler) takes it
+// there, never across the wait for a busy store. A batch whose wait failed
+// never calls held.
+func (s *Store) BatchHeld(ctx context.Context, held func(), fn func(*Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("callmeter store %s: begin transaction: %w", s.path, err)
+	}
+	if held != nil {
+		held()
 	}
 	if err := fn(&Tx{tx: tx, path: s.path}); err != nil {
 		return errors.Join(err, tx.Rollback())
@@ -606,7 +620,7 @@ type UnfinishedCall struct {
 	AgentType *string
 	NoTS      bool // ts IS NULL: stored before every hook set one
 	// Delivered: bytes_delivered is set, so the batch already stored the call's
-	// size; RecoverQuiet settles only a call whose size is still unknown.
+	// size; RecoverQuiet fills only its real size, from a result that has one.
 	Delivered bool
 	// Rebuilt: a call recovery rebuilt from a transcript (source transcript)
 	// that did not fail, so its real size is its result's toolUseResult.
