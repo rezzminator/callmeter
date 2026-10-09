@@ -155,7 +155,7 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 				d.latest = max(d.latest, c.ts)
 				return nil
 			}},
-		{"requests", `SELECT request_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(ts,0), COALESCE(model,''), COALESCE(stop_reason,''), COALESCE(input_tokens,-1), COALESCE(output_tokens,-1), COALESCE(cache_read_tokens,-1), COALESCE(cache_creation_tokens,-1), COALESCE(calls,-1), COALESCE(pending,0) FROM requests`,
+		{"requests", `SELECT request_id, COALESCE(session_id,''), COALESCE(agent_id,''), COALESCE(ts,0), COALESCE(model,''), COALESCE(stop_reason,''), COALESCE(input_tokens,-1), COALESCE(output_tokens,-1), COALESCE(cache_read_tokens,-1), COALESCE(cache_creation_tokens,-1), COALESCE(calls,-1), COALESCE(pending,0) FROM requests WHERE source IS NOT 'ledger'`,
 			func(r *sql.Rows) error {
 				q := &sRequest{}
 				if err := r.Scan(&q.id, &q.session, &q.agent, &q.ts, &q.model, &q.stopReason, &q.usage.input, &q.usage.output, &q.usage.cacheRead, &q.usage.cacheCreation, &q.calls, &q.pending); err != nil {

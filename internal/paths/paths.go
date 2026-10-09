@@ -88,3 +88,25 @@ func userHome(getenv Getenv) (string, error) {
 	}
 	return user, nil
 }
+
+// EnvCostLedgerDir names the variable that overrides the cost ledger's
+// directory, the one another tool writes and callmeter only reads.
+const EnvCostLedgerDir = "PFM_COST_LEDGER_DIR"
+
+// CostLedger is the directory of the optional cost ledger: $PFM_COST_LEDGER_DIR
+// when set, else .local/state/pfm/cost-ledger under $PFM_HOME when set, else
+// under $HOME. It is where the ledger's writer puts it by default; callmeter
+// reads it as data and never requires it to exist.
+func CostLedger(getenv Getenv) (string, error) {
+	if dir := getenv(EnvCostLedgerDir); dir != "" {
+		return dir, nil
+	}
+	user := getenv("PFM_HOME")
+	if user == "" {
+		var err error
+		if user, err = userHome(getenv); err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(user, ".local", "state", "pfm", "cost-ledger"), nil
+}

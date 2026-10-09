@@ -391,6 +391,10 @@ func TestRecoverQuietSettlesAPendingRequestFromItsTranscript(t *testing.T) {
 	if call := row(t, q.store, "calls", "tool_use_id = 'toolu_main'"); call["request_id"] != "msg_main" {
 		t.Errorf("main call request_id = %v, want msg_main", call["request_id"])
 	}
+	if request["api_request_id"] != "req_demo_1" || request["cost_source"] != CostSourceTable || request["cost_usd_micros"] == nil {
+		t.Errorf("recovered request = api_request_id %v cost %v from %v, want req_demo_1 and a table price",
+			request["api_request_id"], request["cost_usd_micros"], request["cost_source"])
+	}
 }
 
 // TestRecoverQuietMarksAnOpenCallOnce: a call with no result in any transcript
@@ -2335,5 +2339,31 @@ func TestRequestFillsAMissingIteration(t *testing.T) {
 	}
 	if got := count(t, store, "request_iterations"); got != 1 {
 		t.Errorf("request_iterations holds %d rows, want 1", got)
+	}
+}
+
+// TestUnfilledTurnIgnoresLedgerRows: an agent turn with no transcript request
+// in its span stays unfilled although the cost ledger holds a call of that
+// agent in the span: the ledger's rows are side calls, not the turn's reply.
+func TestUnfilledTurnIgnoresLedgerRows(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	for _, stmt := range []string{
+		`INSERT INTO agent_turns (agent_id, seq, session_id, started, stopped) VALUES ('a1', 1, 'sess-1', 100, 200)`,
+		`INSERT INTO requests (request_id, session_id, agent_id, ts, source) VALUES ('req_invented_side', 'sess-1', 'a1', 150, 'ledger')`,
+	} {
+		if _, err := store.DB().Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := store.unfilledPending(ctx, "sess-1")
+	if err != nil || !pending {
+		t.Fatalf("unfilledPending = %v, %v; want true: only a ledger row sits in the turn", pending, err)
+	}
+	if _, err := store.DB().Exec(`INSERT INTO requests (request_id, session_id, agent_id, ts, source) VALUES ('msg_a1', 'sess-1', 'a1', 160, 'hook')`); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err = store.unfilledPending(ctx, "sess-1"); err != nil || pending {
+		t.Fatalf("unfilledPending = %v, %v; want false once a transcript request fills the turn", pending, err)
 	}
 }

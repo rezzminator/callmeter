@@ -467,7 +467,7 @@ func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 		"agents":      "callmeter: no sub-agents in window",
 		"tokens":      "callmeter: no requests in window",
 		"compactions": "callmeter: no compactions in window",
-		"cost":        "callmeter: no cost-state recorded in window",
+		"cost":        "callmeter: no cost recorded in window",
 		"hooks":       "callmeter: no Stop hook summaries in window",
 		"turns":       "callmeter: no turn durations in window",
 		"resumes":     "callmeter: no resumes in window",
@@ -983,5 +983,105 @@ func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
 				t.Errorf("notes = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// ledgerLab is a lab whose environment names a cost ledger directory holding
+// one session's file of three side calls (invented ids), written an hour ago.
+func ledgerLab(t *testing.T) (fixture lab, session string) {
+	t.Helper()
+	fixture = newLab(t)
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat) // the store the hooks would have made
+	dir := filepath.Join(filepath.Dir(fixture.userHome), "cost-ledger")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	session = "00000000-0000-4000-8000-0000000000a1"
+	at := time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	line := func(n int, agent, source string, cost int) string {
+		return fmt.Sprintf(`{"request_id":"req_011CFixture%08d","ts":%q,"session_id":%q,"agent_id":%q,"parent_agent_id":"","query_source":%q,`+
+			`"model":"claude-haiku-5-5","input_tokens":1000,"output_tokens":100,"cache_read_tokens":0,"cache_creation_tokens":0,`+
+			`"cost_usd_micros":%d,"speed":"normal","effort":"","join":"log+span"}`, n, at, session, agent, source, cost)
+	}
+	lines := []string{line(1, "", "web_search_tool", 75000), line(2, "a0000000000000001", "agent_summary", 900), line(3, "", "prompt_suggestion", 20000)}
+	if err := os.WriteFile(filepath.Join(dir, session+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath), "HOME": fixture.userHome, paths.EnvCostLedgerDir: dir})
+	return fixture, session
+}
+
+// TestCallmeterCLIReportCostIngestsTheLedgerInEveryView: the report brings the
+// cost ledger's side calls into the store before the topic runs, so the chat,
+// agent and call views all count them, the second run changes nothing, and the
+// notes name the ledger read.
+func TestCallmeterCLIReportCostIngestsTheLedgerInEveryView(t *testing.T) {
+	fixture, session := ledgerLab(t)
+	for run := 1; run <= 2; run++ {
+		code, stdout, stderr := fixture.run("report", "cost", "--session", session)
+		if code != 0 || stderr != "" {
+			t.Fatalf("run %d: report cost = %d\nstdout:\n%s\nstderr:\n%s", run, code, stdout, stderr)
+		}
+		for _, want := range []string{"0.10", "note: cost ledger ", ": 3 calls in the window, 0 held by a transcript, 3 side calls"} {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("run %d: report cost lacks %q:\n%s", run, want, stdout)
+			}
+		}
+	}
+	code, stdout, stderr := fixture.run("report", "cost", "--view", "agent", "--session", session)
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "main") || !strings.Contains(stdout, "a0000000000000001") || !strings.Contains(stdout, "0.10") {
+		t.Errorf("agent view = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	code, stdout, stderr = fixture.run("report", "cost", "--view", "call", "--session", session, "--json")
+	got := decodeReport(t, stdout)
+	if code != 0 || stderr != "" || len(got.Rows) != 3 || got.Rows[0][3] != "web_search_tool" || got.Rows[0][9] != "0.0750" {
+		t.Errorf("call view = %d rows %v\nstdout:\n%s\nstderr:\n%s", code, got.Rows, stdout, stderr)
+	}
+	code, stdout, _ = fixture.run("report", "tokens", "--view", "agent")
+	if code != 0 || !strings.Contains(stdout, "note: --view does not apply to tokens") {
+		t.Errorf("report tokens --view agent = %d, want a note that --view does not apply\n%s", code, stdout)
+	}
+}
+
+// TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted: no ledger
+// directory is the default path of nothing, never an error and never a
+// smaller number passed off as complete.
+func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedEverything(t)
+	code, stdout, stderr := fixture.run("report", "cost")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger at ") || !strings.Contains(stdout, ".local/state/pfm/cost-ledger") {
+		t.Errorf("report cost lacks the side-calls-not-counted note naming the default ledger path:\n%s", stdout)
+	}
+}
+
+// TestCallmeterCLIReportCostNamesALedgerItCannotRead: a ledger path that is not
+// a directory is a stderr line and a note on the cost report, never "no
+// ledger"; the other reports still run.
+func TestCallmeterCLIReportCostNamesALedgerItCannotRead(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedEverything(t)
+	file := filepath.Join(fixture.userHome, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath), "HOME": fixture.userHome, paths.EnvCostLedgerDir: file})
+	code, stdout, stderr := fixture.run("report", "cost")
+	if code != 0 || !strings.Contains(stderr, "cost ledger") || !strings.Contains(stdout, "note: side calls are not counted: the cost ledger could not be read") {
+		t.Errorf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if code, _, _ := fixture.run("report", "tokens"); code != 0 {
+		t.Errorf("report tokens = %d with an unreadable ledger, want 0", code)
+	}
+}
+
+func TestCallmeterCLIReportCostRejectsAnUnknownView(t *testing.T) {
+	fixture := newLab(t)
+	code, stdout, stderr := fixture.run("report", "cost", "--view", "nope")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, `--view "nope" is none of chat, agent, call`) {
+		t.Errorf("report cost --view nope = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }

@@ -68,7 +68,7 @@ func Waiting(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	err := query(ctx, store, "waits",
 		`SELECT e.session_id, `+kind+`, e.ts,
 			(SELECT MIN(u.ts) FROM events u WHERE u.session_id = e.session_id AND u.event = ? AND u.ts > e.ts),
-			(SELECT MIN(r.ts) FROM requests r WHERE r.session_id = e.session_id AND r.ts > e.ts)
+			(SELECT MIN(r.ts) FROM requests r WHERE r.session_id = e.session_id AND r.source IS NOT 'ledger' AND r.ts > e.ts)
 		FROM events e WHERE e.event = ? AND `+kind+` IN (?, ?) AND e.session_id IS NOT NULL AND e.ts IS NOT NULL AND `+where,
 		append([]any{eventUserPromptSubmit, eventNotification, waitKinds[0], waitKinds[1]}, args...),
 		func(r rowSource) error {

@@ -96,7 +96,8 @@ type Request struct {
 	CacheCreation1hTokens *int64
 	ContextTokens         *int64 // input + cache read + cache creation
 	OutputTokens          *int64
-	ThinkingTokens        *int64 // the share of OutputTokens spent thinking; NULL when the usage carries none
+	ThinkingTokens        *int64  // the share of OutputTokens spent thinking; NULL when the usage carries none
+	APIRequestID          *string // the transcript line's requestId, the Anthropic API request id the cost ledger keys by
 	Calls                 *int64
 	Pending               *bool
 	Source                *string
@@ -223,6 +224,7 @@ func (r Request) columns() []column {
 	cs = add(cs, "context_tokens", r.ContextTokens)
 	cs = add(cs, "output_tokens", r.OutputTokens)
 	cs = add(cs, "thinking_tokens", r.ThinkingTokens)
+	cs = add(cs, "api_request_id", r.APIRequestID)
 	cs = add(cs, "calls", r.Calls)
 	cs = add(cs, "pending", r.Pending)
 	cs = add(cs, "source", r.Source)
@@ -347,12 +349,63 @@ func (t *Tx) UpsertCall(ctx context.Context, c Call, mode Mode) error {
 // iterations (writeIterations).
 func (t *Tx) UpsertRequest(ctx context.Context, r Request, mode Mode) error {
 	if !t.complete {
-		r.ThinkingTokens = nil
+		r.ThinkingTokens, r.APIRequestID = nil, nil
 	}
 	if err := t.upsert(ctx, "requests", "request_id", r.RequestID, r.columns(), mode); err != nil {
 		return err
 	}
+	if err := t.priceRequest(ctx, r.RequestID); err != nil {
+		return err
+	}
 	return t.writeIterations(ctx, r.RequestID, r.Iterations, mode)
+}
+
+// priceRequest sets the cost of the stored request from the price table, at the
+// tokens the row holds after its merge: cost_source 'table', or NULL and NULL
+// for a model the table does not list, a row with no model or no input and
+// output count, and a provisional row. A price the cost ledger gave
+// (cost_source 'ledger') is Claude Code's own and stays. A store without the
+// cost columns (Store.SchemaComplete false) is left alone.
+func (t *Tx) priceRequest(ctx context.Context, requestID string) error {
+	if !t.complete {
+		return nil
+	}
+	var model, source sql.NullString
+	var input, output, read, create, write5m, write1h, pending, micros sql.NullInt64
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+			cache_creation_5m_tokens, cache_creation_1h_tokens, pending, cost_usd_micros, cost_source
+		FROM requests WHERE request_id = ?`, requestID).
+		Scan(&model, &input, &output, &read, &create, &write5m, &write1h, &pending, &micros, &source)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: read request %q to price it: %w", t.path, requestID, err)
+	}
+	if source.String == SourceLedger {
+		return nil
+	}
+	var priced any
+	var pricedSource any
+	if model.Valid && input.Valid && output.Valid && pending.Int64 == 0 {
+		var w5, w1 *int64
+		if write5m.Valid {
+			w5 = &write5m.Int64
+		}
+		if write1h.Valid {
+			w1 = &write1h.Int64
+		}
+		if cost, ok := PriceMicros(model.String, input.Int64, output.Int64, read.Int64, create.Int64, w5, w1); ok {
+			priced, pricedSource = cost, CostSourceTable
+		}
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2 WHERE request_id = ?3
+		AND (cost_usd_micros IS NOT ?1 OR cost_source IS NOT ?2)`, priced, pricedSource, requestID); err != nil {
+		return fmt.Errorf("callmeter store %s: price request %q: %w", t.path, requestID, err)
+	}
+	return nil
 }
 
 // iterationColumns are the request_iterations columns an iteration provides,
@@ -588,7 +641,7 @@ func (t *Tx) RecoverRequest(ctx context.Context, r Request, toolUseIDs []string,
 // source and seat columns only fill in both.
 func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, since int64, mode Mode) error {
 	if !t.complete {
-		r.ThinkingTokens = nil
+		r.ThinkingTokens, r.APIRequestID = nil, nil
 	}
 	columns := r.columns()
 	for i := range columns {
@@ -637,6 +690,9 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 		if updated == 0 {
 			return nil
 		}
+	}
+	if err := t.priceRequest(ctx, r.RequestID); err != nil {
+		return err
 	}
 	if err := t.writeIterations(ctx, r.RequestID, r.Iterations, mode); err != nil {
 		return err

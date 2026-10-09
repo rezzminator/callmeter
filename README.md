@@ -96,7 +96,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 ## 📊 Reports: token usage, context growth, files and commands
 
 ```text
-/callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--json]
+/callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--view V] [--json]
 ```
 
 | Topic | Answers |
@@ -116,7 +116,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
 | `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
-| `cost` | Claude Code's own cost per session: USD, seconds in the API, in retries, in tools, per model |
+| `cost` | per chat the sum of its requests' prices, Claude Code's own total and the named difference; `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
 | `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
@@ -130,6 +130,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `--agent-type T` | calls made by that agent type |
 | `--session S` | one session |
 | `--limit N` | rows per table, default 25 |
+| `--view V` | `cost` only: `chat` (default), `agent` or `call` |
 | `--json` | one JSON object (`topic`, `store`, `title`, `columns`, `rows`, `notes`) instead of the text table |
 
 The `tokens` report over the same scratch store:
@@ -155,7 +156,7 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
-- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size.
+- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from pfm's cost ledger when it is present.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
 - `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.

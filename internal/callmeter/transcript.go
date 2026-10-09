@@ -21,7 +21,10 @@ import (
 // RequestUsage is the model request that issued one tool call, as the
 // transcript records it.
 type RequestUsage struct {
-	MessageID           string
+	MessageID string
+	// APIRequestID is the requestId of the transcript line, the API request id
+	// the cost ledger keys by; "" when the line carries none.
+	APIRequestID        string
 	TS                  int64 // the entry's timestamp, Unix ms UTC
 	Model               string
 	StopReason          string // "" when the entry carries none
@@ -145,17 +148,20 @@ func ApplyUsage(request *Request, usage RequestUsage) {
 	request.ContextTokens = Ptr(usage.ContextTokens)
 	request.OutputTokens = Ptr(usage.OutputTokens)
 	request.ThinkingTokens = usage.ThinkingTokens
+	request.APIRequestID = presentString(usage.APIRequestID)
 	request.Iterations = usage.Iterations
 }
 
 type transcriptEntry struct {
 	Type      string          `json:"type"`
+	RequestID string          `json:"requestId"`
 	Timestamp string          `json:"timestamp"`
 	Message   json.RawMessage `json:"message"`
 }
 
 type assistantMessage struct {
 	timestamp  string          // its entry's, set by agentMessage
+	requestID  string          // its entry's requestId, set where an entry's message is decoded
 	ID         string          `json:"id"`
 	Model      string          `json:"model"`
 	StopReason *string         `json:"stop_reason"`
@@ -357,6 +363,7 @@ func (scan *requestScan) entry(raw []byte) error {
 	if err := json.Unmarshal(entry.Message, &message); err != nil {
 		return fmt.Errorf("malformed assistant message: %w", err)
 	}
+	message.requestID = entry.RequestID
 	var blocks []contentBlock
 	if err := json.Unmarshal(message.Content, &blocks); err != nil {
 		return fmt.Errorf("assistant message %q: content is not a block list: %w", message.ID, err)
@@ -405,6 +412,9 @@ func entryTime(messageID, timestamp string) (time.Time, error) {
 // reason and usage the entry carries replace the earlier entries' (the last
 // entry's are final); the message id and the first entry's time stay.
 func foldEntry(request *RequestUsage, message *assistantMessage) {
+	if message.requestID != "" {
+		request.APIRequestID = message.requestID
+	}
 	if message.Model != "" {
 		request.Model = message.Model
 	}
@@ -673,6 +683,7 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 	if err := json.Unmarshal(entry.Message, &message); err != nil {
 		return fmt.Errorf("malformed assistant message: %w", err)
 	}
+	message.requestID = entry.RequestID
 	if message.ID == "" || message.Model == syntheticModel {
 		return nil
 	}

@@ -42,7 +42,7 @@ The one exception is a report run, the store's own writer, and only when the use
 - `tool = 'Read'` undercounts reading: agents read mostly through Bash (`cat`, `sed -n`, `rg`). The files a Bash call touched are in `command_parts.files`, which only a report run fills.
 - `context_tokens` is a request's whole prompt (`input_tokens + cache_read_tokens + cache_creation_tokens`), so peak context is `max(context_tokens)`. `sum(context_tokens)` re-counts the cached prefix at every request: label it "tokens processed", never "unique tokens". `thinking_tokens` is part of `output_tokens`, never added to it; NULL means not reported, not 0.
 - A request with `pending = 1` (its `request_id` starts `pending:`) has no final usage yet; exclude it from sums and say how many you excluded. `agents.total_tokens` and `tool_uses` are written when a stop is recorded or rebuilt, so NULL means a running agent or a lost stop; sum its `requests` instead. `agents.stopped IS NULL` is an agent still running or one whose stop was never recorded.
-- Cost: `session_costs` is Claude Code's own cumulative USD per session (`cost_usd`, plus `model_costs` JSON per model, NULL when Claude Code gave no split), the number to quote; only sessions recorded by a recent callmeter on a recent Claude Code have a row, so count the sessions without one. No per-agent cost column exists: when you price `requests` yourself, take the rates from the user or the provider's current price page (cache writes at 5 m and 1 h are priced differently: `cache_creation_5m_tokens`, `cache_creation_1h_tokens`), reconcile your total against `session_costs.cost_usd` for the same session, and state the gap.
+- Cost: `session_costs.cost_usd` is Claude Code's own cumulative USD per session (`model_costs` JSON per model, NULL when Claude Code gave no split), the number to quote for a chat; only sessions recorded by a recent callmeter on a recent Claude Code have a row, so count the sessions without one. `requests.cost_usd_micros` (USD millionths) prices each request: `cost_source = 'ledger'` is Claude Code's own price of that call, `'table'` is callmeter's embedded price list applied to the row's tokens (no web-search fee, no advisor iteration), NULL is an unknown model or a pending row, never zero: count the NULLs and say the sum is a floor. `requests` rows with `source = 'ledger'` are side calls no transcript records, there only when a report run found a cost ledger; a chat's request sum is not `session_costs.cost_usd`: name the difference (`callmeter report cost` does, per chat). Their `agent_id` is NULL (main) or `?` (unknown), so a sum over agents is a floor for the sub-agents.
 - Numbers settle late. A session quiet for an hour is completed from its transcripts (missing sizes, pending requests, lost stops) only when a report runs (§ Never write to the store). Without one, say that a quiet session's numbers may be unsettled.
 - `tool` is the name as the model called it: a handful of calls refused by Claude Code carry a misspelt name such as `bash`.
 
@@ -58,8 +58,19 @@ SELECT coalesce(r.agent_id, '(main)') AS agent, a.agent_type, count(*) AS reques
        sum(r.thinking_tokens) AS thinking, sum(r.cache_read_tokens) AS cache_read,
        sum(r.cache_creation_tokens) AS cache_write
 FROM requests r LEFT JOIN agents a USING (agent_id)
-WHERE r.session_id = :sid AND r.pending = 0
+WHERE r.session_id = :sid AND r.pending = 0 AND r.source IS NOT 'ledger'
 GROUP BY r.agent_id ORDER BY peak_context DESC LIMIT 30;
+```
+
+Money per party in one session, side calls included (`cost_usd_micros` is USD millionths; `unpriced` counts the requests whose price is unknown, so the dollars are a floor wherever it is above 0; a `ledger` row is a call no transcript records, [schema.md § requests](schema.md#requests)):
+
+```sql
+SELECT coalesce(r.agent_id, '(main)') AS agent, a.agent_type, count(*) AS requests,
+       sum(r.source = 'ledger') AS side_calls, round(coalesce(sum(r.cost_usd_micros), 0) / 1e6, 4) AS usd,
+       sum(r.cost_usd_micros IS NULL) AS unpriced, group_concat(DISTINCT r.cost_source) AS price_from
+FROM requests r LEFT JOIN agents a USING (agent_id)
+WHERE r.session_id = :sid AND r.pending = 0
+GROUP BY r.agent_id ORDER BY usd DESC LIMIT 30;
 ```
 
 Each Agent call in a session and the agent it started, with wall time:
@@ -87,7 +98,7 @@ WITH RECURSIVE tree(agent_id, depth) AS (
 )
 SELECT count(DISTINCT t.agent_id) AS agents, max(t.depth) AS depth, count(r.request_id) AS requests,
        sum(r.output_tokens) AS output, max(r.context_tokens) AS peak_context
-FROM tree t LEFT JOIN requests r ON r.agent_id = t.agent_id AND r.pending = 0;
+FROM tree t LEFT JOIN requests r ON r.agent_id = t.agent_id AND r.pending = 0 AND r.source IS NOT 'ledger';
 ```
 
 The walk misses an agent whose `parent_tool_use_id` is NULL (launched before recording began, or its parent's result lost) or points at no recorded call. A whole session needs no walk: filter by `session_id`, which every row of the main chat and of every sub-agent carries.
@@ -181,7 +192,7 @@ try:
     peaks = {}
     for row in con.execute(
         "SELECT a.agent_type, max(r.context_tokens) AS peak FROM requests r JOIN agents a USING (agent_id) "
-        "WHERE r.pending = 0 AND r.ts >= (strftime('%s','now') - 7*86400) * 1000 GROUP BY r.agent_id"
+        "WHERE r.pending = 0 AND r.source IS NOT 'ledger' AND r.ts >= (strftime('%s','now') - 7*86400) * 1000 GROUP BY r.agent_id"
     ):
         peaks.setdefault(row["agent_type"] or "?", []).append(row["peak"])
 finally:

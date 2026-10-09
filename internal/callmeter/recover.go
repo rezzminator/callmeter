@@ -237,10 +237,10 @@ func callUnmarked(c string) string {
 func agentTurnUnfilled(t string) string {
 	return fmt.Sprintf(`(%[1]s.stopped IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = %[1]s.session_id AND r.agent_id = %[1]s.agent_id
-			AND r.ts <= %[1]s.stopped AND r.ts > COALESCE(
+			AND r.source IS NOT '%[4]s' AND r.ts <= %[1]s.stopped AND r.ts > COALESCE(
 				(SELECT MAX(p.stopped) FROM agent_turns p WHERE p.agent_id = %[1]s.agent_id AND p.seq < %[1]s.seq), 0))
 		AND NOT EXISTS (SELECT 1 FROM faults f WHERE f.session_id = %[1]s.session_id AND f.stage = '%[2]s'
-			AND f.error = %[3]s))`, t, StageTranscript, agentTurnMarker(t))
+			AND f.error = %[3]s))`, t, StageTranscript, agentTurnMarker(t), SourceLedger)
 }
 
 // stopReplyUnfilled is the SQL condition that the turns row aliased t is a

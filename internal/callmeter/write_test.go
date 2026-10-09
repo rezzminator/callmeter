@@ -1292,3 +1292,87 @@ func TestRequestIterationsFollowTheirRequest(t *testing.T) {
 		}
 	})
 }
+
+// pricedRequest is the sample's first ledger row as a request: Claude Code
+// priced it 149149 micros with all of its cache write at the 1-hour rate.
+func pricedRequest(id string) Request {
+	return Request{
+		RequestID: id, SessionID: Ptr("sess-1"), AgentID: nil, TS: Ptr(int64(5)), Model: Ptr("claude-opus-5-5"),
+		InputTokens: Ptr(int64(2)), OutputTokens: Ptr(int64(323)), CacheReadTokens: Ptr(int64(76447)),
+		CacheCreationTokens: Ptr(int64(15924)), CacheCreation5mTokens: Ptr(int64(0)), CacheCreation1hTokens: Ptr(int64(15924)),
+		ContextTokens: Ptr(int64(2 + 76447 + 15924)), Pending: Ptr(false), APIRequestID: Ptr("req_invented_1"),
+	}
+}
+
+// TestRequestsAreWrittenWithTheirTablePrice: every writer of a request leaves
+// it priced from the table (cost_source 'table') at its final tokens, an unknown
+// model unpriced (NULL, NULL), a provisional row unpriced, and a price the
+// ledger gave ('ledger') untouched by a later write.
+func TestRequestsAreWrittenWithTheirTablePrice(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	check := func(name, id string, micros any, source any) {
+		t.Helper()
+		got := row(t, store, "requests", "request_id = ?", id)
+		if got["cost_usd_micros"] != micros || got["cost_source"] != source {
+			t.Errorf("%s: cost = %v / %v, want %v / %v", name, got["cost_usd_micros"], got["cost_source"], micros, source)
+		}
+	}
+	if err := store.UpsertRequest(ctx, pricedRequest("msg_1"), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("upsert", "msg_1", int64(149149), "table")
+	if got := row(t, store, "requests", "request_id = ?", "msg_1"); got["api_request_id"] != "req_invented_1" {
+		t.Errorf("api_request_id = %v, want req_invented_1", got["api_request_id"])
+	}
+	// Streaming: a later entry of the message raises its output tokens.
+	longer := pricedRequest("msg_1")
+	longer.OutputTokens = Ptr(int64(400))
+	if err := store.UpsertRequest(ctx, longer, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("rewrite with more output", "msg_1", int64(149149+77*20), "table")
+
+	unknown := pricedRequest("msg_unknown")
+	unknown.Model = Ptr("claude-nonesuch-9")
+	if err := store.UpsertRequest(ctx, unknown, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("unknown model", "msg_unknown", nil, nil)
+
+	if err := store.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_p"), SessionID: Ptr("sess-1"), Pending: Ptr(true)}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("provisional", ProvisionalKey("toolu_p"), nil, nil)
+
+	// A provisional row resolved to its message gets the message's price.
+	if err := store.ResolveRequest(ctx, ProvisionalKey("toolu_p"), pricedRequest("msg_resolved")); err != nil {
+		t.Fatal(err)
+	}
+	check("resolved", "msg_resolved", int64(149149), "table")
+
+	// SettleRequest and RecoverRequest price the row they wrote.
+	if err := store.UpsertRequest(ctx, Request{RequestID: "msg_settled", SessionID: Ptr("sess-1")}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.SettleRequest(ctx, pricedRequest("msg_settled"), nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	check("settle", "msg_settled", int64(149149), "table")
+	if err := store.UpsertRequest(ctx, Request{RequestID: "msg_recovered", SessionID: Ptr("sess-1"), TS: Ptr(int64(5))}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.RecoverRequest(ctx, pricedRequest("msg_recovered"), nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	check("recover", "msg_recovered", int64(149149), "table")
+
+	// The ledger's price stands against a rewrite.
+	if _, err := store.DB().ExecContext(ctx, "UPDATE requests SET cost_usd_micros = 150000, cost_source = 'ledger' WHERE request_id = 'msg_1'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertRequest(ctx, longer, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("ledger price kept", "msg_1", int64(150000), "ledger")
+}

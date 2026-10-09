@@ -802,7 +802,7 @@ func TestEmptyTopicsNameWhatTheyFoundNone(t *testing.T) {
 		{"events", Events, "callmeter: no events in window"},
 		{"effort", Effort, "callmeter: no effort recorded in window"},
 		{"compactions", Compactions, "callmeter: no compactions in window"},
-		{"cost", Cost, "callmeter: no cost-state recorded in window"},
+		{"cost", Cost, "callmeter: no cost recorded in window"},
 		{"hooks", Hooks, "callmeter: no Stop hook summaries in window"},
 		{"turns", Turns, "callmeter: no turn durations in window"},
 		{"resumes", Resumes, "callmeter: no resumes in window"},

@@ -45,6 +45,10 @@ type Filter struct {
 	// the coverage topic scans its projects/ beside every seat the store
 	// recorded. Empty when it could not be resolved.
 	OwnSeat string
+	// CostView is the cost topic's view: "chat" (the default), "agent" or "call".
+	CostView string
+	// Ledger is what the cost ledger ingest found; nil when none was read.
+	Ledger *callmeter.LedgerSummary
 }
 
 // NameOf resolves a session id to its chat name; the CLI reads the title
@@ -280,6 +284,9 @@ var inapplicable = map[string][]string{
 // table is never read as a narrowed one.
 func InapplicableNotes(topic string, f Filter) []string {
 	var notes []string
+	if topic != "cost" && f.CostView != "" {
+		notes = append(notes, fmt.Sprintf("--view does not apply to %s", topic))
+	}
 	for _, flag := range inapplicable[topic] {
 		if (flag == "project" && f.Project != "") || (flag == "agent-type" && f.AgentType != "") {
 			notes = append(notes, fmt.Sprintf("--%s does not apply to %s", flag, topic))

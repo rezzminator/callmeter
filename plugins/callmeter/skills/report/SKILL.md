@@ -1,7 +1,7 @@
 ---
 name: report
 description: "Show callmeter reports: tool calls, files, commands, context, tokens, sessions, prompts, effort, agents, outcomes, coverage, lifecycle events, compactions, cost, Stop-hook overhead, turn durations, resumes, waiting on the user and prompt-cache hits and misses, recorded from Claude Code hooks and transcripts."
-argument-hint: "{topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--json]"
+argument-hint: "{topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--view V] [--json]"
 allowed-tools: Bash
 ---
 
@@ -9,7 +9,7 @@ allowed-tools: Bash
 
 Show one callmeter report over the local store the hooks fill.
 
-The topics are `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`, `compactions`, `cost`, `hooks`, `turns`, `resumes`, `waiting` and `cache`. The flags are `--since D` (a duration such as `7d` or `24h`, or a date such as `2026-09-01`), `--project P`, `--agent-type T`, `--session S`, `--limit N` and `--json`.
+The topics are `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessions`, `prompts`, `effort`, `tokens`, `agents`, `outcomes`, `coverage`, `events`, `compactions`, `cost`, `hooks`, `turns`, `resumes`, `waiting` and `cache`. The flags are `--since D` (a duration such as `7d` or `24h`, or a date such as `2026-09-01`), `--project P`, `--agent-type T`, `--session S`, `--limit N`, `--view V` (`cost` only: `chat`, `agent` or `call`) and `--json`.
 
 ## Steps
 

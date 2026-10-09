@@ -38,6 +38,14 @@ const SourceHook = "hook"
 // from a transcript, no hook (RecoverQuiet).
 const SourceTranscript = "transcript"
 
+// SourceLedger is the source of a requests row ingested from the cost ledger: a
+// call no transcript records (a side call), priced by Claude Code itself.
+const SourceLedger = "ledger"
+
+// CostSourceTable is the cost_source of a request priced from the embedded
+// price table; SourceLedger is that of one priced by Claude Code itself.
+const CostSourceTable = "table"
+
 // Fault stages: where a failure to record or parse happened. StageBinary and
 // StageTerminated rows come only from ingesting missed.log (IngestMissed):
 // binary from a wrapper line, terminated from a line the binary itself wrote
@@ -130,10 +138,15 @@ CREATE TABLE IF NOT EXISTS requests (
 	source TEXT,
 	config_dir TEXT,
 	seat_dir TEXT,
-	thinking_tokens INTEGER
+	thinking_tokens INTEGER,
+	api_request_id TEXT,
+	cost_usd_micros INTEGER,
+	cost_source TEXT,
+	query_source TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_session_agent_pending ON requests(session_id, agent_id, pending);
 CREATE INDEX IF NOT EXISTS requests_session_agent_ts ON requests(session_id, agent_id, ts);
+CREATE INDEX IF NOT EXISTS requests_api_request_id ON requests(api_request_id);
 CREATE TABLE IF NOT EXISTS agents (
 	agent_id TEXT PRIMARY KEY,
 	session_id TEXT,
@@ -320,15 +333,15 @@ CREATE TABLE IF NOT EXISTS request_iterations (
 	output_tokens INTEGER,
 	PRIMARY KEY (request_id, seq)
 );
-CREATE VIEW IF NOT EXISTS request_cache AS -- version 1
+CREATE VIEW IF NOT EXISTS request_cache AS -- version 2
   WITH party AS (
     SELECT r.request_id, r.session_id, r.agent_id, r.ts, r.model, r.cache_read_tokens,
       v.ts AS previous_ts, v.context_tokens AS expected_read, v.model AS previous_model
     FROM requests r LEFT JOIN requests v ON v.request_id = (SELECT e.request_id FROM requests e
-        WHERE e.session_id IS r.session_id AND e.agent_id IS r.agent_id AND e.pending IS NOT 1
+        WHERE e.session_id IS r.session_id AND e.agent_id IS r.agent_id AND e.pending IS NOT 1 AND e.source IS NOT 'ledger'
           AND e.ts <= r.ts AND (e.ts < r.ts OR e.request_id < r.request_id)
         ORDER BY e.ts DESC, e.request_id DESC LIMIT 1)
-    WHERE r.pending IS NOT 1 AND r.ts IS NOT NULL
+    WHERE r.pending IS NOT 1 AND r.source IS NOT 'ledger' AND r.ts IS NOT NULL
   ),
   judged AS (
     SELECT p.*, p.ts - p.previous_ts AS gap_ms,
@@ -338,7 +351,7 @@ CREATE VIEW IF NOT EXISTS request_cache AS -- version 1
           WHEN e.cache_creation_5m_tokens > 0 THEN '5m'
         END
         FROM requests e
-        WHERE e.session_id IS p.session_id AND e.agent_id IS p.agent_id AND e.pending IS NOT 1
+        WHERE e.session_id IS p.session_id AND e.agent_id IS p.agent_id AND e.pending IS NOT 1 AND e.source IS NOT 'ledger'
           AND e.ts <= p.ts AND (e.ts < p.ts OR e.request_id < p.request_id) AND e.cache_creation_tokens > 0
         ORDER BY e.ts DESC, e.request_id DESC LIMIT 1) AS entry_ttl,
       CASE

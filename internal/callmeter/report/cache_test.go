@@ -108,3 +108,28 @@ func TestCacheOverAViewItCannotReadAnswersTheNote(t *testing.T) {
 		}
 	}
 }
+
+// TestCacheLeavesLedgerRowsOut: a request row ingested from the cost ledger (a
+// side call on its own context) is no party's previous request, so it never
+// turns the next request's outcome.
+func TestCacheLeavesLedgerRowsOut(t *testing.T) {
+	store := openStore(t)
+	seedCacheRequests(t, store)
+	n := callmeter.Ptr[int64]
+	seedRequest(t, store, callmeter.Request{
+		RequestID: "ledger-side", SessionID: callmeter.Ptr("s1"), TS: n(ms(3*time.Hour) + 90*int64(time.Second/time.Millisecond)),
+		Model: callmeter.Ptr("opus"), Pending: callmeter.Ptr(false), Source: callmeter.Ptr(callmeter.SourceLedger),
+		ContextTokens: n(200), CacheReadTokens: n(0), CacheCreationTokens: n(200), CacheCreation5mTokens: n(200), CacheCreation1hTokens: n(0),
+	})
+	table, err := Cache(context.Background(), store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Cache: %v", err)
+	}
+	wantRows(t, table,
+		"sub-agent|5m|hit|-|3",
+		"main chat|-|first|-|1",
+		"main chat|1h|hit|-|1",
+		"main chat|1h|miss|unknown|1",
+		"sub-agent|-|first|-|1",
+	)
+}

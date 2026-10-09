@@ -64,3 +64,18 @@ func TestWaitingCountsEachEndOnceEndsPermissionsAtTheNextRequestAndLeavesOpenOne
 		}
 	}
 }
+
+// TestWaitingEndsAtTheNextTranscriptRequest: a request row ingested from the
+// cost ledger (a side call made while the chat waited) does not end a wait.
+func TestWaitingEndsAtTheNextTranscriptRequest(t *testing.T) {
+	store := openStore(t)
+	exec(t, store, `INSERT INTO events (event_id, event, ts, session_id, detail) VALUES ('n1', 'Notification', ?, 's1', '{"notification_type":"permission_prompt"}')`,
+		ms(2*time.Hour))
+	exec(t, store, `INSERT INTO requests (request_id, session_id, ts, source) VALUES ('side', 's1', ?, 'ledger'), ('real', 's1', ?, 'hook')`,
+		ms(110*time.Minute), ms(100*time.Minute))
+	table, err := Waiting(context.Background(), store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Waiting: %v", err)
+	}
+	wantRows(t, table, "chat-s1|permission_prompt|1|20m00s|20m00s|20m00s")
+}

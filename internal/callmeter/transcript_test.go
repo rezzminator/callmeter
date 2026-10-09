@@ -102,6 +102,7 @@ func TestFindRequests(t *testing.T) {
 	want := map[string]RequestUsage{
 		"toolu_demo_A": {
 			MessageID:           "msg_demo_1",
+			APIRequestID:        "req_demo_1",
 			TS:                  1790119005062,
 			Model:               "claude-haiku-4-5-20251001",
 			InputTokens:         10,
@@ -112,6 +113,7 @@ func TestFindRequests(t *testing.T) {
 		},
 		"toolu_demo_B": {
 			MessageID:           "msg_demo_1",
+			APIRequestID:        "req_demo_1",
 			TS:                  1790119005300,
 			Model:               "claude-haiku-4-5-20251001",
 			InputTokens:         10,
@@ -921,5 +923,53 @@ func TestPromptHookNeverStoresItsText(t *testing.T) {
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestRequestsCarryTheAPIRequestID: the requestId of a message's entries (the
+// API request id the cost ledger keys by) lands on its request whether the
+// request is found by a tool call or read whole; an entry with no requestId
+// leaves it empty.
+func TestRequestsCarryTheAPIRequestID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ids.jsonl")
+	entry := func(message, requestID, toolUseID, stop string) string {
+		id := ""
+		if requestID != "" {
+			id = `"requestId":"` + requestID + `",`
+		}
+		return `{"type":"assistant",` + id + `"timestamp":"2026-09-22T23:17:00.000Z","message":{"id":"` + message +
+			`","model":"claude-sonnet-4-5","stop_reason":` + stop + `,"content":[{"type":"tool_use","id":"` + toolUseID +
+			`"}],"usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	}
+	transcript := entry("msg_a", "req_invented_a", "toolu_a", `null`) + entry("msg_a", "req_invented_a", "toolu_a2", `"tool_use"`) +
+		entry("msg_b", "", "toolu_b", `"tool_use"`)
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	found, err := FindRequests(path, []string{"toolu_a", "toolu_b"})
+	if err != nil {
+		t.Fatalf("FindRequests: %v", err)
+	}
+	if got := found["toolu_a"].APIRequestID; got != "req_invented_a" {
+		t.Errorf("FindRequests toolu_a APIRequestID = %q, want req_invented_a", got)
+	}
+	if got := found["toolu_b"].APIRequestID; got != "" {
+		t.Errorf("FindRequests toolu_b APIRequestID = %q, want empty", got)
+	}
+	read, _, err := ReadRequests(path)
+	if err != nil {
+		t.Fatalf("ReadRequests: %v", err)
+	}
+	if len(read) != 2 || read[0].APIRequestID != "req_invented_a" || read[1].APIRequestID != "" {
+		t.Errorf("ReadRequests APIRequestIDs = %+v, want req_invented_a then empty", read)
+	}
+	request := Request{}
+	ApplyUsage(&request, read[0].RequestUsage)
+	if request.APIRequestID == nil || *request.APIRequestID != "req_invented_a" {
+		t.Errorf("ApplyUsage APIRequestID = %v, want req_invented_a", request.APIRequestID)
+	}
+	ApplyUsage(&request, read[1].RequestUsage)
+	if request.APIRequestID != nil {
+		t.Errorf("ApplyUsage APIRequestID = %v for a message with no requestId, want NULL", *request.APIRequestID)
 	}
 }

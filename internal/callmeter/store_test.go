@@ -182,7 +182,7 @@ var storeColumns = map[string]string{
 		"commit_branch,test_runner,source,config_dir,seat_dir",
 	"requests": "request_id,session_id,agent_id,prompt_id,ts,model,stop_reason,input_tokens,cache_read_tokens," +
 		"cache_creation_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,context_tokens,output_tokens," +
-		"calls,pending,source,config_dir,seat_dir,thinking_tokens",
+		"calls,pending,source,config_dir,seat_dir,thinking_tokens,api_request_id,cost_usd_micros,cost_source,query_source",
 	"agents": "agent_id,session_id,agent_type,prompt_id,parent_tool_use_id,started,stopped,transcript_path," +
 		"total_tokens,tool_uses,model,source,config_dir,seat_dir",
 	"agent_turns": "agent_id,seq,session_id,agent_type,prompt_id,started,stopped,start_event_id,stop_event_id",
@@ -224,7 +224,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_event_ts,events_session_ts,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
@@ -1032,9 +1032,16 @@ func makeVersionOneStore(t *testing.T, path string) {
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
-	if got := keys(t, old.DB(), "SELECT name FROM pragma_table_info('requests') WHERE name = 'thinking_tokens'"); got != "" {
-		if _, err := old.DB().Exec("ALTER TABLE requests DROP COLUMN thinking_tokens"); err != nil {
-			t.Fatalf("drop thinking_tokens: %v", err)
+	for _, column := range []string{"thinking_tokens", "api_request_id", "cost_usd_micros", "cost_source", "query_source"} {
+		if got := keys(t, old.DB(), "SELECT name FROM pragma_table_info('requests') WHERE name = '"+column+"'"); got != "" {
+			if column == "api_request_id" {
+				if _, err := old.DB().Exec("DROP INDEX IF EXISTS requests_api_request_id"); err != nil {
+					t.Fatalf("drop requests_api_request_id: %v", err)
+				}
+			}
+			if _, err := old.DB().Exec("ALTER TABLE requests DROP COLUMN " + column); err != nil {
+				t.Fatalf("drop %s: %v", column, err)
+			}
 		}
 	}
 	for _, statement := range []string{
@@ -1068,7 +1075,7 @@ func TestOpenCompletesAVersionOneStore(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_event_ts,events_session_ts,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes after the reopen = %s, want %s", gotIndexes, wantIndexes)
@@ -1171,6 +1178,10 @@ func TestPruneAddsMissingColumnsToAnOlderArchive(t *testing.T) {
 	for _, statement := range []string{
 		strings.Replace(archiveTables["requests"].ddl, "archive.", "", 1),
 		"ALTER TABLE requests DROP COLUMN thinking_tokens",
+		"ALTER TABLE requests DROP COLUMN api_request_id",
+		"ALTER TABLE requests DROP COLUMN cost_usd_micros",
+		"ALTER TABLE requests DROP COLUMN cost_source",
+		"ALTER TABLE requests DROP COLUMN query_source",
 		"PRAGMA user_version=1",
 	} {
 		if _, err := older.Exec(statement); err != nil {
@@ -1777,7 +1788,10 @@ func TestViewVersion(t *testing.T) {
 	}
 	// a changed view raises its `-- version N` and records its sum here
 	recorded := map[string]map[int]string{
-		"request_cache": {1: "273afb523986dce2225859a17966c0f0c251f55f36fc23351d6120dfcc39fc6d"},
+		"request_cache": {
+			1: "273afb523986dce2225859a17966c0f0c251f55f36fc23351d6120dfcc39fc6d",
+			2: "309aea2b360c4477613517c4e155802a9333703112d22803de4c4470eca3bd89",
+		},
 	}
 	for name, text := range schemaViews {
 		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(text)))

@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,8 +25,9 @@ import (
 
 // Usage is the report action's usage text.
 const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events|compactions|cost|hooks|turns|resumes|waiting|cache} [--since D] [--project P]
-                       [--agent-type T] [--session S] [--limit N] [--json]
+                       [--agent-type T] [--session S] [--limit N] [--view V] [--json]
   --since D         a duration (7d, 24h) or a date (2026-09-01); default and floor: the 30-day retention window
+  --view V          cost only: chat (default), agent or call
   --json            one JSON object on stdout instead of the text table`
 
 type topicFunc func(context.Context, *callmeter.Store, report.Filter, report.NameOf) (*report.Table, error)
@@ -57,6 +59,7 @@ func CLI(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 type flagValues struct {
 	since, project, agentType, session string
 	limit                              int
+	view                               string
 	json                               bool
 }
 
@@ -70,6 +73,7 @@ func newFlags(name string, stderr io.Writer) (*flag.FlagSet, *flagValues) {
 	flags.StringVar(&values.agentType, "agent-type", "", "calls made by this agent type")
 	flags.StringVar(&values.session, "session", "", "calls in this session")
 	flags.IntVar(&values.limit, "limit", report.DefaultLimit, "rows per table")
+	flags.StringVar(&values.view, "view", "", "cost only: chat (default), agent or call")
 	flags.BoolVar(&values.json, "json", false, "one JSON object on stdout instead of the text table")
 	return flags, values
 }
@@ -208,6 +212,13 @@ func reportAction(
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)
 		return 1
 	}
+	// Calls no transcript records come in from the optional cost ledger, and every
+	// settled request gets its price, before the topic reads the store.
+	if _, _, err := db.PriceUnpriced(ctx); err != nil {
+		fmt.Fprintf(stderr, "callmeter: price requests: %v\n", err)
+		return 1
+	}
+	filter.Ledger = ingestLedger(ctx, db, getenv, now, stderr)
 	// An own seat that cannot be resolved stays empty: coverage names it in a note.
 	filter.OwnSeat, _ = paths.SeatDir(getenv)
 	table, err := topic(ctx, db, filter, names.nameOf)
@@ -230,6 +241,23 @@ func reportAction(
 		return 1
 	}
 	return 0
+}
+
+// ingestLedger brings the cost ledger in. A ledger that cannot be read is one
+// stderr line and a summary naming the failure, never "no ledger": the reports
+// still run, and the cost topic says its side calls are not counted.
+func ingestLedger(ctx context.Context, db *callmeter.Store, getenv paths.Getenv, now time.Time, stderr io.Writer) *callmeter.LedgerSummary {
+	dir, err := paths.CostLedger(getenv)
+	if err != nil {
+		// No home to look under: there is no default ledger to read.
+		return &callmeter.LedgerSummary{}
+	}
+	summary, err := db.IngestLedger(ctx, dir, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "callmeter: cost ledger: %v\n", err)
+		summary.Err = err.Error()
+	}
+	return &summary
 }
 
 // recoveryNotes summarizes skipped transcripts without exposing paths or OS
@@ -336,8 +364,12 @@ func buildFilter(values *flagValues, now time.Time, stderr io.Writer) (report.Fi
 			return report.Filter{}, 2, false
 		}
 	}
+	if values.view != "" && !slices.Contains(report.CostViews, values.view) {
+		fmt.Fprintf(stderr, "callmeter: --view %q is none of %s\n", values.view, strings.Join(report.CostViews, ", "))
+		return report.Filter{}, 2, false
+	}
 	return report.Filter{
 		Since: since, Project: project, AgentType: values.agentType, Session: values.session,
-		Limit: values.limit,
+		Limit: values.limit, CostView: values.view,
 	}, 0, true
 }
