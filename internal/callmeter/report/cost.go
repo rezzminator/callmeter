@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -20,7 +21,10 @@ var CostViews = []string{"chat", "agent", "call"}
 // own total for it (CLAUDE CODE USD, the session's latest cumulative cost-state;
 // callmeter computes none of that), their difference (DIFF USD = Claude Code's
 // total minus the request sum: the spend no priced request row accounts for),
-// the part of the request sum from calls no transcript records (SIDE USD), and
+// the part of the request sum from calls no transcript records (SIDE USD), the
+// spend the cost ledger never saw (PRE-LEDGER USD = Claude Code's total minus
+// the ledger-priced calls up to the exit that total was written at: a resumed
+// chat keeps its restored total, so what the ledger never saw stays in it), and
 // Claude Code's seconds in API calls, retries, tools and on the wall, and its
 // cost per model. A figure the store does not hold is "-", never zero.
 //
@@ -45,6 +49,25 @@ func Cost(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) 
 	return nil, fmt.Errorf("callmeter report: cost view %q is none of %s", f.CostView, strings.Join(CostViews, ", "))
 }
 
+// exitGraceMS is how long after the exit a cost-state was written at a ledger-
+// priced call still belongs to that launch: a call's ledger row trails its
+// transcript line by up to a quarter second, and a reload starts the next
+// launch's first call seconds later. The same two seconds as pfm's
+// costledger.exitGrace, which callmeter does not import.
+const exitGraceMS = 2000
+
+// costExit is the SQL for the exit a session's latest cost-state was written
+// at, Unix ms, NULL when unknown: the later of started + wall_ms and the
+// session's latest SessionEnd event (the session_costs row aliased s, the
+// SessionEnd event name its one argument). started + wall_ms is the exit's
+// wall clock on a session's first launch only: Claude Code keeps startTime
+// across a resume while totalDuration counts no time between launches, so a
+// resumed session's clock lags its exit by those gaps, and the SessionEnd hook,
+// which fires at the exit that wrote the latest cost-state, places it.
+const costExit = `(SELECT MAX(COALESCE(clock, ended), COALESCE(ended, clock)) FROM (SELECT
+		CASE WHEN s.started > 0 AND s.wall_ms > 0 THEN s.started + s.wall_ms END AS clock,
+		(SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.session_id AND e.event = ?) AS ended))`
+
 // usd is a USD-micros sum as dollars; NULL is "-".
 func usd(micros sql.NullInt64, places int) string {
 	if !micros.Valid {
@@ -63,17 +86,33 @@ func costWhere(f Filter) (string, []any) {
 type chatCost struct {
 	session                string
 	cc                     *float64
+	exit                   *int64 // costExit
 	api, retry, tool, wall *int64
 	models                 *string
 	requests               int64
 	micros, side           sql.NullInt64
+	ledgered               int64 // the ledger-priced calls of the chat
+	ledgeredToExit         int64 // their price in USD micros, the calls up to its cost-state's exit
+}
+
+// preLedger is the chat's PRE-LEDGER USD cell: Claude Code's total minus the
+// ledger-priced calls up to the exit its cost-state was written at (costExit),
+// floored at zero. "-" while any of the three is unknown: the chat has no
+// ledger-priced call (no ledger to precede), no total, or no exit (no clock
+// and no SessionEnd).
+func (c *chatCost) preLedger() string {
+	if c.cc == nil || c.ledgered == 0 || c.exit == nil {
+		return "-"
+	}
+	before := max(int64(math.Round(*c.cc*1e6))-c.ledgeredToExit, 0)
+	return fmt.Sprintf("%.2f", float64(before)/1e6)
 }
 
 func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) (*Table, error) {
 	t := &Table{
 		Empty:  "callmeter: no cost recorded in window",
 		Title:  f.title("cost", n),
-		Header: []string{"CHAT", "REQUESTS USD", "CLAUDE CODE USD", "DIFF USD", "SIDE USD", "API S", "RETRY S", "TOOL S", "WALL S", "MODELS"},
+		Header: []string{"CHAT", "REQUESTS USD", "CLAUDE CODE USD", "DIFF USD", "PRE-LEDGER USD", "SIDE USD", "API S", "RETRY S", "TOOL S", "WALL S", "MODELS"},
 	}
 	var err error
 	if !store.SchemaComplete() {
@@ -84,15 +123,36 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 	chats := map[string]*chatCost{}
 	where, args := f.scoped(scope{ts: "s.ts", session: "s.session_id"})
 	err = query(ctx, store, "session costs",
-		`SELECT s.session_id, s.cost_usd, s.api_ms, s.api_ms - s.api_no_retry_ms, s.tool_ms, s.wall_ms, s.model_costs
+		`SELECT s.session_id, s.cost_usd, `+costExit+`, s.api_ms, s.api_ms - s.api_no_retry_ms, s.tool_ms, s.wall_ms, s.model_costs
 		FROM session_costs s WHERE `+where,
-		args,
+		append([]any{callmeter.EventSessionEnd}, args...),
 		func(r rowSource) error {
 			c := &chatCost{}
-			if err := r.Scan(&c.session, &c.cc, &c.api, &c.retry, &c.tool, &c.wall, &c.models); err != nil {
+			if err := r.Scan(&c.session, &c.cc, &c.exit, &c.api, &c.retry, &c.tool, &c.wall, &c.models); err != nil {
 				return err
 			}
 			chats[c.session] = c
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	err = query(ctx, store, "ledger-priced calls",
+		`SELECT s.session_id, COUNT(*),
+			COALESCE(SUM(CASE WHEN r.ts <= `+costExit+` + ? THEN r.cost_usd_micros END), 0)
+		FROM session_costs s JOIN requests r ON r.session_id = s.session_id
+		WHERE r.cost_source = 'ledger' AND r.cost_usd_micros IS NOT NULL AND COALESCE(r.pending, 0) = 0 AND `+where+`
+		GROUP BY s.session_id`,
+		append([]any{callmeter.EventSessionEnd, exitGraceMS}, args...),
+		func(r rowSource) error {
+			var session string
+			var count, toExit int64
+			if err := r.Scan(&session, &count, &toExit); err != nil {
+				return err
+			}
+			if c := chats[session]; c != nil {
+				c.ledgered, c.ledgeredToExit = count, toExit
+			}
 			return nil
 		})
 	if err != nil {
@@ -168,7 +228,7 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 		if !c.side.Valid && c.micros.Valid && ledgerRead {
 			side = "0.00"
 		}
-		t.Rows = append(t.Rows, []string{"", usd(c.micros, 2), cc, diff, side, tenths(c.api), tenths(c.retry), tenths(c.tool), tenths(c.wall), modelCosts(c.models)})
+		t.Rows = append(t.Rows, []string{"", usd(c.micros, 2), cc, diff, c.preLedger(), side, tenths(c.api), tenths(c.retry), tenths(c.tool), tenths(c.wall), modelCosts(c.models)})
 	}
 	nameChats(n, t, sessions)
 	if t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs table"); err != nil {
@@ -178,7 +238,8 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 		t.Notes = append(t.Notes,
 			"REQUESTS USD sums each request's cost: 'ledger' is Claude Code's own price from the cost ledger, 'table' is callmeter's embedded price list at the row's tokens",
 			"DIFF USD is Claude Code's total minus REQUESTS USD: spend Claude Code accounts for that no priced request row does",
-			"SIDE USD is the part of REQUESTS USD from calls no transcript records (the cost ledger's side calls)")
+			"SIDE USD is the part of REQUESTS USD from calls no transcript records (the cost ledger's side calls)",
+			"PRE-LEDGER USD is Claude Code's total minus the cost ledger's calls up to the exit that total was written at: spend the ledger never saw (before it began, in a launch without it, or calls it never received), that no agent owns; '-' when the chat has no ledger-priced call or no known exit")
 	}
 	gaps, err := costGaps(ctx, store, reqWhere, reqArgs)
 	if err != nil {
@@ -317,7 +378,8 @@ func costAgents(ctx context.Context, store *callmeter.Store, f Filter, n *names)
 	}
 	t.Notes = append(t.Notes,
 		"USD sums each request's cost: LEDGER USD the part Claude Code priced itself (cost ledger), TABLE USD the part priced from callmeter's embedded price list, SIDE USD the part from calls no transcript records",
-		"an agent's USD includes its own side calls (web searches, summaries, suggestions), not its sub-agents' requests")
+		"an agent's USD includes its own side calls (web searches, summaries, suggestions), not its sub-agents' requests",
+		"the spend before the ledger belongs to no agent: the chat view's PRE-LEDGER USD names it")
 	t.Notes = append(t.Notes, gaps...)
 	t.Notes = append(t.Notes, ledgerNotes(f.Ledger)...)
 	return t, nil

@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,11 +20,11 @@ func TestCostListsSessionsByCostWithRetryAndModels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Cost: %v", err)
 	}
-	wantHeader(t, table, "CHAT", "REQUESTS USD", "CLAUDE CODE USD", "DIFF USD", "SIDE USD", "API S", "RETRY S", "TOOL S", "WALL S", "MODELS")
-	// No request row of either chat: its request sum and difference are unknown, never zero.
+	wantHeader(t, table, "CHAT", "REQUESTS USD", "CLAUDE CODE USD", "DIFF USD", "PRE-LEDGER USD", "SIDE USD", "API S", "RETRY S", "TOOL S", "WALL S", "MODELS")
+	// No request row of either chat: its request sum, difference and pre-ledger spend are unknown, never zero.
 	wantRows(t, table,
-		"chat-s2|-|4.50|-|-|1.0|-|-|3.0|-",
-		"chat-s1|-|1.23|-|-|100.0|10.0|5.5|200.0|opus=1.00 haiku=0.23",
+		"chat-s2|-|4.50|-|-|-|1.0|-|-|3.0|-",
+		"chat-s1|-|1.23|-|-|-|100.0|10.0|5.5|200.0|opus=1.00 haiku=0.23",
 	)
 	hasNote(t, table, "5.73 USD in total over 2 sessions (Claude Code's own accounting)")
 }
@@ -77,10 +78,11 @@ func TestCostChatComparesTheRequestSumWithClaudeCodesTotal(t *testing.T) {
 		t.Fatalf("Cost: %v", err)
 	}
 	// Priced requests: 0.40 + 0.10 + 0.20 + 0.15 + 0.003 + 0.007 = 0.86; side: 0.15 + 0.003 + 0.007.
-	wantRows(t, table, "chat-s1|0.86|1.00|+0.14|0.16|-|-|-|-|-")
+	wantRows(t, table, "chat-s1|0.86|1.00|+0.14|-|0.16|-|-|-|-|-")
 	for _, want := range []string{
 		"REQUESTS USD sums each request's cost: 'ledger' is Claude Code's own price from the cost ledger, 'table' is callmeter's embedded price list at the row's tokens",
 		"DIFF USD is Claude Code's total minus REQUESTS USD: spend Claude Code accounts for that no priced request row does",
+		"PRE-LEDGER USD is Claude Code's total minus the cost ledger's calls up to the exit that total was written at: spend the ledger never saw (before it began, in a launch without it, or calls it never received), that no agent owns; '-' when the chat has no ledger-priced call or no known exit",
 		"SIDE USD is the part of REQUESTS USD from calls no transcript records (the cost ledger's side calls)",
 		"1 request has no price (a model the table does not list): not in REQUESTS USD",
 		"1 side call has no ledger price yet: priced from the table, its cache writes taken as 5-minute ones",
@@ -161,4 +163,85 @@ func TestCostCallViewListsTheDearestCallsFirst(t *testing.T) {
 		"chat-s1|2026-09-23 09:00|main|-|claude-opus-5-5|10|30|40|20|0.2000|table|-",
 		"chat-s1|2026-09-23 10:00|a1|web_search_tool|claude-opus-5-5|10|30|40|20|0.1500|ledger|yes",
 	)
+}
+
+// A chat's pre-ledger spend is what Claude Code's own total holds beyond the
+// cost ledger's calls up to the exit that total was written at (started +
+// wall_ms of its cost-state, or the session's latest SessionEnd when that is
+// later): a resume restores Claude Code's total, so the calls the ledger never
+// saw stay in it. The clock's exit here is two hours before now; a call's age
+// is how long before now it ran.
+func TestCostChatNamesWhatCameBeforeTheLedger(t *testing.T) {
+	const exit = 2 * time.Hour
+	type call struct {
+		age        time.Duration
+		micros     int64
+		source     string
+		costSource string
+	}
+	ledgered := func(age time.Duration, micros int64) call { return call{age, micros, "hook", "ledger"} }
+	cases := []struct {
+		name  string
+		cc    float64
+		clock bool          // the cost-state carries startTime and totalDuration
+		ended time.Duration // the age of the session's latest SessionEnd, none when 0
+		calls []call
+		want  string
+	}{
+		{"a session first seen by the ledger after its exit", 75.20, true, 0, []call{ledgered(time.Hour, 1_440_000)}, "75.20"},
+		{"a healthy resume: the launch before was fully ledgered", 10.00, true, 0,
+			[]call{ledgered(5*time.Hour, 4_000_000), ledgered(3*time.Hour, 6_000_000), ledgered(time.Hour, 2_000_000)}, "0.00"},
+		{"a launch with a sink, then one without", 15.00, true, 0, []call{ledgered(3*time.Hour, 10_000_000), ledgered(time.Hour, 3_000_000)}, "5.00"},
+		{"the last call's row trails the exit inside the grace", 2.00, true, 0, []call{ledgered(exit-1900*time.Millisecond, 2_000_000)}, "0.00"},
+		{"a call beyond the grace belongs to the launch after the exit", 2.00, true, 0, []call{ledgered(exit-3*time.Second, 2_000_000)}, "2.00"},
+		{"a ledger above Claude Code's total floors at zero", 5.00, true, 0, []call{ledgered(3*time.Hour, 9_000_000)}, "0.00"},
+		{"a side call before the exit is ledger spend", 10.00, true, 0,
+			[]call{ledgered(3*time.Hour, 4_000_000), {4 * time.Hour, 3_000_000, "ledger", "ledger"}}, "3.00"},
+		{"a call priced from the table is no ledger spend", 10.00, true, 0,
+			[]call{ledgered(3*time.Hour, 4_000_000), {4 * time.Hour, 6_000_000, "hook", "table"}}, "6.00"},
+		{"no ledger-priced call: unknown, never zero", 5.00, true, 0, []call{{3 * time.Hour, 5_000_000, "hook", "table"}}, "-"},
+		{"a resumed chat's clock lags its exit by the time between launches: the SessionEnd places it", 10.00, true, 30 * time.Minute,
+			[]call{ledgered(3*time.Hour, 4_000_000), ledgered(time.Hour, 6_000_000)}, "0.00"},
+		{"no clock fields, a SessionEnd: the exit is known", 5.00, false, 2 * time.Hour, []call{ledgered(3*time.Hour, 5_000_000)}, "0.00"},
+		{"no clock fields: the exit is unknown", 5.00, false, 0, []call{ledgered(3*time.Hour, 5_000_000)}, "-"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openStore(t)
+			if tc.clock {
+				exec(t, store, `INSERT INTO session_costs (session_id, ts, started, cost_usd, wall_ms) VALUES ('s1', ?, ?, ?, ?)`,
+					ms(time.Hour), ms(10*time.Hour), tc.cc, (8 * time.Hour).Milliseconds())
+			} else {
+				exec(t, store, `INSERT INTO session_costs (session_id, ts, cost_usd) VALUES ('s1', ?, ?)`, ms(time.Hour), tc.cc)
+			}
+			if tc.ended != 0 {
+				exec(t, store, `INSERT INTO events (event_id, event, ts, session_id, reason) VALUES ('end', 'SessionEnd', ?, 's1', 'other')`, ms(tc.ended))
+			}
+			for i, c := range tc.calls {
+				seedPricedRequest(t, store, "r"+strings.Repeat("x", i), "s1", "", c.age, c.source, c.micros, c.costSource, "repl_main_thread")
+			}
+			table, err := Cost(context.Background(), store, Filter{Ledger: &callmeter.LedgerSummary{Dir: "/ledger", Present: true}}, chatOf)
+			if err != nil {
+				t.Fatalf("Cost: %v", err)
+			}
+			wantHeader(t, table, "CHAT", "REQUESTS USD", "CLAUDE CODE USD", "DIFF USD", "PRE-LEDGER USD", "SIDE USD", "API S", "RETRY S", "TOOL S", "WALL S", "MODELS")
+			rows := rowsOf(table)
+			if len(rows) != 1 {
+				t.Fatalf("rows = %q, want one", rows)
+			}
+			if got := strings.Split(rows[0], "|")[4]; got != tc.want {
+				t.Errorf("PRE-LEDGER USD = %q, want %q (row %q)", got, tc.want, rows[0])
+			}
+		})
+	}
+}
+
+func TestCostAgentViewSaysWhereTheSpendBeforeTheLedgerIs(t *testing.T) {
+	store := openStore(t)
+	seedCostSession(t, store)
+	table, err := Cost(context.Background(), store, Filter{CostView: "agent"}, chatOf)
+	if err != nil {
+		t.Fatalf("Cost: %v", err)
+	}
+	hasNote(t, table, "the spend before the ledger belongs to no agent: the chat view's PRE-LEDGER USD names it")
 }

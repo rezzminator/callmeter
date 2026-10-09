@@ -116,7 +116,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
 | `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
-| `cost` | per chat the sum of its requests' prices, Claude Code's own total and the named difference; `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
+| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
 | `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
