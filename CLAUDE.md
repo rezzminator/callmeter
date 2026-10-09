@@ -18,7 +18,9 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - `hookentry`: the `callmeter hook` handler, with the captured payload fixtures · `internal/hookentry/`
 - cmdparse: the Bash command parser filling `command_parts` · `internal/callmeter/cmdparse/` · design `docs/design.md` § Parsing a command
 - reports: `callmeter report {name}`, read by the report skill · `internal/callmeter/report/`, `plugins/callmeter/skills/report/SKILL.md` · design `docs/design.md` § Reports
-- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs · `internal/testjail/testjail.go`
+- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs and clears `PFM_COST_LEDGER_DIR` and `PFM_HOME` · `internal/testjail/testjail.go`
+- cost ledger: pfm's per-call price files `{session_id}.jsonl` in `$PFM_COST_LEDGER_DIR`, else `{PFM_HOME or HOME}/.local/state/pfm/cost-ledger`, read at report time as optional data · `internal/callmeter/ledger.go`; `requests.api_request_id` links a row to transcripts
+- price table: a copy of pfm's, moved together with it · `internal/callmeter/pricing.go`
 - e2e: real `claude -p` runs reading the store they wrote · `e2e/`
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
