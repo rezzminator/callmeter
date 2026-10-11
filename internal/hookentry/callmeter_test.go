@@ -3410,3 +3410,152 @@ func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
 	expect(t, "SubagentStop side call", sub.row("SELECT * FROM requests WHERE request_id = 'req_hook0009'"),
 		map[string]any{"source": "ledger", "cost_usd_micros": 9999, "cost_source": "ledger"})
 }
+
+// ledgerFaults counts the faults rows a cost-ledger error writes.
+func (lab *callmeterLab) ledgerFaults(session string) int {
+	lab.t.Helper()
+	return lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND session_id = ? AND error LIKE 'cost ledger:%'",
+		callmeter.StageParse, session)
+}
+
+// TestCallmeterALedgerErrorIsOneFaultPerSession: a cost-ledger error that lasts
+// (a ledger directory that is a file) is stored as a fault once per session and
+// error text, not on every Stop and SubagentStop; a repeat is logged only, a
+// new text or another session is a new row.
+func TestCallmeterALedgerErrorIsOneFaultPerSession(t *testing.T) {
+	lab := newCallmeterLab(t)
+	main := lab.transcript(cmSessionA)
+	lab.write(main, []byte(sweepEntry("msg_ledgerr0001", "01", `"end_turn"`, 5, `{"type":"text","text":"invented"}`)))
+	notDirs := []string{filepath.Join(lab.root, "file-one"), filepath.Join(lab.root, "file-two")}
+	for _, path := range notDirs {
+		lab.write(path, []byte("not a directory"))
+	}
+	const at = 1790125140000 // 2026-09-23T00:59:00Z
+	stop := func(n int, session string) {
+		lab.t.Helper()
+		lab.feedAt(at+int64(n)*1000, hookPayload(t, eventStop, map[string]any{
+			"transcript_path": main, "prompt_id": fmt.Sprintf("prompt-%d", n), "session_id": session,
+		}))
+	}
+
+	lab.env["PFM_COST_LEDGER_DIR"] = notDirs[0]
+	stop(1, cmSessionA)
+	stop(2, cmSessionA)
+	lab.feedAt(at+3000, hookPayload(t, callmeter.EventSubagentStop, map[string]any{"transcript_path": main}))
+	if n := lab.ledgerFaults(cmSessionA); n != 1 {
+		t.Errorf("ledger faults of session A after three settling hooks hitting one error = %d, want 1", n)
+	}
+	if logged, err := os.ReadFile(lab.logPath); err != nil || strings.Count(string(logged), "cost ledger:") < 3 {
+		t.Errorf("callmeter.log holds %d cost-ledger lines (read error %v), want each of the three occurrences logged",
+			strings.Count(string(logged), "cost ledger:"), err)
+	}
+
+	lab.env["PFM_COST_LEDGER_DIR"] = notDirs[1]
+	stop(4, cmSessionA)
+	stop(5, cmSessionA)
+	if n := lab.ledgerFaults(cmSessionA); n != 2 {
+		t.Errorf("ledger faults of session A after a second error text = %d, want 2", n)
+	}
+
+	stop(6, cmSessionB)
+	stop(7, cmSessionB)
+	if n := lab.ledgerFaults(cmSessionB); n != 1 {
+		t.Errorf("ledger faults of session B = %d, want its own 1", n)
+	}
+	if n := lab.ledgerFaults(cmSessionA); n != 2 {
+		t.Errorf("ledger faults of session A after session B's = %d, want 2", n)
+	}
+}
+
+// TestCallmeterSessionEndIngestStaysInsideItsBudget: SessionEnd's ledger ingest
+// runs under the hook's budget (run.deadline); one that runs out mid-ingest
+// rolls back, so the offset stays and the bytes are read at the next hook, and
+// it is logged, never a ledger fault. A hook without a deadline is unchanged.
+// Serial: it sets the package's budget and gate.
+func TestCallmeterSessionEndIngestStaysInsideItsBudget(t *testing.T) {
+	saved := sessionEndBudget
+	t.Cleanup(func() { sessionEndBudget = saved })
+	const at = 1790125140000 // 2026-09-23T00:59:00Z
+	setup := func(t *testing.T) (lab *callmeterLab, main, file string) {
+		lab = newCallmeterLab(t)
+		dir := filepath.Join(lab.root, "cost-ledger")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		lab.env["PFM_COST_LEDGER_DIR"] = dir
+		file = filepath.Join(dir, cmSessionA+".jsonl")
+		lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"))
+		main = lab.transcript(cmSessionA)
+		lab.write(main, []byte(sweepEntry("msg_ledbudget01", "01", `"end_turn"`, 5, `{"type":"text","text":"invented"}`)))
+		return lab, main, file
+	}
+	offset := func(lab *callmeterLab) string {
+		return lab.row("SELECT ledger_offset FROM sessions WHERE session_id = '" + cmSessionA + "'")["ledger_offset"]
+	}
+
+	t.Run("a budget spent before the ingest starts", func(t *testing.T) {
+		sessionEndBudget = 0
+		lab, main, _ := setup(t)
+		lab.feedAt(at, hookPayload(t, "SessionEnd", map[string]any{"transcript_path": main, "reason": "other"}))
+		if got := offset(lab); got != "<nil>" {
+			t.Errorf("ledger_offset = %s, want it unmoved", got)
+		}
+		if n := lab.ledgerFaults(cmSessionA); n != 0 {
+			t.Errorf("ledger faults = %d, want none: a budget spent is not a ledger error", n)
+		}
+	})
+
+	t.Run("a budget that runs out during the ingest", func(t *testing.T) {
+		sessionEndBudget = 600 * time.Millisecond
+		lab, main, file := setup(t)
+		// The ingest's write stalls in a trigger past the deadline.
+		if _, err := lab.db().DB().ExecContext(lab.ctx, "CREATE TRIGGER stall_ledger_offset AFTER UPDATE OF ledger_offset ON sessions BEGIN "+
+			"SELECT callmeter_test_stall(); END"); err != nil {
+			t.Fatalf("create the stalling trigger: %v", err)
+		}
+		stall := &batchStall{entered: make(chan struct{}), release: make(chan struct{})}
+		currentStall.Store(stall)
+		t.Cleanup(func() { currentStall.Store(nil) })
+		entered := make(chan bool, 1)
+		go func() {
+			select {
+			case <-stall.entered:
+				entered <- true
+				time.Sleep(sessionEndBudget + 100*time.Millisecond)
+			case <-time.After(10 * time.Second):
+				entered <- false
+			}
+			close(stall.release)
+		}()
+		lab.feedAt(at, hookPayload(t, "SessionEnd", map[string]any{"transcript_path": main, "reason": "other"}))
+		if !<-entered {
+			t.Fatal("the ingest never reached its write: the SessionEnd budget was spent before it")
+		}
+		if got := offset(lab); got != "<nil>" {
+			t.Errorf("ledger_offset = %s after an ingest that ran out of budget, want it unmoved", got)
+		}
+		if n := lab.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 0 {
+			t.Errorf("ledger requests = %d after a rolled-back ingest, want 0", n)
+		}
+		if n := lab.ledgerFaults(cmSessionA); n != 0 {
+			t.Errorf("ledger faults = %d, want none: a budget spent is logged, not a ledger error", n)
+		}
+		if logged, err := os.ReadFile(lab.logPath); err != nil || !strings.Contains(string(logged), "budget spent during the ingest") {
+			t.Errorf("callmeter.log lacks the budget expiry (read error %v)", err)
+		}
+
+		// The next hook has no deadline and reads the same bytes.
+		currentStall.Store(nil)
+		lab.feedAt(at+1000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-1"}))
+		size, err := os.Stat(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := offset(lab); got != fmt.Sprint(size.Size()) {
+			t.Errorf("ledger_offset after a Stop = %s, want the file's %d bytes", got, size.Size())
+		}
+		if n := lab.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 2 {
+			t.Errorf("ledger requests after a Stop = %d, want 2", n)
+		}
+	})
+}

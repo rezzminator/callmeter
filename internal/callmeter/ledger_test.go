@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/rezzminator/callmeter/internal/sqlitedb"
 )
 
 const ledgerSession = "00000000-0000-4000-8000-0000000000a1"
@@ -572,7 +574,8 @@ func TestIngestLedgerSessionDefersATornLastLine(t *testing.T) {
 
 // TestIngestLedgerSessionCapsEveryRead: a run reads at most its cap; the rest
 // of a larger file waits for the next run, and the runs together end where the
-// report run does. A line longer than the cap is a fault, not a stall.
+// report run does (a line longer than the cap:
+// TestIngestLedgerSessionPassesALineLongerThanItsCap).
 func TestIngestLedgerSessionCapsEveryRead(t *testing.T) {
 	e := newLedgerEnv(t)
 	e.holdAll()
@@ -601,14 +604,6 @@ func TestIngestLedgerSessionCapsEveryRead(t *testing.T) {
 	}
 	if h, r := e.requestsDump(), report.requestsDump(); h != r {
 		t.Errorf("capped runs differ from the report's:\nhooks  %s\nreport %s", h, r)
-	}
-
-	long := newLedgerEnv(t)
-	long.holdAll()
-	long.writeLedger(ledgerSession, strings.Repeat("x", 3000))
-	got := long.ingestSession(1000)
-	if got.Faults != 1 || long.offset() != 1000 {
-		t.Errorf("a line over the cap = %+v, offset %d; want one fault and the offset past the cap", got, long.offset())
 	}
 }
 
@@ -764,6 +759,285 @@ func TestIngestLedgerSessionRequestWrittenAfterItsLedgerLine(t *testing.T) {
 	e.ingest() // the report run finds nothing to change
 	if after := e.requestsDump(); after != before {
 		t.Errorf("the report run changed the store:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// sideRow parses sample row n as a ledger row of the test session.
+func (e *ledgerEnv) sideRow(n int) ledgerRow {
+	e.t.Helper()
+	r, ok := parseLedgerLine([]byte(e.sample[n-1]), ledgerSession)
+	if !ok {
+		e.t.Fatalf("sample row %d does not parse", n)
+	}
+	return r
+}
+
+// applySide runs the write half of an ingest over side rows only.
+func (e *ledgerEnv) applySide(rows ...ledgerRow) {
+	e.t.Helper()
+	ctx := context.Background()
+	if err := e.store.Batch(ctx, func(tx *Tx) error { return tx.applyLedger(ctx, nil, nil, rows) }); err != nil {
+		e.t.Fatalf("applyLedger: %v", err)
+	}
+}
+
+// TestApplyLedgerWritesNoSideRowBesideATranscriptRequest: a report run decides
+// which calls are side calls before it takes the write lock, so a hook can give
+// a transcript request the call in between. The side upsert decides again under
+// the lock: no 'ledger' row is written (inserted or updated) while a request of
+// another source holds the call's requestId, so the call counts once.
+func TestApplyLedgerWritesNoSideRowBesideATranscriptRequest(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.transcribe("", 15)
+	e.storeRequest(15, true) // a hook wrote the transcript request, requestId and all
+	held := row(t, e.store, "requests", "request_id = 'msg_invented_15'")
+
+	e.applySide(e.sideRow(15), e.sideRow(7))
+	if n, _ := e.sum("source = 'ledger' AND api_request_id = '" + sampleRequestID(15) + "'"); n != 0 {
+		t.Errorf("a side row was written beside the transcript request holding %s: %d rows", sampleRequestID(15), n)
+	}
+	if after := row(t, e.store, "requests", "request_id = 'msg_invented_15'"); fmt.Sprint(after) != fmt.Sprint(held) {
+		t.Errorf("the transcript request changed:\nbefore %v\nafter  %v", held, after)
+	}
+	// A call no transcript request holds is still a side call.
+	if n, micros := e.sum("source = 'ledger'"); n != 1 || micros != 73956 {
+		t.Errorf("side rows = %d at %d micros, want only call 7 at 73956", n, micros)
+	}
+
+	// A ledger row left beside a transcript request is not brought up to date
+	// either: the next report run's overlay drops it.
+	if _, err := e.store.DB().Exec(`INSERT INTO requests (request_id, session_id, ts, source, api_request_id, cost_usd_micros, cost_source)
+		VALUES (?1, ?2, 1, ?3, ?1, 1, ?3)`, sampleRequestID(15), ledgerSession, SourceLedger); err != nil {
+		t.Fatal(err)
+	}
+	e.applySide(e.sideRow(15))
+	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(15)); r["cost_usd_micros"] != int64(1) {
+		t.Errorf("the left-over ledger row was updated to %v, want it untouched at 1", r["cost_usd_micros"])
+	}
+	e.writeLedger(ledgerSession, e.sample[14])
+	e.ingest()
+	if n, _ := e.sum("source = 'ledger' AND api_request_id = '" + sampleRequestID(15) + "'"); n != 0 {
+		t.Errorf("the report run left %d ledger rows beside the transcript request", n)
+	}
+}
+
+// TestIngestLedgerHoldsASideCallAHookStoredInBetween: a report run decides its
+// side calls before it takes the write lock; a call a hook gave a transcript
+// request in between is decided again under the lock, so it is counted held,
+// not side, and that request takes the ledger's price, as on the hook path.
+func TestIngestLedgerHoldsASideCallAHookStoredInBetween(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.transcribe("", 15)
+	e.storeRequest(15, true) // the hook, after the report read which calls the store holds
+	sum := LedgerSummary{Held: 4}
+	ctx := context.Background()
+	if err := e.store.Batch(ctx, func(tx *Tx) error {
+		return tx.applyReportLedger(ctx, nil, nil, []ledgerRow{e.sideRow(15), e.sideRow(7)}, &sum)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Side != 1 || sum.Held != 5 {
+		t.Errorf("summary side %d, held %d; want 1 side call (7) and call 15 held on top of 4", sum.Side, sum.Held)
+	}
+	if n, _ := e.sum("source = 'ledger' AND api_request_id = '" + sampleRequestID(15) + "'"); n != 0 {
+		t.Errorf("%d ledger rows beside the transcript request holding %s, want none", n, sampleRequestID(15))
+	}
+	want := *e.sideRow(15).Cost
+	if r := row(t, e.store, "requests", "request_id = 'msg_invented_15'"); r["cost_source"] != SourceLedger || r["cost_usd_micros"] != want {
+		t.Errorf("the transcript request = %v from %v, want the ledger's %d", r["cost_usd_micros"], r["cost_source"], want)
+	}
+}
+
+// TestIngestLedgerSessionReadsAReplacedFileFromItsStart: the stored offset is
+// the end of a complete line, so the byte before it is a newline; when it is
+// not (the file was replaced by one that has grown past the offset) the file is
+// read from its start, and the store ends as an ingest of that file fresh.
+func TestIngestLedgerSessionReadsAReplacedFileFromItsStart(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	e.writeLedger(ledgerSession, e.sample[:3]...)
+	e.ingestSession(LedgerReadCap)
+	old := e.offset()
+
+	var replacement []string
+	for n := 1; n <= 8; n++ {
+		replacement = append(replacement, e.line(n, map[string]any{"cost_usd_micros": 5000 + n, "query_source": "replaced"}))
+	}
+	e.writeLedger(ledgerSession, replacement...)
+	raw, err := os.ReadFile(filepath.Join(e.dir, ledgerSession+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(len(raw)) <= old || raw[old-1] == '\n' {
+		t.Fatalf("the replacement must be longer than the old offset %d and have no line end before it", old)
+	}
+	got := e.ingestSession(LedgerReadCap)
+	if !got.Reset || got.Lines != 8 || got.Faults != 0 || e.offset() != int64(len(raw)) {
+		t.Errorf("run over a replaced file = %+v, offset %d; want a reset, 8 lines, no fault, offset %d", got, e.offset(), len(raw))
+	}
+	fresh := newLedgerEnv(t)
+	fresh.holdAll()
+	fresh.writeLedger(ledgerSession, replacement...)
+	fresh.ingestSession(LedgerReadCap)
+	if h, f := e.requestsDump(), fresh.requestsDump(); h != f {
+		t.Errorf("a replaced file differs from the same file ingested fresh:\nreplaced %s\nfresh    %s", h, f)
+	}
+}
+
+// TestIngestLedgerSessionKeepsAResetThatReadNoLine: a file replaced by an empty
+// one or by a torn line (shorter than the old offset, or longer with no line end
+// before it) is a reset that moves the stored offset to 0 even though the run
+// read no complete line, so the file, grown later, is read from its first line.
+func TestIngestLedgerSessionKeepsAResetThatReadNoLine(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content func(e *ledgerEnv, old int64) string
+	}{
+		{"an empty file", func(*ledgerEnv, int64) string { return "" }},
+		{"a torn line shorter than the offset", func(e *ledgerEnv, _ int64) string { return e.sample[3][:100] }},
+		{"a torn line longer than the offset", func(e *ledgerEnv, old int64) string {
+			return strings.Repeat("x", int(old)+50)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newLedgerEnv(t)
+			e.holdAll()
+			e.writeLedger(ledgerSession, e.sample[:5]...)
+			e.ingestSession(LedgerReadCap)
+			old := e.offset()
+			path := filepath.Join(e.dir, ledgerSession+".jsonl")
+			if err := os.WriteFile(path, []byte(tc.content(e, old)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got := e.ingestSession(LedgerReadCap)
+			if !got.Reset || got.Lines != 0 || e.offset() != 0 {
+				t.Errorf("run over %s = %+v, offset %d; want a reset, no line, offset 0 kept", tc.name, got, e.offset())
+			}
+			// The writer goes on: the file grows past the old offset.
+			e.writeLedger(ledgerSession, e.sample[:8]...)
+			got = e.ingestSession(LedgerReadCap)
+			if got.Reset || got.Lines != 8 || e.offset() != byteLen(e.sample[:8]...) {
+				t.Errorf("run after the file grew = %+v, offset %d; want its 8 lines from the first, offset %d", got, e.offset(), byteLen(e.sample[:8]...))
+			}
+			fresh := newLedgerEnv(t)
+			fresh.holdAll()
+			fresh.writeLedger(ledgerSession, fresh.sample[:8]...)
+			fresh.ingestSession(LedgerReadCap)
+			if h, f := e.requestsDump(), fresh.requestsDump(); h != f {
+				t.Errorf("after %s the store differs from an ingest of the file fresh:\nhooks %s\nfresh %s", tc.name, h, f)
+			}
+		})
+	}
+}
+
+// TestIngestLedgerSessionWaitsForTheLockNoLongerThanItsDeadline: the store's
+// busy wait ignores a ctx deadline, so a hook ingesting under one (SessionEnd's
+// budget) waits for a busy store's write lock only until that deadline, never
+// the whole busy wait; the offset stays, and the next run reads the bytes.
+func TestIngestLedgerSessionWaitsForTheLockNoLongerThanItsDeadline(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	e.writeLedger(ledgerSession, e.sample[:3]...)
+	probe, err := sqlitedb.OpenReadWrite(e.store.path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	if _, err := probe.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	const budget = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	start := time.Now()
+	_, err = e.store.IngestLedgerSession(ctx, e.dir, ledgerSession, e.now)
+	if waited := time.Since(start); waited > budget+BusyTimeout/2 || err == nil {
+		t.Errorf("an ingest at a busy store with a %v deadline returned %v after %v, want an error by its deadline", budget, err, waited)
+	}
+	if _, err := probe.Exec("ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if e.offset() != -1 {
+		t.Errorf("offset after the busy run = %d, want it unmoved (-1: NULL)", e.offset())
+	}
+	if got := e.ingestSession(LedgerReadCap); got.Lines != 3 || e.offset() != byteLen(e.sample[:3]...) {
+		t.Errorf("the next run = %+v, offset %d; want the 3 lines read", got, e.offset())
+	}
+}
+
+// TestIngestLedgerSessionPassesALineLongerThanItsCap: a line longer than the cap
+// is counted and passed to the end of that line, so the offset still stands at a
+// line end and the next run does not take it for a replaced file; a long line
+// whose end has not been written yet waits like any torn line.
+func TestIngestLedgerSessionPassesALineLongerThanItsCap(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	path := filepath.Join(e.dir, ledgerSession+".jsonl")
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", 3000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.ingestSession(1000); got.Lines != 0 || got.Faults != 0 || e.offset() != -1 {
+		t.Errorf("a long line without its end = %+v, offset %d; want it to wait, nothing counted, the offset unmoved (-1: NULL)", got, e.offset())
+	}
+	// The scan for the line's end stops when its run's ctx ends (a SessionEnd
+	// budget), however far the line runs.
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, found, err := lineEndAfter(ended, path, 1000, 3000); !errors.Is(err, context.Canceled) || found {
+		t.Errorf("a scan under an ended ctx = found %v, err %v; want ctx's error", found, err)
+	}
+	e.append("") // the writer ends the line
+	want := int64(3001)
+	if got := e.ingestSession(1000); got.Faults != 1 || got.Reset || got.More || e.offset() != want {
+		t.Errorf("the long line ended = %+v, offset %d; want one fault, nothing more, and the offset %d past its end", got, e.offset(), want)
+	}
+	e.append(e.sample[6])
+	got := e.ingestSession(1000)
+	if got.Reset || got.Lines != 1 || got.Faults != 0 || e.offset() != want+byteLen(e.sample[6]) {
+		t.Errorf("the line after it = %+v, offset %d; want it read, no reset, offset %d", got, e.offset(), want+byteLen(e.sample[6]))
+	}
+}
+
+// TestLedgerLinesPastTheBoundsAreFaults: a count above 1e12 or a price above 1e15
+// micros is no ledger line, so no sum of a row's counts can wrap and no price
+// leaves the range of an int64; a value at the bound parses. Both ingest paths
+// count the line in Faults and store nothing.
+func TestLedgerLinesPastTheBoundsAreFaults(t *testing.T) {
+	const bigCount, bigMicros = int64(9_000_000_000_000_000_000), int64(9_000_000_000_000_000_000)
+	for _, tc := range []struct {
+		field string
+		value int64
+		ok    bool
+	}{
+		{"input_tokens", bigCount, false}, {"input_tokens", 1_000_000_000_001, false}, {"input_tokens", 1_000_000_000_000, true},
+		{"output_tokens", bigCount, false}, {"output_tokens", 1_000_000_000_001, false}, {"output_tokens", 1_000_000_000_000, true},
+		{"cache_read_tokens", bigCount, false}, {"cache_read_tokens", 1_000_000_000_001, false}, {"cache_read_tokens", 1_000_000_000_000, true},
+		{"cache_creation_tokens", bigCount, false}, {"cache_creation_tokens", 1_000_000_000_001, false}, {"cache_creation_tokens", 1_000_000_000_000, true},
+		{"cost_usd_micros", bigMicros, false}, {"cost_usd_micros", 1_000_000_000_000_001, false}, {"cost_usd_micros", 1_000_000_000_000_000, true},
+	} {
+		t.Run(fmt.Sprintf("%s=%d", tc.field, tc.value), func(t *testing.T) {
+			wantRows, wantFaults := 1, 0
+			if !tc.ok {
+				wantRows, wantFaults = 0, 1
+			}
+			report := newLedgerEnv(t)
+			line := report.line(7, map[string]any{tc.field: tc.value})
+			if _, ok := parseLedgerLine([]byte(line), ledgerSession); ok != tc.ok {
+				t.Errorf("parseLedgerLine ok = %v, want %v", ok, tc.ok)
+			}
+			report.writeLedger(ledgerSession, line)
+			sum := report.ingest()
+			if n, _ := report.sum("source = 'ledger'"); sum.Faults != wantFaults || n != wantRows {
+				t.Errorf("report run: %d faults, %d rows; want %d, %d", sum.Faults, n, wantFaults, wantRows)
+			}
+			hooks := newLedgerEnv(t)
+			hooks.holdAll()
+			hooks.writeLedger(ledgerSession, line)
+			got := hooks.ingestSession(LedgerReadCap)
+			if n, _ := hooks.sum("source = 'ledger'"); got.Faults != wantFaults || n != wantRows || got.Lines != 1 {
+				t.Errorf("hook run = %+v with %d side rows; want %d faults, %d rows from 1 line", got, n, wantFaults, wantRows)
+			}
+		})
 	}
 }
 

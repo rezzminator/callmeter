@@ -55,6 +55,20 @@ type ledgerRow struct {
 // arrived and its agent could not be learned.
 const UnknownLedgerAgent = "?"
 
+// The largest count and price a ledger line may carry. Real calls are far
+// below them (a million-token context is 1e6; a 1e9 USD call is not a call),
+// and they keep every sum and conversion of one line inside int64: the three
+// counts of context_tokens add to at most 3e12, a count times the dearest rate
+// per token stays near 1e14 micros, and no price reaches the range where
+// PriceMicros's float64 to int64 conversion is implementation-defined. A sum
+// over many lines is not bounded by them (about 9,000 lines at the price bound
+// fill an int64). A line past either is a bad line, counted in Faults and
+// stored nowhere.
+const (
+	maxLedgerTokens = 1_000_000_000_000
+	maxLedgerMicros = 1_000_000_000_000_000
+)
+
 // joinRank orders the ledger's joins: the row with the best one wins a request
 // id (a log+span line is the exact one).
 func joinRank(join string) int {
@@ -167,9 +181,30 @@ func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (Le
 			}
 		}
 	}
-	sum.Side = len(side)
-	err = s.Batch(ctx, func(tx *Tx) error { return tx.applyLedger(ctx, fills, overlay, side) })
+	err = s.Batch(ctx, func(tx *Tx) error { return tx.applyReportLedger(ctx, fills, overlay, side, &sum) })
 	return sum, err
+}
+
+// applyReportLedger is a report run's applyLedger. Its side calls were decided
+// before the write lock, so they are decided again under it: a call a request
+// of another source holds by now (a hook wrote it in between) is held, priced
+// like any held call, and counted so; sum's Side counts the rest.
+func (t *Tx) applyReportLedger(ctx context.Context, fills []ledgerFill, overlay, side []ledgerRow, sum *LedgerSummary) error {
+	known, err := t.knownLedgerRequests(ctx, side)
+	if err != nil {
+		return err
+	}
+	stillSide := side[:0:0]
+	for _, r := range side {
+		if stored, isKnown := known[r.id]; isKnown && stored.source != SourceLedger {
+			sum.Held++
+			overlay = append(overlay, r)
+			continue
+		}
+		stillSide = append(stillSide, r)
+	}
+	sum.Side = len(stillSide)
+	return t.applyLedger(ctx, fills, overlay, stillSide)
 }
 
 // ledgerFill gives the stored transcript request messageID the requestId apiID.
@@ -223,7 +258,12 @@ func nullablePtr(s *string) any {
 
 // upsertSideCall writes a ledger row no transcript holds as a requests row,
 // keyed by its request id; a row already there (a source 'ledger' one) is
-// brought up to date, any other row is left alone.
+// brought up to date, any other row is left alone. The caller decided that no
+// transcript holds the call before it took the write lock, so the statement
+// decides again under it: nothing is written (inserted or updated) while a
+// request of another source holds the call's requestId, the guard the overlay
+// DELETE of applyLedger shares, so a hook that gave a transcript request the
+// call in between leaves it counted once.
 func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 	var agent any
 	if r.AgentID != nil && *r.AgentID != "" {
@@ -246,7 +286,8 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 		`INSERT INTO requests (request_id, session_id, agent_id, ts, model, input_tokens, cache_read_tokens,
 			cache_creation_tokens, context_tokens, output_tokens, pending, source, api_request_id, query_source,
 			cost_usd_micros, cost_source)
-		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?1, ?12, ?13, ?14)
+		SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?1, ?12, ?13, ?14
+		WHERE NOT EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?11)
 		ON CONFLICT(request_id) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id,
 			ts = excluded.ts, model = excluded.model, input_tokens = excluded.input_tokens,
 			cache_read_tokens = excluded.cache_read_tokens, cache_creation_tokens = excluded.cache_creation_tokens,
@@ -350,7 +391,12 @@ func parseLedgerLine(line []byte, session string) (ledgerRow, bool) {
 		f.CacheRead == nil || f.CacheCreation == nil {
 		return ledgerRow{}, false
 	}
-	if *f.Input < 0 || *f.Output < 0 || *f.CacheRead < 0 || *f.CacheCreation < 0 || (f.Cost != nil && *f.Cost < 0) {
+	for _, count := range []int64{*f.Input, *f.Output, *f.CacheRead, *f.CacheCreation} {
+		if count < 0 || count > maxLedgerTokens {
+			return ledgerRow{}, false
+		}
+	}
+	if f.Cost != nil && (*f.Cost < 0 || *f.Cost > maxLedgerMicros) {
 		return ledgerRow{}, false
 	}
 	at, err := time.Parse(time.RFC3339Nano, *f.TS)

@@ -478,8 +478,12 @@ func runCallmeter(
 // (Store.IngestLedgerSession), so Claude Code's own price of each call is
 // stored without a report run. The ledger is optional data: no directory or
 // file is nothing to do, and a ledger that cannot be read is a parse fault at
-// most; a busy store is only logged, the next hook or report run reads the
-// same bytes. SessionEnd skips it once its budget is spent.
+// most, once per session and error text (faultOnce: a ledger that stays broken
+// is not a row per hook); a busy store is only logged, the next hook or report
+// run reads the same bytes. SessionEnd skips it once its budget is spent, and
+// an ingest that runs past that budget rolls back and is only logged (the
+// offset did not move, so the next hook reads the bytes): it is a budget spent,
+// not a ledger error.
 func (run *callmeterRun) ingestLedger() {
 	switch run.payload.HookEventName {
 	case eventStop, callmeter.EventSubagentStop, callmeter.EventSessionEnd:
@@ -493,12 +497,21 @@ func (run *callmeterRun) ingestLedger() {
 	if err != nil {
 		return // no home to look under: there is no default ledger to read
 	}
-	sum, err := run.store.IngestLedgerSession(run.ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
+	ctx := run.ctx
+	if !run.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, run.deadline)
+		defer cancel()
+	}
+	sum, err := run.store.IngestLedgerSession(ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
 	switch {
+	case !run.deadline.IsZero() && errors.Is(err, context.DeadlineExceeded):
+		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "",
+			fmt.Errorf("cost ledger: %s budget spent during the ingest, its bytes wait for the next hook: %w", run.payload.HookEventName, err))
 	case err != nil && callmeter.IsBusy(err):
 		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
 	case err != nil:
-		run.fault(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
+		run.faultOnce(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
 	case sum.Faults > 0:
 		run.fault(callmeter.StageParse, "", fmt.Errorf(
 			"cost ledger: %d lines of the session's file skipped: not a JSON object, or missing a field the ledger contract requires", sum.Faults))
@@ -1557,7 +1570,7 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 		return run.runRows(tx)
 	})
 	if err != nil {
-		run.faultHeld(&hold, held, callmeter.StageStore, toolUseID, err)
+		run.faultHeld(&hold, held, false, callmeter.StageStore, toolUseID, err)
 		return
 	}
 	hold.account()
@@ -1573,21 +1586,31 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 // missed.log line instead (giveUp); after it, such a fault is logged only, and
 // so is every fault of a run that gave up.
 func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
+	run.faultRow(false, stage, toolUseID, cause)
+}
+
+// faultOnce is fault for a failure that lasts across hooks: the faults row is
+// written once per session, stage and error text, a repeat only logged.
+func (run *callmeterRun) faultOnce(stage, toolUseID string, cause error) {
+	run.faultRow(true, stage, toolUseID, cause)
+}
+
+func (run *callmeterRun) faultRow(once bool, stage, toolUseID string, cause error) {
 	if run.gaveUp {
 		applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
 	var hold termHold
 	defer func() { hold.release() }()
-	run.faultHeld(&hold, false, stage, toolUseID, cause)
+	run.faultHeld(&hold, false, once, stage, toolUseID, cause)
 }
 
 // faultHeld is fault with the caller's hold on the signal handler, released by
 // the caller: held is true when the caller already took it (write, after its
 // batch failed), otherwise faultHeld takes it into hold, for a fault row once
 // that row's transaction holds the store's write lock (AddFaultHeld), never
-// across the wait for a busy store.
-func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID string, cause error) {
+// across the wait for a busy store. once is callmeter.Fault.Once.
+func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolUseID string, cause error) {
 	take := func() {
 		if !held {
 			*hold, held = run.state.hold(), true
@@ -1605,7 +1628,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID s
 		run.giveUp(*hold, toolUseID, cause)
 		return
 	}
-	fault := callmeter.Fault{TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error()}
+	fault := callmeter.Fault{TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error(), Once: once}
 	if held && hold.locked {
 		// A failed batch's hold: its fault row goes in under it when the store
 		// is free at once, so a signal that waited on the batch is judged by

@@ -266,6 +266,7 @@ CREATE TABLE IF NOT EXISTS faults (
 	stage TEXT,
 	error TEXT
 );
+CREATE INDEX IF NOT EXISTS faults_session_stage ON faults(session_id, stage);
 CREATE TABLE IF NOT EXISTS compactions (
 	entry_id TEXT PRIMARY KEY,
 	session_id TEXT,
@@ -698,6 +699,7 @@ type Fault struct {
 	ToolUseID string
 	Stage     string // one of the Stage* constants
 	Error     string
+	Once      bool // write the row only when the session holds no fault of this stage and error yet (Tx.AddFault)
 }
 
 // AddFault records f in its own transaction; an empty SessionID or ToolUseID
@@ -728,18 +730,11 @@ func (s *Store) AddFaultIfFree(ctx context.Context, f Fault) (written bool, err 
 			err = errors.Join(err, fmt.Errorf("callmeter store %s: release its connection: %w", s.path, closeErr))
 		}
 	}()
-	var wait int64
-	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&wait); err != nil {
-		return false, fmt.Errorf("callmeter store %s: read busy_timeout: %w", s.path, err)
+	restore, err := s.shortenBusyWait(ctx, conn, 0)
+	if err != nil {
+		return false, err
 	}
-	if _, err := conn.ExecContext(ctx, "PRAGMA busy_timeout=0"); err != nil {
-		return false, fmt.Errorf("callmeter store %s: set busy_timeout: %w", s.path, err)
-	}
-	defer func() {
-		if _, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", wait)); restoreErr != nil {
-			err = errors.Join(err, fmt.Errorf("callmeter store %s: restore busy_timeout: %w", s.path, restoreErr))
-		}
-	}()
+	defer func() { err = errors.Join(err, restore()) }()
 	tx, err := conn.BeginTx(ctx, nil)
 	if IsBusy(err) {
 		return false, nil
@@ -756,13 +751,44 @@ func (s *Store) AddFaultIfFree(ctx context.Context, f Fault) (written bool, err 
 	return true, nil
 }
 
+// shortenBusyWait lowers conn's busy wait to at most millis milliseconds, and
+// returns the call that puts the store's own wait back (a no-op when it was
+// already that short); the driver does not end that wait at a ctx deadline, so
+// this is how a caller bounds it.
+func (s *Store) shortenBusyWait(ctx context.Context, conn *sql.Conn, millis int64) (restore func() error, err error) {
+	restore = func() error { return nil }
+	var wait int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&wait); err != nil {
+		return restore, fmt.Errorf("callmeter store %s: read busy_timeout: %w", s.path, err)
+	}
+	if wait <= millis {
+		return restore, nil
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", max(millis, 0))); err != nil {
+		return restore, fmt.Errorf("callmeter store %s: set busy_timeout: %w", s.path, err)
+	}
+	return func() error {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", wait)); err != nil {
+			return fmt.Errorf("callmeter store %s: restore busy_timeout: %w", s.path, err)
+		}
+		return nil
+	}, nil
+}
+
 // AddFault records f as part of the transaction; an empty SessionID or
 // ToolUseID is stored as NULL.
 func (t *Tx) AddFault(ctx context.Context, f Fault) error {
-	if _, err := t.tx.ExecContext(ctx,
-		"INSERT INTO faults (ts, session_id, tool_use_id, stage, error) VALUES (?, ?, ?, ?, ?)",
-		f.TS, nullString(f.SessionID), nullString(f.ToolUseID), f.Stage, f.Error,
-	); err != nil {
+	query := "INSERT INTO faults (ts, session_id, tool_use_id, stage, error) VALUES (?1, ?2, ?3, ?4, ?5)"
+	args := []any{f.TS, nullString(f.SessionID), nullString(f.ToolUseID), f.Stage, f.Error}
+	if f.Once {
+		// Decided under the write lock by the statement itself, through
+		// faults_session_stage, so two hooks of a session cannot both write it;
+		// the row may hold the text as Redact rewrote it (?6).
+		query = `INSERT INTO faults (ts, session_id, tool_use_id, stage, error) SELECT ?1, ?2, ?3, ?4, ?5
+			WHERE NOT EXISTS (SELECT 1 FROM faults WHERE session_id IS ?2 AND stage = ?4 AND error IN (?5, ?6))`
+		args = append(args, sanitizeFault(f.Stage, f.Error))
+	}
+	if _, err := t.tx.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("callmeter store %s: add %s fault for call %q: %w", t.path, f.Stage, f.ToolUseID, err)
 	}
 	return nil

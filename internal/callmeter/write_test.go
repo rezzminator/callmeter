@@ -1635,6 +1635,45 @@ func TestCallResultSplitNeedsEveryDeliveredSize(t *testing.T) {
 	}
 }
 
+// TestCallResultWriteMicrosIsNullForALedgerPricedRequestOfAnUnlistedModel: the
+// write price per token is always the embedded table's, never derived from the
+// ledger's total (which holds no cache-write rate), so a next request Claude
+// Code priced whose model the table does not name leaves result_write_micros
+// NULL beside its result tokens.
+func TestCallResultWriteMicrosIsNullForALedgerPricedRequestOfAnUnlistedModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertRequest(ctx, streamRequest("msg_a", nil, 100, "claude-opus-5-5", 1000, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	call := Call{ToolUseID: "toolu_1", SessionID: Ptr("sess-r5"), RequestID: Ptr("msg_a"), BytesDelivered: Ptr(int64(40))}
+	if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	const unlisted = "claude-nonesuch-9"
+	side := ledgerRow{
+		ledgerFields: ledgerFields{
+			Model: Ptr(unlisted), Input: Ptr(int64(1)), Output: Ptr(int64(1)), CacheRead: Ptr(int64(1)), CacheCreation: Ptr(int64(1)), Cost: Ptr(int64(777)),
+		},
+		id: "req_unlisted", session: "sess-r5", at: time.UnixMilli(150),
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.applyLedger(ctx, nil, nil, []ledgerRow{side}) }); err != nil {
+		t.Fatal(err)
+	}
+	next := streamRequest("msg_b", nil, 200, unlisted, 1100, 0, 0, 5)
+	next.APIRequestID = Ptr("req_unlisted")
+	if err := store.UpsertRequest(ctx, next, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if got := row(t, store, "requests", "request_id = 'msg_b'"); got["cost_source"] != "ledger" || got["cost_usd_micros"] != int64(777) {
+		t.Fatalf("the next request = %v from %v, want the ledger's 777", got["cost_usd_micros"], got["cost_source"])
+	}
+	got := row(t, store, "calls", "tool_use_id = 'toolu_1'")
+	if got["result_tokens"] == nil || got["result_write_micros"] != nil {
+		t.Errorf("result_tokens/result_write_micros = %v / %v, want tokens and a NULL write price", got["result_tokens"], got["result_write_micros"])
+	}
+}
+
 // TestPreviousRequestLookupIsIndexed: the hot-path lookups of a stream's
 // previous and next request walk requests_session_agent_ts, and the calls of a request
 // calls_request, never a scan under the write lock.

@@ -224,7 +224,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
@@ -1075,7 +1075,7 @@ func TestOpenCompletesAVersionOneStore(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes after the reopen = %s, want %s", gotIndexes, wantIndexes)
@@ -1889,5 +1889,72 @@ func TestRequestCacheView(t *testing.T) {
 	}, ",")
 	if got != want {
 		t.Errorf("request_cache =\n%s\nwant\n%s", strings.ReplaceAll(got, ",", "\n"), strings.ReplaceAll(want, ",", "\n"))
+	}
+}
+
+// TestAddFaultOnceKeepsOneRowPerSessionStageAndError: a fault written Once is
+// skipped when its session already holds a fault of that stage and error; the
+// same error of another session, another error text and another stage are new
+// rows, a fault not written Once is always a row, and the check walks an index.
+func TestAddFaultOnceKeepsOneRowPerSessionStageAndError(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	add := func(f Fault) {
+		t.Helper()
+		f.TS = 1
+		if err := store.AddFault(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	faults := func() int { return count(t, store, "faults") }
+	once := Fault{SessionID: "sess-a", Stage: StageParse, Error: "cost ledger: stat x: not a directory", Once: true}
+	add(once)
+	add(once)
+	if n := faults(); n != 1 {
+		t.Fatalf("faults after the same Once fault twice = %d, want 1", n)
+	}
+	other := once
+	other.SessionID = "sess-b"
+	add(other)
+	other = once
+	other.Error = "cost ledger: stat y: not a directory"
+	add(other)
+	other = once
+	other.Stage = StageStore
+	add(other)
+	if n := faults(); n != 4 {
+		t.Errorf("faults after another session, text and stage = %d, want 4", n)
+	}
+	plain := once
+	plain.Once = false
+	add(plain)
+	if n := faults(); n != 5 {
+		t.Errorf("faults after the same fault not written Once = %d, want 5 (a plain fault is always a row)", n)
+	}
+	// Redact stores a parse fault's text as its size only; the same lasting
+	// error is still the row already there.
+	if _, err := store.Redact(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add(once)
+	if n := faults(); n != 5 {
+		t.Errorf("faults after the same Once fault following a redact = %d, want 5", n)
+	}
+	rows, err := store.DB().Query("EXPLAIN QUERY PLAN SELECT 1 FROM faults WHERE session_id IS ? AND stage = ? AND error IN (?, ?)", "s", StageParse, "e", "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if !strings.Contains(strings.Join(plan, "\n"), "USING INDEX faults_session_stage") && !strings.Contains(strings.Join(plan, "\n"), "USING COVERING INDEX faults_session_stage") {
+		t.Errorf("the repeat check plan = %v, want a search of faults_session_stage, not a scan of the table", plan)
 	}
 }

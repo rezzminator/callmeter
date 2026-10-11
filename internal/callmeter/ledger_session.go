@@ -44,7 +44,7 @@ type LedgerSessionSummary struct {
 	Held    int   // calls a stored transcript request holds: priced from the ledger
 	Side    int   // calls no stored transcript request holds: ingested as source 'ledger' requests
 	More    bool  // bytes remain beyond this run's cap
-	Reset   bool  // the file was shorter than the kept offset (or the offset no file position): read again from its start
+	Reset   bool  // the file was shorter than the kept offset, or had no line end before it (or the offset no file position): read again from its start
 }
 
 // validLedgerSessionID reports whether id may name a ledger file: 1..128
@@ -68,7 +68,10 @@ func validLedgerSessionID(id string) bool {
 // store, idempotently and incrementally:
 //  1. it reads at most LedgerReadCap bytes from the offset the session's row
 //     keeps, only complete lines (a torn last line waits for the next run),
-//     and only from a regular file;
+//     and only from a regular file; the offset is the end of a complete line,
+//     so a file shorter than it, or with no line end just before it, is a
+//     replaced one and is read from its start (the reset is kept even when that
+//     read holds no complete line);
 //  2. a call a stored transcript request holds gives it the ledger's price and
 //     query source; every other call is stored as a 'ledger' request, which the
 //     transcript request, once written, takes over (Tx.priceRequest);
@@ -123,21 +126,49 @@ func (s *Store) ingestLedgerSession(ctx context.Context, dir, session string, no
 	if size == offset && !sum.Reset {
 		return sum, nil
 	}
-	data, err := readLedgerSlice(path, offset, min(size-offset, limit))
+	// The kept offset is the end of a complete line, so the byte before it is a
+	// newline; it is read with the new bytes, inside the same cap. When it is
+	// not, the file is not the one the offset was kept for (replaced, then grown
+	// past it): it is read again from its start.
+	lookback := int64(0)
+	if offset > 0 {
+		lookback = 1
+	}
+	data, err := readLedgerSlice(path, offset-lookback, min(size-offset+lookback, limit))
 	if err != nil {
 		return sum, err
 	}
+	if lookback == 1 && (len(data) == 0 || data[0] != '\n') {
+		offset, lookback, sum.Reset, sum.Offset = 0, 0, true, 0
+		if data, err = readLedgerSlice(path, 0, min(size, limit)); err != nil {
+			return sum, err
+		}
+	}
+	data = data[lookback:]
 	sum.Bytes = int64(len(data))
 	end := int64(bytes.LastIndexByte(data, '\n')) + 1
-	if end == 0 && int64(len(data)) >= limit {
-		// A line longer than the cap is no ledger line: counted, passed.
-		end, sum.Faults = int64(len(data)), 1
-		data = nil
+	if end == 0 && int64(len(data)) >= limit-lookback {
+		// A line longer than the cap is no ledger line: counted, passed to its
+		// end (the offset stays at a line end). One whose end is not written yet
+		// waits like any torn line.
+		if lineEnd, found, err := lineEndAfter(ctx, path, offset+int64(len(data)), size); err != nil {
+			return sum, err
+		} else if found {
+			end, sum.Faults = lineEnd-offset, 1
+			data = nil
+		}
 	}
 	sum.More = offset+end < size
 	if end == 0 {
 		// Only a torn line is new: nothing to apply and no offset to move, so
-		// the hook takes no write lock.
+		// the hook takes no write lock; a reset is kept all the same.
+		if sum.Reset {
+			err = s.batchWithin(ctx, func(tx *Tx) error { return tx.moveLedgerOffset(ctx, session, kept.Int64, 0) })
+			if errors.Is(err, errLedgerRaced) {
+				return LedgerSessionSummary{Present: true}, nil
+			}
+			return sum, err
+		}
 		return sum, nil
 	}
 	best := map[string]ledgerRow{}
@@ -161,15 +192,9 @@ func (s *Store) ingestLedgerSession(ctx context.Context, dir, session string, no
 		}
 	}
 	sum.Offset = offset + end
-	err = s.Batch(ctx, func(tx *Tx) error {
-		moved, err := tx.tx.ExecContext(ctx,
-			"UPDATE sessions SET ledger_offset = ?1 WHERE session_id = ?2 AND COALESCE(ledger_offset, 0) IS ?3",
-			sum.Offset, session, kept.Int64)
-		if err != nil {
-			return fmt.Errorf("callmeter store %s: keep the ledger offset of session %q: %w", s.path, session, err)
-		}
-		if n, err := moved.RowsAffected(); err != nil || n == 0 {
-			return errors.Join(err, errLedgerRaced)
+	err = s.batchWithin(ctx, func(tx *Tx) error {
+		if err := tx.moveLedgerOffset(ctx, session, kept.Int64, sum.Offset); err != nil {
+			return err
 		}
 		// Which calls the store holds is read under the write lock, so a report
 		// run's ingest committing first cannot leave a side row beside the
@@ -198,6 +223,92 @@ func (s *Store) ingestLedgerSession(ctx context.Context, dir, session string, no
 		return LedgerSessionSummary{Present: true}, nil
 	}
 	return sum, err
+}
+
+// batchWithin is Batch for a ctx that may carry a deadline (SessionEnd's
+// budget): the wait for a busy store's write lock ends at that deadline, since
+// the store's own busy wait does not stop at it. A lock not free by then is a
+// busy store (IsBusy) and nothing is written.
+func (s *Store) batchWithin(ctx context.Context, fn func(*Tx) error) (err error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return s.Batch(ctx, fn)
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: take its connection: %w", s.path, err)
+	}
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: release its connection: %w", s.path, closeErr))
+		}
+	}()
+	restore, err := s.shortenBusyWait(ctx, conn, time.Until(deadline).Milliseconds())
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, restore()) }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: begin transaction: %w", s.path, err)
+	}
+	if err := fn(&Tx{tx: tx, path: s.path, complete: s.SchemaComplete()}); err != nil {
+		return errors.Join(err, tx.Rollback())
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("callmeter store %s: commit: %w", s.path, err)
+	}
+	return nil
+}
+
+// moveLedgerOffset moves session's kept offset from old to new by a
+// compare-and-swap, the first statement of a run's transaction: errLedgerRaced
+// when another hook moved it first.
+func (t *Tx) moveLedgerOffset(ctx context.Context, session string, old, new int64) error {
+	moved, err := t.tx.ExecContext(ctx,
+		"UPDATE sessions SET ledger_offset = ?1 WHERE session_id = ?2 AND COALESCE(ledger_offset, 0) IS ?3",
+		new, session, old)
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: keep the ledger offset of session %q: %w", t.path, session, err)
+	}
+	if n, err := moved.RowsAffected(); err != nil || n == 0 {
+		return errors.Join(err, errLedgerRaced)
+	}
+	return nil
+}
+
+// ledgerScanChunk is the piece lineEndAfter reads at a time.
+const ledgerScanChunk = 64 << 10
+
+// lineEndAfter returns the offset just past the first newline at or after from
+// in the regular file at path, looking no further than size; found is false when
+// the line has no end yet. It reads in pieces and keeps nothing, so a line far
+// past the cap costs time, not memory, and it stops at ctx's end (a SessionEnd
+// budget) with ctx's error.
+func lineEndAfter(ctx context.Context, path string, from, size int64) (end int64, found bool, err error) {
+	file, err := openRegular(path)
+	if err != nil {
+		return 0, false, err
+	}
+	defer file.Close()
+	chunk := make([]byte, ledgerScanChunk)
+	for pos := from; pos < size; {
+		if err := ctx.Err(); err != nil {
+			return 0, false, fmt.Errorf("callmeter ledger: read %s for a line end: %w", path, err)
+		}
+		n, err := file.ReadAt(chunk[:min(int64(len(chunk)), size-pos)], pos)
+		if i := bytes.IndexByte(chunk[:n], '\n'); i >= 0 {
+			return pos + int64(i) + 1, true, nil
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return 0, false, fmt.Errorf("callmeter ledger: read %s: %w", path, err)
+		}
+		if n == 0 {
+			break
+		}
+		pos += int64(n)
+	}
+	return 0, false, nil
 }
 
 // openRegular opens the file at path for reading and returns it only when it is
