@@ -10,6 +10,7 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 - A `cache` report topic, the 21st: those outcomes and causes per main chat or sub-agent and per cache TTL.
 - The `callmeter` skill's schema covers the new table and the view, with a recipe for cache outcomes.
 - An optional `config.json` under `CALLMETER_HOME` with one key, `retention_days` (0 to 36500): how many days of rows the store keeps. A config the report cannot trust (unreadable, empty, malformed, an unknown key, a value out of range) stops the report with a line naming the file.
+- `/callmeter:ultimate-visualization [focus]`: a skill, invoked by the user only, that has Claude explore the store and publish one animated Artifact of what happened in the past, in a form it chooses. It carries its own build discipline, so it needs no other plugin or skill; it falls back to asking before it builds a plain HTML file when the session cannot publish an Artifact, and the page it publishes carries structure, timing and counts only, never commands, paths or prompts.
 
 ### Changed
 - A report no longer prunes rows older than 30 days: the store keeps every row by default, `--since` defaults to the whole store and a report's title reads `window: all time`. Set `retention_days` in `config.json` to prune again; `--since` then defaults to that window. An `archive.db` left by the earlier prune stays readable.

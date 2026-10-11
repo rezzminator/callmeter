@@ -153,6 +153,14 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 /callmeter:callmeter which of my sub-agents in this session hit the highest context?
 ```
 
+## 🎬 Watch what happened
+
+`/callmeter:ultimate-visualization [focus]` has Claude explore the store and publish one animated Artifact of what happened in the past, in a form it chooses: an open greenfield, seen as the work and its flow, never as a file. The skill carries its own build discipline, so it needs nothing beyond Claude Code and its Artifact tool, and the page it publishes carries structure, timing and counts only: no commands, paths or prompts.
+
+```text
+/callmeter:ultimate-visualization the sub-agents of the last two days
+```
+
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
