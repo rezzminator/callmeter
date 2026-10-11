@@ -200,23 +200,33 @@ func (s *Store) ingestLedgerSession(ctx context.Context, dir, session string, no
 	return sum, err
 }
 
-// readLedgerSlice reads size bytes of the regular file at path from offset.
-// The file is opened non-blocking and checked again once open, so a path
-// swapped for a pipe after its stat cannot stall a hook; a file that shrank
-// since the stat gives the bytes it still has.
-func readLedgerSlice(path string, offset, size int64) ([]byte, error) {
+// openRegular opens the file at path for reading and returns it only when it is
+// a regular file. The open is non-blocking and the check runs on the open
+// descriptor, so a path that is, or becomes after any earlier stat, a pipe, a
+// device or a socket stalls nothing: it is refused with an error naming it.
+func openRegular(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("callmeter ledger: open %s: %w", path, err)
 	}
-	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("callmeter ledger: stat %s: %w", path, err)
+		return nil, errors.Join(fmt.Errorf("callmeter ledger: stat %s: %w", path, err), file.Close())
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("callmeter ledger: %s is not a regular file", path)
+		return nil, errors.Join(fmt.Errorf("callmeter ledger: %s is not a regular file", path), file.Close())
 	}
+	return file, nil
+}
+
+// readLedgerSlice reads size bytes of the regular file at path from offset; a
+// file that shrank since the stat gives the bytes it still has.
+func readLedgerSlice(path string, offset, size int64) ([]byte, error) {
+	file, err := openRegular(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
 	data := make([]byte, size)
 	n, err := file.ReadAt(data, offset)
 	if err != nil && !errors.Is(err, io.EOF) {

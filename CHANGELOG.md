@@ -24,6 +24,7 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 - A `PermissionRequest` or `PermissionDenied` event of an `mcp__` tool keeps no string of its `tool_input` in `events.detail`, each one `{key}_bytes`, as a call's input already did; `callmeter redact` rewrites stored details, reading the tool from `events.tool_name`, or from the detail itself for a `PermissionDenied` stored before that column held it.
 
 ### Fixed
+- A named pipe, device or socket where a cost-ledger file or a transcript is expected no longer stalls `callmeter report`: the report run's ledger read and the transcript scan open a file without blocking and refuse anything but a regular file, with an error, as the hooks' ledger read already did.
 - A hook whose write batch failed no longer holds off its signal handler while the fault row waits for a store another writer took meanwhile: the fault goes in under the hold only when the store is free at once, so a cancel during that wait leaves its `missed.log` line instead of being cut short by Claude Code's SIGKILL with nothing recorded.
 - A hook that panics after its event was recorded logs the panic and its stack to `callmeter.log` again, as an unrecorded one does; only the `missed.log` line stays reserved for the unrecorded event.
 - A signal landing while an unrecorded hook's panic unwinds no longer adds a `terminated` line to `missed.log` beside the panic's own, which counted one lost event twice.

@@ -669,6 +669,49 @@ func TestIngestLedgerSessionLedgerIsOptionalData(t *testing.T) {
 	}
 }
 
+// TestLedgerReadsRefuseAPathThatIsNoRegularFile: the report run's ledger read
+// and the transcript scan open a file out of a directory or a path the store
+// names; a pipe there is refused with an error before it can stall a run.
+func TestLedgerReadsRefuseAPathThatIsNoRegularFile(t *testing.T) {
+	e := newLedgerEnv(t)
+	fifo := filepath.Join(e.dir, "pipe-session.jsonl")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A reader blocked in open(2) is released by a writer, so a failing run
+	// leaks no goroutine.
+	t.Cleanup(func() {
+		if f, err := os.OpenFile(fifo, os.O_RDWR, 0); err == nil {
+			f.Close()
+		}
+	})
+	runs := []struct {
+		name string
+		run  func() error
+	}{
+		{"the report run's ledger read", func() error {
+			_, err := e.store.IngestLedger(context.Background(), e.dir, e.now)
+			return err
+		}},
+		{"the transcript scan", func() error {
+			_, err := scanRequestIDs(fifo)
+			return err
+		}},
+	}
+	for _, tc := range runs {
+		done := make(chan error, 1)
+		go func() { done <- tc.run() }()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
+				t.Errorf("%s: err = %v; want a refusal naming a path that is no regular file", tc.name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: blocked on a pipe", tc.name)
+		}
+	}
+}
+
 // TestIngestLedgerSessionCountsBadLinesAndKeepsALedgerPrice: a line that is no
 // JSON object is a counted fault the offset passes; a worse line of a call
 // whose ledger price is stored never takes it back to the table's.

@@ -314,9 +314,9 @@ func readLedger(dir string, cutoff time.Time, sum *LedgerSummary) ([]ledgerRow, 
 }
 
 func readLedgerFile(path, session string, best map[string]ledgerRow, sum *LedgerSummary) error {
-	file, err := os.Open(path)
+	file, err := openRegular(path)
 	if err != nil {
-		return fmt.Errorf("callmeter ledger: open %s: %w", path, err)
+		return err
 	}
 	defer file.Close()
 	reader := bufio.NewReader(file)
@@ -527,9 +527,9 @@ func (s *Store) sessionTranscripts(ctx context.Context, session string) (transcr
 // scanRequestIDs reads a transcript for the requestId of each assistant message
 // it records, mapped to the message's id. Nothing else of a line is kept.
 func scanRequestIDs(path string) (map[string]string, error) {
-	file, err := os.Open(path)
+	file, err := openRegular(path)
 	if err != nil {
-		return nil, fmt.Errorf("callmeter ledger: open transcript: %w", err)
+		return nil, err
 	}
 	defer file.Close()
 	found := map[string]string{}
