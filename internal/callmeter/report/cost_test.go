@@ -245,3 +245,43 @@ func TestCostAgentViewSaysWhereTheSpendBeforeTheLedgerIs(t *testing.T) {
 	}
 	hasNote(t, table, "the spend before the ledger belongs to no agent: the chat view's PRE-LEDGER USD names it")
 }
+
+// GPT requests are priced from the embedded list, which is a list-equivalent:
+// the GPT route runs on a ChatGPT subscription, so there is no per-token bill.
+// Every cost view says so beside the sum, with the GPT part of it.
+func TestCostLabelsTheGPTSubtotalListEquivalent(t *testing.T) {
+	store := openStore(t)
+	seedCostSession(t, store)
+	for i, tc := range []struct {
+		id     string
+		micros int64
+	}{{"g1", 2_500_000}, {"g2", 500_000}} {
+		exec(t, store, `INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, cache_read_tokens,
+			cache_creation_tokens, pending, source, cost_usd_micros, cost_source) VALUES (?, 's1', ?, 'gpt-6-sol', 10, 20, 30, 0, 0, 'hook', ?, 'table')`,
+			tc.id, ms(time.Duration(6+i)*time.Hour), tc.micros)
+	}
+	// A GPT request stored before the list named GPT keeps its NULL (forward
+	// only): it is in no total, so it is no part of the list-equivalent one.
+	exec(t, store, `INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending, source)
+		VALUES ('g0', 's1', ?, 'gpt-6-sol', 10, 20, 0, 'hook')`, ms(5*time.Hour))
+	const want = "2 GPT requests, 3.00 USD of the total, are list-equivalent: the GPT route runs on a ChatGPT subscription, so there is no per-token bill for them"
+	for _, view := range CostViews {
+		table, err := Cost(context.Background(), store, Filter{CostView: view}, chatOf)
+		if err != nil {
+			t.Fatalf("%s: Cost: %v", view, err)
+		}
+		hasNote(t, table, want)
+	}
+	// No GPT request in the window: no such note.
+	clean := openStore(t)
+	seedCostSession(t, clean)
+	table, err := Cost(context.Background(), clean, Filter{}, chatOf)
+	if err != nil {
+		t.Fatalf("Cost: %v", err)
+	}
+	for _, note := range table.Notes {
+		if strings.Contains(note, "list-equivalent") {
+			t.Errorf("note %q appears with no GPT request", note)
+		}
+	}
+}

@@ -35,7 +35,9 @@ var CostViews = []string{"chat", "agent", "call"}
 //
 // A request's price is cost_usd_micros: cost_source 'ledger' is Claude Code's
 // own price of the call from the cost ledger, 'table' callmeter's embedded price
-// list at the row's tokens, and NULL a model the list does not name.
+// list at the row's tokens, and NULL a model the list does not name. A GPT
+// request's table price is a list-equivalent, not a bill: that route runs on a
+// ChatGPT subscription, and every view notes the GPT part of its sum.
 func Cost(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
 	switch f.CostView {
@@ -255,12 +257,14 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 
 // costGaps names what the request prices leave out, counted over the window.
 func costGaps(ctx context.Context, store *callmeter.Store, where string, args []any) ([]string, error) {
-	var unpriced, undecided, unknownAgent int64
+	var unpriced, undecided, unknownAgent, gpt, gptMicros int64
 	err := store.DB().QueryRowContext(ctx,
 		`SELECT COALESCE(SUM(r.cost_usd_micros IS NULL), 0),
 			COALESCE(SUM(r.source = 'ledger' AND r.cost_source = 'table'), 0),
-			COALESCE(SUM(r.source = 'ledger' AND r.agent_id = '?'), 0)
-		FROM requests r WHERE `+where, args...).Scan(&unpriced, &undecided, &unknownAgent)
+			COALESCE(SUM(r.source = 'ledger' AND r.agent_id = '?'), 0),
+			COALESCE(SUM(lower(r.model) LIKE 'gpt-%' AND r.cost_usd_micros IS NOT NULL), 0),
+			COALESCE(SUM(CASE WHEN lower(r.model) LIKE 'gpt-%' THEN r.cost_usd_micros END), 0)
+		FROM requests r WHERE `+where, args...).Scan(&unpriced, &undecided, &unknownAgent, &gpt, &gptMicros)
 	if err != nil {
 		return nil, fmt.Errorf("callmeter report: count the unpriced requests: %w", err)
 	}
@@ -279,6 +283,11 @@ func costGaps(ctx context.Context, store *callmeter.Store, where string, args []
 		notes = append(notes, plural(unknownAgent,
 			"1 side call has an unknown agent (the ledger's log half arrived without its span)",
 			"%d side calls have an unknown agent (the ledger's log half arrived without its span)"))
+	}
+	if gpt > 0 {
+		notes = append(notes, plural(gpt,
+			fmt.Sprintf("1 GPT request, %.2f USD of the total, is list-equivalent: the GPT route runs on a ChatGPT subscription, so there is no per-token bill for it", float64(gptMicros)/1e6),
+			fmt.Sprintf("%%d GPT requests, %.2f USD of the total, are list-equivalent: the GPT route runs on a ChatGPT subscription, so there is no per-token bill for them", float64(gptMicros)/1e6)))
 	}
 	return notes, nil
 }
@@ -437,7 +446,7 @@ func costCalls(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = append(t.Notes, "USD is the request's cost; PRICE FROM is 'ledger' (Claude Code's own price from the cost ledger), 'table' (callmeter's embedded price list at the row's tokens) or - (a model the list does not name); SIDE CALL marks calls no transcript records")
+	t.Notes = append(t.Notes, "USD is the request's cost; PRICE FROM is 'ledger' (Claude Code's own price from the cost ledger), 'table' (callmeter's embedded price list at the row's tokens; for a GPT model a list-equivalent, not a bill) or - (a model the list does not name); SIDE CALL marks calls no transcript records")
 	t.Notes = append(t.Notes, gaps...)
 	t.Notes = append(t.Notes, ledgerNotes(f.Ledger)...)
 	return t, nil

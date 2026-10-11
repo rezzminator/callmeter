@@ -179,7 +179,7 @@ var storeColumns = map[string]string{
 	"calls": "tool_use_id,session_id,agent_id,agent_type,request_id,prompt_id,ts,tool,input,cwd,duration_ms,failed," +
 		"is_interrupt,error,bytes_real,bytes_delivered,persisted_path,file_path,file_bytes,file_bytes_before," +
 		"read_start,read_lines,read_total_lines,effort,permission_mode,lines_added,lines_removed,commit_sha," +
-		"commit_branch,test_runner,source,config_dir,seat_dir",
+		"commit_branch,test_runner,source,config_dir,seat_dir,result_tokens,result_basis,result_write_micros",
 	"requests": "request_id,session_id,agent_id,prompt_id,ts,model,stop_reason,input_tokens,cache_read_tokens," +
 		"cache_creation_tokens,cache_creation_5m_tokens,cache_creation_1h_tokens,context_tokens,output_tokens," +
 		"calls,pending,source,config_dir,seat_dir,thinking_tokens,api_request_id,cost_usd_micros,cost_source,query_source",
@@ -193,7 +193,7 @@ var storeColumns = map[string]string{
 		"detail,seat_dir",
 	"sessions": "session_id,first_ts,last_ts,engine,model,start_source,end_reason,cwd,transcript_path,seat_dir," +
 		"config_dir,host,tz_name,tz_offset_minutes,cwd_ts,transcript_path_ts,seat_dir_ts,config_dir_ts,host_ts,tz_name_ts," +
-		"tz_offset_minutes_ts",
+		"tz_offset_minutes_ts,ledger_offset",
 	"command_parts": "tool_use_id,seq,lang,program,args,files,parse_status,conditional,parser",
 	"faults":        "fault_id,ts,session_id,tool_use_id,stage,error",
 	"compactions": "entry_id,session_id,agent_id,ts,trigger,pre_tokens,post_tokens,cumulative_dropped_tokens,duration_ms," +

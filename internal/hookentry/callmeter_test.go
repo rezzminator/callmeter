@@ -3329,3 +3329,84 @@ func TestCallmeterStopWritesTheTranscriptMarks(t *testing.T) {
 		t.Errorf("faults = %d, want 0: %s", n, lab.faultsText())
 	}
 }
+
+// ledgerLine is one cost-ledger line of a side call (a call no transcript
+// records) of session A, priced micros by Claude Code.
+func ledgerLine(n int, micros int64) string {
+	return fmt.Sprintf(`{"request_id":"req_hook%04d","ts":"2026-09-23T01:00:%02d.000Z","session_id":%q,"agent_id":"","query_source":"prompt_suggestion",`+
+		`"model":"claude-opus-5-5","input_tokens":3,"output_tokens":4,"cache_read_tokens":5,"cache_creation_tokens":6,"cost_usd_micros":%d,"join":"log+span"}`,
+		n, n, cmSessionA, micros)
+}
+
+// TestCallmeterSettlingHooksIngestTheSessionsLedger: the hooks that settle a
+// session's requests (Stop, SubagentStop, SessionEnd) bring the new lines of
+// the session's cost-ledger file in, from a byte offset the store keeps, so a
+// price is stored without a report run; another hook leaves the file alone,
+// and a ledger that cannot be read costs the hook nothing.
+func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
+	lab := newCallmeterLab(t)
+	dir := filepath.Join(lab.root, "cost-ledger")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lab.env["PFM_COST_LEDGER_DIR"] = dir
+	file := filepath.Join(dir, cmSessionA+".jsonl")
+	lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"))
+	main := lab.transcript(cmSessionA)
+	lab.write(main, []byte(sweepEntry("msg_ledger0001", "01", `"end_turn"`, 5, `{"type":"text","text":"invented"}`)))
+	const at = 1790125140000 // 2026-09-23T00:59:00Z
+
+	// A hook that settles nothing leaves the ledger alone.
+	lab.feedAt(at, hookPayload(t, "UserPromptSubmit", map[string]any{"transcript_path": main, "prompt": "invented"}))
+	if n := lab.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 0 {
+		t.Fatalf("a UserPromptSubmit ingested %d ledger calls, want 0", n)
+	}
+	lab.feedAt(at+1000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-1"}))
+	expect(t, "first side call", lab.row("SELECT * FROM requests WHERE request_id = 'req_hook0001'"),
+		map[string]any{"source": "ledger", "cost_usd_micros": 1111, "cost_source": "ledger", "query_source": "prompt_suggestion"})
+	expect(t, "second side call", lab.row("SELECT * FROM requests WHERE request_id = 'req_hook0002'"),
+		map[string]any{"source": "ledger", "cost_usd_micros": 2222, "cost_source": "ledger"})
+
+	// New lines are read from the offset, by a Stop and a SessionEnd alike.
+	lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"+ledgerLine(3, 3333)+"\n"+ledgerLine(4, 4444)))
+	lab.feedAt(at+2000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-2"}))
+	if n := lab.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 3 {
+		t.Errorf("ledger calls after the third line = %d, want 3 (the fourth line is torn)", n)
+	}
+	lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"+ledgerLine(3, 3333)+"\n"+ledgerLine(4, 4444)+"\n"))
+	lab.feedAt(at+3000, hookPayload(t, "SessionEnd", map[string]any{"transcript_path": main, "reason": "other"}))
+	if n := lab.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 4 {
+		t.Errorf("ledger calls after SessionEnd = %d, want 4", n)
+	}
+	size, _ := os.Stat(file)
+	if got := lab.count("SELECT ledger_offset FROM sessions WHERE session_id = '" + cmSessionA + "'"); int64(got) != size.Size() {
+		t.Errorf("ledger_offset = %d, want the file's %d bytes", got, size.Size())
+	}
+
+	// A ledger directory that is a file is a fault, not a failed hook; the
+	// hook's own rows land.
+	lab.env["PFM_COST_LEDGER_DIR"] = main
+	before := lab.count("SELECT COUNT(*) FROM turns")
+	lab.feedAt(at+4000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-3"}))
+	if got := lab.count("SELECT COUNT(*) FROM turns"); got != before+1 {
+		t.Errorf("turns after a Stop beside an unreadable ledger = %d, want %d", got, before+1)
+	}
+
+	// A sub-agent's SubagentStop settles its requests too, and ingests alike.
+	sub := newCallmeterLab(t)
+	scripted := sub.payloads("scripted.jsonl")
+	session, _ := payloadField(t, scripted[8], "session_id").(string)
+	subDir := filepath.Join(sub.root, "cost-ledger")
+	if err := os.MkdirAll(subDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sub.env["PFM_COST_LEDGER_DIR"] = subDir
+	sub.write(filepath.Join(subDir, session+".jsonl"), []byte(strings.Replace(ledgerLine(9, 9999), cmSessionA, session, 1)+"\n"))
+	sub.feed(scripted[5], asyncAgentResult(t, scripted[9]))
+	if n := sub.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 0 {
+		t.Fatalf("hooks before the SubagentStop ingested %d ledger calls, want 0", n)
+	}
+	sub.feed(scripted[8])
+	expect(t, "SubagentStop side call", sub.row("SELECT * FROM requests WHERE request_id = 'req_hook0009'"),
+		map[string]any{"source": "ledger", "cost_usd_micros": 9999, "cost_source": "ledger"})
+}

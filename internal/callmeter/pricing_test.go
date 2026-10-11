@@ -3,6 +3,7 @@ package callmeter
 import (
 	"bufio"
 	"encoding/json"
+	"math"
 	"os"
 	"testing"
 )
@@ -110,5 +111,66 @@ func TestPriceMicrosTiersSplitsAndModelNames(t *testing.T) {
 		if ok != c.wantOK || got != c.want {
 			t.Errorf("%s: PriceMicros = (%d, %v), want (%d, %v)", c.name, got, ok, c.want, c.wantOK)
 		}
+	}
+}
+
+// openAIRates are the R2 rows as the request states them, USD per million
+// tokens: in, out, cached, then the long tier's in, out, cached.
+var openAIRates = []struct {
+	model                       string
+	in, out, cached             float64
+	longIn, longOut, longCached float64
+}{
+	{"gpt-6-sol", 2, 10, 0.2, 4, 15, 0.4},
+	{"gpt-6.1-sol", 2, 10, 0.1, 4, 15, 0.2},
+	{"gpt-6-luna", 0.1, 0.5, 0.01, 0.2, 0.75, 0.02},
+	{"gpt-6-astra", 10, 50, 1, 20, 75, 2},
+	{"gpt-5.6-sol", 4, 20, 0.4, 8, 30, 0.8},
+	{"gpt-5.6-luna", 0.2, 1.2, 0.02, 0.4, 1.8, 0.04},
+	{"gpt-5.6-terra", 2, 12, 0.2, 4, 18, 0.4},
+}
+
+// TestPriceMicrosPricesGPTAsAListEquivalent: input_tokens is the uncached
+// input, cache_read_tokens the cached part, no cache-write fee (a written
+// token bills as input), the long tier above 272000 context tokens, and the
+// dotted ids are real ids that stay dotted.
+func TestPriceMicrosPricesGPTAsAListEquivalent(t *testing.T) {
+	for _, row := range openAIRates {
+		// 1000 uncached, 2000 cached, 500 out: 3000 context, the short tier.
+		short := int64(math.Round(1000*row.in + 500*row.out + 2000*row.cached))
+		if got, ok := PriceMicros(row.model, 1000, 500, 2000, 0, nil, nil); !ok || got != short {
+			t.Errorf("%s short tier: PriceMicros = (%d, %v), want (%d, true)", row.model, got, ok, short)
+		}
+		// 100000 uncached + 172000 cached is exactly 272000: not above the bound.
+		edge := int64(math.Round(100000*row.in + 500*row.out + 172000*row.cached))
+		if got, ok := PriceMicros(row.model, 100000, 500, 172000, 0, nil, nil); !ok || got != edge {
+			t.Errorf("%s at the bound: PriceMicros = (%d, %v), want (%d, true)", row.model, got, ok, edge)
+		}
+		// 272001 context: every count at the long rates.
+		long := int64(math.Round(100001*row.longIn + 500*row.longOut + 172000*row.longCached))
+		if got, ok := PriceMicros(row.model, 100001, 500, 172000, 0, nil, nil); !ok || got != long {
+			t.Errorf("%s above the bound: PriceMicros = (%d, %v), want (%d, true)", row.model, got, ok, long)
+		}
+	}
+	cases := []struct {
+		name, model string
+		write       int64
+		want        int64
+	}{
+		{"case and context tag", "GPT-6-Sol[1m]", 0, 2*1000 + 10*500 + 200*2000/1000},
+		{"a written token bills as input", "gpt-6-luna", 1000, int64(math.Round(1000*0.1 + 500*0.5 + 2000*0.01 + 1000*0.1))},
+	}
+	for _, c := range cases {
+		got, ok := PriceMicros(c.model, 1000, 500, 2000, c.write, nil, nil)
+		if !ok || got != c.want {
+			t.Errorf("%s: PriceMicros = (%d, %v), want (%d, true)", c.name, got, ok, c.want)
+		}
+	}
+	// A dotted id is not a dashed one: gpt-6-1-sol is no model.
+	if _, ok := PriceMicros("gpt-6-1-sol", 1, 1, 0, 0, nil, nil); ok {
+		t.Errorf("gpt-6-1-sol priced: a GPT id keeps its dots")
+	}
+	if _, ok := PriceMicros("gpt-9-nonesuch", 1, 1, 0, 0, nil, nil); ok {
+		t.Errorf("an unlisted GPT model priced")
 	}
 }

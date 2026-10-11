@@ -111,7 +111,10 @@ CREATE TABLE IF NOT EXISTS calls (
 	test_runner TEXT,
 	source TEXT,
 	config_dir TEXT,
-	seat_dir TEXT
+	seat_dir TEXT,
+	result_tokens INTEGER,
+	result_basis TEXT,
+	result_write_micros INTEGER
 );
 CREATE INDEX IF NOT EXISTS calls_session_agent_ts ON calls(session_id, agent_id, ts);
 CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts);
@@ -240,7 +243,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	config_dir_ts INTEGER,
 	host_ts INTEGER,
 	tz_name_ts INTEGER,
-	tz_offset_minutes_ts INTEGER
+	tz_offset_minutes_ts INTEGER,
+	ledger_offset INTEGER
 );
 CREATE TABLE IF NOT EXISTS command_parts (
 	tool_use_id TEXT NOT NULL,

@@ -1,12 +1,15 @@
 package callmeter
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -404,5 +407,400 @@ func TestPriceUnpricedPricesLegacyRows(t *testing.T) {
 	}
 	if r := row(t, store, "requests", "request_id = 'msg_unknown'"); r["cost_usd_micros"] != nil || r["cost_source"] != nil {
 		t.Errorf("unknown-model row = %v / %v, want NULL / NULL", r["cost_usd_micros"], r["cost_source"])
+	}
+}
+
+// holdAll stores every sample request a transcript holds, with its requestId:
+// the main chat's 1, 2 and 15 and the sub-agent's 4, 6, 12 and 14. The other
+// eight calls are side calls. A run over this store reads the same under the
+// report's whole-directory ingest and the hooks' per-session one.
+func (e *ledgerEnv) holdAll() {
+	e.t.Helper()
+	e.transcribe("", 1, 2, 15)
+	e.transcribe("a0000000000000002", 4, 6, 12, 14)
+	for _, n := range []int{1, 2, 4, 6, 12, 14, 15} {
+		e.storeRequest(n, true)
+	}
+}
+
+func (e *ledgerEnv) ingestSession(limit int64) LedgerSessionSummary {
+	e.t.Helper()
+	got, err := e.store.ingestLedgerSession(context.Background(), e.dir, ledgerSession, e.now, limit)
+	if err != nil {
+		e.t.Fatalf("ingestLedgerSession: %v", err)
+	}
+	return got
+}
+
+func (e *ledgerEnv) requestsDump() string {
+	e.t.Helper()
+	return keys(e.t, e.store.DB(), `SELECT request_id || '|' || COALESCE(session_id, '-') || '|' || COALESCE(agent_id, '-') || '|' || COALESCE(source, '-') || '|' ||
+		COALESCE(cost_usd_micros, -1) || '|' || COALESCE(cost_source, '-') || '|' || COALESCE(api_request_id, '-') || '|' ||
+		COALESCE(query_source, '-') || '|' || COALESCE(input_tokens, -1) FROM requests ORDER BY request_id`)
+}
+
+func (e *ledgerEnv) offset() int64 {
+	e.t.Helper()
+	var offset *int64
+	if err := e.store.DB().QueryRow("SELECT ledger_offset FROM sessions WHERE session_id = ?", ledgerSession).Scan(&offset); err != nil {
+		e.t.Fatal(err)
+	}
+	if offset == nil {
+		return -1
+	}
+	return *offset
+}
+
+func (e *ledgerEnv) append(lines ...string) {
+	e.t.Helper()
+	f, err := os.OpenFile(filepath.Join(e.dir, ledgerSession+".jsonl"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if _, err := f.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func byteLen(lines ...string) int64 {
+	var n int64
+	for _, l := range lines {
+		n += int64(len(l)) + 1
+	}
+	return n
+}
+
+// TestIngestLedgerSessionReadsOnlyNewBytesAndMatchesTheReportRun: the hooks'
+// ingest of one session's file, run as the file grows, leaves the store as the
+// report's whole-directory ingest of the same file does; it keeps its byte
+// offset in the store, reads nothing when no byte is new, and is idempotent
+// with the report run in either order.
+func TestIngestLedgerSessionReadsOnlyNewBytesAndMatchesTheReportRun(t *testing.T) {
+	hooks := newLedgerEnv(t)
+	hooks.holdAll()
+	report := newLedgerEnv(t)
+	report.holdAll()
+
+	hooks.writeLedger(ledgerSession, hooks.sample[:8]...)
+	report.writeLedger(ledgerSession, report.sample[:8]...)
+	first := hooks.ingestSession(LedgerReadCap)
+	report.ingest()
+	if first.Lines != 8 || first.Bytes != byteLen(hooks.sample[:8]...) || first.Faults != 0 || first.More {
+		t.Errorf("first run = %+v, want 8 lines of %d bytes, no faults, nothing more", first, byteLen(hooks.sample[:8]...))
+	}
+	if got := hooks.offset(); got != byteLen(hooks.sample[:8]...) {
+		t.Errorf("offset after the first run = %d, want %d", got, byteLen(hooks.sample[:8]...))
+	}
+	if h, r := hooks.requestsDump(), report.requestsDump(); h != r {
+		t.Errorf("after 8 lines the hooks' ingest differs from the report's:\nhooks  %s\nreport %s", h, r)
+	}
+
+	hooks.append(hooks.sample[8:]...)
+	report.append(report.sample[8:]...)
+	second := hooks.ingestSession(LedgerReadCap)
+	report.ingest()
+	if second.Lines != 7 || second.Bytes != byteLen(hooks.sample[8:]...) {
+		t.Errorf("second run = %+v, want only the 7 new lines (%d bytes)", second, byteLen(hooks.sample[8:]...))
+	}
+	if h, r := hooks.requestsDump(), report.requestsDump(); h != r {
+		t.Errorf("after 15 lines the hooks' ingest differs from the report's:\nhooks  %s\nreport %s", h, r)
+	}
+	if n, micros := hooks.sum("1 = 1"); n != 15 || micros != 1294100 {
+		t.Errorf("requests = %d rows, %d micros; want the sample's 15 calls and 1294100 micros", n, micros)
+	}
+
+	before := hooks.requestsDump()
+	third := hooks.ingestSession(LedgerReadCap)
+	if third.Bytes != 0 || third.Lines != 0 || hooks.requestsDump() != before {
+		t.Errorf("a run with no new byte = %+v, want nothing read and nothing changed", third)
+	}
+	// Idempotent with the report run, in this order and in the other.
+	hooks.ingest()
+	if after := hooks.requestsDump(); after != before {
+		t.Errorf("the report run after the hooks' changed the store:\nbefore %s\nafter  %s", before, after)
+	}
+	other := newLedgerEnv(t)
+	other.holdAll()
+	other.writeLedger(ledgerSession, other.sample...)
+	other.ingest()
+	settled := other.requestsDump()
+	other.ingestSession(LedgerReadCap)
+	if after := other.requestsDump(); after != settled {
+		t.Errorf("the hooks' run after the report's changed the store:\nbefore %s\nafter  %s", settled, after)
+	}
+}
+
+// TestIngestLedgerSessionDefersATornLastLine: a line the ledger writer has not
+// finished stays unread, the offset stopping before it; the next run reads it
+// whole.
+func TestIngestLedgerSessionDefersATornLastLine(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	torn := e.sample[3][:100]
+	if err := os.WriteFile(filepath.Join(e.dir, ledgerSession+".jsonl"),
+		[]byte(strings.Join(e.sample[:3], "\n")+"\n"+torn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := e.ingestSession(LedgerReadCap)
+	if got.Lines != 3 || got.Faults != 0 || e.offset() != byteLen(e.sample[:3]...) {
+		t.Errorf("run over a torn tail = %+v, offset %d; want 3 lines, no fault, offset %d", got, e.offset(), byteLen(e.sample[:3]...))
+	}
+	if n, _ := e.sum("1 = 1"); n != 7+1 {
+		t.Errorf("requests = %d, want the 7 held plus side call 3", n)
+	}
+	// The next hook meets only the torn line again: it writes nothing, so it
+	// takes no write lock beside the hook's own.
+	changes := func() (n int64) {
+		if err := e.store.DB().QueryRow("SELECT total_changes()").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := changes()
+	if got = e.ingestSession(LedgerReadCap); got.Lines != 0 || changes() != before {
+		t.Errorf("run over the torn tail alone = %+v with %d rows written, want nothing read and nothing written", got, changes()-before)
+	}
+	e.append(e.sample[3][100:]) // the writer finishes line 4
+	got = e.ingestSession(LedgerReadCap)
+	if got.Lines != 1 || got.Faults != 0 || e.offset() != byteLen(e.sample[:4]...) {
+		t.Errorf("run after the line completed = %+v, offset %d; want 1 line, no fault, offset %d", got, e.offset(), byteLen(e.sample[:4]...))
+	}
+}
+
+// TestIngestLedgerSessionCapsEveryRead: a run reads at most its cap; the rest
+// of a larger file waits for the next run, and the runs together end where the
+// report run does. A line longer than the cap is a fault, not a stall.
+func TestIngestLedgerSessionCapsEveryRead(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	report := newLedgerEnv(t)
+	report.holdAll()
+	e.writeLedger(ledgerSession, e.sample...)
+	report.writeLedger(ledgerSession, report.sample...)
+	report.ingest()
+	limit := byteLen(e.sample[:3]...) + 10 // three lines and a part of the fourth
+	runs := 0
+	for {
+		got := e.ingestSession(limit)
+		runs++
+		if got.Bytes > limit {
+			t.Fatalf("run %d read %d bytes, over its cap of %d", runs, got.Bytes, limit)
+		}
+		if !got.More {
+			break
+		}
+		if runs > 15 {
+			t.Fatal("the offset does not advance")
+		}
+	}
+	if runs < 5 {
+		t.Errorf("a %d-byte file read in %d runs of %d bytes, want at least 5", byteLen(e.sample...), runs, limit)
+	}
+	if h, r := e.requestsDump(), report.requestsDump(); h != r {
+		t.Errorf("capped runs differ from the report's:\nhooks  %s\nreport %s", h, r)
+	}
+
+	long := newLedgerEnv(t)
+	long.holdAll()
+	long.writeLedger(ledgerSession, strings.Repeat("x", 3000))
+	got := long.ingestSession(1000)
+	if got.Faults != 1 || long.offset() != 1000 {
+		t.Errorf("a line over the cap = %+v, offset %d; want one fault and the offset past the cap", got, long.offset())
+	}
+}
+
+// TestIngestLedgerSessionLedgerIsOptionalData: no directory, no file, a file
+// that shrank, a path that is no regular file and a session id that is no file
+// name are never a smaller number, a hang or a read outside the directory.
+func TestIngestLedgerSessionLedgerIsOptionalData(t *testing.T) {
+	ctx := context.Background()
+	e := newLedgerEnv(t)
+	e.holdAll()
+	for _, dir := range []string{"", filepath.Join(e.dir, "absent")} {
+		if got, err := e.store.IngestLedgerSession(ctx, dir, ledgerSession, e.now); err != nil || got.Present {
+			t.Errorf("IngestLedgerSession(%q) = %+v, %v; want no ledger, no error", dir, got, err)
+		}
+	}
+	if got, err := e.store.IngestLedgerSession(ctx, e.dir, ledgerSession, e.now); err != nil || got.Present {
+		t.Errorf("a session with no file = %+v, %v; want no ledger, no error", got, err)
+	}
+	for _, bad := range []string{"", ".", "..", "../" + ledgerSession, "a/b", strings.Repeat("a", 200)} {
+		if _, err := e.store.IngestLedgerSession(ctx, e.dir, bad, e.now); err == nil {
+			t.Errorf("session id %q was read as a file name", bad)
+		}
+	}
+
+	// A named pipe where the file should be: refused before it can block a hook.
+	fifo := filepath.Join(e.dir, "pipe-session.jsonl")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(e.dir, "dir-session.jsonl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range []string{"pipe-session", "dir-session"} {
+		done := make(chan error, 1)
+		go func() {
+			_, err := e.store.IngestLedgerSession(ctx, e.dir, session, e.now)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s: a path that is no regular file was read", session)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the ingest blocked on a path that is no regular file", session)
+		}
+	}
+
+	// A file that shrank below the offset is read again from its start.
+	e.writeLedger(ledgerSession, e.sample[:5]...)
+	e.ingestSession(LedgerReadCap)
+	e.writeLedger(ledgerSession, e.sample[:2]...)
+	before := e.requestsDump()
+	got := e.ingestSession(LedgerReadCap)
+	if !got.Reset || got.Lines != 2 || e.offset() != byteLen(e.sample[:2]...) || e.requestsDump() != before {
+		t.Errorf("run after the file shrank = %+v, offset %d; want a reset, 2 lines read again, offset %d, nothing changed",
+			got, e.offset(), byteLen(e.sample[:2]...))
+	}
+}
+
+// TestIngestLedgerSessionCountsBadLinesAndKeepsALedgerPrice: a line that is no
+// JSON object is a counted fault the offset passes; a worse line of a call
+// whose ledger price is stored never takes it back to the table's.
+func TestIngestLedgerSessionCountsBadLinesAndKeepsALedgerPrice(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	e.writeLedger(ledgerSession, e.sample[6], `["not","an","object"]`, `{"request_id":"req_torn"`)
+	got := e.ingestSession(LedgerReadCap)
+	if got.Faults != 2 || got.Lines != 3 || e.offset() != byteLen(e.sample[6], `["not","an","object"]`, `{"request_id":"req_torn"`) {
+		t.Errorf("run = %+v, offset %d; want 2 faults over 3 lines and the offset past them", got, e.offset())
+	}
+	e.append(e.line(7, map[string]any{"cost_usd_micros": nil, "join": "span"}))
+	e.ingestSession(LedgerReadCap)
+	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(7)); r["cost_source"] != "ledger" || r["cost_usd_micros"] != int64(73956) {
+		t.Errorf("row 7 = %v from %v after a span-only line, want 73956 from the ledger", r["cost_usd_micros"], r["cost_source"])
+	}
+}
+
+// TestIngestLedgerSessionNeedsTheSessionsRow: the offset lives on the session's
+// row; a session the store does not know is left alone, not half-read.
+func TestIngestLedgerSessionNeedsTheSessionsRow(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.writeLedger(ledgerSession, e.sample[:3]...)
+	got := e.ingestSession(LedgerReadCap)
+	if got.Lines != 0 || count(t, e.store, "requests") != 0 {
+		t.Errorf("run with no sessions row = %+v with %d requests, want nothing read", got, count(t, e.store, "requests"))
+	}
+}
+
+// TestIngestLedgerSessionRequestWrittenAfterItsLedgerLine: a ledger line read
+// before its transcript request was written is stored as a side call row; the
+// request, written next, takes the row's price and replaces it, so the call
+// counts once.
+func TestIngestLedgerSessionRequestWrittenAfterItsLedgerLine(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.transcribe("", 15)
+	e.writeLedger(ledgerSession, e.sample[14])
+	e.ingestSession(LedgerReadCap)
+	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(15)); r == nil || r["source"] != "ledger" {
+		t.Fatalf("the unmatched line is no side call row: %v", r)
+	}
+	e.storeRequest(15, true)
+	if n, micros := e.sum("1 = 1"); n != 1 || micros != 31036 {
+		t.Errorf("after the request: %d rows, %d micros; want one row at the ledger's 31036", n, micros)
+	}
+	if r := row(t, e.store, "requests", "request_id = 'msg_invented_15'"); r["cost_source"] != "ledger" || r["query_source"] == nil {
+		t.Errorf("request 15 = %v from %v, query %v; want the ledger's price and query source", r["cost_usd_micros"], r["cost_source"], r["query_source"])
+	}
+	before := e.requestsDump()
+	e.ingest() // the report run finds nothing to change
+	if after := e.requestsDump(); after != before {
+		t.Errorf("the report run changed the store:\nbefore %s\nafter  %s", before, after)
+	}
+}
+
+// writeBigLedger writes a ledger of about size bytes: sample row 7's line
+// repeated under distinct request ids.
+func (e *ledgerEnv) writeBigLedger(size int64) {
+	e.t.Helper()
+	file, err := os.Create(filepath.Join(e.dir, ledgerSession+".jsonl"))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	w := bufio.NewWriterSize(file, 1<<20)
+	template := e.sample[6]
+	for n, written := 0, int64(0); written < size; n++ {
+		line := strings.Replace(template, sampleRequestID(7), fmt.Sprintf("req_big%012d", n), 1) + "\n"
+		if _, err := w.WriteString(line); err != nil {
+			e.t.Fatal(err)
+		}
+		written += int64(len(line))
+	}
+	if err := errors.Join(w.Flush(), file.Close()); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// TestIngestLedgerSessionStaysWithinItsCapOnAHugeLedger: a hook meeting a
+// ledger far larger than its cap reads the cap and no more, and a run with no
+// new byte costs a stat and a lookup, nowhere near a read.
+func TestIngestLedgerSessionStaysWithinItsCapOnAHugeLedger(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.holdAll()
+	e.writeBigLedger(24 << 20)
+	got := e.ingestSession(LedgerReadCap)
+	if got.Bytes > LedgerReadCap || !got.More || got.Lines < 1000 {
+		t.Fatalf("run over a 24 MiB ledger = %+v, want at most %d bytes read, more waiting", got, LedgerReadCap)
+	}
+	// Catch the offset up to the end, then time the hook with no new byte.
+	for e.ingestSession(LedgerReadCap).More {
+	}
+	const runs = 200
+	began := time.Now()
+	for range runs {
+		if again := e.ingestSession(LedgerReadCap); again.Bytes != 0 || again.Lines != 0 {
+			t.Fatalf("a run with no new byte = %+v", again)
+		}
+	}
+	if per := time.Since(began) / runs; per > 5*time.Millisecond {
+		t.Errorf("a hook's ingest with no new byte took %v, want a few milliseconds at most", per)
+	}
+}
+
+func BenchmarkIngestLedgerSessionNoNewBytes(b *testing.B) {
+	root := b.TempDir()
+	store, err := OpenDB(context.Background(), filepath.Join(root, "callmeter.db"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	dir := filepath.Join(root, "ledger")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		b.Fatal(err)
+	}
+	raw, err := os.ReadFile("testdata/ledger/sample-15.jsonl")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ledgerSession+".jsonl"), raw, 0o600); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := store.DB().Exec("INSERT INTO sessions (session_id) VALUES (?)", ledgerSession); err != nil {
+		b.Fatal(err)
+	}
+	now := time.Date(2026, 10, 9, 19, 0, 0, 0, time.UTC)
+	if _, err := store.IngestLedgerSession(context.Background(), dir, ledgerSession, now); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for range b.N {
+		if _, err := store.IngestLedgerSession(context.Background(), dir, ledgerSession, now); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

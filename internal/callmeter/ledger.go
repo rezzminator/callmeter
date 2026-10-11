@@ -137,8 +137,7 @@ func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (Le
 	}
 	var side []ledgerRow
 	var overlay []ledgerRow
-	type fill struct{ apiID, messageID string }
-	var fills []fill
+	var fills []ledgerFill
 	for _, r := range rows {
 		stored, isKnown := known[r.id]
 		switch {
@@ -149,7 +148,7 @@ func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (Le
 			if _, held := scanned.held[r.id]; held && scanned.twin(r.id) {
 				sum.Held++
 				overlay = append(overlay, r)
-				fills = append(fills, fill{r.id, scanned.held[r.id]})
+				fills = append(fills, ledgerFill{r.id, scanned.held[r.id]})
 				continue
 			}
 			side = append(side, r)
@@ -162,47 +161,56 @@ func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (Le
 			sum.Held++
 			if scanned.stored[messageID] {
 				overlay = append(overlay, r)
-				fills = append(fills, fill{r.id, messageID})
+				fills = append(fills, ledgerFill{r.id, messageID})
 			} else {
 				sum.HeldUnrecorded++
 			}
 		}
 	}
 	sum.Side = len(side)
-	err = s.Batch(ctx, func(tx *Tx) error {
-		for _, f := range fills {
-			if _, err := tx.tx.ExecContext(ctx,
-				`UPDATE requests SET api_request_id = ?1 WHERE request_id = ?2 AND api_request_id IS NULL AND source IS NOT ?3`,
-				f.apiID, f.messageID, SourceLedger); err != nil {
-				return fmt.Errorf("callmeter store %s: give request %q its requestId: %w", s.path, f.messageID, err)
-			}
-		}
-		for _, r := range overlay {
-			if _, err := tx.tx.ExecContext(ctx,
-				`DELETE FROM requests WHERE request_id = ?1 AND source = ?2
-				AND EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?2)`,
-				r.id, SourceLedger); err != nil {
-				return fmt.Errorf("callmeter store %s: drop ledger row %q held by a transcript: %w", s.path, r.id, err)
-			}
-			if r.Cost == nil {
-				continue
-			}
-			if _, err := tx.tx.ExecContext(ctx,
-				`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2, query_source = ?3
-				WHERE api_request_id = ?4 AND source IS NOT ?2
-				AND (cost_source IS NOT ?2 OR cost_usd_micros IS NOT ?1 OR query_source IS NOT ?3)`,
-				*r.Cost, SourceLedger, nullablePtr(r.QuerySource), r.id); err != nil {
-				return fmt.Errorf("callmeter store %s: price request of %q from the ledger: %w", s.path, r.id, err)
-			}
-		}
-		for _, r := range side {
-			if err := tx.upsertSideCall(ctx, r); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	err = s.Batch(ctx, func(tx *Tx) error { return tx.applyLedger(ctx, fills, overlay, side) })
 	return sum, err
+}
+
+// ledgerFill gives the stored transcript request messageID the requestId apiID.
+type ledgerFill struct{ apiID, messageID string }
+
+// applyLedger writes what an ingest decided, in the order the report run
+// settled on: the requestIds of the transcript requests that lack theirs, the
+// ledger price (and the drop of a ledger row a transcript request now holds)
+// for each held call, and each side call as a 'ledger' request.
+func (t *Tx) applyLedger(ctx context.Context, fills []ledgerFill, overlay, side []ledgerRow) error {
+	for _, f := range fills {
+		if _, err := t.tx.ExecContext(ctx,
+			`UPDATE requests SET api_request_id = ?1 WHERE request_id = ?2 AND api_request_id IS NULL AND source IS NOT ?3`,
+			f.apiID, f.messageID, SourceLedger); err != nil {
+			return fmt.Errorf("callmeter store %s: give request %q its requestId: %w", t.path, f.messageID, err)
+		}
+	}
+	for _, r := range overlay {
+		if _, err := t.tx.ExecContext(ctx,
+			`DELETE FROM requests WHERE request_id = ?1 AND source = ?2
+			AND EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?2)`,
+			r.id, SourceLedger); err != nil {
+			return fmt.Errorf("callmeter store %s: drop ledger row %q held by a transcript: %w", t.path, r.id, err)
+		}
+		if r.Cost == nil {
+			continue
+		}
+		if _, err := t.tx.ExecContext(ctx,
+			`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2, query_source = ?3
+			WHERE api_request_id = ?4 AND source IS NOT ?2
+			AND (cost_source IS NOT ?2 OR cost_usd_micros IS NOT ?1 OR query_source IS NOT ?3)`,
+			*r.Cost, SourceLedger, nullablePtr(r.QuerySource), r.id); err != nil {
+			return fmt.Errorf("callmeter store %s: price request of %q from the ledger: %w", t.path, r.id, err)
+		}
+	}
+	for _, r := range side {
+		if err := t.upsertSideCall(ctx, r); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // nullablePtr is an optional string as a bound value: NULL when it is absent or empty.
@@ -553,7 +561,9 @@ func scanRequestIDs(path string) (map[string]string, error) {
 
 // PriceUnpriced prices from the table every settled request that has no price
 // yet (a row stored before the price columns existed), and counts the settled
-// requests of a model the table does not list, which stay unpriced.
+// requests of a model the table does not list, which stay unpriced. It never
+// prices a GPT row (neither counts it): the price is forward only, and every
+// GPT request stored before the list named its models keeps its NULL.
 func (s *Store) PriceUnpriced(ctx context.Context) (priced, unpriced int, err error) {
 	if !s.complete {
 		return 0, 0, nil
@@ -567,7 +577,7 @@ func (s *Store) PriceUnpriced(ctx context.Context) (priced, unpriced int, err er
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT request_id, model, input_tokens, output_tokens, COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
 			cache_creation_5m_tokens, cache_creation_1h_tokens
-		FROM requests WHERE cost_source IS NULL AND COALESCE(pending, 0) = 0 AND model IS NOT NULL AND model != ''
+		FROM requests WHERE cost_source IS NULL AND COALESCE(pending, 0) = 0 AND model IS NOT NULL AND model != '' AND lower(model) NOT LIKE 'gpt-%'
 		AND input_tokens IS NOT NULL AND output_tokens IS NOT NULL`)
 	if err != nil {
 		return 0, 0, fmt.Errorf("callmeter store %s: list requests to price: %w", s.path, err)

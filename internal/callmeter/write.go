@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -322,8 +323,44 @@ func (s *Store) ReplaceCommandParts(ctx context.Context, toolUseID string, parts
 	return s.Batch(ctx, func(tx *Tx) error { return tx.ReplaceCommandParts(ctx, toolUseID, parts) })
 }
 
-// UpsertCall writes c's provided columns by tool_use_id.
+// UpsertCall writes c's provided columns by tool_use_id. A call given its
+// request or its delivered size sets its request's call results again
+// (refreshCallResults), and those of a request it no longer names.
 func (t *Tx) UpsertCall(ctx context.Context, c Call, mode Mode) error {
+	if !t.complete || (c.RequestID == nil && c.BytesDelivered == nil) {
+		return t.upsertCall(ctx, c, mode)
+	}
+	before, err := t.callRequest(ctx, c.ToolUseID)
+	if err != nil {
+		return err
+	}
+	if err := t.upsertCall(ctx, c, mode); err != nil {
+		return err
+	}
+	after, err := t.callRequest(ctx, c.ToolUseID)
+	if err != nil {
+		return err
+	}
+	if before != after {
+		if err := t.refreshCallResults(ctx, before); err != nil {
+			return err
+		}
+	}
+	return t.refreshCallResults(ctx, after)
+}
+
+// callRequest is the request call toolUseID names, "" when none or no row.
+func (t *Tx) callRequest(ctx context.Context, toolUseID string) (string, error) {
+	var request sql.NullString
+	err := t.tx.QueryRowContext(ctx, "SELECT request_id FROM calls WHERE tool_use_id = ?", toolUseID).Scan(&request)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("callmeter store %s: read the request of call %q: %w", t.path, toolUseID, err)
+	}
+	return request.String, nil
+}
+
+// upsertCall is UpsertCall's write of the row.
+func (t *Tx) upsertCall(ctx context.Context, c Call, mode Mode) error {
 	if c.Cwd == nil && c.Input == nil {
 		return t.upsert(ctx, "calls", "tool_use_id", c.ToolUseID, c.columns(), mode)
 	}
@@ -357,26 +394,34 @@ func (t *Tx) UpsertRequest(ctx context.Context, r Request, mode Mode) error {
 	if err := t.priceRequest(ctx, r.RequestID); err != nil {
 		return err
 	}
+	if err := t.writeCallResults(ctx, r.RequestID); err != nil {
+		return err
+	}
 	return t.writeIterations(ctx, r.RequestID, r.Iterations, mode)
 }
 
-// priceRequest sets the cost of the stored request from the price table, at the
-// tokens the row holds after its merge: cost_source 'table', or NULL and NULL
-// for a model the table does not list, a row with no model or no input and
-// output count, and a provisional row. A price the cost ledger gave
-// (cost_source 'ledger') is Claude Code's own and stays. A store without the
-// cost columns (Store.SchemaComplete false) is left alone.
+// priceRequest sets the cost of the stored request when it is written, at the
+// tokens the row holds after its merge. Claude Code's own price comes first:
+// a price the cost ledger gave (cost_source 'ledger') stays, and a ledger row
+// already stored under the request's API request id (a side call row, written
+// when the ledger line arrived before the request) gives its price and query
+// source to the request and goes, the transcript row being the call. Else the
+// embedded price list prices it (cost_source 'table'; an OpenAI model's price
+// is a list-equivalent), and NULL and NULL stand for a model the list does not
+// name, a row with no model or no input and output count, and a provisional
+// row. A store without the cost columns (Store.SchemaComplete false) is left
+// alone.
 func (t *Tx) priceRequest(ctx context.Context, requestID string) error {
 	if !t.complete {
 		return nil
 	}
-	var model, source sql.NullString
+	var model, source, apiID sql.NullString
 	var input, output, read, create, write5m, write1h, pending, micros sql.NullInt64
 	err := t.tx.QueryRowContext(ctx,
 		`SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-			cache_creation_5m_tokens, cache_creation_1h_tokens, pending, cost_usd_micros, cost_source
+			cache_creation_5m_tokens, cache_creation_1h_tokens, pending, cost_usd_micros, cost_source, api_request_id
 		FROM requests WHERE request_id = ?`, requestID).
-		Scan(&model, &input, &output, &read, &create, &write5m, &write1h, &pending, &micros, &source)
+		Scan(&model, &input, &output, &read, &create, &write5m, &write1h, &pending, &micros, &source, &apiID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -385,6 +430,12 @@ func (t *Tx) priceRequest(ctx context.Context, requestID string) error {
 	}
 	if source.String == SourceLedger {
 		return nil
+	}
+	if apiID.String != "" && apiID.String != requestID {
+		adopted, err := t.adoptLedgerRow(ctx, requestID, apiID.String)
+		if err != nil || adopted {
+			return err
+		}
 	}
 	var priced any
 	var pricedSource any
@@ -406,6 +457,43 @@ func (t *Tx) priceRequest(ctx context.Context, requestID string) error {
 		return fmt.Errorf("callmeter store %s: price request %q: %w", t.path, requestID, err)
 	}
 	return nil
+}
+
+// adoptLedgerRow takes over the 'ledger' requests row keyed by apiID, the
+// side-call row the cost ledger's line made before the transcript request
+// requestID was written: its query source goes to the request, the row goes,
+// and when Claude Code priced it (cost_source 'ledger') that price goes to the
+// request too, reported as adopted. A row the ledger could only table-price
+// carries nothing the request lacks.
+func (t *Tx) adoptLedgerRow(ctx context.Context, requestID, apiID string) (adopted bool, err error) {
+	var micros sql.NullInt64
+	var costSource, querySource sql.NullString
+	err = t.tx.QueryRowContext(ctx,
+		`SELECT cost_usd_micros, cost_source, query_source FROM requests WHERE request_id = ? AND source = ?`,
+		apiID, SourceLedger).Scan(&micros, &costSource, &querySource)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: read the ledger row %q of request %q: %w", t.path, apiID, requestID, err)
+	}
+	if _, err := t.tx.ExecContext(ctx, `DELETE FROM requests WHERE request_id = ? AND source = ?`, apiID, SourceLedger); err != nil {
+		return false, fmt.Errorf("callmeter store %s: drop the ledger row %q held by request %q: %w", t.path, apiID, requestID, err)
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE requests SET query_source = COALESCE(?1, query_source) WHERE request_id = ?2`,
+		querySource, requestID); err != nil {
+		return false, fmt.Errorf("callmeter store %s: give request %q its query source: %w", t.path, requestID, err)
+	}
+	if !micros.Valid || costSource.String != SourceLedger {
+		return false, nil
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2 WHERE request_id = ?3`,
+		micros.Int64, SourceLedger, requestID); err != nil {
+		return false, fmt.Errorf("callmeter store %s: price request %q from the ledger: %w", t.path, requestID, err)
+	}
+	return true, nil
 }
 
 // iterationColumns are the request_iterations columns an iteration provides,
@@ -559,6 +647,22 @@ func (t *Tx) ResolveRequest(ctx context.Context, provisionalID string, r Request
 	if _, err := t.tx.ExecContext(ctx, merge, r.RequestID, provisionalID); err != nil {
 		return fmt.Errorf("callmeter store %s: merge request %q into %q: %w", t.path, provisionalID, r.RequestID, err)
 	}
+	// The request before the provisional one had it as its next: once it goes,
+	// that request's calls are set again from their new next.
+	var before string
+	if t.complete {
+		if provisional, ok, err := t.streamRowOf(ctx, provisionalID); err != nil {
+			return err
+		} else if ok && provisional.inStream() {
+			previous, ok, err := t.neighbour(ctx, provisional, previousRequestSQL)
+			if err != nil {
+				return err
+			}
+			if ok {
+				before = previous.id
+			}
+		}
+	}
 	if provisionalID != r.RequestID {
 		if _, err := t.tx.ExecContext(ctx, "DELETE FROM requests WHERE request_id = ?", provisionalID); err != nil {
 			return fmt.Errorf("callmeter store %s: delete provisional request %q: %w", t.path, provisionalID, err)
@@ -575,6 +679,14 @@ func (t *Tx) ResolveRequest(ctx context.Context, provisionalID string, r Request
 		provisionalID,
 	); err != nil {
 		return fmt.Errorf("callmeter store %s: point calls of %q at %q: %w", t.path, provisionalID, r.RequestID, err)
+	}
+	if before != r.RequestID {
+		if err := t.refreshCallResults(ctx, before); err != nil {
+			return err
+		}
+	}
+	if err := t.refreshCallResults(ctx, r.RequestID); err != nil {
+		return err
 	}
 	return t.RecountRequest(ctx, r.RequestID)
 }
@@ -694,14 +806,29 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 	if err := t.priceRequest(ctx, r.RequestID); err != nil {
 		return err
 	}
+	if err := t.writeCallResults(ctx, r.RequestID); err != nil {
+		return err
+	}
 	if err := t.writeIterations(ctx, r.RequestID, r.Iterations, mode); err != nil {
 		return err
 	}
+	var pointed int64
 	for _, id := range toolUseIDs {
-		if _, err := t.tx.ExecContext(ctx,
+		result, err := t.tx.ExecContext(ctx,
 			"UPDATE calls SET request_id = ? WHERE tool_use_id = ? AND request_id IS NULL", r.RequestID, id,
-		); err != nil {
+		)
+		if err != nil {
 			return fmt.Errorf("callmeter store %s: point call %q at request %q: %w", t.path, id, r.RequestID, err)
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("callmeter store %s: point call %q at request %q: %w", t.path, id, r.RequestID, err)
+		}
+		pointed += n
+	}
+	if pointed > 0 {
+		if err := t.refreshCallResults(ctx, r.RequestID); err != nil {
+			return err
 		}
 	}
 	return t.RecountRequest(ctx, r.RequestID)
@@ -1168,4 +1295,236 @@ func (t *Tx) PutMarks(ctx context.Context, sessionID, agentID, seatDir string, n
 		}
 	}
 	return nil
+}
+
+// compactionDrop is how far a stream's context may fall between two requests
+// before the fall is read as a compaction: the growth of the calls' results is
+// then unknown, not zero.
+const compactionDrop = 5000
+
+// previousRequestSQL and nextRequestSQL find the stream's request just before
+// and just after the one at ?3: ?1 the session, ?2 the agent (NULL for the
+// main chat), ?4 the request itself. A provisional request is a neighbour (it
+// stands between two others until it resolves); a side call row of the cost
+// ledger is not, and neither is a request of the same ts.
+const (
+	previousRequestSQL = `SELECT request_id FROM requests
+	WHERE session_id = ?1 AND agent_id IS ?2 AND ts < ?3 AND request_id != ?4
+	AND source IS NOT 'ledger' ORDER BY ts DESC LIMIT 1`
+	nextRequestSQL = `SELECT request_id FROM requests
+	WHERE session_id = ?1 AND agent_id IS ?2 AND ts > ?3 AND request_id != ?4
+	AND source IS NOT 'ledger' ORDER BY ts ASC LIMIT 1`
+)
+
+// requestCallsSQL lists the calls a request issued by tool_use_id, the order
+// the split hands out its rounding in, which no later column fill can move.
+const requestCallsSQL = `SELECT tool_use_id, bytes_delivered FROM calls WHERE request_id = ?1 ORDER BY tool_use_id`
+
+// streamRow is the stored row of a request as its stream's call results
+// read it.
+type streamRow struct {
+	id                                                                  string
+	session, agent, model, source                                       sql.NullString
+	ts, context, output, input, read, create, write5m, write1h, pending sql.NullInt64
+	cost                                                                sql.NullInt64
+}
+
+// inStream reports whether the request belongs to a stream: a session and a
+// ts, and no side call row of the cost ledger.
+func (r streamRow) inStream() bool {
+	return r.session.Valid && r.ts.Valid && r.source.String != SourceLedger
+}
+
+// settled reports whether the request is a resolved one: not provisional.
+func (r streamRow) settled() bool {
+	return r.pending.Int64 == 0 && !strings.HasPrefix(r.id, PendingPrefix)
+}
+
+// streamRowOf reads request requestID, ok false when it has no row.
+func (t *Tx) streamRowOf(ctx context.Context, requestID string) (streamRow, bool, error) {
+	r := streamRow{id: requestID}
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT session_id, agent_id, ts, model, context_tokens, output_tokens, input_tokens, cache_read_tokens, cache_creation_tokens,
+			cache_creation_5m_tokens, cache_creation_1h_tokens, pending, source, cost_usd_micros
+		FROM requests WHERE request_id = ?`, requestID).
+		Scan(&r.session, &r.agent, &r.ts, &r.model, &r.context, &r.output, &r.input, &r.read, &r.create,
+			&r.write5m, &r.write1h, &r.pending, &r.source, &r.cost)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, fmt.Errorf("callmeter store %s: read request %q for its stream's call results: %w", t.path, requestID, err)
+	}
+	return r, true, nil
+}
+
+// neighbour is the stream request next to r, before it (previousRequestSQL)
+// or after it (nextRequestSQL), ok false at the stream's end.
+func (t *Tx) neighbour(ctx context.Context, r streamRow, query string) (streamRow, bool, error) {
+	var id string
+	err := t.tx.QueryRowContext(ctx, query, r.session.String, nullableString(r.agent), r.ts.Int64, r.id).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return streamRow{}, false, nil
+	}
+	if err != nil {
+		return streamRow{}, false, fmt.Errorf("callmeter store %s: find the request next to %q: %w", t.path, r.id, err)
+	}
+	return t.streamRowOf(ctx, id)
+}
+
+// writeCallResults, run when request requestID is written, sets what the
+// results of the calls on both sides of it cost the context: the calls of the
+// stream's previous request, which this one follows, and its own calls, which
+// the stream's next request follows (fillCallResults). Both sides are written
+// because async hooks store a stream's requests in any order: whichever of two
+// neighbours lands last fills the pair, so the values are those of the stored
+// rows, never of their arrival. A request outside a stream writes nothing.
+func (t *Tx) writeCallResults(ctx context.Context, requestID string) error {
+	if !t.complete {
+		return nil
+	}
+	r, ok, err := t.streamRowOf(ctx, requestID)
+	if err != nil || !ok || !r.inStream() {
+		return err
+	}
+	previous, ok, err := t.neighbour(ctx, r, previousRequestSQL)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if err := t.fillCallResults(ctx, previous, &r); err != nil {
+			return err
+		}
+	}
+	return t.callResultsOf(ctx, r)
+}
+
+// refreshCallResults, run when a call of request requestID gains or loses its
+// link to it or its delivered size, sets the results of that request's calls
+// again from the stream's next request.
+func (t *Tx) refreshCallResults(ctx context.Context, requestID string) error {
+	if !t.complete || requestID == "" {
+		return nil
+	}
+	r, ok, err := t.streamRowOf(ctx, requestID)
+	if err != nil || !ok || !r.inStream() {
+		return err
+	}
+	return t.callResultsOf(ctx, r)
+}
+
+// callResultsOf sets the results of r's calls from the stream's request after r.
+func (t *Tx) callResultsOf(ctx context.Context, r streamRow) error {
+	next, ok, err := t.neighbour(ctx, r, nextRequestSQL)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return t.fillCallResults(ctx, r, nil)
+	}
+	return t.fillCallResults(ctx, r, &next)
+}
+
+// fillCallResults gives the calls request r issued what their results cost the
+// context, read from next, the stream's request after r: result_tokens, the
+// growth of the context from r to next past r's output (clamped at 0; NULL
+// when the context fell by more than compactionDrop, a compaction, or a count
+// is unknown), result_basis ('exact' when r issued one call; 'split' when it
+// issued several, the tokens divided by each call's bytes_delivered, NULL
+// tokens when a size is unknown), and result_write_micros, those tokens at
+// next's average cache-write price (NULL when next carries no price). With no
+// next yet, or either request provisional, the growth is not known and all
+// three are NULL: a provisional request stands between the two it will
+// separate once resolved. Indexed lookups only, since a hook runs this under
+// the store's write lock.
+func (t *Tx) fillCallResults(ctx context.Context, r streamRow, next *streamRow) error {
+	type issued struct {
+		id        string
+		delivered sql.NullInt64
+	}
+	var calls []issued
+	rows, err := t.tx.QueryContext(ctx, requestCallsSQL, r.id)
+	if err != nil {
+		return fmt.Errorf("callmeter store %s: list the calls of request %q: %w", t.path, r.id, err)
+	}
+	for rows.Next() {
+		var c issued
+		if err := rows.Scan(&c.id, &c.delivered); err != nil {
+			return errors.Join(fmt.Errorf("callmeter store %s: read a call of request %q: %w", t.path, r.id, err), rows.Close())
+		}
+		calls = append(calls, c)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return fmt.Errorf("callmeter store %s: list the calls of request %q: %w", t.path, r.id, err)
+	}
+	if len(calls) == 0 {
+		return nil
+	}
+	shares := make([]*int64, len(calls))
+	var basis any
+	var perToken float64
+	priced := false
+	if next != nil && r.settled() && next.settled() {
+		var growth *int64
+		if next.context.Valid && r.context.Valid && r.output.Valid {
+			if delta := next.context.Int64 - r.context.Int64 - r.output.Int64; delta >= -compactionDrop {
+				growth = Ptr(max(delta, 0))
+			}
+		}
+		if next.cost.Valid && next.model.Valid && next.input.Valid {
+			var w5, w1 *int64
+			if next.write5m.Valid {
+				w5 = &next.write5m.Int64
+			}
+			if next.write1h.Valid {
+				w1 = &next.write1h.Int64
+			}
+			perToken, priced = WritePriceMicros(next.model.String, next.input.Int64, next.read.Int64, next.create.Int64, w5, w1)
+		}
+		if len(calls) == 1 {
+			basis, shares[0] = "exact", growth
+		} else {
+			basis = "split"
+			var total int64
+			known := true
+			for _, c := range calls {
+				known = known && c.delivered.Valid
+				total += c.delivered.Int64
+			}
+			if growth != nil && known && total > 0 {
+				var seen, given int64
+				for i, c := range calls {
+					seen += c.delivered.Int64
+					upTo := int64(math.Round(float64(*growth) * float64(seen) / float64(total)))
+					shares[i] = Ptr(upTo - given)
+					given = upTo
+				}
+			}
+		}
+	}
+	for i, c := range calls {
+		var micros any
+		if shares[i] != nil && priced {
+			micros = int64(math.Round(float64(*shares[i]) * perToken))
+		}
+		var tokens any
+		if shares[i] != nil {
+			tokens = *shares[i]
+		}
+		if _, err := t.tx.ExecContext(ctx,
+			`UPDATE calls SET result_tokens = ?1, result_basis = ?2, result_write_micros = ?3 WHERE tool_use_id = ?4
+			AND (result_tokens IS NOT ?1 OR result_basis IS NOT ?2 OR result_write_micros IS NOT ?3)`,
+			tokens, basis, micros, c.id); err != nil {
+			return fmt.Errorf("callmeter store %s: give call %q the cost of its result: %w", t.path, c.id, err)
+		}
+	}
+	return nil
+}
+
+// nullableString is a nullable string column as a bound value.
+func nullableString(s sql.NullString) any {
+	if !s.Valid {
+		return nil
+	}
+	return s.String
 }

@@ -468,7 +468,41 @@ func runCallmeter(
 		return run.store.SessionModel(run.ctx, run.payload.SessionID)
 	})
 	run.record()
+	run.ingestLedger()
 	return 0
+}
+
+// ingestLedger, after the hooks that settle a session's requests (the main
+// chat's Stop, a sub-agent's SubagentStop and SessionEnd) have written them,
+// brings the new lines of the session's cost-ledger file into the store
+// (Store.IngestLedgerSession), so Claude Code's own price of each call is
+// stored without a report run. The ledger is optional data: no directory or
+// file is nothing to do, and a ledger that cannot be read is a parse fault at
+// most; a busy store is only logged, the next hook or report run reads the
+// same bytes. SessionEnd skips it once its budget is spent.
+func (run *callmeterRun) ingestLedger() {
+	switch run.payload.HookEventName {
+	case eventStop, callmeter.EventSubagentStop, callmeter.EventSessionEnd:
+	default:
+		return
+	}
+	if run.gaveUp || run.store == nil || run.payload.SessionID == "" || (!run.deadline.IsZero() && run.spent()) {
+		return
+	}
+	dir, err := paths.CostLedger(run.getenv)
+	if err != nil {
+		return // no home to look under: there is no default ledger to read
+	}
+	sum, err := run.store.IngestLedgerSession(run.ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
+	switch {
+	case err != nil && callmeter.IsBusy(err):
+		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
+	case err != nil:
+		run.fault(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
+	case sum.Faults > 0:
+		run.fault(callmeter.StageParse, "", fmt.Errorf(
+			"cost ledger: %d lines of the session's file skipped: not a JSON object, or missing a field the ledger contract requires", sum.Faults))
+	}
 }
 
 // hookTimeouts are the timeouts of the sync hooks of plugins/callmeter/hooks/hooks.json,
