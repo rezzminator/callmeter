@@ -17,13 +17,21 @@ const CutPlaceholder = "'[cut]'"
 // CutContent is command with its content operands replaced by CutPlaceholder,
 // and removed the bytes cut:
 //
-//   - the message of a `git commit`: the value of `-m`, `--message` and
+//   - the message of a `git commit`, also under a wrapper (programAt): the
+//     value of `-m`, `--message` and
 //     `--trailer`, attached (`-mMSG`, `-m=MSG`, `--message=MSG`, a cluster
 //     `-am MSG`) or the next word; `-F FILE` is a path and stays;
 //   - every operand but the leading flags of an `echo` or `printf` whose
-//     standard output goes to a file (`>`, `>>`, `>|`, `&>`, `&>>` to a target
-//     outside /dev/) or into `tee`, the redirect inherited from an enclosing
-//     block, subshell, list, loop or branch.
+//     standard output goes to a file (`>`, `>>`, `>|`, `&>`, `&>>`, `1<>` to
+//     any target but a non-file device), into `tee` or into a pipe whose
+//     output goes to a file, the redirect inherited from an enclosing block,
+//     subshell, list, loop or branch, or from a bare `exec` before it (one
+//     in a `{ … }` block, a `&&` or `||` list or an `if` branch included);
+//     a pipe into a block or loop writing a file goes to a file; standard
+//     output and error are followed
+//     apart (`>&2`, `/dev/stdout`: redirected), and a `>&N` to a descriptor
+//     the script opened (3 and up) is a file;
+//   - every here-string (`<<< word`): a body, as a heredoc's is.
 //
 // An operand holding no literal text (`"$X"`, `"$(…)"`) stays as written. One
 // holding literal text keeps its command substitutions after the placeholder,
@@ -32,9 +40,9 @@ const CutPlaceholder = "'[cut]'"
 // bytes. The script string of `bash -c` is code and is not entered.
 //
 // ok is false when the command cannot be cut safely and the caller must then
-// store none of it: it names `commit`, `echo` or `printf` yet parses as
-// neither bash nor zsh, or a backquoted substitution in a cut word or a
-// redirected command holds one of those names.
+// store none of it: it names `commit`, `echo` or `printf` or holds a `<<<`
+// yet parses as neither bash nor zsh, or a backquoted substitution anywhere in
+// it holds one of those (a backquoted text is not cut in place).
 func CutContent(command string) (cut string, removed int, ok bool) {
 	if !mayHoldContent(command) {
 		return command, 0, true
@@ -42,9 +50,11 @@ func CutContent(command string) (cut string, removed int, ok bool) {
 	return cutContent(command, 0)
 }
 
-// mayHoldContent is whether text names a program CutContent cuts operands of.
+// mayHoldContent is whether text names a program CutContent cuts operands of,
+// or holds a here-string.
 func mayHoldContent(text string) bool {
-	return strings.Contains(text, "commit") || strings.Contains(text, "echo") || strings.Contains(text, "printf")
+	return strings.Contains(text, "commit") || strings.Contains(text, "echo") || strings.Contains(text, "printf") ||
+		strings.Contains(text, "<<<")
 }
 
 // contentCutter collects the edits of one script.
@@ -65,7 +75,7 @@ func cutContent(src string, depth int) (string, int, bool) {
 		return "", 0, false
 	}
 	c := &contentCutter{src: src, depth: depth, ok: true}
-	c.stmts(file.Stmts, false)
+	c.stmts(file.Stmts, streams{})
 	if !c.ok {
 		return "", 0, false
 	}
@@ -77,23 +87,89 @@ func cutContent(src string, depth int) (string, int, bool) {
 	return out, c.removed, true
 }
 
-func (c *contentCutter) stmts(list []*syntax.Stmt, toFile bool) {
+// streams is where a statement's standard output and standard error go:
+// whether each may reach a file.
+type streams struct{ out, err bool }
+
+// stmts walks a list; a bare `exec` redirecting standard output or error sends
+// every later statement's stream where it says.
+func (c *contentCutter) stmts(list []*syntax.Stmt, in streams) {
 	for _, s := range list {
-		c.stmt(s, toFile)
+		c.stmt(s, in)
+		if dest, set := execRedirect(s, in); set {
+			in = dest
+		}
 	}
 }
 
-// stmt walks one statement; toFile is whether its standard output reaches a
-// file when its own redirects say nothing.
-func (c *contentCutter) stmt(s *syntax.Stmt, toFile bool) {
+// execRedirect is where a bare `exec` (no command) sends the shell's streams
+// from then on, given in: set when s is one, or holds one in a statement that
+// runs in the same shell: a `{ … }` block (each applied in turn), either side
+// of a `&&` or `||` list, or an `if` branch. One that may not run (the right
+// side of a list, a branch) leaves each stream reaching a file when either
+// way does.
+func execRedirect(s *syntax.Stmt, in streams) (dest streams, set bool) {
+	if s == nil {
+		return in, false
+	}
+	switch x := s.Cmd.(type) {
+	case *syntax.Block:
+		return execRedirects(x.Stmts, in)
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			return in, false // each side of a pipe runs in a subshell
+		}
+		dest, set = execRedirect(x.X, in)
+		if d, ySet := execRedirect(x.Y, dest); ySet {
+			dest, set = either(dest, d), true
+		}
+		return dest, set
+	case *syntax.IfClause:
+		dest = in
+		for clause := x; clause != nil; clause = clause.Else {
+			for _, list := range [][]*syntax.Stmt{clause.Cond, clause.Then} {
+				if d, listSet := execRedirects(list, in); listSet {
+					dest, set = either(dest, d), true
+				}
+			}
+		}
+		return dest, set
+	case *syntax.CallExpr:
+		if len(x.Args) == 1 && literalWord(x.Args[0]) == "exec" {
+			return redirected(s.Redirs, in), true
+		}
+	}
+	return in, false
+}
+
+// execRedirects is execRedirect over a list run in turn.
+func execRedirects(list []*syntax.Stmt, in streams) (dest streams, set bool) {
+	dest = in
+	for _, s := range list {
+		if d, sSet := execRedirect(s, dest); sSet {
+			dest, set = d, true
+		}
+	}
+	return dest, set
+}
+
+// either is where streams go when they go to a or to b.
+func either(a, b streams) streams {
+	return streams{out: a.out || b.out, err: a.err || b.err}
+}
+
+// stmt walks one statement; in is where its streams go when its own redirects
+// say nothing.
+func (c *contentCutter) stmt(s *syntax.Stmt, in streams) {
 	if s == nil || !c.ok {
 		return
 	}
-	if dest, set := stdoutToFile(s.Redirs); set {
-		toFile = dest
-	}
+	st := redirected(s.Redirs, in)
 	for _, r := range s.Redirs {
-		if r.Word != nil {
+		switch {
+		case r.Op == syntax.WordHdoc && r.Word != nil:
+			c.cutWord(r.Word, "") // a here-string is a body, as a heredoc's is
+		case r.Word != nil:
 			c.nested(r.Word)
 		}
 		if r.Hdoc != nil {
@@ -102,73 +178,183 @@ func (c *contentCutter) stmt(s *syntax.Stmt, toFile bool) {
 	}
 	switch x := s.Cmd.(type) {
 	case *syntax.CallExpr:
-		c.call(x, toFile)
+		c.call(x, st.out)
 	case *syntax.BinaryCmd:
+		next := st
 		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
-			c.stmt(x.X, intoTee(x.Y))
+			left := streams{out: intoTee(x.Y) || outToFile(x.Y, st), err: st.err}
+			if x.Op == syntax.PipeAll {
+				left.err = left.out
+			}
+			c.stmt(x.X, left)
 		} else {
-			c.stmt(x.X, toFile)
+			c.stmt(x.X, st)
+			if dest, set := execRedirect(x.X, st); set {
+				next = dest
+			}
 		}
-		c.stmt(x.Y, toFile)
+		c.stmt(x.Y, next)
 	case *syntax.Block:
-		c.stmts(x.Stmts, toFile)
+		c.stmts(x.Stmts, st)
 	case *syntax.Subshell:
-		c.stmts(x.Stmts, toFile)
+		c.stmts(x.Stmts, st)
 	case *syntax.IfClause:
 		for clause := x; clause != nil; clause = clause.Else {
-			c.stmts(clause.Cond, toFile)
-			c.stmts(clause.Then, toFile)
+			c.stmts(clause.Cond, st)
+			c.stmts(clause.Then, st)
 		}
 	case *syntax.WhileClause:
-		c.stmts(x.Cond, toFile)
-		c.stmts(x.Do, toFile)
+		c.stmts(x.Cond, st)
+		c.stmts(x.Do, st)
 	case *syntax.ForClause:
 		c.nested(x.Loop)
-		c.stmts(x.Do, toFile)
+		c.stmts(x.Do, st)
 	case *syntax.CaseClause:
 		c.nested(x.Word)
 		for _, item := range x.Items {
 			for _, p := range item.Patterns {
 				c.nested(p)
 			}
-			c.stmts(item.Stmts, toFile)
+			c.stmts(item.Stmts, st)
 		}
 	case *syntax.TimeClause:
-		c.stmt(x.Stmt, toFile)
+		c.stmt(x.Stmt, st)
 	case *syntax.CoprocClause:
-		c.stmt(x.Stmt, false)
+		c.stmt(x.Stmt, streams{})
 	case *syntax.FuncDecl:
-		c.stmt(x.Body, false)
+		c.stmt(x.Body, streams{})
 	case *syntax.TestDecl:
-		c.stmt(x.Body, false)
+		c.stmt(x.Body, streams{})
 	default:
 		c.nested(s.Cmd)
 	}
 }
 
-// stdoutToFile is where a statement's own redirects send its standard output:
-// set when one of them redirects it, toFile when the last such names a file.
-func stdoutToFile(redirs []*syntax.Redirect) (toFile, set bool) {
+// outToFile is whether s's standard output reaches a file, given in: its own
+// redirects, then a pipeline's last command, and of a compound command (a
+// block, a loop) any file one of its commands writes or tees into. Whatever a
+// pipe carries may reach that file, so its left side writes there too.
+func outToFile(s *syntax.Stmt, in streams) bool {
+	if s == nil {
+		return in.out
+	}
+	st := redirected(s.Redirs, in)
+	switch x := s.Cmd.(type) {
+	case *syntax.BinaryCmd:
+		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
+			return outToFile(x.Y, st)
+		}
+	case *syntax.CallExpr, nil:
+		return st.out
+	}
+	return st.out || writesFile(s.Cmd, st)
+}
+
+// writesFile is whether a compound command may write what it reads to a file:
+// one of the statements in it sends its standard output to a file, or runs
+// tee, given in.
+func writesFile(cmd syntax.Command, in streams) bool {
+	found := false
+	syntax.Walk(cmd, func(node syntax.Node) bool {
+		switch x := node.(type) {
+		case *syntax.Stmt:
+			found = found || redirected(x.Redirs, in).out
+		case *syntax.CallExpr:
+			p := programAt(x.Args)
+			found = found || (p < len(x.Args) && path.Base(literalWord(x.Args[p])) == "tee")
+		}
+		return !found
+	})
+	return found
+}
+
+// redirected is where a statement's streams go after its own redirects of fd
+// 1 and fd 2, applied in order from in: a path names a file unless it is a
+// non-file device (nonFileDevice) or names a stream itself (/dev/stdout,
+// /dev/stderr, /dev/fd/1, /dev/fd/2, which go where that stream goes); a `>&`
+// to 1 or 2 goes where that stream goes, to 0 or closed nowhere, to a
+// descriptor the script opened (3 and up) or a word that is not literal
+// possibly a file. `<>` opens a stream only when it names its fd.
+func redirected(redirs []*syntax.Redirect, in streams) streams {
+	st := in
 	for _, r := range redirs {
-		if r.N != nil && r.N.Value != "1" {
+		fd := "1"
+		if r.N != nil {
+			fd = r.N.Value
+		}
+		if fd != "1" && fd != "2" {
 			continue
 		}
 		target, literal := wordValue(r.Word)
+		var dest bool
 		switch r.Op {
-		case syntax.RdrOut, syntax.AppOut, syntax.RdrClob, syntax.AppClob, syntax.RdrAll, syntax.AppAll:
-			toFile, set = !literal || !strings.HasPrefix(target, "/dev/"), true
+		case syntax.RdrAll, syntax.AppAll:
+			dest = pathDest(target, literal, st)
+			st.out, st.err = dest, dest
+			continue
+		case syntax.RdrOut, syntax.AppOut, syntax.RdrClob, syntax.AppClob:
+			dest = pathDest(target, literal, st)
+		case syntax.RdrInOut:
+			if r.N == nil {
+				continue
+			}
+			dest = pathDest(target, literal, st)
 		case syntax.DplOut:
-			toFile, set = !literal || !fdTarget.MatchString(target), true
+			dest = fdDest(target, literal, st)
+		default:
+			continue
+		}
+		if fd == "1" {
+			st.out = dest
+		} else {
+			st.err = dest
 		}
 	}
-	return toFile, set
+	return st
 }
 
-// fdTarget is a `>&` target naming a file descriptor or closing one.
-var fdTarget = regexp.MustCompile(`^([0-9]+-?|-)$`)
+// pathDest is whether a redirect to path target may reach a file, given where
+// the streams go now.
+func pathDest(target string, literal bool, st streams) bool {
+	if !literal {
+		return true
+	}
+	switch target {
+	case "/dev/stdout", "/dev/fd/1":
+		return st.out
+	case "/dev/stderr", "/dev/fd/2":
+		return st.err
+	}
+	if fd, isFd := strings.CutPrefix(target, "/dev/fd/"); isFd {
+		return fdDest(fd, true, st)
+	}
+	return !nonFileDevice.MatchString(target)
+}
 
-// intoTee is whether a pipe's right side starts with `tee` or `sudo tee`,
-// past sudo's options and their values (wrappers' sudo entry).
+// fdDest is whether a `>&` to target may reach a file, given where the
+// streams go now.
+func fdDest(target string, literal bool, st streams) bool {
+	if !literal {
+		return true
+	}
+	switch strings.TrimSuffix(target, "-") {
+	case "1":
+		return st.out
+	case "2":
+		return st.err
+	case "0", "":
+		return false
+	}
+	return true
+}
+
+// nonFileDevice is a redirect target that keeps nothing: the null device, the
+// terminal or standard input. Any other path under /dev/ (/dev/shm, a disk)
+// is a file.
+var nonFileDevice = regexp.MustCompile(`^/dev/(null|stdin|tty)$`)
+
+// intoTee is whether a pipe's right side starts with `tee`, after any
+// wrapper running it (`sudo -u USER tee`, programAt).
 func intoTee(s *syntax.Stmt) bool {
 	for s != nil {
 		switch x := s.Cmd.(type) {
@@ -176,27 +362,50 @@ func intoTee(s *syntax.Stmt) bool {
 			s = x.X
 			continue
 		case *syntax.CallExpr:
-			if len(x.Args) == 0 {
-				return false
-			}
-			name, _ := wordValue(x.Args[0])
-			if path.Base(name) == "sudo" {
-				rest := make([]arg, 0, len(x.Args)-1)
-				for _, w := range x.Args[1:] {
-					text, _ := wordValue(w)
-					rest = append(rest, arg{text: text, word: w})
-				}
-				n, _ := wrappers["sudo"].skip(rest)
-				if n >= len(rest) {
-					return false
-				}
-				name = rest[n].text
-			}
-			return path.Base(name) == "tee"
+			p := programAt(x.Args)
+			return p < len(x.Args) && path.Base(literalWord(x.Args[p])) == "tee"
 		}
 		return false
 	}
 	return false
+}
+
+// programAt is the index in words of the program a simple command runs, past
+// every wrapper and its options as the parser strips them (unwrapProgram:
+// `sudo git commit`, `env A=1 echo`, `timeout 30 git commit`, `xargs -I{}
+// git commit`); len(words) when it runs none (`command -v X`, a bare `env`).
+// A word read as "" (wrapperArgText) is never a wrapper.
+func programAt(words []*syntax.Word) int {
+	if len(words) == 0 {
+		return 0
+	}
+	args := make([]arg, len(words))
+	for i, w := range words {
+		args[i] = arg{text: wrapperArgText(w), word: w}
+	}
+	program, runs := unwrapProgram(args)
+	if !runs {
+		return len(words)
+	}
+	return len(words) - len(program)
+}
+
+// wrapperArgText is a word as programAt reads it: its literal value, or the
+// text of a word of unquoted text only (`-I{}`), which the parser reads as
+// written too; any other word is "".
+func wrapperArgText(w *syntax.Word) string {
+	if text := literalWord(w); text != "" {
+		return text
+	}
+	var b strings.Builder
+	for _, part := range w.Parts {
+		lit, isLit := part.(*syntax.Lit)
+		if !isLit {
+			return ""
+		}
+		b.WriteString(lit.Value)
+	}
+	return b.String()
 }
 
 // literalWord is a word's value when it is literal, else "".
@@ -208,12 +417,13 @@ func literalWord(w *syntax.Word) string {
 // call cuts the content operands of one simple command.
 func (c *contentCutter) call(x *syntax.CallExpr, toFile bool) {
 	cut := map[*syntax.Word]string{} // a cut word → the flag text kept before its placeholder
-	if len(x.Args) > 0 {
-		switch name := path.Base(literalWord(x.Args[0])); {
+	if p := programAt(x.Args); p < len(x.Args) {
+		args := x.Args[p:]
+		switch name := path.Base(literalWord(args[0])); {
 		case name == "git":
-			commitMessages(x.Args, cut)
+			commitMessages(args, cut)
 		case (name == "echo" || name == "printf") && toFile:
-			writtenOperands(name, x.Args, cut)
+			writtenOperands(name, args, cut)
 		}
 	}
 	for _, a := range x.Assigns {
@@ -476,10 +686,10 @@ func (c *contentCutter) nested(node syntax.Node) {
 				}
 				return false
 			}
-			c.stmts(x.Stmts, false)
+			c.stmts(x.Stmts, streams{})
 			return false
 		case *syntax.ProcSubst:
-			c.stmts(x.Stmts, false)
+			c.stmts(x.Stmts, streams{})
 			return false
 		}
 		return true

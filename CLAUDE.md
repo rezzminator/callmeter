@@ -11,6 +11,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - wrapper: the POSIX sh entry every hook and both skills run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
 - binary: the Go program behind `callmeter {hook|report|version}` · `cmd/callmeter/main.go`
 - `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset · `internal/paths/paths.go`
+- settings file: the one optional config, `retention_days` alone; absent keeps every row forever, and only `callmeter report` reads it · `{CALLMETER_HOME}/config.json`, `internal/config/config.go` · design `docs/design.md` § Where the store lives
 - binary cache: the installed binary per plugin version · `{CALLMETER_HOME}/bin/{version}/callmeter`
 - `missed.log`: one line per hook the wrapper could not hand to the binary, counted on the binary's next run · `{CALLMETER_HOME}/missed.log`
 - store: SQLite rows per tool call, request, agent, turn, event and command part · `{CALLMETER_HOME}/callmeter.db`, schema `internal/callmeter/store.go` · design `docs/design.md` § The store
@@ -18,7 +19,9 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - `hookentry`: the `callmeter hook` handler, with the captured payload fixtures · `internal/hookentry/`
 - cmdparse: the Bash command parser filling `command_parts` · `internal/callmeter/cmdparse/` · design `docs/design.md` § Parsing a command
 - reports: `callmeter report {name}`, read by the report skill · `internal/callmeter/report/`, `plugins/callmeter/skills/report/SKILL.md` · design `docs/design.md` § Reports
-- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs · `internal/testjail/testjail.go`
+- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs and clears `PFM_COST_LEDGER_DIR` and `PFM_HOME` · `internal/testjail/testjail.go`
+- cost ledger: pfm's per-call price files `{session_id}.jsonl` in `$PFM_COST_LEDGER_DIR`, else `{PFM_HOME or HOME}/.local/state/pfm/cost-ledger`, read at report time as optional data · `internal/callmeter/ledger.go`; `requests.api_request_id` links a row to transcripts
+- price table: a copy of pfm's, moved together with it · `internal/callmeter/pricing.go`
 - e2e: real `claude -p` runs reading the store they wrote · `e2e/`
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
@@ -55,6 +58,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## Sacred ground
 
+- **Standalone:** NEVER require pfm, Professor or any other tool: the plugin, binary, tests and gates run for anyone with Claude Code and nothing else installed; other tools read the store, callmeter never calls them, and data it takes from one is optional.
 - **Privacy:** NEVER store prompt, message or file content; the store keeps only its `{name}_bytes` count.
 - **Publication:** NEVER push, tag or release without the user's explicit ask in the current turn.
 - **Nothing identifying** ships in a tracked file: no machine-absolute path (`/Users/…`, `/home/…`), no private term; the leak gate is the backstop.

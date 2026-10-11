@@ -18,6 +18,10 @@ Topics: `files`, `writes`, `commands`, `context`, `sequences`, `faults`, `sessio
 
 `/callmeter:callmeter` teaches Claude to read the store directly, read-only, with SQL or Python: the schema, units, joins and tested recipes for questions no report answers.
 
+## A picture of what happened
+
+`/callmeter:ultimate-visualization [focus]` has Claude explore the store and publish one animated Artifact of the past, in a form it chooses. The page carries structure, timing and counts only: never commands, paths or prompts.
+
 ## Where the store lives
 
 `${CALLMETER_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/callmeter}/callmeter.db`: one store per machine, shared by every Claude Code config dir, never the plugin's per-seat data directory. The binary is downloaded on first use into `bin/` beside it and checked against `libexec/SHA256SUMS`.

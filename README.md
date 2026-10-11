@@ -7,7 +7,7 @@
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 [![CI](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -96,7 +96,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 ## 📊 Reports: token usage, context growth, files and commands
 
 ```text
-/callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--json]
+/callmeter:report {topic} [--since D] [--project P] [--agent-type T] [--session S] [--limit N] [--view V] [--json]
 ```
 
 | Topic | Answers |
@@ -116,19 +116,21 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
 | `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
-| `cost` | Claude Code's own cost per session: USD, seconds in the API, in retries, in tools, per model |
+| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
 | `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
 | `waiting` | time spent waiting on you: idle prompts and permission prompts, total, median and longest |
+| `cache` | prompt-cache hits, partial hits and misses per main chat and sub-agent and per cache TTL, with the cause the store proves (expired, compacted, model changed) |
 
 | Flag | Meaning |
 | --- | --- |
-| `--since D` | a duration (`7d`, `24h`) or a date (`2026-09-01`); default the whole 30-day window |
+| `--since D` | a duration (`7d`, `24h`) or a date (`2026-09-01`); default the whole store, or with `retention_days` set its retention window, which also floors it |
 | `--project P` | calls whose `cwd` is `P` or under it |
 | `--agent-type T` | calls made by that agent type |
 | `--session S` | one session |
 | `--limit N` | rows per table, default 25 |
+| `--view V` | `cost` only: `chat` (default), `agent` or `call` |
 | `--json` | one JSON object (`topic`, `store`, `title`, `columns`, `rows`, `notes`) instead of the text table |
 
 The `tokens` report over the same scratch store:
@@ -151,10 +153,18 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 /callmeter:callmeter which of my sub-agents in this session hit the highest context?
 ```
 
+## 🎬 Watch what happened
+
+`/callmeter:ultimate-visualization [focus]` has Claude explore the store and publish one animated Artifact of what happened in the past, in a form it chooses: an open greenfield, seen as the work and its flow, never as a file. The skill carries its own build discipline, so it needs nothing beyond Claude Code and its Artifact tool, and the page it publishes carries structure, timing and counts only: no commands, paths or prompts.
+
+```text
+/callmeter:ultimate-visualization the sub-agents of the last two days
+```
+
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
-- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size.
+- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from pfm's cost ledger when it is present.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
 - `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.
@@ -166,12 +176,14 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 - `sessions`: one row per session: first and last activity, model, how it started and ended, cwd, seat, host, time zone.
 - `command_parts`: every simple command inside a Bash call, with the files it read or wrote, parsed at report time.
 - `faults`: every event that could not be recorded and every command part that could not be parsed, by stage; a parse fault keeps the byte count of the parser's message, never its text.
+- `request_iterations`: one row per entry of a request's usage `iterations` other than the message itself, such as a fallback model's answer, with its own token counts.
+- `request_cache`, a view computed when read: each request's cache outcome against the previous request of its chat or sub-agent: the gap, the cache TTL it could read, hit, partial or miss, and the proven cause.
 
 ## 🔒 Privacy
 
 The store stays on your machine; callmeter sends nothing anywhere. Its only network use is the one-time binary download.
 
-No prompt, message or file content is ever stored: each becomes a `{name}_bytes` count. A tool input keeps its command with every heredoc body cut out, an unquoted body keeping only the `$(…)` and backquote substitutions the shell runs, then each `git commit` message and every operand an `echo` or `printf` writes to a file or into `tee` replaced by the one word `'[cut]'`, the bytes cut stored as `operand_bytes` (a command that cannot be cut safely keeps only its byte count), file paths, search patterns and read range; `content`, `old_string`, `new_string`, an edit's `edits`, an agent's `prompt` and a `description`, `query` or `target` are replaced by their byte length. Event details keep only their shape, numbers, booleans, a short list of enum-like keys (`type`, `status`, `source`, `model`, `file_path`, …) and the known labels of a stop failure's `error` and a session end's `reason`; every other string becomes its byte count. A failed call keeps only its exit code or an outcome label, and a parse fault only the size of the parser's message. Commit messages given as `git commit` operands, the text an `echo` or `printf` writes to a file, patch lines, command output, heredoc bodies and error text are never stored. The rest of a command is stored as written, so text it carries in another form stays: a message assigned to a variable before the commit, a commit inside a `bash -c` or `ssh` script string, a word an `echo` prints to the terminal. `callmeter redact` rewrites rows already stored under these rules.
+No prompt, message or file content is ever stored: each becomes a `{name}_bytes` count. A tool input keeps its command with every heredoc body cut out, an unquoted body keeping only the `$(…)` and backquote substitutions the shell runs, then each `git commit` message (also under `sudo`, `env` and the like), every operand an `echo` or `printf` writes to a file, into `tee` or into a pipe that ends in a file, and every `<<<` here-string replaced by the one word `'[cut]'`, the bytes cut stored as `operand_bytes` (a command that cannot be cut safely keeps only its byte count), file paths, search patterns and read range; `content`, `old_string`, `new_string`, an edit's `edits`, an agent's `prompt` and a `description`, `query` or `target` are replaced by their byte length. Event details keep only their shape, numbers, booleans, a short list of enum-like keys (`type`, `status`, `source`, `model`, `file_path`, …; none of them inside an `mcp__` tool's `tool_input`) and the known labels of a stop failure's `error` and a session end's `reason`; every other string becomes its byte count. A failed call keeps only its exit code or an outcome label, and a parse fault only the size of the parser's message. Commit messages given as `git commit` operands, the text an `echo` or `printf` writes to a file, here-strings, patch lines, command output, heredoc bodies and error text are never stored. The rest of a command is stored as written, so text it carries in another form stays: a message assigned to a variable before the commit, a commit inside a `bash -c` or `ssh` script string, a word an `echo` prints to the terminal. `callmeter redact` rewrites rows already stored under these rules.
 
 ## 🧠 How it works
 
@@ -190,7 +202,7 @@ flowchart LR
 - Every registered event runs the plugin's wrapper with `hook`. The wrapper finds the `callmeter` binary for this plugin version and `exec`s it with the hook's payload on stdin.
 - On the first `SessionStart` after install, the wrapper downloads the binary for your platform from the GitHub release of this version, checks it against the `SHA256SUMS` committed in the plugin, and caches it under `CALLMETER_HOME`. Every later run uses the cache.
 - The binary writes one short SQLite transaction per event and exits 0 on every path. A hook it could not serve is logged to `missed.log` with the writer's pid at the end of its reason (` (pid N)`) and counted as a fault on the next run, so a gap shows in the reports instead of a smaller number.
-- Reports read the same store. Each report run first prunes rows older than 30 days, archiving them to `archive.db`, then fills missing sub-agent parent and type from metadata for live or quiet sessions before settling every session with no hook and no transcript write for an hour from its transcripts: calls left in flight, requests no hook wrote, a turn end whose `Stop` or `StopFailure` hook was lost.
+- Reports read the same store. By default nothing is ever pruned: the store keeps every row. When `config.json` sets `retention_days`, each report run first prunes rows older than that, archiving them to `archive.db`. Each run then fills missing sub-agent parent and type from metadata for live or quiet sessions before settling every session with no hook and no transcript write for an hour from its transcripts: calls left in flight, requests no hook wrote, a turn end whose `Stop` or `StopFailure` hook was lost.
 
 Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing waits for callmeter before a tool runs.
 
@@ -203,7 +215,19 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
-Under `CALLMETER_HOME`: `callmeter.db` (the store), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (pruned rows) and `bin/{version}/callmeter` (the cached binary).
+Settings live in an optional `config.json` under `CALLMETER_HOME`. Without it every default applies.
+
+| Key | Effect |
+| --- | --- |
+| `retention_days` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
+
+```json
+{ "retention_days": 90 }
+```
+
+A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
+
+Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
 
 ## ❓ FAQ
 
@@ -251,7 +275,7 @@ cmd/callmeter/            the binary
 internal/callmeter/       the store, with cmdparse/, report/, command/
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
-internal/…                clock, sqlitedb, runner, testjail, paths, applog
+internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/

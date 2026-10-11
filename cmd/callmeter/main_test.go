@@ -201,6 +201,9 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 				if !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
 					t.Fatalf("accounted panic left %d bytes in missed.log (%v), want no line", len(missed), err)
 				}
+				if logged, err := os.ReadFile(paths.Log(c.state)); err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
+					t.Errorf("callmeter.log = %q (%v), want one line saying the accounted panic", logged, err)
+				}
 				code, stdout, stderr = c.run("", "report", "files")
 				if code != 0 || strings.Contains(stdout, "events unrecorded: hook terminated before recording") {
 					t.Errorf("accounted panic report = %d, unrecorded event note %v; stderr %q", code,
@@ -285,7 +288,7 @@ func TestReportFilesOverASeededStore(t *testing.T) {
 	c.seed()
 	code, stdout, stderr := c.run("", "report", "files")
 	title, _, _ := strings.Cut(stdout, "\n")
-	if code != 0 || !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: since ") ||
+	if code != 0 || !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: all time") ||
 		!strings.Contains(stdout, "fixture.go") {
 		t.Fatalf("report files = %d, want a table titled with its window\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}

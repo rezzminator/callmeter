@@ -20,7 +20,7 @@ func Hooks(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	}
 	var err error
 	if !store.SchemaComplete() {
-		t.Notes, err = gainedNotes(ctx, store, f, n, "stop_hooks")
+		t.Notes, err = gainedNotes(ctx, store, f, n, "stop_hooks table")
 		return t, err
 	}
 	where, args := f.scoped(scope{ts: "h.ts", session: "h.session_id"})
@@ -58,7 +58,7 @@ func Hooks(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	).Scan(&untimed); err != nil {
 		return nil, fmt.Errorf("callmeter report: count the untimed Stop hook runs: %w", err)
 	}
-	if t.Notes, err = gainedNotes(ctx, store, f, n, "stop_hooks"); err != nil {
+	if t.Notes, err = gainedNotes(ctx, store, f, n, "stop_hooks table"); err != nil {
 		return nil, err
 	}
 	if summaries > 0 {

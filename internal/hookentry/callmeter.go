@@ -164,13 +164,7 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	state := &terminationState{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			state.mu.Lock()
-			accounted := state.accounted
-			state.mu.Unlock()
-			if accounted {
-				panic(AccountedPanic{Value: recovered})
-			}
-			panic(recovered)
+			state.repanic(recovered)
 		}
 	}()
 	signals := make(chan os.Signal, 1)
@@ -216,6 +210,20 @@ type terminationState struct {
 	event     string
 	session   string
 	accounted bool
+}
+
+// repanic panics again with a run's recovered panic, for the caller to say:
+// as an AccountedPanic when the run's event is accounted for. An unaccounted
+// one keeps the state's lock, so the signal handler, which would add its own
+// missed.log line beside the panic's, never takes it; the process ends with
+// the panic's line alone.
+func (state *terminationState) repanic(recovered any) {
+	state.mu.Lock()
+	if state.accounted {
+		state.mu.Unlock()
+		panic(AccountedPanic{Value: recovered})
+	}
+	panic(recovered)
 }
 
 // terminationKey carries the terminationState in the ctx runCallmeter gets;
@@ -460,7 +468,54 @@ func runCallmeter(
 		return run.store.SessionModel(run.ctx, run.payload.SessionID)
 	})
 	run.record()
+	run.ingestLedger()
 	return 0
+}
+
+// ingestLedger, after the hooks that settle a session's requests (the main
+// chat's Stop, a sub-agent's SubagentStop and SessionEnd) have written them,
+// brings the new lines of the session's cost-ledger file into the store
+// (Store.IngestLedgerSession), so Claude Code's own price of each call is
+// stored without a report run. The ledger is optional data: no directory or
+// file is nothing to do, and a ledger that cannot be read is a parse fault at
+// most, once per session and error text (faultOnce: a ledger that stays broken
+// is not a row per hook); a busy store is only logged, the next hook or report
+// run reads the same bytes. SessionEnd skips it once its budget is spent, and
+// an ingest that runs past that budget rolls back and is only logged (the
+// offset did not move, so the next hook reads the bytes): it is a budget spent,
+// not a ledger error.
+func (run *callmeterRun) ingestLedger() {
+	switch run.payload.HookEventName {
+	case eventStop, callmeter.EventSubagentStop, callmeter.EventSessionEnd:
+	default:
+		return
+	}
+	if run.gaveUp || run.store == nil || run.payload.SessionID == "" || (!run.deadline.IsZero() && run.spent()) {
+		return
+	}
+	dir, err := paths.CostLedger(run.getenv)
+	if err != nil {
+		return // no home to look under: there is no default ledger to read
+	}
+	ctx := run.ctx
+	if !run.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, run.deadline)
+		defer cancel()
+	}
+	sum, err := run.store.IngestLedgerSession(ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
+	switch {
+	case !run.deadline.IsZero() && errors.Is(err, context.DeadlineExceeded):
+		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "",
+			fmt.Errorf("cost ledger: %s budget spent during the ingest, its bytes wait for the next hook: %w", run.payload.HookEventName, err))
+	case err != nil && callmeter.IsBusy(err):
+		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
+	case err != nil:
+		run.faultOnce(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
+	case sum.Faults > 0:
+		run.fault(callmeter.StageParse, "", fmt.Errorf(
+			"cost ledger: %d lines of the session's file skipped: not a JSON object, or missing a field the ledger contract requires", sum.Faults))
+	}
 }
 
 // hookTimeouts are the timeouts of the sync hooks of plugins/callmeter/hooks/hooks.json,
@@ -1495,8 +1550,9 @@ func (run *callmeterRun) resolveUnfinished() {
 // them (runRows); a failure is a store fault. fn nil writes the run's rows only.
 // While the run's event is not accounted for, the signal handler is held off
 // from the moment the batch holds the store's write lock until it committed
-// or, failed, until its fault row was written; never across the wait for a
-// busy store, so a signal during that wait is decided at once.
+// or, failed, until its fault row was written when the store is free at once
+// (faultHeld); never across the wait for a busy store, the fault's included,
+// so a signal during that wait is decided at once.
 func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 	run.batches++
 	if run.gaveUp {
@@ -1514,7 +1570,7 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 		return run.runRows(tx)
 	})
 	if err != nil {
-		run.faultHeld(&hold, held, callmeter.StageStore, toolUseID, err)
+		run.faultHeld(&hold, held, false, callmeter.StageStore, toolUseID, err)
 		return
 	}
 	hold.account()
@@ -1530,21 +1586,31 @@ func (run *callmeterRun) write(toolUseID string, fn func(*callmeter.Tx) error) {
 // missed.log line instead (giveUp); after it, such a fault is logged only, and
 // so is every fault of a run that gave up.
 func (run *callmeterRun) fault(stage, toolUseID string, cause error) {
+	run.faultRow(false, stage, toolUseID, cause)
+}
+
+// faultOnce is fault for a failure that lasts across hooks: the faults row is
+// written once per session, stage and error text, a repeat only logged.
+func (run *callmeterRun) faultOnce(stage, toolUseID string, cause error) {
+	run.faultRow(true, stage, toolUseID, cause)
+}
+
+func (run *callmeterRun) faultRow(once bool, stage, toolUseID string, cause error) {
 	if run.gaveUp {
 		applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
 	var hold termHold
 	defer func() { hold.release() }()
-	run.faultHeld(&hold, false, stage, toolUseID, cause)
+	run.faultHeld(&hold, false, once, stage, toolUseID, cause)
 }
 
 // faultHeld is fault with the caller's hold on the signal handler, released by
 // the caller: held is true when the caller already took it (write, after its
 // batch failed), otherwise faultHeld takes it into hold, for a fault row once
 // that row's transaction holds the store's write lock (AddFaultHeld), never
-// across the wait for a busy store.
-func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID string, cause error) {
+// across the wait for a busy store. once is callmeter.Fault.Once.
+func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolUseID string, cause error) {
 	take := func() {
 		if !held {
 			*hold, held = run.state.hold(), true
@@ -1562,9 +1628,30 @@ func (run *callmeterRun) faultHeld(hold *termHold, held bool, stage, toolUseID s
 		run.giveUp(*hold, toolUseID, cause)
 		return
 	}
-	err := run.store.AddFaultHeld(run.ctx, callmeter.Fault{
-		TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error(),
-	}, take)
+	fault := callmeter.Fault{TS: run.now, SessionID: session, ToolUseID: toolUseID, Stage: stage, Error: cause.Error(), Once: once}
+	if held && hold.locked {
+		// A failed batch's hold: its fault row goes in under it when the store
+		// is free at once, so a signal that waited on the batch is judged by
+		// that row. A writer that took the store since the rollback is waited
+		// out without the hold, a signal meanwhile decided at once.
+		written, err := run.store.AddFaultIfFree(run.ctx, fault)
+		if err != nil {
+			applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		}
+		switch {
+		case written: // the row stands, whatever failed after its commit
+			hold.account()
+			run.accounted = true
+			return
+		case err == nil: // busy
+			hold.release()
+			*hold, held = termHold{}, false
+		default:
+			run.giveUp(*hold, toolUseID, err)
+			return
+		}
+	}
+	err := run.store.AddFaultHeld(run.ctx, fault, take)
 	if err != nil {
 		applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
 		take()

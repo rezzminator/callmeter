@@ -14,9 +14,6 @@ import (
 	"time"
 )
 
-// Retention is the age window recovery keeps after old store rows are pruned.
-const Retention = 30 * 24 * time.Hour
-
 // ResolveTranscript keeps an existing stored path, otherwise finding the first
 // sorted session transcript under the stored projects root, then the seat's.
 // An unfound path is returned unchanged so callers retain their read errors.
@@ -237,10 +234,10 @@ func callUnmarked(c string) string {
 func agentTurnUnfilled(t string) string {
 	return fmt.Sprintf(`(%[1]s.stopped IS NOT NULL
 		AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = %[1]s.session_id AND r.agent_id = %[1]s.agent_id
-			AND r.ts <= %[1]s.stopped AND r.ts > COALESCE(
+			AND r.source IS NOT '%[4]s' AND r.ts <= %[1]s.stopped AND r.ts > COALESCE(
 				(SELECT MAX(p.stopped) FROM agent_turns p WHERE p.agent_id = %[1]s.agent_id AND p.seq < %[1]s.seq), 0))
 		AND NOT EXISTS (SELECT 1 FROM faults f WHERE f.session_id = %[1]s.session_id AND f.stage = '%[2]s'
-			AND f.error = %[3]s))`, t, StageTranscript, agentTurnMarker(t))
+			AND f.error = %[3]s))`, t, StageTranscript, agentTurnMarker(t), SourceLedger)
 }
 
 // stopReplyUnfilled is the SQL condition that the turns row aliased t is a
@@ -686,7 +683,9 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	if err != nil {
 		return err
 	}
-	since = max(since, now.Add(-Retention).UnixMilli())
+	if floor := s.retentionFloor(now); !floor.IsZero() {
+		since = max(since, floor.UnixMilli())
+	}
 	mainRequest := false
 	resolved := map[string]bool{} // message ids a pending request was resolved to
 	resolvedCount := 0
@@ -701,7 +700,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	}
 	var writes []requestWrite
 	built := map[string]requestWrite{} // every request read, by message id, so a rebuilt call's request is written
-	var uses []rebuildUse              // every tool_use within the session and retention window
+	var uses []rebuildUse              // every tool_use of the session, inside the retention window when one is set
 	ends := map[string][]int64{}       // agent id -> the ts of the turn-end entry of each of its requests that ends a turn
 	var notices map[string][]int64     // agent id -> main-transcript task-notification times
 	metas := map[string]subagentMeta{} // agent id -> its meta file
@@ -1500,7 +1499,9 @@ func (s *Store) lostTurnEnd(ctx context.Context, sessionID, transcript string, s
 
 // requestFills reports whether RecoverRequest of r would change the store: the
 // row is absent and not older than since (so it would be written), a column r
-// provides is NULL in the stored row, or a call of toolUseIDs names no request.
+// provides is NULL in the stored row, an iteration r carries has no
+// request_iterations row (on a store that has the table), or a call of
+// toolUseIDs names no request.
 // It reads outside the write transaction, so a fully settled request costs the
 // report no write at all.
 func (s *Store) requestFills(ctx context.Context, r Request, toolUseIDs []string, since int64) (bool, error) {
@@ -1523,6 +1524,18 @@ func (s *Store) requestFills(ctx context.Context, r Request, toolUseIDs []string
 	for _, value := range values {
 		if value == nil {
 			return true, nil
+		}
+	}
+	if s.complete {
+		for _, it := range r.Iterations {
+			var stored int
+			if err := s.db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM request_iterations WHERE request_id = ? AND seq = ?", r.RequestID, it.Seq).Scan(&stored); err != nil {
+				return false, fmt.Errorf("callmeter store %s: read iteration %d of request %q: %w", s.path, it.Seq, r.RequestID, err)
+			}
+			if stored == 0 {
+				return true, nil
+			}
 		}
 	}
 	for _, id := range toolUseIDs {

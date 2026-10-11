@@ -185,6 +185,17 @@ func TestMatchingFixtureIsClean(t *testing.T) {
 	}
 }
 
+// TestLedgerRequestIsNoMismatch: a request row ingested from the cost ledger (a
+// call no transcript records) is not compared against the transcripts.
+func TestLedgerRequestIsNoMismatch(t *testing.T) {
+	f := newFixture(t, nil, []string{fmt.Sprintf(`INSERT INTO requests(request_id, session_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, pending, source)
+		VALUES('req_invented_side', '%s', %d, 'claude-opus-5-5', 5, 5, 0, 0, 0, 'ledger')`, fxSession, fxMS(4))})
+	code, out := f.run(t, "2030-01-01T00:00:00Z")
+	if code != 0 || !strings.Contains(out, "mismatches 0 unexplained 0 expected; by class: none") {
+		t.Fatalf("exit %d, want 0 and a clean summary:\n%s", code, out)
+	}
+}
+
 func TestSeededMismatchIsCaught(t *testing.T) {
 	cases := []struct {
 		name, class string

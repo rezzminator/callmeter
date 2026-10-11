@@ -1151,6 +1151,120 @@ func TestTerminationHoldIsNotTakenAcrossABusyWait(t *testing.T) {
 	}
 }
 
+// TestTerminationHoldIsNotKeptFromAFailedBatchIntoItsFaultsWait: a batch that
+// held the store's write lock and failed lets the signal handler go before its
+// fault row waits on a store another writer took meanwhile, so a signal during
+// that wait is decided at once; once the store frees, the fault row lands. The
+// competing writer must win the lock between the rollback and the fault's
+// BEGIN, so a round the run wins is run again, up to 20.
+func TestTerminationHoldIsNotKeptFromAFailedBatchIntoItsFaultsWait(t *testing.T) {
+	for round := 1; ; round++ {
+		if round > 20 {
+			t.Fatal("the competing writer never took the store between the batch's rollback and its fault")
+		}
+		if failedBatchRound(t) {
+			return
+		}
+	}
+}
+
+// failedBatchRound runs one round of the test above; false when the run's
+// fault took the lock before the competing writer did.
+func failedBatchRound(t *testing.T) (decided bool) {
+	scene := newSignalScene(t, "")
+	lab := scene.lab
+	payload := scene.payload(t, "PreToolUse")
+	if _, err := lab.db().DB().ExecContext(lab.ctx, "CREATE TRIGGER stall_calls BEFORE INSERT ON calls BEGIN "+
+		"SELECT callmeter_test_stall(); SELECT RAISE(ABORT, 'refused by the test'); END"); err != nil {
+		t.Fatalf("create the stalling trigger: %v", err)
+	}
+	stall := &batchStall{entered: make(chan struct{}), release: make(chan struct{})}
+	currentStall.Store(stall)
+	defer currentStall.Store(nil)
+	competitor, err := sqlitedb.OpenReadWrite(paths.Store(scene.home), 0)
+	if err != nil {
+		t.Fatalf("open the competing writer: %v", err)
+	}
+	defer func() {
+		if err := competitor.Close(); err != nil {
+			t.Errorf("close the competing writer: %v", err)
+		}
+	}()
+	conn, err := competitor.Conn(lab.ctx)
+	if err != nil {
+		t.Fatalf("take a connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	state := &terminationState{}
+	ran := make(chan int, 1)
+	go func() { ran <- lab.feedWithState(state, payload) }()
+	select {
+	case <-stall.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run's batch never reached its calls insert")
+	}
+	grabbed := make(chan error, 1)
+	go func() { // spin, no busy wait, to take the lock the rollback frees
+		for until := time.Now().Add(10 * time.Second); time.Now().Before(until); {
+			if _, err := conn.ExecContext(lab.ctx, "BEGIN IMMEDIATE"); err == nil {
+				grabbed <- nil
+				return
+			}
+		}
+		grabbed <- errors.New("the competing writer never took the store")
+	}()
+	close(stall.release)
+	if err := <-grabbed; err != nil {
+		t.Fatal(err)
+	}
+	var faults int
+	if err := conn.QueryRowContext(lab.ctx, "SELECT COUNT(*) FROM faults WHERE error LIKE '%refused by the test%'").Scan(&faults); err != nil {
+		t.Fatalf("count faults: %v", err)
+	}
+	if faults != 0 { // the run's fault went first: no wait to judge
+		if _, err := conn.ExecContext(lab.ctx, "ROLLBACK"); err != nil {
+			t.Fatalf("release the store: %v", err)
+		}
+		<-ran
+		return false
+	}
+	// The store stays taken past half the run's wait: the hold must be let go
+	// within it, and stay free while the fault waits.
+	released := false
+	for until := time.Now().Add(storeWait("PreToolUse") / 2); !released && time.Now().Before(until); {
+		if released = state.mu.TryLock(); released {
+			state.mu.Unlock()
+		} else {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !released {
+		t.Error("the run kept the signal state's lock from its failed batch into its fault's wait on the busy store")
+	}
+	for until := time.Now().Add(300 * time.Millisecond); released && time.Now().Before(until); {
+		if !state.mu.TryLock() {
+			t.Error("the run took the signal state's lock again during its fault's wait on the busy store")
+			break
+		}
+		state.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := conn.ExecContext(lab.ctx, "ROLLBACK"); err != nil {
+		t.Fatalf("release the store: %v", err)
+	}
+	if code := <-ran; code != 0 {
+		t.Errorf("run exit code = %d, want 0", code)
+	}
+	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error LIKE '%refused by the test%'", callmeter.StageStore); n != 1 {
+		t.Errorf("store faults of the refused batch = %d, want 1", n)
+	}
+	if got := scene.missedLines(t); got != "" {
+		t.Errorf("missed.log = %q, want no line: the fault row accounts for the event", got)
+	}
+	return true
+}
+
 // The archive trigger holds phase 1 open while a real SessionEnd writes the
 // main WAL. This makes overlap observable even on a fast host.
 func TestProcessPruneLetsASessionEndLand(t *testing.T) {

@@ -30,7 +30,10 @@ var oldRows = []string{
 		('ev3', 'PermissionDenied', 8, '{"reason":"private-reason"}'),
 		('ev4', 'StopFailure', 9, '{"error":"rate_limit"}'),
 		('ev5', 'PermissionDenied', 10, '{"tool_name":"Bash","tool_use_id_bytes":12}'),
-		('ev6', 'PermissionDenied', 11, '{"tool_use_id":"toolu_denied"}')`,
+		('ev6', 'PermissionDenied', 11, '{"tool_use_id":"toolu_denied"}'),
+		('ev8', 'PermissionDenied', 13, '{"tool_name":"mcp__mail__send","tool_input":{"destination":"private-to@x","timeout":3}}')`,
+	`INSERT INTO events (event_id, event, ts, tool_name, detail) VALUES
+		('ev7', 'PermissionRequest', 12, 'mcp__ide__run', '{"tool_input":{"source":"SECRETCODE","timeout":3}}')`,
 	`INSERT INTO faults (ts, tool_use_id, stage, error) VALUES
 		(10, 'toolu_plain', 'parse', 'part 0 (): 1:9: private-token must be followed by )'),
 		(11, 'toolu_plain', 'parse', 'part 2 (grep): 1:4: reached EOF near private-quote'),
@@ -57,7 +60,7 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Redact: %v", err)
 	}
-	want := []RedactCount{{"calls.input", 2}, {"calls.error", 2}, {"events.detail", 2}, {"faults.error", 2}, {"stop_hook_runs.name", 0}, {"command_parts", 2}}
+	want := []RedactCount{{"calls.input", 2}, {"calls.error", 2}, {"events.detail", 4}, {"faults.error", 2}, {"stop_hook_runs.name", 0}, {"command_parts", 2}}
 	if !reflect.DeepEqual(counts, want) {
 		t.Fatalf("Redact = %v, want %v", counts, want)
 	}
@@ -76,6 +79,15 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	// and one stored after, are both their own sanitized form.
 	if !strings.Contains(detail, `{"tool_name":"Bash","tool_use_id_bytes":12}`) || !strings.Contains(detail, `{"tool_use_id":"toolu_denied"}`) {
 		t.Fatalf("details = %s, want both PermissionDenied details unchanged", detail)
+	}
+	// An mcp__ tool's input in a permission event keeps no string, its tool
+	// read from the row's tool_name column, or from the detail of a
+	// PermissionDenied stored before that event filled the column.
+	if !strings.Contains(detail, `{"tool_input":{"source_bytes":10,"timeout":3}}`) || strings.Contains(detail, "SECRETCODE") {
+		t.Fatalf("details = %s, want the mcp__ tool's input source sized", detail)
+	}
+	if !strings.Contains(detail, `{"tool_name":"mcp__mail__send","tool_input":{"destination_bytes":12,"timeout":3}}`) {
+		t.Fatalf("details = %s, want the mcp__ tool named in its detail to have its input sized", detail)
 	}
 	var faults string
 	if err := store.DB().QueryRow(`SELECT group_concat(error, '|') FROM (SELECT error FROM faults ORDER BY ts)`).Scan(&faults); err != nil {

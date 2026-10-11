@@ -578,6 +578,28 @@ func TestReplayOutcomes(t *testing.T) {
 // permutationSeeds fix the arrival orders: a failing seed replays exactly.
 var permutationSeeds = []uint64{1, 7, 42, 1009, 65537}
 
+// TestReplayWritesCallResults: fed in order, a real session leaves what each
+// call's result cost the context on the calls of every request but the last
+// of its stream, so the order test's equal columns are not all NULL.
+func TestReplayWritesCallResults(t *testing.T) {
+	for _, session := range gymSessions {
+		t.Run(session, func(t *testing.T) {
+			t.Parallel()
+			r := newReplay(t, "gym/"+session)
+			r.feedInOrder()
+			var withBasis int
+			for _, row := range r.lab.dump()["calls"] {
+				if strings.Contains(row, `result_basis="exact"`) || strings.Contains(row, `result_basis="split"`) {
+					withBasis++
+				}
+			}
+			if withBasis == 0 {
+				t.Errorf("%s fed in order left no call with a result_basis", session)
+			}
+		})
+	}
+}
+
 // TestReplayPermutedArrival: the store is a function of the set of (payload,
 // ts) pairs, never of their arrival order.
 func TestReplayPermutedArrival(t *testing.T) {

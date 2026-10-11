@@ -175,3 +175,27 @@ func TestContextCallFilterKeepsOnlyFilteredRequests(t *testing.T) {
 		})
 	}
 }
+
+// TestContextLeavesLedgerRowsOut: a request row ingested from the cost ledger
+// is a side call on its own context, never part of the chat's context growth.
+func TestContextLeavesLedgerRowsOut(t *testing.T) {
+	store := openStore(t)
+	sizedRequest(t, store, "tool-use", "s", "A", ms(2*time.Hour), 100)
+	sizedRequest(t, store, "final-text", "s", "A", ms(time.Hour), 150)
+	seedRequest(t, store, callmeter.Request{RequestID: "ledger-side", SessionID: callmeter.Ptr("s"), AgentID: callmeter.Ptr("A"),
+		TS: callmeter.Ptr(ms(90 * time.Minute)), Pending: callmeter.Ptr(false), ContextTokens: callmeter.Ptr(int64(9000)),
+		Source: callmeter.Ptr(callmeter.SourceLedger)})
+	table, err := Context(context.Background(), store, Filter{}, chatOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row []string
+	for _, candidate := range table.Rows {
+		if candidate[1] == "s" {
+			row = candidate
+		}
+	}
+	if len(row) == 0 || row[4] != "2" || row[6] != "150" {
+		t.Errorf("target row = %v, want REQUESTS 2 PEAK 150: the ledger row is no request of the chat", row)
+	}
+}

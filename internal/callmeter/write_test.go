@@ -1191,3 +1191,603 @@ func TestPutMarksStoresNoCommandText(t *testing.T) {
 		}
 	}
 }
+
+// fallbackIteration is the fallback_message iteration of
+// testdata/transcript-iterations.jsonl as TestRequestIterations reads it.
+func fallbackIteration() Iteration {
+	return Iteration{
+		Seq: 1, Type: "fallback_message", Model: "claude-opus-4-8",
+		InputTokens: Ptr(int64(2)), CacheReadTokens: Ptr(int64(69945)), CacheCreationTokens: Ptr(int64(574)),
+		CacheCreation5m: Ptr(int64(0)), CacheCreation1h: Ptr(int64(574)), OutputTokens: Ptr(int64(4474)),
+	}
+}
+
+// TestRequestIterationsFollowTheirRequest: every write of a requests row a
+// transcript read fills (a batch's upsert, a provisional key's resolve, a
+// sweep's settle, recovery) writes its iterations under the request's id with
+// the request's ts, only once the request's own row was written: none under a
+// provisional key, none for another owner's row or a request older than the
+// session that was never stored, none on a store without the table. A settle
+// overwrites a stored iteration; recovery only fills.
+func TestRequestIterationsFollowTheirRequest(t *testing.T) {
+	ctx := context.Background()
+	stored := fallbackIteration()
+	stored.OutputTokens, stored.Model = Ptr(int64(99)), ""
+	want := map[string]any{
+		"request_id": "msg_1", "seq": int64(1), "ts": int64(1788019350229), "type": "fallback_message", "model": "claude-opus-4-8",
+		"input_tokens": int64(2), "cache_read_tokens": int64(69945), "cache_creation_tokens": int64(574),
+		"cache_creation_5m_tokens": int64(0), "cache_creation_1h_tokens": int64(574), "output_tokens": int64(4474),
+	}
+	request := func(id string) Request {
+		return Request{RequestID: id, SessionID: Ptr("sess-1"), TS: Ptr(int64(1788019350229)), Model: Ptr("claude-opus-4-8"),
+			Pending: Ptr(false), Iterations: []Iteration{fallbackIteration()}}
+	}
+	cases := []struct {
+		name  string
+		write func(tx *Tx) error
+		want  map[string]any // the msg_1 iteration row; nil: none
+	}{
+		{"batch upsert", func(tx *Tx) error { return tx.UpsertRequest(ctx, request("msg_1"), Overwrite) }, want},
+		{"provisional key", func(tx *Tx) error { return tx.UpsertRequest(ctx, request(ProvisionalKey("toolu_1")), Overwrite) }, nil},
+		{"resolve", func(tx *Tx) error {
+			if err := tx.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_1"), SessionID: Ptr("sess-1"),
+				TS: Ptr(int64(5)), Pending: Ptr(true)}, Overwrite); err != nil {
+				return err
+			}
+			return tx.ResolveRequest(ctx, ProvisionalKey("toolu_1"), request("msg_1"))
+		}, want},
+		{"settle", func(tx *Tx) error { return tx.SettleRequest(ctx, request("msg_1"), nil, 0) }, want},
+		{"settle over a stored iteration", func(tx *Tx) error {
+			old := request("msg_1")
+			old.Iterations = []Iteration{stored}
+			if err := tx.SettleRequest(ctx, old, nil, 0); err != nil {
+				return err
+			}
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 0)
+		}, want},
+		{"recover over a stored iteration", func(tx *Tx) error {
+			old := request("msg_1")
+			old.Iterations = []Iteration{stored}
+			if err := tx.SettleRequest(ctx, old, nil, 0); err != nil {
+				return err
+			}
+			return tx.RecoverRequest(ctx, request("msg_1"), nil, 0)
+		}, func() map[string]any {
+			kept := map[string]any{}
+			for k, v := range want {
+				kept[k] = v
+			}
+			kept["output_tokens"] = int64(99) // recovery never overwrites a stored value
+			return kept
+		}()},
+		{"another owner's row", func(tx *Tx) error {
+			if err := tx.UpsertRequest(ctx, Request{RequestID: "msg_1", SessionID: Ptr("sess-parent"), TS: Ptr(int64(1788019350229))},
+				Overwrite); err != nil {
+				return err
+			}
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 0)
+		}, nil},
+		{"older than the session, never stored", func(tx *Tx) error {
+			return tx.SettleRequest(ctx, request("msg_1"), nil, 1788019350229+1)
+		}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store := openTestStore(t)
+			if err := store.Batch(ctx, c.write); err != nil {
+				t.Fatal(err)
+			}
+			if got := row(t, store, "request_iterations", "request_id = ? AND seq = 1", "msg_1"); !reflect.DeepEqual(got, c.want) {
+				t.Errorf("iteration row = %v\nwant %v", got, c.want)
+			}
+			if c.want == nil && count(t, store, "request_iterations") != 0 {
+				t.Errorf("request_iterations holds %d rows, want none", count(t, store, "request_iterations"))
+			}
+		})
+	}
+	t.Run("store without the table", func(t *testing.T) {
+		store := openIncompleteStore(t)
+		if err := store.Batch(ctx, func(tx *Tx) error { return tx.UpsertRequest(ctx, request("msg_1"), Overwrite) }); err != nil {
+			t.Fatalf("UpsertRequest on an incomplete store: %v", err)
+		}
+	})
+}
+
+// pricedRequest is the sample's first ledger row as a request: Claude Code
+// priced it 149149 micros with all of its cache write at the 1-hour rate.
+func pricedRequest(id string) Request {
+	return Request{
+		RequestID: id, SessionID: Ptr("sess-1"), AgentID: nil, TS: Ptr(int64(5)), Model: Ptr("claude-opus-5-5"),
+		InputTokens: Ptr(int64(2)), OutputTokens: Ptr(int64(323)), CacheReadTokens: Ptr(int64(76447)),
+		CacheCreationTokens: Ptr(int64(15924)), CacheCreation5mTokens: Ptr(int64(0)), CacheCreation1hTokens: Ptr(int64(15924)),
+		ContextTokens: Ptr(int64(2 + 76447 + 15924)), Pending: Ptr(false), APIRequestID: Ptr("req_invented_1"),
+	}
+}
+
+// TestRequestsAreWrittenWithTheirTablePrice: every writer of a request leaves
+// it priced from the table (cost_source 'table') at its final tokens, an unknown
+// model unpriced (NULL, NULL), a provisional row unpriced, and a price the
+// ledger gave ('ledger') untouched by a later write.
+func TestRequestsAreWrittenWithTheirTablePrice(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	check := func(name, id string, micros any, source any) {
+		t.Helper()
+		got := row(t, store, "requests", "request_id = ?", id)
+		if got["cost_usd_micros"] != micros || got["cost_source"] != source {
+			t.Errorf("%s: cost = %v / %v, want %v / %v", name, got["cost_usd_micros"], got["cost_source"], micros, source)
+		}
+	}
+	if err := store.UpsertRequest(ctx, pricedRequest("msg_1"), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("upsert", "msg_1", int64(149149), "table")
+	if got := row(t, store, "requests", "request_id = ?", "msg_1"); got["api_request_id"] != "req_invented_1" {
+		t.Errorf("api_request_id = %v, want req_invented_1", got["api_request_id"])
+	}
+	// Streaming: a later entry of the message raises its output tokens.
+	longer := pricedRequest("msg_1")
+	longer.OutputTokens = Ptr(int64(400))
+	if err := store.UpsertRequest(ctx, longer, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("rewrite with more output", "msg_1", int64(149149+77*20), "table")
+
+	unknown := pricedRequest("msg_unknown")
+	unknown.Model = Ptr("claude-nonesuch-9")
+	if err := store.UpsertRequest(ctx, unknown, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("unknown model", "msg_unknown", nil, nil)
+
+	if err := store.UpsertRequest(ctx, Request{RequestID: ProvisionalKey("toolu_p"), SessionID: Ptr("sess-1"), Pending: Ptr(true)}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("provisional", ProvisionalKey("toolu_p"), nil, nil)
+
+	// A provisional row resolved to its message gets the message's price.
+	if err := store.ResolveRequest(ctx, ProvisionalKey("toolu_p"), pricedRequest("msg_resolved")); err != nil {
+		t.Fatal(err)
+	}
+	check("resolved", "msg_resolved", int64(149149), "table")
+
+	// SettleRequest and RecoverRequest price the row they wrote.
+	if err := store.UpsertRequest(ctx, Request{RequestID: "msg_settled", SessionID: Ptr("sess-1")}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.SettleRequest(ctx, pricedRequest("msg_settled"), nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	check("settle", "msg_settled", int64(149149), "table")
+	if err := store.UpsertRequest(ctx, Request{RequestID: "msg_recovered", SessionID: Ptr("sess-1"), TS: Ptr(int64(5))}, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.RecoverRequest(ctx, pricedRequest("msg_recovered"), nil, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	check("recover", "msg_recovered", int64(149149), "table")
+
+	// The ledger's price stands against a rewrite.
+	if _, err := store.DB().ExecContext(ctx, "UPDATE requests SET cost_usd_micros = 150000, cost_source = 'ledger' WHERE request_id = 'msg_1'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertRequest(ctx, longer, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("ledger price kept", "msg_1", int64(150000), "ledger")
+}
+
+// gptRequest is a GPT request in the store's units: input_tokens the uncached
+// input, cache_read_tokens the cached part, no cache write.
+func gptRequest(id, model string) Request {
+	return Request{
+		RequestID: id, SessionID: Ptr("sess-gpt"), TS: Ptr(int64(5)), Model: Ptr(model),
+		InputTokens: Ptr(int64(1000)), OutputTokens: Ptr(int64(500)), CacheReadTokens: Ptr(int64(2000)),
+		CacheCreationTokens: Ptr(int64(0)), ContextTokens: Ptr(int64(3000)), Pending: Ptr(false),
+	}
+}
+
+// TestRequestPriceAtInsert: a request carries its price from the moment it is
+// written. Claude Code's own price (the cost ledger) first, whether it was
+// stored before the request arrived (a ledger row keyed by the API request id
+// the request then takes over) or after; else the embedded list, a GPT model's
+// a list-equivalent; NULL only for a pending row or a model neither names.
+func TestRequestPriceAtInsert(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	check := func(name, id string, micros any, source any) {
+		t.Helper()
+		got := row(t, store, "requests", "request_id = ?", id)
+		if got == nil {
+			t.Fatalf("%s: no request %q", name, id)
+		}
+		if got["cost_usd_micros"] != micros || got["cost_source"] != source {
+			t.Errorf("%s: cost = %v / %v, want %v / %v", name, got["cost_usd_micros"], got["cost_source"], micros, source)
+		}
+	}
+	// A GPT request is priced from the list the moment it is written.
+	if err := store.UpsertRequest(ctx, gptRequest("msg_gpt", "gpt-6-sol"), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("gpt-6-sol", "msg_gpt", int64(1000*2+500*10+2000*0.2), "table")
+
+	// The ledger priced the call before the request was written: its side row,
+	// keyed by the API request id, gives the price and the query source to the
+	// request that takes the id, and goes.
+	if _, err := store.DB().ExecContext(ctx,
+		`INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending, source, api_request_id,
+			query_source, cost_usd_micros, cost_source)
+		VALUES ('req_early', 'sess-1', 5, 'claude-opus-5-5', 2, 323, 0, 'ledger', 'req_early', 'repl_main_thread', 150000, 'ledger')`); err != nil {
+		t.Fatal(err)
+	}
+	early := pricedRequest("msg_early")
+	early.APIRequestID = Ptr("req_early")
+	if err := store.UpsertRequest(ctx, early, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("ledger row stored first", "msg_early", int64(150000), "ledger")
+	if got := row(t, store, "requests", "request_id = ?", "msg_early"); got["query_source"] != "repl_main_thread" {
+		t.Errorf("query_source = %v, want the ledger row's", got["query_source"])
+	}
+	if got := row(t, store, "requests", "request_id = ?", "req_early"); got != nil {
+		t.Errorf("the ledger row of a call a transcript request now holds stays: %v", got)
+	}
+	// A rewrite of the request (more output) keeps the ledger's price.
+	early.OutputTokens = Ptr(int64(400))
+	if err := store.UpsertRequest(ctx, early, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("ledger price kept on a rewrite", "msg_early", int64(150000), "ledger")
+
+	// A request whose API request id no ledger row holds takes the table's price.
+	late := pricedRequest("msg_late")
+	late.APIRequestID = Ptr("req_late")
+	if err := store.UpsertRequest(ctx, late, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	check("no ledger row", "msg_late", int64(149149), "table")
+}
+
+// oldRequests are rows a binary before this one wrote: a GPT request with no
+// price, a Claude one of a model the list did not name, and two priced with
+// numbers the list would not give.
+func oldRequests(t *testing.T, store *Store) {
+	t.Helper()
+	for _, statement := range []string{
+		`INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+			context_tokens, pending, source) VALUES ('old_gpt', 'sess-old', 1, 'gpt-6-sol', 1000, 500, 2000, 0, 3000, 0, 'hook')`,
+		`INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending, source)
+			VALUES ('old_unlisted', 'sess-old', 2, 'claude-nonesuch-9', 10, 5, 0, 'hook')`,
+		`INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending, source, cost_usd_micros, cost_source)
+			VALUES ('old_table', 'sess-old', 3, 'claude-opus-5-5', 10, 5, 0, 'hook', 424242, 'table')`,
+		`INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending, source, cost_usd_micros, cost_source,
+			api_request_id, query_source) VALUES ('old_ledger', 'sess-old', 4, 'claude-opus-5-5', 10, 5, 0, 'hook', 77, 'ledger', 'req_old', 'q')`,
+	} {
+		if _, err := store.DB().Exec(statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+}
+
+// requestDump is every requests row of the old session, whole.
+func requestDump(t *testing.T, store *Store) string {
+	t.Helper()
+	var out []string
+	for _, id := range []string{"old_gpt", "old_unlisted", "old_table", "old_ledger"} {
+		out = append(out, fmt.Sprint(row(t, store, "requests", "request_id = ?", id)))
+	}
+	return strings.Join(out, "\n")
+}
+
+// TestOldRowsKeepTheirPriceOrTheirNull: the price is forward only. A store
+// holding NULL-priced and priced rows is opened by this binary, a report
+// run's pricing pass runs, and new requests are written into the same session:
+// every old row stays byte-identical.
+func TestOldRowsKeepTheirPriceOrTheirNull(t *testing.T) {
+	ctx := context.Background()
+	first := openTestStore(t)
+	oldRequests(t, first)
+	before := requestDump(t, first)
+
+	reopened, err := OpenDB(ctx, first.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := requestDump(t, reopened); got != before {
+		t.Errorf("opening the store changed old rows:\nbefore %s\nafter  %s", before, got)
+	}
+	if _, _, err := reopened.PriceUnpriced(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := requestDump(t, reopened); got != before {
+		t.Errorf("the pricing pass of a report run changed old rows:\nbefore %s\nafter  %s", before, got)
+	}
+	newer := gptRequest("msg_new", "gpt-6-sol")
+	newer.SessionID, newer.TS = Ptr("sess-old"), Ptr(int64(10))
+	if err := reopened.UpsertRequest(ctx, newer, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if got := requestDump(t, reopened); got != before {
+		t.Errorf("a later request write changed old rows:\nbefore %s\nafter  %s", before, got)
+	}
+}
+
+// streamRequest is a request of a stream (session, agent), ts and model given,
+// its tokens split as a Claude Code message reports them: context_tokens the
+// sum of the input, the cache read and the cache write.
+func streamRequest(id string, agent *string, ts int64, model string, read, create5m, create1h, out int64) Request {
+	return Request{
+		RequestID: id, SessionID: Ptr("sess-r5"), AgentID: agent, TS: Ptr(ts), Model: Ptr(model),
+		InputTokens: Ptr(int64(10)), CacheReadTokens: Ptr(read), CacheCreationTokens: Ptr(create5m + create1h),
+		CacheCreation5mTokens: Ptr(create5m), CacheCreation1hTokens: Ptr(create1h), OutputTokens: Ptr(out),
+		ContextTokens: Ptr(10 + read + create5m + create1h), Pending: Ptr(false),
+	}
+}
+
+// TestCallResultTokensFollowTheNextRequest: when request k is written, the
+// calls of the stream's previous request get result_tokens (k's context minus
+// the previous context and its output, clamped at 0; NULL after a compaction,
+// a drop of more than 5000), result_basis (exact for one call, split by
+// bytes_delivered for several) and result_write_micros (the tokens at k's
+// average cache-write price; NULL when k has no price). Streams are told apart
+// by agent, and a rewrite of k leaves the same values.
+func TestCallResultTokensFollowTheNextRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	const opus = "claude-opus-5-5" // write 5m 5, write 1h 8 USD per million
+	mainChat := func(id string, ts int64, model string, read, c5, c1, out int64) {
+		t.Helper()
+		if err := store.UpsertRequest(ctx, streamRequest(id, nil, ts, model, read, c5, c1, out), Overwrite); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issue := func(tool, request string, agent *string, delivered *int64) {
+		t.Helper()
+		call := Call{ToolUseID: tool, SessionID: Ptr("sess-r5"), AgentID: agent, RequestID: Ptr(request), BytesDelivered: delivered}
+		if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := func(name, tool string, tokens any, basis any, micros any) {
+		t.Helper()
+		got := row(t, store, "calls", "tool_use_id = ?", tool)
+		if got["result_tokens"] != tokens || got["result_basis"] != basis || got["result_write_micros"] != micros {
+			t.Errorf("%s: result_tokens/basis/write_micros = %v / %v / %v, want %v / %v / %v", name, got["result_tokens"],
+				got["result_basis"], got["result_write_micros"], tokens, basis, micros)
+		}
+	}
+	// A: the stream's first request, 20000 context, 50 out, two calls.
+	mainChat("msg_a", 100, opus, 15000, 4990, 0, 50)
+	issue("toolu_a1", "msg_a", nil, Ptr(int64(300)))
+	issue("toolu_a2", "msg_a", nil, Ptr(int64(100)))
+	want("the first request's calls wait", "toolu_a1", nil, nil, nil)
+
+	// B: 20450 context. Growth 20450-20000-50 = 400, split 300:100 by bytes
+	// delivered, at B's cache write price (all 5-minute: 5 per token).
+	mainChat("msg_b", 200, opus, 20000, 440, 0, 30)
+	want("A's first call", "toolu_a1", int64(300), "split", int64(1500))
+	want("A's second call", "toolu_a2", int64(100), "split", int64(500))
+	issue("toolu_b1", "msg_b", nil, Ptr(int64(10)))
+	// Another stream in the same session: the sub-agent's first request, and
+	// one call, between the main chat's requests.
+	agent := Ptr("agent-1")
+	if err := store.UpsertRequest(ctx, streamRequest("msg_g", agent, 250, opus, 1000, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	issue("toolu_g1", "msg_g", agent, Ptr(int64(7)))
+
+	// C: 20500 context. B issued one call: exact, 20500-20450-30 = 20 tokens at
+	// C's 1-hour write price (8 per token).
+	mainChat("msg_c", 300, opus, 20450, 0, 40, 10)
+	want("B's call", "toolu_b1", int64(20), "exact", int64(160))
+	want("the sub-agent's call waits for its own stream", "toolu_g1", nil, nil, nil)
+	issue("toolu_c1", "msg_c", nil, Ptr(int64(50)))
+
+	// D: the context fell by 17000 tokens, a compaction: no result tokens.
+	mainChat("msg_d", 400, opus, 3000, 0, 0, 10)
+	want("after a compaction", "toolu_c1", nil, "exact", nil)
+	issue("toolu_d1", "msg_d", nil, Ptr(int64(5)))
+
+	// E: 3005 context against D's 3010+10: growth -15, clamped at 0.
+	mainChat("msg_e", 500, opus, 2995, 0, 0, 10)
+	want("a shrink inside the margin is zero", "toolu_d1", int64(0), "exact", int64(0))
+	issue("toolu_e1", "msg_e", nil, Ptr(int64(5)))
+
+	// F: a model the list does not name carries no price: tokens, no write price.
+	mainChat("msg_f", 600, "claude-nonesuch-9", 3100, 0, 0, 1)
+	want("a request with no price", "toolu_e1", int64(3110-3005-10), "exact", nil)
+
+	// The sub-agent's next request closes its own stream's call.
+	if err := store.UpsertRequest(ctx, streamRequest("msg_h", agent, 700, opus, 1020, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	want("the sub-agent's call", "toolu_g1", int64(1030-1010-5), "exact", int64(15*5))
+
+	// A rewrite of B (the same message again) leaves A's results as they were.
+	mainChat("msg_b", 200, opus, 20000, 440, 0, 30)
+	want("A's first call after B's rewrite", "toolu_a1", int64(300), "split", int64(1500))
+}
+
+// TestCallResultSplitNeedsEveryDeliveredSize: several calls with an unknown
+// delivered size cannot be split: split basis, NULL tokens, never an even
+// share read as the real one.
+func TestCallResultSplitNeedsEveryDeliveredSize(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertRequest(ctx, streamRequest("msg_a", nil, 100, "claude-opus-5-5", 1000, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	for tool, delivered := range map[string]*int64{"toolu_1": Ptr(int64(40)), "toolu_2": nil} {
+		call := Call{ToolUseID: tool, SessionID: Ptr("sess-r5"), RequestID: Ptr("msg_a"), BytesDelivered: delivered}
+		if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertRequest(ctx, streamRequest("msg_b", nil, 200, "claude-opus-5-5", 1100, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range []string{"toolu_1", "toolu_2"} {
+		got := row(t, store, "calls", "tool_use_id = ?", tool)
+		if got["result_tokens"] != nil || got["result_basis"] != "split" || got["result_write_micros"] != nil {
+			t.Errorf("%s: tokens/basis/micros = %v / %v / %v, want NULL / split / NULL", tool, got["result_tokens"], got["result_basis"], got["result_write_micros"])
+		}
+	}
+}
+
+// TestCallResultWriteMicrosIsNullForALedgerPricedRequestOfAnUnlistedModel: the
+// write price per token is always the embedded table's, never derived from the
+// ledger's total (which holds no cache-write rate), so a next request Claude
+// Code priced whose model the table does not name leaves result_write_micros
+// NULL beside its result tokens.
+func TestCallResultWriteMicrosIsNullForALedgerPricedRequestOfAnUnlistedModel(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertRequest(ctx, streamRequest("msg_a", nil, 100, "claude-opus-5-5", 1000, 0, 0, 5), Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	call := Call{ToolUseID: "toolu_1", SessionID: Ptr("sess-r5"), RequestID: Ptr("msg_a"), BytesDelivered: Ptr(int64(40))}
+	if err := store.UpsertCall(ctx, call, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	const unlisted = "claude-nonesuch-9"
+	side := ledgerRow{
+		ledgerFields: ledgerFields{
+			Model: Ptr(unlisted), Input: Ptr(int64(1)), Output: Ptr(int64(1)), CacheRead: Ptr(int64(1)), CacheCreation: Ptr(int64(1)), Cost: Ptr(int64(777)),
+		},
+		id: "req_unlisted", session: "sess-r5", at: time.UnixMilli(150),
+	}
+	if err := store.Batch(ctx, func(tx *Tx) error { return tx.applyLedger(ctx, nil, nil, []ledgerRow{side}) }); err != nil {
+		t.Fatal(err)
+	}
+	next := streamRequest("msg_b", nil, 200, unlisted, 1100, 0, 0, 5)
+	next.APIRequestID = Ptr("req_unlisted")
+	if err := store.UpsertRequest(ctx, next, Overwrite); err != nil {
+		t.Fatal(err)
+	}
+	if got := row(t, store, "requests", "request_id = 'msg_b'"); got["cost_source"] != "ledger" || got["cost_usd_micros"] != int64(777) {
+		t.Fatalf("the next request = %v from %v, want the ledger's 777", got["cost_usd_micros"], got["cost_source"])
+	}
+	got := row(t, store, "calls", "tool_use_id = 'toolu_1'")
+	if got["result_tokens"] == nil || got["result_write_micros"] != nil {
+		t.Errorf("result_tokens/result_write_micros = %v / %v, want tokens and a NULL write price", got["result_tokens"], got["result_write_micros"])
+	}
+}
+
+// TestPreviousRequestLookupIsIndexed: the hot-path lookups of a stream's
+// previous and next request walk requests_session_agent_ts, and the calls of a request
+// calls_request, never a scan under the write lock.
+func TestPreviousRequestLookupIsIndexed(t *testing.T) {
+	store := openTestStore(t)
+	for _, c := range []struct {
+		query, index string
+		args         []any
+	}{
+		{previousRequestSQL, "requests_session_agent_ts", []any{"s", "a", 1, "r"}},
+		{nextRequestSQL, "requests_session_agent_ts", []any{"s", "a", 1, "r"}},
+		{previousRequestSQL, "requests_session_agent_ts", []any{"s", nil, 1, "r"}},
+		{requestCallsSQL, "calls_request", []any{"r"}},
+	} {
+		rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+c.query, c.args...)
+		if err != nil {
+			t.Fatalf("%s: %v", c.query, err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
+		if p := strings.Join(plan, "; "); !strings.Contains(p, c.index) || strings.Contains(p, "SCAN") {
+			t.Errorf("plan of %q = %s, want a search of %s", c.query, p, c.index)
+		}
+	}
+}
+
+// TestCallResultsDoNotDependOnArrival: async hooks land a stream's requests,
+// its calls, their delivered sizes and their request links in any order, and
+// a provisional request (its message not yet in the transcript) may stand
+// between two resolved ones for a while. The calls' result columns are a
+// function of the rows stored at the end, never of the order that built them.
+func TestCallResultsDoNotDependOnArrival(t *testing.T) {
+	ctx := context.Background()
+	const opus = "claude-opus-5-5"
+	provisional := ProvisionalKey("toolu_b1")
+	steps := map[string]func(*Store) error{
+		"A": func(s *Store) error {
+			return s.UpsertRequest(ctx, streamRequest("msg_a", nil, 100, opus, 15000, 4990, 0, 50), Overwrite)
+		},
+		"a1": func(s *Store) error {
+			return s.UpsertCall(ctx, Call{ToolUseID: "toolu_a1", SessionID: Ptr("sess-r5"), RequestID: Ptr("msg_a"), BytesDelivered: Ptr(int64(300))}, Overwrite)
+		},
+		// a2's delivered size and its request link land apart: the link from
+		// the Stop sweep's settle of A, which re-reads A from the transcript and
+		// points only a call already stored, so it follows the size.
+		"a2 size": func(s *Store) error {
+			return s.UpsertCall(ctx, Call{ToolUseID: "toolu_a2", SessionID: Ptr("sess-r5"), BytesDelivered: Ptr(int64(100))}, Overwrite)
+		},
+		"a2 link": func(s *Store) error {
+			return s.Batch(ctx, func(tx *Tx) error {
+				return tx.SettleRequest(ctx, streamRequest("msg_a", nil, 100, opus, 15000, 4990, 0, 50), []string{"toolu_a2"}, 0)
+			})
+		},
+		"B": func(s *Store) error {
+			return s.UpsertRequest(ctx, streamRequest("msg_b", nil, 200, opus, 20000, 440, 0, 30), Overwrite)
+		},
+		"b1": func(s *Store) error {
+			return s.UpsertCall(ctx, Call{ToolUseID: "toolu_b1", SessionID: Ptr("sess-r5"), RequestID: Ptr("msg_b"), BytesDelivered: Ptr(int64(10))}, Overwrite)
+		},
+		"C": func(s *Store) error {
+			return s.UpsertRequest(ctx, streamRequest("msg_c", nil, 300, opus, 20450, 0, 40, 10), Overwrite)
+		},
+		// B first stored as a batch's provisional request, its call pointing
+		// at it, then resolved to its message.
+		"B provisional": func(s *Store) error {
+			return s.Batch(ctx, func(tx *Tx) error {
+				if err := tx.UpsertRequest(ctx, Request{RequestID: provisional, SessionID: Ptr("sess-r5"), TS: Ptr(int64(200)), Pending: Ptr(true)}, Overwrite); err != nil {
+					return err
+				}
+				return tx.UpsertCall(ctx, Call{ToolUseID: "toolu_b1", SessionID: Ptr("sess-r5"), RequestID: Ptr(provisional), BytesDelivered: Ptr(int64(10))}, Overwrite)
+			})
+		},
+		"B resolved": func(s *Store) error {
+			return s.ResolveRequest(ctx, provisional, streamRequest("msg_b", nil, 200, opus, 20000, 440, 0, 30))
+		},
+	}
+	results := func(order []string) string {
+		t.Helper()
+		store := openTestStore(t)
+		for _, step := range order {
+			if err := steps[step](store); err != nil {
+				t.Fatalf("%v: step %s: %v", order, step, err)
+			}
+		}
+		return keys(t, store.DB(), `SELECT tool_use_id || ' ' || COALESCE(request_id, '-') || ' ' || COALESCE(result_tokens, '-') || ' ' ||
+			COALESCE(result_basis, '-') || ' ' || COALESCE(result_write_micros, '-') FROM calls ORDER BY tool_use_id`)
+	}
+	// The values themselves are TestCallResultTokensFollowTheNextRequest's;
+	// here every call must hold some, or equal orders would prove nothing.
+	want := results([]string{"A", "a1", "a2 size", "a2 link", "B", "b1", "C"})
+	if strings.Contains(want, " -") {
+		t.Fatalf("in order = %q: a call holds no result", want)
+	}
+	for _, order := range [][]string{
+		{"C", "b1", "B", "a2 size", "a2 link", "a1", "A"},
+		{"A", "B", "C", "a1", "b1", "a2 size", "a2 link"},
+		{"A", "a1", "B", "a2 size", "C", "b1", "a2 link"},
+		{"b1", "A", "C", "a1", "B", "a2 size", "a2 link"},
+		{"A", "a1", "a2 size", "a2 link", "B provisional", "C", "B resolved"},
+		{"A", "a1", "a2 size", "B provisional", "C", "a2 link", "B resolved"},
+		{"C", "B provisional", "A", "a1", "B resolved", "a2 size", "a2 link"},
+	} {
+		if got := results(order); got != want {
+			t.Errorf("order %v:\n got  %q\n want %q", order, got, want)
+		}
+	}
+}

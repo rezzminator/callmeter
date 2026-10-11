@@ -57,8 +57,14 @@ func (fixture lab) run(args ...string) (code int, stdout, stderr string) {
 	return code, out.String(), errs.String()
 }
 
-// seedRead records one Read call of file in session, run from seat.
+// seedRead records one Read call of file in session, run from seat, now.
 func (fixture lab) seedRead(t *testing.T, id, session, file, seat string) {
+	t.Helper()
+	fixture.seedReadAt(t, id, session, file, seat, time.Now())
+}
+
+// seedReadAt records one Read call of file in session, run from seat, at ts.
+func (fixture lab) seedReadAt(t *testing.T, id, session, file, seat string, ts time.Time) {
 	t.Helper()
 	ctx := context.Background()
 	store, err := callmeter.OpenDB(ctx, fixture.storePath)
@@ -72,7 +78,7 @@ func (fixture lab) seedRead(t *testing.T, id, session, file, seat string) {
 	}()
 	call := callmeter.Call{
 		ToolUseID: id, SessionID: callmeter.Ptr(session), AgentID: callmeter.Ptr(""),
-		TS: callmeter.Ptr(time.Now().UnixMilli()), Tool: callmeter.Ptr("Read"),
+		TS: callmeter.Ptr(ts.UnixMilli()), Tool: callmeter.Ptr("Read"),
 		Cwd: callmeter.Ptr(filepath.Dir(file)), FilePath: callmeter.Ptr(file),
 		// failed=0 is what PostToolUse sets on a Read that ran; with it NULL the row
 		// reads as PostToolBatch-only and the report names it in a note.
@@ -93,9 +99,127 @@ func TestCallmeterCLIReportOverASeededStoreRendersTheTable(t *testing.T) {
 		t.Fatalf("report files = %d, want 0 and a quiet stderr\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 	title, _, _ := strings.Cut(stdout, "\n")
-	if !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: since ") ||
+	if !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: all time") ||
 		!strings.Contains(stdout, "/work/one.md") {
-		t.Fatalf("report files stdout = %q, want a title naming the window and the seeded file", stdout)
+		t.Fatalf("report files stdout = %q, want a title naming the whole-store window and the seeded file", stdout)
+	}
+}
+
+// writeConfig puts content in the lab's settings file, {CALLMETER_HOME}/config.json.
+func (fixture lab) writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := paths.Config(filepath.Dir(fixture.storePath))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// storedCalls is the number of calls the lab's store holds.
+func (fixture lab) storedCalls(t *testing.T) int {
+	t.Helper()
+	store, err := callmeter.OpenDB(context.Background(), fixture.storePath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+	var n int
+	if err := store.DB().QueryRow("SELECT COUNT(*) FROM calls").Scan(&n); err != nil {
+		t.Fatalf("count calls: %v", err)
+	}
+	return n
+}
+
+// seedAgedReads records a read from a year ago and one from now.
+func (fixture lab) seedAgedReads(t *testing.T) {
+	t.Helper()
+	fixture.seedReadAt(t, "toolu_old", "sess-1", "/work/old.md", fixture.seat, time.Now().Add(-365*24*time.Hour))
+	fixture.seedRead(t, "toolu_new", "sess-1", "/work/new.md", fixture.seat)
+}
+
+// TestCallmeterCLIReportKeepsEveryRowWithoutAConfig: with no config.json a
+// report prunes nothing, however old a row is, and its window is the whole store.
+func TestCallmeterCLIReportKeepsEveryRowWithoutAConfig(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedAgedReads(t)
+	code, stdout, stderr := fixture.run("report", "files")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report files = %d, want 0 and a quiet stderr\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	title, _, _ := strings.Cut(stdout, "\n")
+	if !strings.Contains(title, "window: all time") || !strings.Contains(stdout, "/work/old.md") || !strings.Contains(stdout, "/work/new.md") {
+		t.Errorf("report files stdout = %q, want the whole-store window and both files", stdout)
+	}
+	if n := fixture.storedCalls(t); n != 2 {
+		t.Errorf("store holds %d calls after a report with no config, want 2", n)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.storePath), "archive.db")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a report with no config wrote archive.db (stat err %v)", err)
+	}
+}
+
+// TestCallmeterCLIReportPrunesToTheConfiguredRetention: retention_days in
+// config.json is the old behavior with a window of the user's choosing: older
+// rows are archived and pruned, the default window is the retention, and a
+// --since beyond it is clamped with one note.
+func TestCallmeterCLIReportPrunesToTheConfiguredRetention(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedAgedReads(t)
+	fixture.writeConfig(t, `{"retention_days": 30}`)
+	code, stdout, stderr := fixture.run("report", "files")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report files = %d, want 0 and a quiet stderr\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	title, _, _ := strings.Cut(stdout, "\n")
+	if !strings.Contains(title, "window: since ") || strings.Contains(stdout, "/work/old.md") || !strings.Contains(stdout, "/work/new.md") {
+		t.Errorf("report files stdout = %q, want a retention-window title and only the new file", stdout)
+	}
+	if n := fixture.storedCalls(t); n != 1 {
+		t.Errorf("store holds %d calls after a 30-day prune, want 1", n)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.storePath), "archive.db")); err != nil {
+		t.Errorf("the pruned row was not archived: %v", err)
+	}
+	code, _, stderr = fixture.run("report", "files", "--since", "90d")
+	if code != 0 || !strings.Contains(stderr, "--since 90d is older than the 30-day retention window; clamped to ") {
+		t.Errorf("report files --since 90d = %d, stderr %q, want 0 and the clamp note", code, stderr)
+	}
+	code, _, stderr = fixture.run("report", "files", "--since", "7d")
+	if code != 0 || stderr != "" {
+		t.Errorf("report files --since 7d = %d, stderr %q, want 0 and a quiet stderr: inside the window", code, stderr)
+	}
+}
+
+// TestCallmeterCLIReportRefusesABadConfigBeforeTouchingTheStore: a settings
+// file the report cannot trust stops it with a line naming the file, so a typo
+// never silently keeps or drops rows.
+func TestCallmeterCLIReportRefusesABadConfigBeforeTouchingTheStore(t *testing.T) {
+	for name, content := range map[string]string{
+		"malformed":        `{"retention_days": `,
+		"misspelled key":   `{"retention_day": 30}`,
+		"negative":         `{"retention_days": -5}`,
+		"empty":            ``,
+		"wrong value type": `{"retention_days": "30"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newLab(t)
+			fixture.seedAgedReads(t)
+			path := fixture.writeConfig(t, content)
+			code, stdout, stderr := fixture.run("report", "files")
+			if code != 1 || stdout != "" || !strings.Contains(stderr, path) {
+				t.Fatalf("report with a bad config = %d, stdout %q, stderr %q; want 1, no stdout, a stderr line naming %s", code, stdout, stderr, path)
+			}
+			if n := fixture.storedCalls(t); n != 2 {
+				t.Errorf("store holds %d calls after a refused report, want 2 untouched", n)
+			}
+		})
 	}
 }
 
@@ -208,12 +332,12 @@ func TestCallmeterCLIUnreadableTranscriptShowsAQuestionMarkAndOneNote(t *testing
 	}
 }
 
-// allTopics are the 20 report topics: the six ported, the eight of 5-b, then the
-// six over the transcript metrics.
+// allTopics are the 21 report topics: the six ported, the eight of 5-b, the six
+// over the transcript metrics, then cache.
 var allTopics = []string{
 	"files", "writes", "commands", "context", "sequences", "faults",
 	"sessions", "prompts", "effort", "tokens", "agents", "outcomes", "coverage", "events",
-	"compactions", "cost", "hooks", "turns", "resumes", "waiting",
+	"compactions", "cost", "hooks", "turns", "resumes", "waiting", "cache",
 }
 
 // seedEverything records something every one of the new topics reports, and an
@@ -347,7 +471,7 @@ func TestCallmeterCLIReportJSONOnEveryTopicMatchesTheText(t *testing.T) {
 	}
 }
 
-// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the fourteen new topics
+// TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows: the fifteen new topics
 // each print the rows the seeded store holds.
 func TestCallmeterCLIReportEveryNewTopicShowsItsSeededRows(t *testing.T) {
 	fixture := newLab(t)
@@ -467,7 +591,7 @@ func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 		"agents":      "callmeter: no sub-agents in window",
 		"tokens":      "callmeter: no requests in window",
 		"compactions": "callmeter: no compactions in window",
-		"cost":        "callmeter: no cost-state recorded in window",
+		"cost":        "callmeter: no cost recorded in window",
 		"hooks":       "callmeter: no Stop hook summaries in window",
 		"turns":       "callmeter: no turn durations in window",
 		"resumes":     "callmeter: no resumes in window",
@@ -485,7 +609,7 @@ func TestCallmeterCLIReportEmptyWindowIsOneLineAndEmptyRows(t *testing.T) {
 	}
 }
 
-func TestCallmeterCLIUnknownTopicListsAllTwenty(t *testing.T) {
+func TestCallmeterCLIUnknownTopicListsAllTwentyOne(t *testing.T) {
 	fixture := newLab(t)
 	code, stdout, stderr := fixture.run("report", "nope")
 	if code != 2 || stdout != "" || !strings.HasPrefix(stderr, "callmeter report: want one topic") {
@@ -551,7 +675,7 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 
 // TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic: a missed.log present
 // when a report runs is turned into faults first, so the note counts it on all
-// 20 topics, and the file is consumed.
+// 21 topics, and the file is consumed.
 func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
@@ -983,5 +1107,105 @@ func TestRecoveryNotesUseOnlySafeLabels(t *testing.T) {
 				t.Errorf("notes = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// ledgerLab is a lab whose environment names a cost ledger directory holding
+// one session's file of three side calls (invented ids), written an hour ago.
+func ledgerLab(t *testing.T) (fixture lab, session string) {
+	t.Helper()
+	fixture = newLab(t)
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat) // the store the hooks would have made
+	dir := filepath.Join(filepath.Dir(fixture.userHome), "cost-ledger")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	session = "00000000-0000-4000-8000-0000000000a1"
+	at := time.Now().Add(-time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	line := func(n int, agent, source string, cost int) string {
+		return fmt.Sprintf(`{"request_id":"req_011CFixture%08d","ts":%q,"session_id":%q,"agent_id":%q,"parent_agent_id":"","query_source":%q,`+
+			`"model":"claude-haiku-5-5","input_tokens":1000,"output_tokens":100,"cache_read_tokens":0,"cache_creation_tokens":0,`+
+			`"cost_usd_micros":%d,"speed":"normal","effort":"","join":"log+span"}`, n, at, session, agent, source, cost)
+	}
+	lines := []string{line(1, "", "web_search_tool", 75000), line(2, "a0000000000000001", "agent_summary", 900), line(3, "", "prompt_suggestion", 20000)}
+	if err := os.WriteFile(filepath.Join(dir, session+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath), "HOME": fixture.userHome, paths.EnvCostLedgerDir: dir})
+	return fixture, session
+}
+
+// TestCallmeterCLIReportCostIngestsTheLedgerInEveryView: the report brings the
+// cost ledger's side calls into the store before the topic runs, so the chat,
+// agent and call views all count them, the second run changes nothing, and the
+// notes name the ledger read.
+func TestCallmeterCLIReportCostIngestsTheLedgerInEveryView(t *testing.T) {
+	fixture, session := ledgerLab(t)
+	for run := 1; run <= 2; run++ {
+		code, stdout, stderr := fixture.run("report", "cost", "--session", session)
+		if code != 0 || stderr != "" {
+			t.Fatalf("run %d: report cost = %d\nstdout:\n%s\nstderr:\n%s", run, code, stdout, stderr)
+		}
+		for _, want := range []string{"0.10", "note: cost ledger ", ": 3 calls in the window, 0 held by a transcript, 3 side calls"} {
+			if !strings.Contains(stdout, want) {
+				t.Errorf("run %d: report cost lacks %q:\n%s", run, want, stdout)
+			}
+		}
+	}
+	code, stdout, stderr := fixture.run("report", "cost", "--view", "agent", "--session", session)
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "main") || !strings.Contains(stdout, "a0000000000000001") || !strings.Contains(stdout, "0.10") {
+		t.Errorf("agent view = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	code, stdout, stderr = fixture.run("report", "cost", "--view", "call", "--session", session, "--json")
+	got := decodeReport(t, stdout)
+	if code != 0 || stderr != "" || len(got.Rows) != 3 || got.Rows[0][3] != "web_search_tool" || got.Rows[0][9] != "0.0750" {
+		t.Errorf("call view = %d rows %v\nstdout:\n%s\nstderr:\n%s", code, got.Rows, stdout, stderr)
+	}
+	code, stdout, _ = fixture.run("report", "tokens", "--view", "agent")
+	if code != 0 || !strings.Contains(stdout, "note: --view does not apply to tokens") {
+		t.Errorf("report tokens --view agent = %d, want a note that --view does not apply\n%s", code, stdout)
+	}
+}
+
+// TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted: no ledger
+// directory is the default path of nothing, never an error and never a
+// smaller number passed off as complete.
+func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedEverything(t)
+	code, stdout, stderr := fixture.run("report", "cost")
+	if code != 0 || stderr != "" {
+		t.Fatalf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger at ") || !strings.Contains(stdout, ".local/state/pfm/cost-ledger") {
+		t.Errorf("report cost lacks the side-calls-not-counted note naming the default ledger path:\n%s", stdout)
+	}
+}
+
+// TestCallmeterCLIReportCostNamesALedgerItCannotRead: a ledger path that is not
+// a directory is a stderr line and a note on the cost report, never "no
+// ledger"; the other reports still run.
+func TestCallmeterCLIReportCostNamesALedgerItCannotRead(t *testing.T) {
+	fixture := newLab(t)
+	fixture.seedEverything(t)
+	file := filepath.Join(fixture.userHome, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath), "HOME": fixture.userHome, paths.EnvCostLedgerDir: file})
+	code, stdout, stderr := fixture.run("report", "cost")
+	if code != 0 || !strings.Contains(stderr, "cost ledger") || !strings.Contains(stdout, "note: side calls are not counted: the cost ledger could not be read") {
+		t.Errorf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if code, _, _ := fixture.run("report", "tokens"); code != 0 {
+		t.Errorf("report tokens = %d with an unreadable ledger, want 0", code)
+	}
+}
+
+func TestCallmeterCLIReportCostRejectsAnUnknownView(t *testing.T) {
+	fixture := newLab(t)
+	code, stdout, stderr := fixture.run("report", "cost", "--view", "nope")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, `--view "nope" is none of chat, agent, call`) {
+		t.Errorf("report cost --view nope = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
 }

@@ -13,19 +13,22 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
 	"github.com/rezzminator/callmeter/internal/clock"
+	"github.com/rezzminator/callmeter/internal/config"
 	"github.com/rezzminator/callmeter/internal/paths"
 )
 
 // Usage is the report action's usage text.
-const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events|compactions|cost|hooks|turns|resumes|waiting} [--since D] [--project P]
-                       [--agent-type T] [--session S] [--limit N] [--json]
-  --since D         a duration (7d, 24h) or a date (2026-09-01); default and floor: the 30-day retention window
+const Usage = `usage: callmeter report {files|writes|commands|context|sequences|faults|sessions|prompts|effort|tokens|agents|outcomes|coverage|events|compactions|cost|hooks|turns|resumes|waiting|cache} [--since D] [--project P]
+                       [--agent-type T] [--session S] [--limit N] [--view V] [--json]
+  --since D         a duration (7d, 24h) or a date (2026-09-01); default: the whole store, or with retention_days set in config.json its retention window, which also floors it
+  --view V          cost only: chat (default), agent or call
   --json            one JSON object on stdout instead of the text table`
 
 type topicFunc func(context.Context, *callmeter.Store, report.Filter, report.NameOf) (*report.Table, error)
@@ -36,7 +39,7 @@ var topics = map[string]topicFunc{
 	"sessions": report.Sessions, "prompts": report.Prompts, "effort": report.Effort, "tokens": report.Tokens,
 	"agents": report.Agents, "outcomes": report.Outcomes, "coverage": report.Coverage, "events": report.Events,
 	"compactions": report.Compactions, "cost": report.Cost, "hooks": report.Hooks, "turns": report.Turns,
-	"resumes": report.Resumes, "waiting": report.Waiting,
+	"resumes": report.Resumes, "waiting": report.Waiting, "cache": report.Cache,
 }
 
 // CLI is `callmeter {args}` for the report action: the reports over the call
@@ -57,6 +60,7 @@ func CLI(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 type flagValues struct {
 	since, project, agentType, session string
 	limit                              int
+	view                               string
 	json                               bool
 }
 
@@ -70,6 +74,7 @@ func newFlags(name string, stderr io.Writer) (*flag.FlagSet, *flagValues) {
 	flags.StringVar(&values.agentType, "agent-type", "", "calls made by this agent type")
 	flags.StringVar(&values.session, "session", "", "calls in this session")
 	flags.IntVar(&values.limit, "limit", report.DefaultLimit, "rows per table")
+	flags.StringVar(&values.view, "view", "", "cost only: chat (default), agent or call")
 	flags.BoolVar(&values.json, "json", false, "one JSON object on stdout instead of the text table")
 	return flags, values
 }
@@ -155,6 +160,12 @@ func reportAction(
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
 		return 1
 	}
+	cfg, err := config.Load(paths.Config(home))
+	if err != nil {
+		fmt.Fprintf(stderr, "callmeter: %v\n", err)
+		return 1
+	}
+	filter.Since = windowSince(filter.Since, values.since, cfg.RetentionDays, now, stderr)
 	path := paths.Store(home)
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		// No store to ingest into: the lines still waiting in missed.log and its
@@ -183,6 +194,7 @@ func reportAction(
 			}
 		}
 	}()
+	db.SetRetention(cfg.Retention())
 	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
 	if _, err := db.IngestMissed(ctx, paths.Missed(home)); err != nil {
 		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
@@ -208,6 +220,13 @@ func reportAction(
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)
 		return 1
 	}
+	// Calls no transcript records come in from the optional cost ledger, and every
+	// settled request gets its price, before the topic reads the store.
+	if _, _, err := db.PriceUnpriced(ctx); err != nil {
+		fmt.Fprintf(stderr, "callmeter: price requests: %v\n", err)
+		return 1
+	}
+	filter.Ledger = ingestLedger(ctx, db, getenv, now, stderr)
 	// An own seat that cannot be resolved stays empty: coverage names it in a note.
 	filter.OwnSeat, _ = paths.SeatDir(getenv)
 	table, err := topic(ctx, db, filter, names.nameOf)
@@ -230,6 +249,23 @@ func reportAction(
 		return 1
 	}
 	return 0
+}
+
+// ingestLedger brings the cost ledger in. A ledger that cannot be read is one
+// stderr line and a summary naming the failure, never "no ledger": the reports
+// still run, and the cost topic says its side calls are not counted.
+func ingestLedger(ctx context.Context, db *callmeter.Store, getenv paths.Getenv, now time.Time, stderr io.Writer) *callmeter.LedgerSummary {
+	dir, err := paths.CostLedger(getenv)
+	if err != nil {
+		// No home to look under: there is no default ledger to read.
+		return &callmeter.LedgerSummary{}
+	}
+	summary, err := db.IngestLedger(ctx, dir, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "callmeter: cost ledger: %v\n", err)
+		summary.Err = err.Error()
+	}
+	return &summary
 }
 
 // recoveryNotes summarizes skipped transcripts without exposing paths or OS
@@ -316,18 +352,14 @@ func printNoStore(stdout io.Writer, asJSON bool, topic, path string, notes []str
 	}{topic, "absent", path, []string{}, [][]string{}, notes})
 }
 
-// buildFilter turns the flags into a report.Filter: --since clamped to the
-// retention window (with one note), --project absolute.
+// buildFilter turns the flags into a report.Filter: --since a time or, unset,
+// none (the whole store; windowSince bounds it by a retention), --project
+// absolute.
 func buildFilter(values *flagValues, now time.Time, stderr io.Writer) (report.Filter, int, bool) {
 	since, err := report.ParseSince(values.since, now)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return report.Filter{}, 2, false
-	}
-	if floor := now.Add(-report.Retention); since.Before(floor) {
-		fmt.Fprintf(stderr, "callmeter: --since %s is older than the %d-day retention window; clamped to %s\n",
-			values.since, int(report.Retention.Hours()/24), floor.UTC().Format(time.RFC3339))
-		since = floor
 	}
 	project := values.project
 	if project != "" {
@@ -336,8 +368,32 @@ func buildFilter(values *flagValues, now time.Time, stderr io.Writer) (report.Fi
 			return report.Filter{}, 2, false
 		}
 	}
+	if values.view != "" && !slices.Contains(report.CostViews, values.view) {
+		fmt.Fprintf(stderr, "callmeter: --view %q is none of %s\n", values.view, strings.Join(report.CostViews, ", "))
+		return report.Filter{}, 2, false
+	}
 	return report.Filter{
 		Since: since, Project: project, AgentType: values.agentType, Session: values.session,
-		Limit: values.limit,
+		Limit: values.limit, CostView: values.view,
 	}, 0, true
+}
+
+// windowSince bounds a report's since by the retention window in days, from
+// config.json; 0 keeps every row, so since stands. With a window, an unset
+// since is its start and one older than it is clamped to it with one stderr
+// note, since the store holds nothing before it. raw is the --since text.
+func windowSince(since time.Time, raw string, retentionDays int, now time.Time, stderr io.Writer) time.Time {
+	if retentionDays == 0 {
+		return since
+	}
+	floor := now.Add(-time.Duration(retentionDays) * 24 * time.Hour)
+	switch {
+	case since.IsZero():
+		return floor
+	case since.Before(floor):
+		fmt.Fprintf(stderr, "callmeter: --since %s is older than the %d-day retention window; clamped to %s\n",
+			raw, retentionDays, floor.UTC().Format(time.RFC3339))
+		return floor
+	}
+	return since
 }

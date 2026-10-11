@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,14 @@ const SourceHook = "hook"
 // SourceTranscript is the source of a row the quiet-session recovery wrote
 // from a transcript, no hook (RecoverQuiet).
 const SourceTranscript = "transcript"
+
+// SourceLedger is the source of a requests row ingested from the cost ledger: a
+// call no transcript records (a side call), priced by Claude Code itself.
+const SourceLedger = "ledger"
+
+// CostSourceTable is the cost_source of a request priced from the embedded
+// price table; SourceLedger is that of one priced by Claude Code itself.
+const CostSourceTable = "table"
 
 // Fault stages: where a failure to record or parse happened. StageBinary and
 // StageTerminated rows come only from ingesting missed.log (IngestMissed):
@@ -61,7 +70,13 @@ const ArchiveFile = "archive.db"
 // with no SQL comment: deriveTables derives the archive's tables and the
 // columns completeSchema adds to an older store from this text. A column added
 // after version 1 goes last in its table, so a store that gained it by ALTER
-// has the order of one created fresh.
+// has the order of one created fresh. A view's lines are indented by spaces,
+// never a tab, its first line ending in `-- version N` (viewVersion; any change
+// to a view's SQL raises N), its last line alone ending in `;` (deriveViews);
+// a view reads only this store's own tables, never an attached database, so
+// the file works opened alone, and uses no window function: a reader whose
+// SQLite cannot parse a view (before 3.25 for window functions) cannot read
+// the store at all.
 const schema = `
 CREATE TABLE IF NOT EXISTS calls (
 	tool_use_id TEXT PRIMARY KEY,
@@ -96,7 +111,10 @@ CREATE TABLE IF NOT EXISTS calls (
 	test_runner TEXT,
 	source TEXT,
 	config_dir TEXT,
-	seat_dir TEXT
+	seat_dir TEXT,
+	result_tokens INTEGER,
+	result_basis TEXT,
+	result_write_micros INTEGER
 );
 CREATE INDEX IF NOT EXISTS calls_session_agent_ts ON calls(session_id, agent_id, ts);
 CREATE INDEX IF NOT EXISTS calls_ts ON calls(ts);
@@ -123,9 +141,15 @@ CREATE TABLE IF NOT EXISTS requests (
 	source TEXT,
 	config_dir TEXT,
 	seat_dir TEXT,
-	thinking_tokens INTEGER
+	thinking_tokens INTEGER,
+	api_request_id TEXT,
+	cost_usd_micros INTEGER,
+	cost_source TEXT,
+	query_source TEXT
 );
 CREATE INDEX IF NOT EXISTS requests_session_agent_pending ON requests(session_id, agent_id, pending);
+CREATE INDEX IF NOT EXISTS requests_session_agent_ts ON requests(session_id, agent_id, ts);
+CREATE INDEX IF NOT EXISTS requests_api_request_id ON requests(api_request_id);
 CREATE TABLE IF NOT EXISTS agents (
 	agent_id TEXT PRIMARY KEY,
 	session_id TEXT,
@@ -219,7 +243,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	config_dir_ts INTEGER,
 	host_ts INTEGER,
 	tz_name_ts INTEGER,
-	tz_offset_minutes_ts INTEGER
+	tz_offset_minutes_ts INTEGER,
+	ledger_offset INTEGER
 );
 CREATE TABLE IF NOT EXISTS command_parts (
 	tool_use_id TEXT NOT NULL,
@@ -241,6 +266,7 @@ CREATE TABLE IF NOT EXISTS faults (
 	stage TEXT,
 	error TEXT
 );
+CREATE INDEX IF NOT EXISTS faults_session_stage ON faults(session_id, stage);
 CREATE TABLE IF NOT EXISTS compactions (
 	entry_id TEXT PRIMARY KEY,
 	session_id TEXT,
@@ -298,6 +324,61 @@ CREATE TABLE IF NOT EXISTS turn_durations (
 	seat_dir TEXT
 );
 CREATE INDEX IF NOT EXISTS turn_durations_session_ts ON turn_durations(session_id, ts);
+CREATE TABLE IF NOT EXISTS request_iterations (
+	request_id TEXT NOT NULL,
+	seq INTEGER NOT NULL,
+	ts INTEGER,
+	type TEXT,
+	model TEXT,
+	input_tokens INTEGER,
+	cache_read_tokens INTEGER,
+	cache_creation_tokens INTEGER,
+	cache_creation_5m_tokens INTEGER,
+	cache_creation_1h_tokens INTEGER,
+	output_tokens INTEGER,
+	PRIMARY KEY (request_id, seq)
+);
+CREATE VIEW IF NOT EXISTS request_cache AS -- version 2
+  WITH party AS (
+    SELECT r.request_id, r.session_id, r.agent_id, r.ts, r.model, r.cache_read_tokens,
+      v.ts AS previous_ts, v.context_tokens AS expected_read, v.model AS previous_model
+    FROM requests r LEFT JOIN requests v ON v.request_id = (SELECT e.request_id FROM requests e
+        WHERE e.session_id IS r.session_id AND e.agent_id IS r.agent_id AND e.pending IS NOT 1 AND e.source IS NOT 'ledger'
+          AND e.ts <= r.ts AND (e.ts < r.ts OR e.request_id < r.request_id)
+        ORDER BY e.ts DESC, e.request_id DESC LIMIT 1)
+    WHERE r.pending IS NOT 1 AND r.source IS NOT 'ledger' AND r.ts IS NOT NULL
+  ),
+  judged AS (
+    SELECT p.*, p.ts - p.previous_ts AS gap_ms,
+      (SELECT CASE
+          WHEN e.cache_creation_5m_tokens > 0 AND e.cache_creation_1h_tokens > 0 THEN 'mixed'
+          WHEN e.cache_creation_1h_tokens > 0 THEN '1h'
+          WHEN e.cache_creation_5m_tokens > 0 THEN '5m'
+        END
+        FROM requests e
+        WHERE e.session_id IS p.session_id AND e.agent_id IS p.agent_id AND e.pending IS NOT 1 AND e.source IS NOT 'ledger'
+          AND e.ts <= p.ts AND (e.ts < p.ts OR e.request_id < p.request_id) AND e.cache_creation_tokens > 0
+        ORDER BY e.ts DESC, e.request_id DESC LIMIT 1) AS entry_ttl,
+      CASE
+        WHEN p.previous_ts IS NULL THEN 'first'
+        WHEN p.expected_read IS NULL OR p.cache_read_tokens IS NULL THEN NULL
+        WHEN p.cache_read_tokens * 100 >= p.expected_read * 95 THEN 'hit'
+        WHEN p.cache_read_tokens * 100 >= p.expected_read * 50 THEN 'partial'
+        ELSE 'miss'
+      END AS outcome
+    FROM party p
+  )
+  SELECT j.request_id, j.gap_ms, j.entry_ttl, j.expected_read, j.outcome,
+    CASE
+      WHEN j.outcome NOT IN ('partial', 'miss') OR j.outcome IS NULL THEN NULL
+      WHEN j.model IS NOT NULL AND j.previous_model IS NOT NULL AND j.model <> j.previous_model THEN 'model_changed'
+      WHEN EXISTS (SELECT 1 FROM compactions c WHERE c.session_id IS j.session_id AND c.agent_id IS j.agent_id
+          AND c.ts > j.previous_ts AND c.ts <= j.ts) THEN 'compacted'
+      WHEN j.gap_ms > CASE j.entry_ttl WHEN '1h' THEN 3600000 WHEN '5m' THEN 300000 WHEN 'mixed' THEN 300000 END
+        THEN 'expired'
+      ELSE 'unknown'
+    END AS cause
+  FROM judged j;
 `
 
 // Store is an open callmeter database.
@@ -305,12 +386,27 @@ type Store struct {
 	db       *sql.DB
 	path     string
 	complete bool // every table, column and index of schema is present
+	// retention is how long the store keeps rows; 0 keeps them forever (SetRetention).
+	retention time.Duration
 }
 
 // SchemaComplete reports whether every table, column and index of schema is
 // present; false only when an open could not add them (a busy store), and a
 // later open tries again.
 func (s *Store) SchemaComplete() bool { return s.complete }
+
+// ViewVersions is the version marker (viewVersion) of the store's view name
+// and of the one this callmeter ships: a stored version above the shipped one
+// is a newer release's view, which an open leaves in place (missingFromSchema)
+// and a report must not read as its own.
+func (s *Store) ViewVersions(ctx context.Context, name string) (stored, shipped int, err error) {
+	var text string
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?", name).Scan(&text); err != nil {
+		return 0, 0, fmt.Errorf("callmeter store %s: read the %s view: %w", s.path, name, err)
+	}
+	return viewVersion(text), viewVersion(schemaViews[name]), nil
+}
 
 // OpenDB opens the store at path with the default wait (OpenDBWaiting).
 func OpenDB(ctx context.Context, path string) (*Store, error) {
@@ -403,16 +499,19 @@ func prepare(ctx context.Context, db *sql.DB, path string) (bool, error) {
 	return true, createSchema(ctx, db, path)
 }
 
-// completeSchema adds to a version-1 store whatever of schema it lacks: a store
-// created before a column, table or index existed has none of it, and the
-// version stays 1 because every addition is only a column or a table the store
-// can do without (a hook then writes the old columns, and the prune leaves
-// the store alone: Prune). An open that finds everything writes nothing, one
-// read-only query. An open that does not takes the write lock at BEGIN
-// IMMEDIATE, works out again what is missing (a concurrent open may have added
-// it), adds each missing column by ALTER TABLE, then runs schema, which
-// creates the missing tables and indexes since every statement of it is IF NOT
-// EXISTS, and commits. It reports true when the store is complete. Any failure
+// completeSchema adds to a version-1 store whatever of schema it lacks, and
+// writes again a view whose SQL is not the shipped one and whose version is
+// not newer (an older binary's): a
+// store created before a column, table, index or view existed has none of it,
+// and the version stays 1 because every addition is only a column, a table or
+// a view the store can do without (a hook then writes the old columns, and the
+// prune leaves the store alone: Prune). An open that finds everything writes
+// nothing, read-only queries only. An open that does not takes the write lock
+// at BEGIN IMMEDIATE, works out again what is missing (a concurrent open may
+// have added it), adds each missing column by ALTER TABLE and drops each such
+// view, then runs schema, which creates the missing tables, indexes and views
+// since every statement of it is IF NOT EXISTS, and commits. It reports true
+// when the store is complete. Any failure
 // (busy included) rolls back and reports false, and the open goes on without:
 // an open must never lose a hook's record over it, and a later open tries
 // again.
@@ -459,8 +558,12 @@ type queryer interface {
 }
 
 // missingFromSchema compares the store behind q with schema, writing nothing:
-// the ALTER TABLE statements for the columns missing from a table that exists
-// (in schema order), and whether any table or index is missing as a whole.
+// the statements that bring what exists to schema before schema runs (an ALTER
+// TABLE for each column missing from a table that exists, in schema order, and
+// a DROP VIEW for each view whose SQL is not the shipped SQL and whose version
+// marker (viewVersion) is not newer than the shipped one, so schema's CREATE
+// VIEW IF NOT EXISTS writes it again; a newer release's view stays), and
+// whether any table, index or view is missing as a whole.
 func missingFromSchema(ctx context.Context, q queryer) (alters []string, schemaMissing bool, err error) {
 	have := map[string]map[string]bool{}
 	rows, err := q.QueryContext(ctx,
@@ -482,19 +585,25 @@ func missingFromSchema(ctx context.Context, q queryer) (alters []string, schemaM
 		return nil, false, fmt.Errorf("read the store's columns: %w", err)
 	}
 	haveIndex := map[string]bool{}
-	rows, err = q.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'index'")
+	haveView := map[string]string{}
+	rows, err = q.QueryContext(ctx,
+		"SELECT type, name, COALESCE(sql, '') FROM sqlite_master WHERE type IN ('index', 'view')")
 	if err != nil {
-		return nil, false, fmt.Errorf("read the store's indexes: %w", err)
+		return nil, false, fmt.Errorf("read the store's indexes and views: %w", err)
 	}
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, false, errors.Join(fmt.Errorf("read the store's indexes: %w", err), rows.Close())
+		var kind, name, text string
+		if err := rows.Scan(&kind, &name, &text); err != nil {
+			return nil, false, errors.Join(fmt.Errorf("read the store's indexes and views: %w", err), rows.Close())
 		}
-		haveIndex[name] = true
+		if kind == "index" {
+			haveIndex[name] = true
+		} else {
+			haveView[name] = text
+		}
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return nil, false, fmt.Errorf("read the store's indexes: %w", err)
+		return nil, false, fmt.Errorf("read the store's indexes and views: %w", err)
 	}
 	for _, name := range sortedKeys(storeTables) {
 		table := storeTables[name]
@@ -511,6 +620,16 @@ func missingFromSchema(ctx context.Context, q queryer) (alters []string, schemaM
 	for _, name := range schemaIndexes {
 		if !haveIndex[name] {
 			schemaMissing = true
+		}
+	}
+	for _, name := range sortedKeys(schemaViews) {
+		text, ok := haveView[name]
+		switch {
+		case !ok:
+			schemaMissing = true
+		case text != schemaViews[name] && viewVersion(text) <= viewVersion(schemaViews[name]):
+			// a newer release's view stays: seats on two releases share the store
+			alters = append(alters, "DROP VIEW "+name)
 		}
 	}
 	return alters, schemaMissing, nil
@@ -580,6 +699,7 @@ type Fault struct {
 	ToolUseID string
 	Stage     string // one of the Stage* constants
 	Error     string
+	Once      bool // write the row only when the session holds no fault of this stage and error yet (Tx.AddFault)
 }
 
 // AddFault records f in its own transaction; an empty SessionID or ToolUseID
@@ -594,13 +714,81 @@ func (s *Store) AddFaultHeld(ctx context.Context, f Fault, held func()) error {
 	return s.BatchHeld(ctx, held, func(tx *Tx) error { return tx.AddFault(ctx, f) })
 }
 
+// AddFaultIfFree records f in its own transaction only when the store's write
+// lock is free at once. written is whether f committed, and stands whatever
+// err says: err after a commit is only the failure to restore the store's own
+// busy wait on its one connection, or to hand that connection back. Not
+// written with no err means another writer holds the lock, and nothing was
+// written.
+func (s *Store) AddFaultIfFree(ctx context.Context, f Fault) (written bool, err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: take its connection: %w", s.path, err)
+	}
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("callmeter store %s: release its connection: %w", s.path, closeErr))
+		}
+	}()
+	restore, err := s.shortenBusyWait(ctx, conn, 0)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, restore()) }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if IsBusy(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("callmeter store %s: begin transaction: %w", s.path, err)
+	}
+	if err := (&Tx{tx: tx, path: s.path, complete: s.SchemaComplete()}).AddFault(ctx, f); err != nil {
+		return false, errors.Join(err, tx.Rollback())
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("callmeter store %s: commit: %w", s.path, err)
+	}
+	return true, nil
+}
+
+// shortenBusyWait lowers conn's busy wait to at most millis milliseconds, and
+// returns the call that puts the store's own wait back (a no-op when it was
+// already that short); the driver does not end that wait at a ctx deadline, so
+// this is how a caller bounds it.
+func (s *Store) shortenBusyWait(ctx context.Context, conn *sql.Conn, millis int64) (restore func() error, err error) {
+	restore = func() error { return nil }
+	var wait int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&wait); err != nil {
+		return restore, fmt.Errorf("callmeter store %s: read busy_timeout: %w", s.path, err)
+	}
+	if wait <= millis {
+		return restore, nil
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", max(millis, 0))); err != nil {
+		return restore, fmt.Errorf("callmeter store %s: set busy_timeout: %w", s.path, err)
+	}
+	return func() error {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout=%d", wait)); err != nil {
+			return fmt.Errorf("callmeter store %s: restore busy_timeout: %w", s.path, err)
+		}
+		return nil
+	}, nil
+}
+
 // AddFault records f as part of the transaction; an empty SessionID or
 // ToolUseID is stored as NULL.
 func (t *Tx) AddFault(ctx context.Context, f Fault) error {
-	if _, err := t.tx.ExecContext(ctx,
-		"INSERT INTO faults (ts, session_id, tool_use_id, stage, error) VALUES (?, ?, ?, ?, ?)",
-		f.TS, nullString(f.SessionID), nullString(f.ToolUseID), f.Stage, f.Error,
-	); err != nil {
+	query := "INSERT INTO faults (ts, session_id, tool_use_id, stage, error) VALUES (?1, ?2, ?3, ?4, ?5)"
+	args := []any{f.TS, nullString(f.SessionID), nullString(f.ToolUseID), f.Stage, f.Error}
+	if f.Once {
+		// Decided under the write lock by the statement itself, through
+		// faults_session_stage, so two hooks of a session cannot both write it;
+		// the row may hold the text as Redact rewrote it (?6).
+		query = `INSERT INTO faults (ts, session_id, tool_use_id, stage, error) SELECT ?1, ?2, ?3, ?4, ?5
+			WHERE NOT EXISTS (SELECT 1 FROM faults WHERE session_id IS ?2 AND stage = ?4 AND error IN (?5, ?6))`
+		args = append(args, sanitizeFault(f.Stage, f.Error))
+	}
+	if _, err := t.tx.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("callmeter store %s: add %s fault for call %q: %w", t.path, f.Stage, f.ToolUseID, err)
 	}
 	return nil
@@ -622,14 +810,26 @@ type pruneTable struct {
 const callsExpired = "COALESCE(ts, (SELECT r.ts FROM requests r WHERE r.request_id = calls.request_id)) < ?"
 
 // pruneTables lists, in prune order, each table with its predicates (see
-// pruneTable); any row with no timestamp has no age and stays. command_parts
-// goes last: its rows age with their call. Phase 1 copies a part whose call
+// pruneTable); any row with no timestamp has no age and stays.
+// request_iterations follows requests, its rows aging with their request, the
+// way command_parts ages with its call. command_parts goes last: its rows age
+// with their call. Phase 1 copies a part whose call
 // is expiring or already gone, and phase 2, running after the calls are
 // deleted, removes the parts whose call is gone: an orphan has no cutoff of its
 // own.
 var pruneTables = []pruneTable{
 	{name: "calls", verb: "REPLACE", key: []string{"tool_use_id"}, expired: callsExpired},
 	{name: "requests", verb: "REPLACE", key: []string{"request_id"}, expired: "ts < ?"},
+	// An iteration follows its request: phase 1 copies those of an expiring
+	// request, phase 2, after the requests are deleted, removes those whose
+	// request is gone.
+	{
+		name:     "request_iterations",
+		verb:     "REPLACE",
+		key:      []string{"request_id", "seq"},
+		expired:  "request_id NOT IN (SELECT request_id FROM requests)",
+		archived: "request_id NOT IN (SELECT request_id FROM requests) OR request_id IN (SELECT request_id FROM requests WHERE ts < ?)",
+	},
 	{name: "turns", verb: "IGNORE", key: []string{"event_id"}, expired: "ts < ?"},
 	{name: "events", verb: "IGNORE", key: []string{"event_id"}, expired: "ts < ?"},
 	// A recreated store can reuse fault_id; inArchive checks the entire copy
@@ -713,6 +913,49 @@ var storeTables = deriveTables(schema, nil)
 // schemaIndexes names the indexes of schema.
 var schemaIndexes = deriveIndexes(schema)
 
+// schemaViews is each view of schema by name, as SQLite keeps its SQL in
+// sqlite_master: what completeSchema compares a store's view with.
+var schemaViews = deriveViews(schema)
+
+// viewVersion is the version marker of a view's SQL, the `-- version N` that
+// ends its first line; 0 when it carries none. Every release parses a stored
+// view, a newer release's included, by this form.
+func viewVersion(sql string) int {
+	first, _, _ := strings.Cut(sql, "\n")
+	_, marker, ok := strings.Cut(first, "-- version ")
+	if !ok {
+		return 0
+	}
+	version, err := strconv.Atoi(strings.TrimSpace(marker))
+	if err != nil {
+		return 0
+	}
+	return version
+}
+
+// deriveViews reads the views out of the store DDL text: each runs from its
+// `CREATE VIEW IF NOT EXISTS {name} AS` line to the line ending in `;`. SQLite
+// keeps a view's SQL as written, less its IF NOT EXISTS.
+func deriveViews(ddl string) map[string]string {
+	const create = "CREATE VIEW IF NOT EXISTS "
+	views := map[string]string{}
+	var name string
+	var lines []string
+	for _, line := range strings.Split(ddl, "\n") {
+		if strings.HasPrefix(line, create) {
+			name = strings.Fields(strings.TrimPrefix(line, create))[0]
+			lines = []string{"CREATE VIEW " + strings.TrimPrefix(line, create)}
+		} else if name != "" {
+			lines = append(lines, line)
+		}
+		if name != "" && strings.HasSuffix(line, ";") {
+			views[name] = strings.TrimSuffix(strings.Join(lines, "\n"), ";")
+			name, lines = "", nil
+		}
+	}
+	return views
+}
+
 // deriveIndexes reads the index names out of the store DDL text.
 func deriveIndexes(ddl string) []string {
 	const create = "CREATE INDEX IF NOT EXISTS "
@@ -770,8 +1013,9 @@ var pruneAfterArchive func() error
 // in archive.db beside the store (see archiveTables): calls, requests, turns,
 // events, faults, compactions, stop_hooks, stop_hook_runs and turn_durations by
 // ts; session_costs by the ts of its snapshot; agents and agent_turns by
-// COALESCE(stopped, started); sessions by last_ts; then every command_parts row
-// whose call is gone. It returns how many store rows went.
+// COALESCE(stopped, started); sessions by last_ts; every request_iterations
+// row whose request is gone, and then every command_parts row whose call is
+// gone. It returns how many store rows went.
 //
 // A commit spanning two WAL databases is atomic per file only, so each
 // transaction writes one file. Phase 1 uses deferred archive transactions of

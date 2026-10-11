@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -68,7 +70,7 @@ func TestParseSince(t *testing.T) {
 		want    time.Time
 		wantErr bool
 	}{
-		{"", testNow.Add(-Retention), false},
+		{"", time.Time{}, false},
 		{"7d", testNow.Add(-7 * 24 * time.Hour), false},
 		{"24h", testNow.Add(-24 * time.Hour), false},
 		{"2026-09-01", time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), false},
@@ -90,6 +92,7 @@ func TestParseSince(t *testing.T) {
 func TestPruneExpiredPrunesOldRowsBeforeReport(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
+	store.SetRetention(30 * 24 * time.Hour)
 	for id, age := range map[string]time.Duration{"old": 40 * 24 * time.Hour, "new": time.Hour} {
 		seed(t, store, callmeter.Call{
 			ToolUseID: id, SessionID: callmeter.Ptr("s"), TS: callmeter.Ptr(ms(age)), Tool: callmeter.Ptr("Read"),
@@ -109,6 +112,53 @@ func TestPruneExpiredPrunesOldRowsBeforeReport(t *testing.T) {
 	}
 	if len(table.Rows) != 1 || table.Rows[0][0] != "/src/new.go" {
 		t.Errorf("rows after prune = %v, want only /src/new.go", table.Rows)
+	}
+}
+
+// TestPruneExpiredWithoutARetentionKeepsEveryRow: a store with no retention,
+// the default, loses nothing to a report however old its rows are.
+func TestPruneExpiredWithoutARetentionKeepsEveryRow(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := callmeter.OpenDB(ctx, filepath.Join(dir, "callmeter.db"))
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	for id, age := range map[string]time.Duration{"ancient": 800 * 24 * time.Hour, "old": 40 * 24 * time.Hour, "new": time.Hour} {
+		seed(t, store, callmeter.Call{
+			ToolUseID: id, SessionID: callmeter.Ptr("s"), TS: callmeter.Ptr(ms(age)), Tool: callmeter.Ptr("Read"),
+			FilePath: callmeter.Ptr("/src/" + id + ".go"), BytesDelivered: callmeter.Ptr(int64(10)),
+		})
+	}
+	removed, err := PruneExpired(ctx, store, testNow)
+	if err != nil || removed != 0 {
+		t.Fatalf("PruneExpired with no retention = %d, %v; want 0, nil", removed, err)
+	}
+	table, err := Files(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+	if len(table.Rows) != 3 {
+		t.Errorf("rows after a report on a store with no retention = %v, want all 3 files", table.Rows)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "archive.db")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a report with no retention touched archive.db (stat err %v)", err)
+	}
+}
+
+// TestTitleNamesTheWindow: a zero Since is the whole store and says so.
+func TestTitleNamesTheWindow(t *testing.T) {
+	if got := (Filter{}).title("files", newNames(nil)); !strings.Contains(got, "window: all time") || strings.Contains(got, "since") {
+		t.Errorf("title of an unbounded filter = %q, want window: all time", got)
+	}
+	got := (Filter{Since: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)}).title("files", newNames(nil))
+	if !strings.Contains(got, "window: since 2026-09-01 00:00 UTC") {
+		t.Errorf("title of a bounded filter = %q, want window: since 2026-09-01 00:00 UTC", got)
 	}
 }
 
@@ -802,7 +852,7 @@ func TestEmptyTopicsNameWhatTheyFoundNone(t *testing.T) {
 		{"events", Events, "callmeter: no events in window"},
 		{"effort", Effort, "callmeter: no effort recorded in window"},
 		{"compactions", Compactions, "callmeter: no compactions in window"},
-		{"cost", Cost, "callmeter: no cost-state recorded in window"},
+		{"cost", Cost, "callmeter: no cost recorded in window"},
 		{"hooks", Hooks, "callmeter: no Stop hook summaries in window"},
 		{"turns", Turns, "callmeter: no turn durations in window"},
 		{"resumes", Resumes, "callmeter: no resumes in window"},

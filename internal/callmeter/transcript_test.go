@@ -102,6 +102,7 @@ func TestFindRequests(t *testing.T) {
 	want := map[string]RequestUsage{
 		"toolu_demo_A": {
 			MessageID:           "msg_demo_1",
+			APIRequestID:        "req_demo_1",
 			TS:                  1790119005062,
 			Model:               "claude-haiku-4-5-20251001",
 			InputTokens:         10,
@@ -112,6 +113,7 @@ func TestFindRequests(t *testing.T) {
 		},
 		"toolu_demo_B": {
 			MessageID:           "msg_demo_1",
+			APIRequestID:        "req_demo_1",
 			TS:                  1790119005300,
 			Model:               "claude-haiku-4-5-20251001",
 			InputTokens:         10,
@@ -633,6 +635,49 @@ func TestReadTranscriptThinkingTokensLastEntryWins(t *testing.T) {
 	}
 }
 
+// iterationsFixture is one real Claude Code 2.1.250 message (sanitized, its
+// content replaced by invented text): six entries of a tool_use reply whose
+// usage.iterations holds the attempt on the requested model (type message) and
+// the fallback model's answer (type fallback_message).
+const iterationsFixture = "testdata/transcript-iterations.jsonl"
+
+// TestRequestIterations: every reader of a request (FindRequests for a batch,
+// ReadTranscript for a sweep or recovery) carries the usage.iterations entries
+// that are not the message itself, at their index in the array and with the
+// transcript's numbers, and ApplyUsage copies them onto the requests row; a
+// usage whose only iteration is the message carries none.
+func TestRequestIterations(t *testing.T) {
+	want := []Iteration{{
+		Seq: 1, Type: "fallback_message", Model: "claude-opus-4-8",
+		InputTokens: Ptr(int64(2)), CacheReadTokens: Ptr(int64(69945)), CacheCreationTokens: Ptr(int64(574)),
+		CacheCreation5m: Ptr(int64(0)), CacheCreation1h: Ptr(int64(574)), OutputTokens: Ptr(int64(4474)),
+	}}
+	found, err := FindRequests(iterationsFixture, []string{"toolu_014JkUzhmaYhbiYoEPErJ4dL"})
+	if err != nil {
+		t.Fatalf("FindRequests: %v", err)
+	}
+	if got := found["toolu_014JkUzhmaYhbiYoEPErJ4dL"].Iterations; !reflect.DeepEqual(got, want) {
+		t.Errorf("FindRequests iterations = %+v, want %+v", got, want)
+	}
+	read, err := ReadTranscript(iterationsFixture, "")
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	if len(read.Requests) != 1 || !reflect.DeepEqual(read.Requests[0].Iterations, want) {
+		t.Fatalf("ReadTranscript requests = %+v, want one carrying %+v", read.Requests, want)
+	}
+	var request Request
+	ApplyUsage(&request, read.Requests[0].RequestUsage)
+	if !reflect.DeepEqual(request.Iterations, want) {
+		t.Errorf("ApplyUsage iterations = %+v, want %+v", request.Iterations, want)
+	}
+	for _, request := range readMarksFixture(t).Requests {
+		if request.Iterations != nil {
+			t.Errorf("request %s of the marks fixture (one message iteration) carries %+v, want none", request.MessageID, request.Iterations)
+		}
+	}
+}
+
 func TestReadTranscriptCompaction(t *testing.T) {
 	marks := readMarksFixture(t).Marks
 	want := []Compaction{{
@@ -878,5 +923,53 @@ func TestPromptHookNeverStoresItsText(t *testing.T) {
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestRequestsCarryTheAPIRequestID: the requestId of a message's entries (the
+// API request id the cost ledger keys by) lands on its request whether the
+// request is found by a tool call or read whole; an entry with no requestId
+// leaves it empty.
+func TestRequestsCarryTheAPIRequestID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ids.jsonl")
+	entry := func(message, requestID, toolUseID, stop string) string {
+		id := ""
+		if requestID != "" {
+			id = `"requestId":"` + requestID + `",`
+		}
+		return `{"type":"assistant",` + id + `"timestamp":"2026-09-22T23:17:00.000Z","message":{"id":"` + message +
+			`","model":"claude-sonnet-4-5","stop_reason":` + stop + `,"content":[{"type":"tool_use","id":"` + toolUseID +
+			`"}],"usage":{"input_tokens":1,"output_tokens":2}}}` + "\n"
+	}
+	transcript := entry("msg_a", "req_invented_a", "toolu_a", `null`) + entry("msg_a", "req_invented_a", "toolu_a2", `"tool_use"`) +
+		entry("msg_b", "", "toolu_b", `"tool_use"`)
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	found, err := FindRequests(path, []string{"toolu_a", "toolu_b"})
+	if err != nil {
+		t.Fatalf("FindRequests: %v", err)
+	}
+	if got := found["toolu_a"].APIRequestID; got != "req_invented_a" {
+		t.Errorf("FindRequests toolu_a APIRequestID = %q, want req_invented_a", got)
+	}
+	if got := found["toolu_b"].APIRequestID; got != "" {
+		t.Errorf("FindRequests toolu_b APIRequestID = %q, want empty", got)
+	}
+	read, _, err := ReadRequests(path)
+	if err != nil {
+		t.Fatalf("ReadRequests: %v", err)
+	}
+	if len(read) != 2 || read[0].APIRequestID != "req_invented_a" || read[1].APIRequestID != "" {
+		t.Errorf("ReadRequests APIRequestIDs = %+v, want req_invented_a then empty", read)
+	}
+	request := Request{}
+	ApplyUsage(&request, read[0].RequestUsage)
+	if request.APIRequestID == nil || *request.APIRequestID != "req_invented_a" {
+		t.Errorf("ApplyUsage APIRequestID = %v, want req_invented_a", request.APIRequestID)
+	}
+	ApplyUsage(&request, read[1].RequestUsage)
+	if request.APIRequestID != nil {
+		t.Errorf("ApplyUsage APIRequestID = %v for a message with no requestId, want NULL", *request.APIRequestID)
 	}
 }

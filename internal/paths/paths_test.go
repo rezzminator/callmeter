@@ -83,6 +83,7 @@ func TestFilesUnderHome(t *testing.T) {
 		"store":    {Store(home), "/x/cm/callmeter.db"},
 		"log":      {Log(home), "/x/cm/callmeter.log"},
 		"missed":   {Missed(home), "/x/cm/missed.log"},
+		"config":   {Config(home), "/x/cm/config.json"},
 		"bincache": {BinCache(home, "0.1.0"), "/x/cm/bin/0.1.0/callmeter"},
 	} {
 		if tt.got != tt.want {
@@ -146,5 +147,25 @@ func TestConfigDir(t *testing.T) {
 	}
 	if _, err := ConfigDir(env(nil)); err == nil || !strings.Contains(err.Error(), "HOME is empty") {
 		t.Fatalf("ConfigDir() without HOME error = %v, want it to say HOME is empty", err)
+	}
+}
+
+func TestCostLedger(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values map[string]string
+		want   string
+	}{
+		{"named", map[string]string{"PFM_COST_LEDGER_DIR": "/ledger", "HOME": "/h"}, "/ledger"},
+		{"default under HOME", map[string]string{"HOME": "/h"}, "/h/.local/state/pfm/cost-ledger"},
+		{"default under PFM_HOME", map[string]string{"HOME": "/h", "PFM_HOME": "/p"}, "/p/.local/state/pfm/cost-ledger"},
+	} {
+		got, err := CostLedger(env(tc.values))
+		if err != nil || got != tc.want {
+			t.Errorf("%s: CostLedger = %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+	if got, err := CostLedger(env(nil)); err == nil || got != "" {
+		t.Errorf("CostLedger without HOME = %q, %v; want an error: no ledger directory can be named", got, err)
 	}
 }

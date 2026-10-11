@@ -86,9 +86,9 @@ func runReport(args []string, stdout, stderr io.Writer, getenv paths.Getenv) (co
 
 // runHook is the hook entry with a net under it: a hook exits 0 on every path,
 // and a panic would exit 2, which Claude Code reads as a blocking error. A
-// recovered panic still prints its stack; an event not yet accounted for also
-// leaves one missed.log line with callmeter.PanicReason and one log line, so
-// the next run counts the lost event as a `terminated` fault.
+// recovered panic still prints its stack and leaves one log line; an event not
+// yet accounted for also leaves one missed.log line with callmeter.PanicReason,
+// so the next run counts the lost event as a `terminated` fault.
 func runHook(stdin io.Reader, stderr io.Writer, getenv paths.Getenv) (code int) {
 	read := &payloadPrefix{}
 	defer func() {
@@ -99,18 +99,17 @@ func runHook(stdin io.Reader, stderr io.Writer, getenv paths.Getenv) (code int) 
 				recovered = accounted.Value
 			}
 			fmt.Fprintf(stderr, "callmeter: hook panicked: %v\n%s", recovered, stack)
-			if !ok {
-				leavePanicLine(read.data, recovered, stack, stderr, getenv)
-			}
+			leavePanicLine(read.data, recovered, stack, ok, stderr, getenv)
 			code = 0
 		}
 	}()
 	return hook(io.TeeReader(stdin, read), stderr, getenv)
 }
 
-// leavePanicLine appends the missed.log line and the log line of a recovered
-// hook panic; with no home resolvable, stderr is all there is.
-func leavePanicLine(prefix []byte, recovered any, stack []byte, stderr io.Writer, getenv paths.Getenv) {
+// leavePanicLine appends the missed.log line, unless the run's event was
+// accounted for, and the log line of a recovered hook panic; with no home
+// resolvable, stderr is all there is.
+func leavePanicLine(prefix []byte, recovered any, stack []byte, accounted bool, stderr io.Writer, getenv paths.Getenv) {
 	home, err := paths.Home(getenv)
 	if err != nil {
 		applog.Failure(stderr, "", callmeter.StageTerminated, "", "", fmt.Errorf("resolve callmeter home: %w", err))
@@ -118,9 +117,11 @@ func leavePanicLine(prefix []byte, recovered any, stack []byte, stderr io.Writer
 	}
 	event, session := panicIDs(prefix)
 	logPath := paths.Log(home)
-	if err := hookentry.AppendMissed(
-		paths.Missed(home), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
-		applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "", err)
+	if !accounted {
+		if err := hookentry.AppendMissed(
+			paths.Missed(home), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
+			applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "", err)
+		}
 	}
 	applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "",
 		fmt.Errorf("hook panicked: %v\n%s", recovered, stack))

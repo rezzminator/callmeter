@@ -76,7 +76,7 @@ func growthCellText(delta int64, labels []string) string {
 // predecessor, each named by the predecessor's calls.
 func Context(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
-	kept := `COALESCE(r.pending, 0) = 0 AND r.context_tokens IS NOT NULL`
+	kept := `COALESCE(r.pending, 0) = 0 AND r.source IS NOT 'ledger' AND r.context_tokens IS NOT NULL`
 	var args []any
 	if f.Project == "" && f.AgentType == "" {
 		where, requestArgs := requestFilter(f)

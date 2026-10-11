@@ -10,7 +10,7 @@ Answer a question from the SQLite store the callmeter hooks fill, read-only, wit
 
 ## Open the store
 
-The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it, rows older than 30 days moved to `archive.db` beside it. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
+The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it, which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
 
 Shell state does not survive between Bash calls: define the helper in the same command that uses it. A function, because zsh does not word-split a command stored in a variable:
 
@@ -23,14 +23,14 @@ cmq "SELECT count(*) AS calls, datetime(max(ts)/1000,'unixepoch') AS latest_utc 
 
 - Output format goes in flags (`-header -column`, `-json`, `-csv`); a dot-command after SQL in the quoted argument fails with `near ".": syntax error`. Several statements or dot-commands go in a heredoc: `sqlite3 -readonly -cmd '.timeout 15000' "$CM_DB" <<'SQL' … SQL`.
 - Every query carries `LIMIT` or aggregates: the tables hold tens of thousands of rows and `calls.input` is wide.
-- A long or repeated analysis works on one snapshot instead of the live file. Take it with SQLite's backup, into one path you overwrite each time (each copy is the store's full size): `sqlite3 -readonly -cmd '.timeout 15000' "$CM_DB" ".backup '${TMPDIR:-/tmp}/callmeter-snap.db'" || echo "FAILED: snapshot"`. A plain `cp` of a live WAL database can produce a corrupt copy, and `immutable=1` reads the main file without its WAL, missing recent rows.
-- Older history: `ATTACH` `archive.db` read-only (`ATTACH 'file:{dir}/archive.db?mode=ro' AS archive` on a URI-enabled connection) and union the same table from both, naming columns explicitly: the archive lacks `calls.input`, `calls.error`, `faults.error` and `events.detail`, and an older archive lacks newer columns. A row can sit in both files, so take the archive's rows only where the key is absent from the store: `… FROM archive.calls WHERE tool_use_id NOT IN (SELECT tool_use_id FROM main.calls)`.
+- A long or repeated analysis works on one snapshot instead of the live file. Take it with SQLite's backup, into one path you overwrite each time (each copy is the store's full size): `sqlite3 -readonly -cmd '.timeout 15000' "$CM_DB" ".backup '${TMPDIR:-/tmp}/callmeter-snap.db'" || echo "FAILED: snapshot"`. A plain `cp` of a live WAL database can produce a corrupt copy, and `immutable=1` reads the main file without its WAL, missing recent rows. A store no hook is writing keeps no `-wal` or `-shm`, which a read-only open cannot create, so that backup fails with `unable to open database file`: take it through `sqlite3 "file:$CM_DB?immutable=1" ".backup '…'"` instead (nothing is missing then, since there is no WAL), delete a stale `-shm` or `-wal` beside the copy before each try, and keep the copy only when `PRAGMA quick_check` on it answers `ok`; a hook writing meanwhile makes it fail, so take it again.
+- Older history, when `archive.db` exists: `ATTACH` it read-only (`ATTACH 'file:{dir}/archive.db?mode=ro' AS archive` on a URI-enabled connection) and union the same table from both, naming columns explicitly: the archive lacks `calls.input`, `calls.error`, `faults.error` and `events.detail`, and an older archive lacks newer columns. A row can sit in both files, so take the archive's rows only where the key is absent from the store: `… FROM archive.calls WHERE tool_use_id NOT IN (SELECT tool_use_id FROM main.calls)`.
 
 ## Never write to the store
 
 The store is the user's only record of their sessions. Open it read-only, every time; scratch tables are `CREATE TEMP TABLE` (allowed on a read-only connection) or live in a snapshot. Run no `callmeter redact` or other maintenance command yourself: a report note naming one is for the user.
 
-The one exception is a report run, the store's own writer, and only when the user asked for a report or agrees to one. A run settles quiet sessions (below), fills `command_parts`, and prunes rows older than 30 days into `archive.db`, dropping their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good. Never point one at a snapshot you want to keep raw.
+The one exception is a report run, the store's own writer, and only when the user asked for a report or agrees to one. A run settles quiet sessions (below), fills `command_parts`, and, only when `config.json` sets `retention_days`, prunes rows older than that into `archive.db`, dropping their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good. Never point one at a snapshot you want to keep raw.
 
 ## Rules that keep an answer true
 
@@ -42,7 +42,7 @@ The one exception is a report run, the store's own writer, and only when the use
 - `tool = 'Read'` undercounts reading: agents read mostly through Bash (`cat`, `sed -n`, `rg`). The files a Bash call touched are in `command_parts.files`, which only a report run fills.
 - `context_tokens` is a request's whole prompt (`input_tokens + cache_read_tokens + cache_creation_tokens`), so peak context is `max(context_tokens)`. `sum(context_tokens)` re-counts the cached prefix at every request: label it "tokens processed", never "unique tokens". `thinking_tokens` is part of `output_tokens`, never added to it; NULL means not reported, not 0.
 - A request with `pending = 1` (its `request_id` starts `pending:`) has no final usage yet; exclude it from sums and say how many you excluded. `agents.total_tokens` and `tool_uses` are written when a stop is recorded or rebuilt, so NULL means a running agent or a lost stop; sum its `requests` instead. `agents.stopped IS NULL` is an agent still running or one whose stop was never recorded.
-- Cost: `session_costs` is Claude Code's own cumulative USD per session (`cost_usd`, plus `model_costs` JSON per model, NULL when Claude Code gave no split), the number to quote; only sessions recorded by a recent callmeter on a recent Claude Code have a row, so count the sessions without one. No per-agent cost column exists: when you price `requests` yourself, take the rates from the user or the provider's current price page (cache writes at 5 m and 1 h are priced differently: `cache_creation_5m_tokens`, `cache_creation_1h_tokens`), reconcile your total against `session_costs.cost_usd` for the same session, and state the gap.
+- Cost: `session_costs.cost_usd` is Claude Code's own cumulative USD per session (`model_costs` JSON per model, NULL when Claude Code gave no split), the number to quote for a chat; only sessions recorded by a recent callmeter on a recent Claude Code have a row, so count the sessions without one. `requests.cost_usd_micros` (USD millionths) prices each request: `cost_source = 'ledger'` is Claude Code's own price of that call, `'table'` is callmeter's embedded price list applied to the row's tokens (no web-search fee, no advisor iteration), set when the request is written (a row written by an older callmeter keeps its price or NULL), NULL is an unknown model or a pending row, never zero: count the NULLs and say the sum is a floor. A `gpt-` model's price is a list-equivalent, not a bill (that route runs on a ChatGPT subscription): label it so, and never quote `session_costs.model_costs` for a non-Claude model, which is Claude Code's fallback rate, not a price. `requests` rows with `source = 'ledger'` are calls no stored transcript request holds, usually side calls no transcript records (until its transcript request is written, a main-chat or sub-agent call can be one too), there only when a hook or a report run found a cost ledger; a chat's request sum is not `session_costs.cost_usd`: name the difference (`callmeter report cost` does, per chat), and the part of the total that predates the ledger (`PRE-LEDGER USD`: Claude Code restores its total on resume, so a chat resumed under a ledger keeps its earlier spend in `session_costs.cost_usd`). Their `agent_id` is NULL (main) or `?` (unknown), so a sum over agents is a floor for the sub-agents.
 - Numbers settle late. A session quiet for an hour is completed from its transcripts (missing sizes, pending requests, lost stops) only when a report runs (§ Never write to the store). Without one, say that a quiet session's numbers may be unsettled.
 - `tool` is the name as the model called it: a handful of calls refused by Claude Code carry a misspelt name such as `bash`.
 
@@ -58,8 +58,19 @@ SELECT coalesce(r.agent_id, '(main)') AS agent, a.agent_type, count(*) AS reques
        sum(r.thinking_tokens) AS thinking, sum(r.cache_read_tokens) AS cache_read,
        sum(r.cache_creation_tokens) AS cache_write
 FROM requests r LEFT JOIN agents a USING (agent_id)
-WHERE r.session_id = :sid AND r.pending = 0
+WHERE r.session_id = :sid AND r.pending = 0 AND r.source IS NOT 'ledger'
 GROUP BY r.agent_id ORDER BY peak_context DESC LIMIT 30;
+```
+
+Money per party in one session, side calls included (`cost_usd_micros` is USD millionths; `unpriced` counts the requests whose price is unknown, so the dollars are a floor wherever it is above 0; a `ledger` row is a call no stored transcript request holds, usually a side call, [schema.md § requests](schema.md#requests)):
+
+```sql
+SELECT coalesce(r.agent_id, '(main)') AS agent, a.agent_type, count(*) AS requests,
+       sum(r.source = 'ledger') AS side_calls, round(coalesce(sum(r.cost_usd_micros), 0) / 1e6, 4) AS usd,
+       sum(r.cost_usd_micros IS NULL) AS unpriced, group_concat(DISTINCT r.cost_source) AS price_from
+FROM requests r LEFT JOIN agents a USING (agent_id)
+WHERE r.session_id = :sid AND r.pending = 0
+GROUP BY r.agent_id ORDER BY usd DESC LIMIT 30;
 ```
 
 Each Agent call in a session and the agent it started, with wall time:
@@ -87,7 +98,7 @@ WITH RECURSIVE tree(agent_id, depth) AS (
 )
 SELECT count(DISTINCT t.agent_id) AS agents, max(t.depth) AS depth, count(r.request_id) AS requests,
        sum(r.output_tokens) AS output, max(r.context_tokens) AS peak_context
-FROM tree t LEFT JOIN requests r ON r.agent_id = t.agent_id AND r.pending = 0;
+FROM tree t LEFT JOIN requests r ON r.agent_id = t.agent_id AND r.pending = 0 AND r.source IS NOT 'ledger';
 ```
 
 The walk misses an agent whose `parent_tool_use_id` is NULL (launched before recording began, or its parent's result lost) or points at no recorded call. A whole session needs no walk: filter by `session_id`, which every row of the main chat and of every sub-agent carries.
@@ -119,6 +130,16 @@ Compactions, newest first (`agent_id` NULL is the main chat; the `PreCompact` an
 SELECT datetime(ts/1000, 'unixepoch') AS utc, session_id, coalesce(agent_id, '(main)') AS agent, trigger,
        pre_tokens, post_tokens, pre_tokens - post_tokens AS freed, round(duration_ms/1000.0, 1) AS secs
 FROM compactions ORDER BY ts DESC LIMIT 20;
+```
+
+Prompt-cache outcomes per party in the last day, with the cause the stored columns prove (`request_cache`, [schema.md § request_cache](schema.md#request_cache); an empty `outcome` is an unknown count, never a miss; `callmeter report cache` is the fixed summary):
+
+```sql
+SELECT CASE WHEN r.agent_id IS NULL THEN '(main)' ELSE 'sub-agent' END AS party, c.entry_ttl, c.outcome, c.cause,
+       count(*) AS requests
+FROM request_cache c JOIN requests r USING (request_id)
+WHERE r.ts >= (strftime('%s','now') - 86400) * 1000
+GROUP BY 1, 2, 3, 4 ORDER BY requests DESC LIMIT 20;
 ```
 
 Cost per session, and per model inside it where Claude Code gave the split:
@@ -171,7 +192,7 @@ try:
     peaks = {}
     for row in con.execute(
         "SELECT a.agent_type, max(r.context_tokens) AS peak FROM requests r JOIN agents a USING (agent_id) "
-        "WHERE r.pending = 0 AND r.ts >= (strftime('%s','now') - 7*86400) * 1000 GROUP BY r.agent_id"
+        "WHERE r.pending = 0 AND r.source IS NOT 'ledger' AND r.ts >= (strftime('%s','now') - 7*86400) * 1000 GROUP BY r.agent_id"
     ):
         peaks.setdefault(row["agent_type"] or "?", []).append(row["peak"])
 finally:

@@ -370,6 +370,10 @@ func TestSessionModel(t *testing.T) {
 			{RequestID: "main-null", TS: Ptr[int64](3)},
 			{RequestID: "agent", TS: Ptr[int64](4), AgentID: Ptr("a1"), Model: Ptr("agent")},
 		}, want: "main"},
+		{name: "a ledger row never names the model", requests: []Request{
+			{RequestID: "main", TS: Ptr[int64](1), Model: Ptr("main")},
+			{RequestID: "req_invented_side", TS: Ptr[int64](9), Model: Ptr("helper"), Source: Ptr(SourceLedger)},
+		}, want: "main"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := openTestStore(t)

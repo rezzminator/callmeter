@@ -329,16 +329,18 @@ func keptString(event, key, s string) bool {
 	return detailKeptStrings[key] || isLabel(event, key, s)
 }
 
-// detailEvent is the hook event a payload names in hook_event_name, empty for
-// an array or a payload naming none: its labels are then never kept.
-func detailEvent(raw json.RawMessage) string {
+// detailHead is the hook event a payload names in hook_event_name, empty for
+// an array or a payload naming none (its labels are then never kept), and the
+// tool it names in tool_name.
+func detailHead(raw json.RawMessage) (event, tool string) {
 	var head struct {
 		Event string `json:"hook_event_name"`
+		Tool  string `json:"tool_name"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
-		return ""
+		return "", ""
 	}
-	return head.Event
+	return head.Event, head.Tool
 }
 
 // SanitizeDetail is the stored form of a hook payload's leftover keys (an
@@ -347,15 +349,18 @@ func detailEvent(raw json.RawMessage) string {
 // booleans and null stay, and a string is kept only under a key of
 // detailKeptStrings or as a label of detailLabels for the event raw names in
 // hook_event_name. Any other string in an object becomes {key}_bytes, and in
-// an array its byte count (UTF-8 bytes). omit names the top-level keys left
-// out. raw must be a JSON object or array.
+// an array its byte count (UTF-8 bytes). The tool_input of a payload whose
+// tool_name is an mcp__ tool keeps no string at all: its keys mean what its
+// server says, as in SanitizeInput. omit names the top-level keys left out.
+// raw must be a JSON object or array.
 func SanitizeDetail(raw json.RawMessage, omit map[string]bool) (string, error) {
-	return sanitizeEventDetail(detailEvent(raw), raw, omit)
+	event, tool := detailHead(raw)
+	return sanitizeEventDetail(event, tool, raw, omit)
 }
 
-// sanitizeEventDetail is SanitizeDetail for a payload of event, which a
-// stored detail no longer names.
-func sanitizeEventDetail(event string, raw json.RawMessage, omit map[string]bool) (string, error) {
+// sanitizeEventDetail is SanitizeDetail for a payload of event naming tool,
+// which a stored detail no longer names.
+func sanitizeEventDetail(event, tool string, raw json.RawMessage, omit map[string]bool) (string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
 		return "", fmt.Errorf("sanitize detail: not a JSON object or array (%d bytes)", len(trimmed))
@@ -364,27 +369,33 @@ func sanitizeEventDetail(event string, raw json.RawMessage, omit map[string]bool
 		return "", fmt.Errorf("sanitize detail: invalid JSON (%d bytes)", len(trimmed))
 	}
 	var out bytes.Buffer
-	if err := sanitizeValue(&out, trimmed, event, "", false, omit); err != nil {
+	var sizeAll map[string]bool // the top-level keys whose strings are all sized
+	if strings.HasPrefix(tool, mcpToolPrefix) {
+		sizeAll = map[string]bool{"tool_input": true}
+	}
+	if err := sanitizeValue(&out, trimmed, event, "", false, false, omit, sizeAll); err != nil {
 		return "", fmt.Errorf("sanitize detail: %w", err)
 	}
 	return out.String(), nil
 }
 
 // sanitizeValue writes the sanitized form of value, found under key (inside an
-// array when inArray) in a payload of event. omit applies to value's own keys.
-func sanitizeValue(out *bytes.Buffer, value json.RawMessage, event, key string, inArray bool, omit map[string]bool) error {
+// array when inArray) in a payload of event; sized keeps no string of it. omit
+// applies to value's own keys, and so does sizeAll, the keys under which
+// every string is sized.
+func sanitizeValue(out *bytes.Buffer, value json.RawMessage, event, key string, inArray, sized bool, omit, sizeAll map[string]bool) error {
 	value = bytes.TrimSpace(value)
 	switch value[0] {
 	case '{':
-		return sanitizeObject(out, value, event, omit)
+		return sanitizeObject(out, value, event, sized, omit, sizeAll)
 	case '[':
-		return sanitizeArray(out, value, event, key)
+		return sanitizeArray(out, value, event, key, sized)
 	case '"':
 		var s string
 		if err := json.Unmarshal(value, &s); err != nil {
 			return fmt.Errorf("decode the %q string: %w", key, err)
 		}
-		if keptString(event, key, s) {
+		if !sized && keptString(event, key, s) {
 			encoded, err := json.Marshal(s)
 			if err != nil {
 				return fmt.Errorf("encode the %q string: %w", key, err)
@@ -403,7 +414,7 @@ func sanitizeValue(out *bytes.Buffer, value json.RawMessage, event, key string, 
 	}
 }
 
-func sanitizeObject(out *bytes.Buffer, value json.RawMessage, event string, omit map[string]bool) error {
+func sanitizeObject(out *bytes.Buffer, value json.RawMessage, event string, sized bool, omit, sizeAll map[string]bool) error {
 	dec := json.NewDecoder(bytes.NewReader(value))
 	if _, err := dec.Token(); err != nil {
 		return fmt.Errorf("open an object: %w", err)
@@ -427,19 +438,20 @@ func sanitizeObject(out *bytes.Buffer, value json.RawMessage, event string, omit
 			out.WriteByte(',')
 		}
 		first = false
+		fieldSized := sized || sizeAll[name]
 		if field[0] == '"' {
 			var s string
 			if err := json.Unmarshal(field, &s); err != nil {
 				return fmt.Errorf("measure the %q string: %w", name, err)
 			}
-			if !keptString(event, name, s) {
+			if fieldSized || !keptString(event, name, s) {
 				writeKey(out, name+"_bytes")
 				fmt.Fprint(out, len(s))
 				continue
 			}
 		}
 		writeKey(out, name)
-		if err := sanitizeValue(out, field, event, name, false, nil); err != nil {
+		if err := sanitizeValue(out, field, event, name, false, fieldSized, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -447,7 +459,7 @@ func sanitizeObject(out *bytes.Buffer, value json.RawMessage, event string, omit
 	return nil
 }
 
-func sanitizeArray(out *bytes.Buffer, value json.RawMessage, event, key string) error {
+func sanitizeArray(out *bytes.Buffer, value json.RawMessage, event, key string, sized bool) error {
 	dec := json.NewDecoder(bytes.NewReader(value))
 	if _, err := dec.Token(); err != nil {
 		return fmt.Errorf("open the %q array: %w", key, err)
@@ -461,7 +473,7 @@ func sanitizeArray(out *bytes.Buffer, value json.RawMessage, event, key string) 
 		if i > 0 {
 			out.WriteByte(',')
 		}
-		if err := sanitizeValue(out, element, event, key, true, nil); err != nil {
+		if err := sanitizeValue(out, element, event, key, true, sized, nil, nil); err != nil {
 			return err
 		}
 	}

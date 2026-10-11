@@ -17,7 +17,7 @@ import (
 // heredoc inside a command substitution, or inside a quoted string that is
 // itself a shell script (`bash -c '…'`, `ssh host '…'`), is cut the same way.
 // A `<<` inside quotes that holds no heredoc, inside arithmetic, or a
-// here-string (`<<<`) is left as written.
+// here-string (`<<<`) is left as written here; CutContent cuts it.
 //
 // A double-quoted script with backslash escapes (`bash -c "cat <<\"EOF\"…"`),
 // or a script written as one word of several literal quoted pieces

@@ -745,7 +745,7 @@ func (t *Tx) AgentSpan(ctx context.Context, agentID string) (started, stopped sq
 // latest SessionStart carrying one.
 func sessionModel(session string) string {
 	return `COALESCE(
-				(SELECT model FROM requests WHERE session_id = ` + session + ` AND agent_id IS NULL AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
+				(SELECT model FROM requests WHERE session_id = ` + session + ` AND agent_id IS NULL AND source IS NOT '` + SourceLedger + `' AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
 				(SELECT model FROM events WHERE session_id = ` + session + ` AND event = '` + EventSessionStart + `' AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))`
 }
 

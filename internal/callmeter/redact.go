@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // RedactCount is how many rows of one column a Redact pass changed.
@@ -82,10 +83,16 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 		return nil, err
 	}
 	details, err := rewriteColumn(ctx, conn, "events.detail",
-		`SELECT event_id, COALESCE(event, ''), detail FROM events WHERE detail IS NOT NULL`,
+		`SELECT event_id, COALESCE(event, '') || char(9) || COALESCE(tool_name, ''), detail FROM events WHERE detail IS NOT NULL`,
 		`UPDATE events SET detail = ? WHERE event_id = ?`,
-		func(event, detail string) (string, error) {
-			return sanitizeEventDetail(event, json.RawMessage(detail), nil)
+		func(eventTool, detail string) (string, error) {
+			// The tool from its column, which omits it from the detail; a
+			// PermissionDenied stored before it filled the column names it there.
+			event, tool, _ := strings.Cut(eventTool, "\t")
+			if tool == "" {
+				_, tool = detailHead(json.RawMessage(detail))
+			}
+			return sanitizeEventDetail(event, tool, json.RawMessage(detail), nil)
 		})
 	if err != nil {
 		return nil, err

@@ -1,0 +1,13 @@
+# Markdown policy for `rumdl` runs inside this repository.
+#
+# CLAUDE.md is an LLM-read orientation file: its heading levels are addressing
+# (other files cite "CLAUDE.md § Rules"), so rumdl must not re-level them, and
+# its one-rule-per-line bullets are not wrapped at 80 columns. A check that
+# cannot load this file falls back to rumdl's defaults, which demote every
+# `#` heading below the first by one level.
+
+[global]
+respect-gitignore = true
+
+[per-file-ignores]
+"CLAUDE.md" = ["MD001", "MD013", "MD024", "MD025", "MD033", "MD041", "MD059"]

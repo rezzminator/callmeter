@@ -9,18 +9,20 @@ import (
 	"github.com/rezzminator/callmeter/internal/callmeter"
 )
 
-// notGained is the note of a topic that reads a table the store has not
-// gained yet (Store.SchemaComplete is false): the topic answers no rows.
-func notGained(table string) string {
-	return fmt.Sprintf("this store has not gained the %s table yet; the next hook or report adds it", table)
+// notGained is the note of a topic that reads a table or view the store has
+// not gained yet (Store.SchemaComplete is false): the topic answers no rows.
+// object is "{name} table" or "{name} view".
+func notGained(object string) string {
+	return fmt.Sprintf("this store has not gained the %s yet; the next hook or report adds it", object)
 }
 
-// gainedNotes is the notes of a topic over a table that may be missing: the
-// not-gained note when the store is incomplete, then the lifecycle gap notes.
-func gainedNotes(ctx context.Context, store *callmeter.Store, f Filter, n *names, table string) ([]string, error) {
+// gainedNotes is the notes of a topic over a table or view that may be
+// missing (object, as notGained names it): the not-gained note when the store
+// is incomplete, then the lifecycle gap notes.
+func gainedNotes(ctx context.Context, store *callmeter.Store, f Filter, n *names, object string) ([]string, error) {
 	var notes []string
 	if !store.SchemaComplete() {
-		notes = append(notes, notGained(table))
+		notes = append(notes, notGained(object))
 	}
 	more, err := topicNotes(ctx, store, f, n, false)
 	if err != nil {

@@ -14,6 +14,7 @@ func TestMain(m *testing.M) { os.Exit(Run(m)) }
 var jailVars = []string{
 	"HOME", "TMPDIR", "CALLMETER_HOME", "XDG_STATE_HOME",
 	"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN",
+	"PFM_COST_LEDGER_DIR", "PFM_HOME",
 }
 
 func preserveJailVars(t *testing.T) {
@@ -54,7 +55,7 @@ func TestJailPointsHomeTmpdirAndCallmeterHomeIntoTemp(t *testing.T) {
 			t.Errorf("%s = %q is not an existing directory: %v", name, value, err)
 		}
 	}
-	for _, name := range []string{"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN"} {
+	for _, name := range []string{"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN", "PFM_COST_LEDGER_DIR", "PFM_HOME"} {
 		if value := os.Getenv(name); value != "" {
 			t.Errorf("%s = %q, want empty", name, value)
 		}
