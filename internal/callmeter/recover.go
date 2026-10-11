@@ -14,9 +14,6 @@ import (
 	"time"
 )
 
-// Retention is the age window recovery keeps after old store rows are pruned.
-const Retention = 30 * 24 * time.Hour
-
 // ResolveTranscript keeps an existing stored path, otherwise finding the first
 // sorted session transcript under the stored projects root, then the seat's.
 // An unfound path is returned unchanged so callers retain their read errors.
@@ -686,7 +683,9 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	if err != nil {
 		return err
 	}
-	since = max(since, now.Add(-Retention).UnixMilli())
+	if floor := s.retentionFloor(now); !floor.IsZero() {
+		since = max(since, floor.UnixMilli())
+	}
 	mainRequest := false
 	resolved := map[string]bool{} // message ids a pending request was resolved to
 	resolvedCount := 0
@@ -701,7 +700,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 	}
 	var writes []requestWrite
 	built := map[string]requestWrite{} // every request read, by message id, so a rebuilt call's request is written
-	var uses []rebuildUse              // every tool_use within the session and retention window
+	var uses []rebuildUse              // every tool_use of the session, inside the retention window when one is set
 	ends := map[string][]int64{}       // agent id -> the ts of the turn-end entry of each of its requests that ends a turn
 	var notices map[string][]int64     // agent id -> main-transcript task-notification times
 	metas := map[string]subagentMeta{} // agent id -> its meta file

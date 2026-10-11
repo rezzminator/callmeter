@@ -381,6 +381,8 @@ type Store struct {
 	db       *sql.DB
 	path     string
 	complete bool // every table, column and index of schema is present
+	// retention is how long the store keeps rows; 0 keeps them forever (SetRetention).
+	retention time.Duration
 }
 
 // SchemaComplete reports whether every table, column and index of schema is

@@ -288,7 +288,7 @@ func TestReportFilesOverASeededStore(t *testing.T) {
 	c.seed()
 	code, stdout, stderr := c.run("", "report", "files")
 	title, _, _ := strings.Cut(stdout, "\n")
-	if code != 0 || !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: since ") ||
+	if code != 0 || !strings.HasPrefix(title, "callmeter files") || !strings.Contains(title, "window: all time") ||
 		!strings.Contains(stdout, "fixture.go") {
 		t.Fatalf("report files = %d, want a table titled with its window\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}

@@ -10,7 +10,7 @@ Answer a question from the SQLite store the callmeter hooks fill, read-only, wit
 
 ## Open the store
 
-The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it, rows older than 30 days moved to `archive.db` beside it. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
+The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it, which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
 
 Shell state does not survive between Bash calls: define the helper in the same command that uses it. A function, because zsh does not word-split a command stored in a variable:
 
@@ -24,13 +24,13 @@ cmq "SELECT count(*) AS calls, datetime(max(ts)/1000,'unixepoch') AS latest_utc 
 - Output format goes in flags (`-header -column`, `-json`, `-csv`); a dot-command after SQL in the quoted argument fails with `near ".": syntax error`. Several statements or dot-commands go in a heredoc: `sqlite3 -readonly -cmd '.timeout 15000' "$CM_DB" <<'SQL' … SQL`.
 - Every query carries `LIMIT` or aggregates: the tables hold tens of thousands of rows and `calls.input` is wide.
 - A long or repeated analysis works on one snapshot instead of the live file. Take it with SQLite's backup, into one path you overwrite each time (each copy is the store's full size): `sqlite3 -readonly -cmd '.timeout 15000' "$CM_DB" ".backup '${TMPDIR:-/tmp}/callmeter-snap.db'" || echo "FAILED: snapshot"`. A plain `cp` of a live WAL database can produce a corrupt copy, and `immutable=1` reads the main file without its WAL, missing recent rows.
-- Older history: `ATTACH` `archive.db` read-only (`ATTACH 'file:{dir}/archive.db?mode=ro' AS archive` on a URI-enabled connection) and union the same table from both, naming columns explicitly: the archive lacks `calls.input`, `calls.error`, `faults.error` and `events.detail`, and an older archive lacks newer columns. A row can sit in both files, so take the archive's rows only where the key is absent from the store: `… FROM archive.calls WHERE tool_use_id NOT IN (SELECT tool_use_id FROM main.calls)`.
+- Older history, when `archive.db` exists: `ATTACH` it read-only (`ATTACH 'file:{dir}/archive.db?mode=ro' AS archive` on a URI-enabled connection) and union the same table from both, naming columns explicitly: the archive lacks `calls.input`, `calls.error`, `faults.error` and `events.detail`, and an older archive lacks newer columns. A row can sit in both files, so take the archive's rows only where the key is absent from the store: `… FROM archive.calls WHERE tool_use_id NOT IN (SELECT tool_use_id FROM main.calls)`.
 
 ## Never write to the store
 
 The store is the user's only record of their sessions. Open it read-only, every time; scratch tables are `CREATE TEMP TABLE` (allowed on a read-only connection) or live in a snapshot. Run no `callmeter redact` or other maintenance command yourself: a report note naming one is for the user.
 
-The one exception is a report run, the store's own writer, and only when the user asked for a report or agrees to one. A run settles quiet sessions (below), fills `command_parts`, and prunes rows older than 30 days into `archive.db`, dropping their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good. Never point one at a snapshot you want to keep raw.
+The one exception is a report run, the store's own writer, and only when the user asked for a report or agrees to one. A run settles quiet sessions (below), fills `command_parts`, and, only when `config.json` sets `retention_days`, prunes rows older than that into `archive.db`, dropping their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good. Never point one at a snapshot you want to keep raw.
 
 ## Rules that keep an answer true
 

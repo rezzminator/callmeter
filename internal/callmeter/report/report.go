@@ -1,7 +1,7 @@
 // Package report answers the callmeter report topics over the store
 // (docs/design/hooks/callmeter.md § Reports): the shared filter, the prune
-// that runs before every report, the command-parse cache fill, the
-// fixed-width table and one query per topic.
+// that runs before every report when a retention is set, the command-parse
+// cache fill, the fixed-width table and one query per topic.
 package report
 
 import (
@@ -23,18 +23,15 @@ import (
 	"github.com/rezzminator/callmeter/internal/callmeter"
 )
 
-// Retention is the store's window: rows older than this are pruned before
-// every report, and it is the default --since.
-const Retention = callmeter.Retention
-
 // DefaultLimit is the rows per table when Filter.Limit is not positive.
 const DefaultLimit = 25
 
 // EmptyLine is the default body line of a table with no rows.
 const EmptyLine = "callmeter: no calls recorded in window"
 
-// Filter narrows every topic. A zero Since covers the whole retention window
-// (PruneExpired has pruned everything older); an empty field does not filter.
+// Filter narrows every topic. A zero Since covers the whole store: every row it
+// ever wrote, or with a retention set (PruneExpired) every row inside it; an
+// empty field does not filter.
 type Filter struct {
 	Since     time.Time
 	Project   string // calls whose cwd is Project or under it
@@ -59,11 +56,11 @@ var durationSince = regexp.MustCompile(`^(\d+)([dh])$`)
 
 // ParseSince reads a --since value: a duration in days or hours ("7d",
 // "24h") counted back from now, or a UTC date ("2026-09-01"). An empty value
-// is the whole retention window, now - Retention.
+// is the whole store: the zero time, no lower bound.
 func ParseSince(s string, now time.Time) (time.Time, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return now.Add(-Retention), nil
+		return time.Time{}, nil
 	}
 	if m := durationSince.FindStringSubmatch(s); m != nil {
 		n, err := strconv.Atoi(m[1])
@@ -86,10 +83,15 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 	return day.UTC(), nil
 }
 
-// PruneExpired prunes every row older than the retention window before a report
-// runs, and returns how many rows went.
+// PruneExpired prunes every row older than the store's retention window before
+// a report runs, and returns how many rows went. A store with no retention
+// (callmeter.Store.SetRetention) keeps every row: nothing goes.
 func PruneExpired(ctx context.Context, store *callmeter.Store, now time.Time) (int64, error) {
-	removed, err := store.Prune(ctx, now.Add(-Retention))
+	retention := store.Retention()
+	if retention <= 0 {
+		return 0, nil
+	}
+	removed, err := store.Prune(ctx, now.Add(-retention))
 	if err != nil {
 		return 0, fmt.Errorf("callmeter report: prune before report: %w", err)
 	}
@@ -186,7 +188,11 @@ func (f Filter) limit() int {
 // title names the topic, the active filters and the window.
 func (f Filter) title(topic string, names *names) string {
 	parts := []string{"callmeter " + topic}
-	parts = append(parts, "window: since "+f.Since.UTC().Format("2006-01-02 15:04")+" UTC")
+	if f.Since.IsZero() {
+		parts = append(parts, "window: all time")
+	} else {
+		parts = append(parts, "window: since "+f.Since.UTC().Format("2006-01-02 15:04")+" UTC")
+	}
 	if f.Project != "" {
 		parts = append(parts, "project="+f.Project)
 	}

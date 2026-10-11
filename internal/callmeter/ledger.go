@@ -79,7 +79,7 @@ type LedgerSummary struct {
 	// SchemaIncomplete: the store lacks the cost columns, so nothing was ingested.
 	SchemaIncomplete bool
 	Files            int // ledger files read
-	Rows             int // distinct calls inside the retention window
+	Rows             int // distinct calls read; inside the retention window when one is set
 	Faults           int // lines skipped: not a JSON object, or missing a field the contract requires
 	Held             int // calls a transcript of their session records
 	HeldUnrecorded   int // held calls the store has no request for yet: not counted until a hook or recovery writes it
@@ -95,9 +95,9 @@ type LedgerSummary struct {
 //     ledger's price (the table's when its cost has not arrived yet);
 //  4. the ledger's price is copied onto the requests transcripts hold.
 //
-// Only calls inside the store's retention window are read, so the prune never
-// takes one out for the next run to bring back. dir "" and a missing dir are
-// "no ledger"; a dir that cannot be read is an error.
+// With a retention set (SetRetention) only calls inside its window are read, so
+// the prune never takes one out for the next run to bring back. dir "" and a
+// missing dir are "no ledger"; a dir that cannot be read is an error.
 func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (LedgerSummary, error) {
 	sum := LedgerSummary{Dir: dir}
 	if dir == "" {
@@ -118,7 +118,7 @@ func (s *Store) IngestLedger(ctx context.Context, dir string, now time.Time) (Le
 		sum.SchemaIncomplete = true
 		return sum, nil
 	}
-	cutoff := now.Add(-Retention)
+	cutoff := s.retentionFloor(now)
 	rows, err := readLedger(dir, cutoff, &sum)
 	if err != nil {
 		return sum, err
@@ -260,8 +260,9 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 	return nil
 }
 
-// readLedger reads every ledger file of dir touched inside the window and
-// returns its distinct calls at or after cutoff, the best join of each request
+// readLedger reads every ledger file of dir touched at or after cutoff and
+// returns its distinct calls at or after cutoff (all of them when cutoff is the
+// zero time), the best join of each request
 // id (a later line among equals), in a stable order. A line that is not a JSON
 // object, or lacks a field the contract requires, is counted in sum.Faults.
 func readLedger(dir string, cutoff time.Time, sum *LedgerSummary) ([]ledgerRow, error) {

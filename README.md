@@ -125,7 +125,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 
 | Flag | Meaning |
 | --- | --- |
-| `--since D` | a duration (`7d`, `24h`) or a date (`2026-09-01`); default the whole 30-day window |
+| `--since D` | a duration (`7d`, `24h`) or a date (`2026-09-01`); default the whole store, or with `retention_days` set its retention window, which also floors it |
 | `--project P` | calls whose `cwd` is `P` or under it |
 | `--agent-type T` | calls made by that agent type |
 | `--session S` | one session |
@@ -194,7 +194,7 @@ flowchart LR
 - Every registered event runs the plugin's wrapper with `hook`. The wrapper finds the `callmeter` binary for this plugin version and `exec`s it with the hook's payload on stdin.
 - On the first `SessionStart` after install, the wrapper downloads the binary for your platform from the GitHub release of this version, checks it against the `SHA256SUMS` committed in the plugin, and caches it under `CALLMETER_HOME`. Every later run uses the cache.
 - The binary writes one short SQLite transaction per event and exits 0 on every path. A hook it could not serve is logged to `missed.log` with the writer's pid at the end of its reason (` (pid N)`) and counted as a fault on the next run, so a gap shows in the reports instead of a smaller number.
-- Reports read the same store. Each report run first prunes rows older than 30 days, archiving them to `archive.db`, then fills missing sub-agent parent and type from metadata for live or quiet sessions before settling every session with no hook and no transcript write for an hour from its transcripts: calls left in flight, requests no hook wrote, a turn end whose `Stop` or `StopFailure` hook was lost.
+- Reports read the same store. By default nothing is ever pruned: the store keeps every row. When `config.json` sets `retention_days`, each report run first prunes rows older than that, archiving them to `archive.db`. Each run then fills missing sub-agent parent and type from metadata for live or quiet sessions before settling every session with no hook and no transcript write for an hour from its transcripts: calls left in flight, requests no hook wrote, a turn end whose `Stop` or `StopFailure` hook was lost.
 
 Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing waits for callmeter before a tool runs.
 
@@ -207,7 +207,19 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
-Under `CALLMETER_HOME`: `callmeter.db` (the store), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (pruned rows) and `bin/{version}/callmeter` (the cached binary).
+Settings live in an optional `config.json` under `CALLMETER_HOME`. Without it every default applies.
+
+| Key | Effect |
+| --- | --- |
+| `retention_days` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
+
+```json
+{ "retention_days": 90 }
+```
+
+A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
+
+Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
 
 ## ❓ FAQ
 
@@ -255,7 +267,7 @@ cmd/callmeter/            the binary
 internal/callmeter/       the store, with cmdparse/, report/, command/
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
-internal/…                clock, sqlitedb, runner, testjail, paths, applog
+internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/

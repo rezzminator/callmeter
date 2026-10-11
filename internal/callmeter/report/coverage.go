@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
-	"github.com/rezzminator/callmeter/internal/clock"
 )
 
 // walkLimit bounds the directory entries one coverage run examines across every
@@ -69,10 +68,6 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		Title:  f.title("coverage", n),
 		Header: []string{"SEAT", "PROJECT", "SESSION", "STARTED", "MODIFIED", "BYTES", "WHY"},
 	}
-	since := f.Since
-	if since.IsZero() {
-		since = clock.Real.Now().Add(-Retention)
-	}
 	seats, err := coverageSeats(ctx, store, f.OwnSeat)
 	if err != nil {
 		return nil, err
@@ -85,7 +80,7 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 	if err != nil {
 		return nil, err
 	}
-	walk := &walker{since: since, session: f.Session, remaining: walkLimit}
+	walk := &walker{since: f.Since, session: f.Session, remaining: walkLimit}
 	dirs, err := projectsDirs(seats)
 	if err != nil {
 		return nil, err

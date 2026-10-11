@@ -47,6 +47,9 @@ func resolveHome(getenv Getenv, underTest bool) (string, error) {
 // Store is the database file under home.
 func Store(home string) string { return filepath.Join(home, "callmeter.db") }
 
+// Config is the optional settings file under home (internal/config).
+func Config(home string) string { return filepath.Join(home, "config.json") }
+
 // Log is the JSON-lines log file under home.
 func Log(home string) string { return filepath.Join(home, "callmeter.log") }
 

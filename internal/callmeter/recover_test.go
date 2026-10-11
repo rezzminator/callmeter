@@ -1936,6 +1936,7 @@ func TestRecoverQuietSizesAHookCallFromItsToolUseResult(t *testing.T) {
 func TestRecoverQuietNeverResurrectsPrunedRows(t *testing.T) {
 	ctx := context.Background()
 	q := quietStore{store: openTestStore(t), now: time.Now()}
+	q.store.SetRetention(testRetention)
 	dir := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj")
 	q.main = filepath.Join(dir, "sess-1.jsonl")
 	old := q.now.Add(-40 * 24 * time.Hour)
@@ -1981,7 +1982,7 @@ func TestRecoverQuietNeverResurrectsPrunedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	removed, err := q.store.Prune(ctx, q.now.Add(-30*24*time.Hour))
+	removed, err := q.store.Prune(ctx, q.now.Add(-testRetention))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2003,7 +2004,7 @@ func TestRecoverQuietNeverResurrectsPrunedRows(t *testing.T) {
 	if c != nil {
 		t.Logf("resurrected call source=%v ts=%v", c["source"], c["ts"])
 	}
-	cutoff := q.now.Add(-30 * 24 * time.Hour).UnixMilli()
+	cutoff := q.now.Add(-testRetention).UnixMilli()
 	for _, table := range []string{"calls", "requests"} {
 		var expired int
 		if err := q.store.DB().QueryRow("SELECT COUNT(*) FROM "+table+" WHERE ts < ?", cutoff).Scan(&expired); err != nil {

@@ -27,6 +27,10 @@ type ledgerEnv struct {
 	sample []string // the sample's lines
 }
 
+// testRetention is the window the ledger and recovery tests give their store:
+// the store keeps rows forever until SetRetention says otherwise.
+const testRetention = 30 * 24 * time.Hour
+
 func newLedgerEnv(t *testing.T) *ledgerEnv {
 	t.Helper()
 	root := t.TempDir()
@@ -39,6 +43,7 @@ func newLedgerEnv(t *testing.T) *ledgerEnv {
 		now:    time.Date(2026, 10, 9, 19, 0, 0, 0, time.UTC),
 		sample: strings.Split(strings.TrimSpace(string(raw)), "\n"),
 	}
+	e.store.SetRetention(testRetention)
 	for _, dir := range []string{e.dir, e.proj} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
@@ -210,7 +215,7 @@ func TestIngestLedgerIsIdempotent(t *testing.T) {
 	if after := snapshot(); after != before {
 		t.Errorf("second run changed the store:\nbefore %s\nafter  %s", before, after)
 	}
-	if _, err := e.store.Prune(context.Background(), e.now.Add(-Retention)); err != nil {
+	if _, err := e.store.Prune(context.Background(), e.now.Add(-testRetention)); err != nil {
 		t.Fatal(err)
 	}
 	e.ingest()
@@ -332,7 +337,7 @@ func TestIngestLedgerWithoutALedger(t *testing.T) {
 // and named.
 func TestIngestLedgerOnlyTakesTheRetentionWindow(t *testing.T) {
 	e := newLedgerEnv(t)
-	old := e.now.Add(-Retention - time.Hour).Format("2006-01-02T15:04:05.000Z")
+	old := e.now.Add(-testRetention - time.Hour).Format("2006-01-02T15:04:05.000Z")
 	e.writeLedger(ledgerSession, e.line(1, map[string]any{"ts": old}), e.sample[2])
 	got := e.ingest()
 	if got.Rows != 1 || got.Side != 1 || got.Unreadable != 1 {
@@ -340,6 +345,22 @@ func TestIngestLedgerOnlyTakesTheRetentionWindow(t *testing.T) {
 	}
 	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(1)); r != nil {
 		t.Errorf("row older than retention stored: %v", r)
+	}
+}
+
+// TestIngestLedgerWithoutARetentionTakesEveryRow: a store that keeps rows
+// forever brings in a row of any age, since no prune will take it out again.
+func TestIngestLedgerWithoutARetentionTakesEveryRow(t *testing.T) {
+	e := newLedgerEnv(t)
+	e.store.SetRetention(0)
+	old := e.now.Add(-400 * 24 * time.Hour).Format("2006-01-02T15:04:05.000Z")
+	e.writeLedger(ledgerSession, e.line(1, map[string]any{"ts": old}), e.sample[2])
+	got := e.ingest()
+	if got.Rows != 2 || got.Side != 2 {
+		t.Errorf("summary = %+v, want both rows read, the 400-day-old one included, as side calls", got)
+	}
+	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(1)); r == nil {
+		t.Error("the 400-day-old row was not stored in a store that keeps every row")
 	}
 }
 
