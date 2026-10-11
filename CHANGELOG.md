@@ -2,7 +2,7 @@
 
 Every release of callmeter. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `v<version>`, with a GitHub release carrying the section below and the four platform binaries.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-11
 
 ### Added
 - `request_iterations`: each entry of a request's transcript usage `iterations` whose type is not `message` (such as `fallback_message`, a fallback model's answer), with its own token counts, written wherever the request is and carried through prune and `archive.db`. A request answered by a fallback model keeps the answering attempt's token columns, never a sum.
