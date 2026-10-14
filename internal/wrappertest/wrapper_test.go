@@ -482,8 +482,9 @@ func TestWrapperIsExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Fatalf("wrapper mode = %v, want 0755", info.Mode().Perm())
+	// git tracks only the executable bit, so group write follows the checkout's umask
+	if perm := info.Mode().Perm(); perm&0o555 != 0o555 {
+		t.Fatalf("wrapper mode = %v, want readable and executable by everyone (r-xr-xr-x)", perm)
 	}
 }
 
