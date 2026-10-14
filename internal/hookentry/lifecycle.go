@@ -349,7 +349,7 @@ func (run *callmeterRun) sessionOf() callmeter.Session {
 	host, err := os.Hostname()
 	if err != nil {
 		// The session row lands without its host; the gap is said, not hidden.
-		applog.Failure(run.stderr, run.logPath, "host", p.SessionID, "", fmt.Errorf("read the host name: %w", err))
+		applog.FailureAt(run.stderr, run.sink, "host", p.SessionID, "", fmt.Errorf("read the host name: %w", err), applog.Row{Level: "warning", Event: "host-unreadable", Where: "internal/hookentry/lifecycle.go#sessionOf"})
 	} else {
 		s.Host = presentString(host)
 	}

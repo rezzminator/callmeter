@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
@@ -576,7 +577,7 @@ func (lab *callmeterLab) terminate(state *terminationState, sig os.Signal, stder
 func (lab *callmeterLab) terminateWithExit(state *terminationState, sig os.Signal, stderr io.Writer, exit func(int)) {
 	signals := make(chan os.Signal, 1)
 	signals <- sig
-	go terminateOnSignal(signals, nil, state, lab.missed, lab.logPath, stderr, exit)
+	go terminateOnSignal(signals, nil, state, lab.missed, applog.Sink{Log: lab.logPath}, stderr, exit)
 }
 
 // await returns the handler's exit code, failing when it does not exit.
@@ -1364,5 +1365,48 @@ func TestProcessPruneLetsASessionEndLand(t *testing.T) {
 	}
 	if got := scene.lab.count("SELECT COUNT(*) FROM events WHERE event = ?", callmeter.EventSessionEnd); got != 1 {
 		t.Errorf("SessionEnd events after prune = %d, want 1", got)
+	}
+}
+
+func TestTerminationAppendFailureKeepsKnownLevelSession(t *testing.T) {
+	root := t.TempDir()
+	missed := filepath.Join(root, "missed.log")
+	if err := os.Mkdir(missed, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sink := applog.Sink{Log: filepath.Join(root, "callmeter.log"), Levels: filepath.Join(root, "levels")}
+	state := &terminationState{event: "PreToolUse", session: "known-session"}
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGTERM
+	var stderr bytes.Buffer
+	code := -1
+	terminateOnSignal(signals, nil, state, missed, sink, &stderr, func(c int) { code = c })
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.HasPrefix(stderr.String(), "callmeter: terminated: session \"\" call \"\": ") || strings.Count(stderr.String(), "\n") != 1 {
+		t.Fatalf("legacy stderr = %q", stderr.String())
+	}
+	raw, err := os.ReadFile(sink.Log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if session, ok := legacy["session"]; ok && session != "" {
+		t.Fatalf("legacy session changed: %v", legacy)
+	}
+	raw, err = os.ReadFile(filepath.Join(sink.Levels, "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["session"] != "known-session" || row["event"] != "append-missed" {
+		t.Fatalf("missed append row = %v, want known session", row)
 	}
 }

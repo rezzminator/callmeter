@@ -190,6 +190,10 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") || !strings.Contains(stderr, "goroutine ") {
 				t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
 			}
+			assertMainPluginEvent(t, c.state, "hook-panic", "cmd/callmeter/main.go#leavePanicLine")
+			if tc.unwritable {
+				assertMainPluginEvent(t, c.state, "append-missed", "cmd/callmeter/main.go#leavePanicLine")
+			}
 			missed, err := os.ReadFile(paths.Missed(c.state))
 			if tc.unwritable {
 				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.state)) {
@@ -469,5 +473,95 @@ func TestRedactWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(c.store()); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("redact created the store: %v", err)
+	}
+}
+
+func TestHookLoggerReadyUsesLinkedVersion(t *testing.T) {
+	c := newCLI(t)
+	previous := version
+	version = "0.4.0"
+	t.Cleanup(func() { version = previous })
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "hookentry", "testdata", "verify", "payloads.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, `"hook_event_name":"SessionStart"`) {
+			payload = line
+			break
+		}
+	}
+	if payload == "" {
+		t.Fatal("captured SessionStart missing")
+	}
+	payload = strings.ReplaceAll(strings.ReplaceAll(payload, "/tmp/demo-home", c.user), "/tmp/demo-proj", filepath.Join(filepath.Dir(c.state), "proj"))
+	code, stdout, stderr := c.run(payload, "hook")
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("hook=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	raw, err := os.ReadFile(filepath.Join(c.state, "logs", "info.jsonl"))
+	if err != nil {
+		t.Fatalf("linked-version readiness row missing: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	detail, ok := row["detail"].(map[string]any)
+	if !ok || row["event"] != "logger-ready" || row["level"] != "info" || detail["version"] != "0.4.0" || detail["dir_source"] != "fallback" {
+		t.Fatalf("linked-version readiness row=%v", row)
+	}
+}
+
+func assertMainPluginEvent(t *testing.T, home, event, where string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, "logs", "errors.jsonl"))
+	if err != nil {
+		t.Fatalf("panic plugin row missing: %v", err)
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row["event"] == event {
+			count++
+			if row["level"] != "error" || row["where"] != where {
+				t.Fatalf("panic row=%v", row)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("%s rows=%d, want one", event, count)
+	}
+}
+
+func TestHookPanicHomeResolutionLevelWhere(t *testing.T) {
+	dir := t.TempDir()
+	previous := hook
+	hook = func(io.Reader, io.Writer, paths.Getenv) int { panic("boom") }
+	t.Cleanup(func() { hook = previous })
+	var out, stderr bytes.Buffer
+	env := func(key string) string {
+		if key == "PLUGIN_LOG_DIR" {
+			return dir
+		}
+		return ""
+	}
+	if code := run([]string{"hook"}, strings.NewReader(""), &out, &stderr, env); code != 0 {
+		t.Fatalf("panic code=%d", code)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["event"] != "hook-terminated" || row["where"] != "cmd/callmeter/main.go#leavePanicLine" {
+		t.Fatalf("home-resolution panic provenance=%v", row)
 	}
 }

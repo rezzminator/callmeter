@@ -77,6 +77,7 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 	rulesPath, ok := classifyArgs(args)
 	if !ok {
 		fmt.Fprintln(stderr, ClassifyUsage)
+		pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/classify.go#Classify", "invalid classify arguments")
 		return 2
 	}
 	var rules callclass.Rules
@@ -84,6 +85,7 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 		var err error
 		if rules, err = callclass.LoadRules(rulesPath); err != nil {
 			fmt.Fprintf(stderr, "callmeter classify: %v\n", err)
+			pluginLog(stderr, getenv, "error", "classify-failed", "internal/callmeter/command/classify.go#Classify", err.Error())
 			return 1
 		}
 	}
@@ -98,10 +100,12 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 		var in classifyIn
 		if err := json.Unmarshal(sc.Bytes(), &in); err != nil {
 			fmt.Fprintf(stderr, "callmeter classify: input line %d: %v\n", n, err)
+			pluginLog(stderr, getenv, "error", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", err.Error())
 			return 1
 		}
 		if in.ID == "" {
 			fmt.Fprintf(stderr, "callmeter classify: input line %d: no id\n", n)
+			pluginLog(stderr, getenv, "error", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", "input line has no id")
 			return 1
 		}
 		ins = append(ins, in)
@@ -109,11 +113,13 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 	}
 	if err := sc.Err(); err != nil {
 		fmt.Fprintf(stderr, "callmeter classify: read input: %v\n", err)
+		pluginLog(stderr, getenv, "error", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", err.Error())
 		return 1
 	}
 	res, err := callclass.Classify(context.Background(), calls, callclass.Options{Home: getenv("HOME"), Rules: rules})
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter classify: %v\n", err)
+		pluginLog(stderr, getenv, "error", "classify-failed", "internal/callmeter/command/classify.go#Classify", err.Error())
 		return 1
 	}
 	enc := json.NewEncoder(stdout)
@@ -125,6 +131,7 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 		}
 		if err := enc.Encode(out); err != nil {
 			fmt.Fprintf(stderr, "callmeter classify: write output: %v\n", err)
+			pluginLog(stderr, getenv, "error", "classify-failed", "internal/callmeter/command/classify.go#Classify", err.Error())
 			return 1
 		}
 	}

@@ -1314,3 +1314,112 @@ func TestCallmeterCLIClassifyRefusesABadRulesFile(t *testing.T) {
 		}
 	}
 }
+
+func TestCallmeterCLIPluginLogsSkippedRecovery(t *testing.T) {
+	fixture := newLab(t)
+	dir := t.TempDir()
+	oldEnv := fixture.getenv
+	fixture.getenv = func(key string) string {
+		if key == "PLUGIN_LOG_DIR" {
+			return dir
+		}
+		return oldEnv(key)
+	}
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-bad.jsonl")
+	fixture.seedQuiet(t, "sess-bad", "toolu_bad", transcript, `{"type":"user","message":{"content":[{"type":"tool_result" toolu_bad`)
+	code, _, stderr := fixture.run("report", "files")
+	if code != 0 || !strings.Contains(stderr, "recover quiet sessions: skipped:") {
+		t.Fatalf("report=%d, stderr=%q", code, stderr)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "warnings.jsonl"))
+	if err != nil {
+		t.Fatalf("recovery warning missing: %v", err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row["event"] == "recover-skipped" {
+			found = true
+			if row["level"] != "warning" || row["where"] != "internal/callmeter/command/command.go#reportAction" {
+				t.Fatalf("wrong recovery row: %v", row)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no recover-skipped row: %s", raw)
+	}
+}
+
+func TestCallmeterCLIPluginLogLevels(t *testing.T) {
+	for _, tc := range []struct {
+		name                             string
+		args                             []string
+		input, file, event, level, where string
+		code                             int
+	}{
+		{"usage", []string{"report", "not-a-topic"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/command.go#reportAction", 2},
+		{"input", []string{"classify"}, "not json", "errors.jsonl", "payload-unparsable", "error", "internal/callmeter/command/classify.go#Classify", 1},
+		{"redact", []string{"redact", "extra"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/redact.go#Redact", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			env := mapEnv(map[string]string{"PLUGIN_LOG_DIR": dir, "CALLMETER_HOME": filepath.Join(dir, "state")})
+			var out, stderr bytes.Buffer
+			code := 0
+			switch tc.args[0] {
+			case "classify":
+				code = Classify(tc.args, strings.NewReader(tc.input), &out, &stderr, env)
+			case "redact":
+				code = Redact(tc.args, &out, &stderr, env)
+			default:
+				code = CLI(tc.args, &out, &stderr, env)
+			}
+			if code != tc.code || stderr.Len() == 0 {
+				t.Fatalf("code=%d stderr=%q", code, stderr.String())
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, "callmeter", tc.file))
+			if err != nil {
+				t.Fatalf("CLI %s event missing: %v", tc.event, err)
+			}
+			var row map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+				t.Fatal(err)
+			}
+			if row["level"] != tc.level || row["event"] != tc.event || row["where"] != tc.where {
+				t.Fatalf("CLI row=%v", row)
+			}
+		})
+	}
+}
+
+func TestCallmeterCLIPluginLogExcludesRulesBody(t *testing.T) {
+	dir := t.TempDir()
+	rules := filepath.Join(dir, "rules.json")
+	if err := os.WriteFile(rules, []byte(`{"tools":{"Read":"PRIVATE_FILE_BODY"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env := mapEnv(map[string]string{"PLUGIN_LOG_DIR": dir, "CALLMETER_HOME": filepath.Join(dir, "state")})
+	var stderr bytes.Buffer
+	code := Classify([]string{"classify", "--rules", rules}, strings.NewReader(`{"id":"one","tool":"Read"}`), io.Discard, &stderr, env)
+	if code != 1 || !strings.Contains(stderr.String(), "PRIVATE_FILE_BODY") {
+		t.Fatalf("legacy result=%d stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("PRIVATE_FILE_BODY")) {
+		t.Fatalf("persisted rules body: %s", raw)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["event"] != "classify-failed" || row["msg"] == "" {
+		t.Fatalf("safe diagnostic missing: %v", row)
+	}
+}

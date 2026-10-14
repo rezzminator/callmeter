@@ -7,7 +7,7 @@
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 [![CI](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -222,6 +222,8 @@ Settings live in an optional `config.json` under `CALLMETER_HOME`. Without it ev
 A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
 
 Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
+
+Plugin errors, warnings and info also append to `errors.jsonl`, `warnings.jsonl` and `info.jsonl` under `$PLUGIN_LOG_DIR/callmeter` when set, otherwise `$CALLMETER_HOME/logs` (the resolved state home). `SessionStart` writes one `logger-ready` row with the plugin version. Each level file past 20 MB moves aside to `.1`, with a `log-capped` warning; rows are bounded to 4096 bytes. A failed write is one additional stderr notice per failing streak and never changes the hook result. The existing `callmeter.log` stays unchanged.
 
 ## ❓ FAQ
 

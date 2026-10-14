@@ -100,7 +100,7 @@ type callmeterResponse struct {
 type callmeterRun struct {
 	ctx     context.Context
 	stderr  io.Writer
-	logPath string // callmeter.log; "" = stderr only
+	sink    applog.Sink // legacy log and level files
 	getenv  paths.Getenv
 	state   *terminationState // shared with the signal handler; nil = none installed
 	store   *callmeter.Store
@@ -154,13 +154,18 @@ var closeStore = func(s *callmeter.Store) error { return s.Close() }
 // that can take neither the event nor its fault the line `store unavailable:
 // {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
+	return CallmeterVersion(input, stderr, getenv, "dev")
+}
+
+// CallmeterVersion records a hook with the binary's linked plugin version.
+func CallmeterVersion(input io.Reader, stderr io.Writer, getenv paths.Getenv, version string) int {
 	home, err := paths.Home(getenv)
 	if err != nil {
 		// No home, so no log file either: stderr only.
-		applog.Failure(stderr, "", callmeter.StageStore, "", "", fmt.Errorf("resolve callmeter home: %w", err))
+		applog.Failure(stderr, applog.ResolveSink(getenv, ""), callmeter.StageStore, "", "", fmt.Errorf("resolve callmeter home: %w", err))
 		return 0
 	}
-	logPath := paths.Log(home)
+	sink := applog.ResolveSink(getenv, home)
 	state := &terminationState{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -185,14 +190,14 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		signal.Stop(signals)
 		close(done)
 	}()
-	go terminateOnSignal(signals, done, state, paths.Missed(home), logPath, stderr, os.Exit)
+	go terminateOnSignal(signals, done, state, paths.Missed(home), sink, stderr, os.Exit)
 	seat, err := resolveCallmeterSeat(getenv)
 	if err != nil {
 		// The rows still land, without their seat; the gap is said, not hidden.
-		applog.Failure(stderr, logPath, "seat", "", "", err)
+		applog.Failure(stderr, sink, "seat", "", "", err)
 	}
 	return runCallmeter(withTerminationState(context.Background(), state), input, stderr, callmeterFiles{
-		store: paths.Store(home), log: logPath, missed: paths.Missed(home),
+		store: paths.Store(home), log: sink.Log, levels: sink.Levels, version: version, missed: paths.Missed(home),
 	}, clock.Real, seat, getenv)
 }
 
@@ -303,7 +308,8 @@ func terminateOnSignal(
 	signals <-chan os.Signal,
 	done <-chan struct{},
 	state *terminationState,
-	missed, logPath string,
+	missed string,
+	sink applog.Sink,
 	stderr io.Writer,
 	exit func(int),
 ) {
@@ -315,11 +321,11 @@ func terminateOnSignal(
 			defer state.mu.Unlock()
 			if !state.accounted && !wrote {
 				if err := AppendMissed(missed, state.event, state.session, callmeter.PanicReason, clock.Real.Now()); err != nil {
-					applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "", err)
+					applog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "", err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
 				}
 			}
-			applog.Failure(stderr, logPath, callmeter.StageTerminated, state.session, "",
-				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack))
+			applog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "",
+				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
 			exit(0)
 		}
 	}()
@@ -334,7 +340,7 @@ func terminateOnSignal(
 	if !state.accounted {
 		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
-			applog.Failure(stderr, logPath, callmeter.StageTerminated, "", "", err)
+			applog.FailureAt(stderr, sink, callmeter.StageTerminated, "", "", err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal", Session: state.session})
 		} else {
 			wrote = true
 		}
@@ -398,9 +404,11 @@ func signalName(sig os.Signal) string {
 
 // callmeterFiles are the files of one run under $CALLMETER_HOME.
 type callmeterFiles struct {
-	store  string // callmeter.db
-	log    string // callmeter.log; "" = stderr only
-	missed string // the wrapper's missed.log, ingested on every run
+	store   string // callmeter.db
+	log     string // callmeter.log; "" = stderr only
+	levels  string // explicit level output, empty when disabled
+	version string // linked plugin version; dev in package tests
+	missed  string // the wrapper's missed.log, ingested on every run
 }
 
 func runCallmeter(
@@ -412,8 +420,15 @@ func runCallmeter(
 	seat callmeterSeat,
 	getenv paths.Getenv,
 ) int {
+	if files.levels == "" {
+		home := ""
+		if files.log != "" {
+			home = filepath.Dir(files.log)
+		}
+		files.levels = applog.LevelDir(getenv, home)
+	}
 	run := &callmeterRun{
-		ctx: ctx, stderr: stderr, logPath: files.log, getenv: getenv, now: timing.Now().UnixMilli(), seat: seat,
+		ctx: ctx, stderr: stderr, sink: applog.Sink{Log: files.log, Levels: files.levels}, getenv: getenv, now: timing.Now().UnixMilli(), seat: seat,
 		state: terminationStateOf(ctx), missed: files.missed,
 	}
 	raw, readErr := io.ReadAll(input)
@@ -427,6 +442,17 @@ func runCallmeter(
 		payloadErr = fmt.Errorf("decode hook payload (%d bytes): %w", len(raw), err)
 	} else {
 		run.state.setPayload(run.payload.HookEventName, run.payload.SessionID)
+	}
+	if payloadErr == nil && run.payload.HookEventName == callmeter.EventSessionStart {
+		version := files.version
+		if version == "" {
+			version = "dev"
+		}
+		source := "fallback"
+		if getenv("PLUGIN_LOG_DIR") != "" {
+			source = "PLUGIN_LOG_DIR"
+		}
+		applog.Level(stderr, run.sink, applog.Row{Level: "info", Event: "logger-ready", Msg: "plugin logger ready", Where: "internal/hookentry/callmeter.go#SessionStart", Session: run.payload.SessionID, Detail: map[string]string{"version": version, "dir_source": source}})
 	}
 	store, err := callmeter.OpenDBWaiting(ctx, files.store, storeWait(run.payload.HookEventName))
 	if err != nil {
@@ -506,10 +532,10 @@ func (run *callmeterRun) ingestLedger() {
 	sum, err := run.store.IngestLedgerSession(ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
 	switch {
 	case !run.deadline.IsZero() && errors.Is(err, context.DeadlineExceeded):
-		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "",
+		applog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "",
 			fmt.Errorf("cost ledger: %s budget spent during the ingest, its bytes wait for the next hook: %w", run.payload.HookEventName, err))
 	case err != nil && callmeter.IsBusy(err):
-		applog.Failure(run.stderr, run.logPath, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
+		applog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
 	case err != nil:
 		run.faultOnce(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
 	case sum.Faults > 0:
@@ -1597,7 +1623,7 @@ func (run *callmeterRun) faultOnce(stage, toolUseID string, cause error) {
 
 func (run *callmeterRun) faultRow(once bool, stage, toolUseID string, cause error) {
 	if run.gaveUp {
-		applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
+		applog.Failure(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
 	var hold termHold
@@ -1622,7 +1648,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 		return
 	}
 	session := run.payload.SessionID
-	applog.Failure(run.stderr, run.logPath, stage, session, toolUseID, cause)
+	applog.Failure(run.stderr, run.sink, stage, session, toolUseID, cause)
 	if run.store == nil { // no store opened (OpenDBWaiting), or it closed
 		take()
 		run.giveUp(*hold, toolUseID, cause)
@@ -1636,7 +1662,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 		// out without the hold, a signal meanwhile decided at once.
 		written, err := run.store.AddFaultIfFree(run.ctx, fault)
 		if err != nil {
-			applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+			applog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
 		}
 		switch {
 		case written: // the row stands, whatever failed after its commit
@@ -1653,7 +1679,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 	}
 	err := run.store.AddFaultHeld(run.ctx, fault, take)
 	if err != nil {
-		applog.Failure(run.stderr, run.logPath, callmeter.StageStore, session, toolUseID, err)
+		applog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
 		take()
 		run.giveUp(*hold, toolUseID, err)
 		return
@@ -1687,7 +1713,7 @@ func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string
 	session := run.payload.SessionID
 	err := AppendMissed(run.missed, run.payload.HookEventName, session, reason, clock.Real.Now())
 	if err != nil {
-		applog.Failure(run.stderr, run.logPath, callmeter.StageTerminated, session, toolUseID, err)
+		applog.FailureAt(run.stderr, run.sink, callmeter.StageTerminated, session, toolUseID, err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#leaveMissedLine"})
 	}
 	hold.account()
 	run.accounted = true
@@ -1700,7 +1726,7 @@ func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string
 // recovery still sees them (IngestMissed, endLost), and the run is accounted
 // for and writes nothing more (gaveUp). hold is the caller's, as in faultHeld.
 func (run *callmeterRun) giveUpBusy(hold termHold, stage, toolUseID string, cause error) {
-	applog.Failure(run.stderr, run.logPath, stage, run.payload.SessionID, toolUseID, cause)
+	applog.FailureAt(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause, applog.Row{Event: "store-busy-gave-up", Where: "internal/hookentry/callmeter.go#giveUpBusy"})
 	run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
 }
 
