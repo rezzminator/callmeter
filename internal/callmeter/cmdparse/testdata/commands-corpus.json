@@ -3179,10 +3179,10 @@
   "covers": "head -N over two files",
   "cwd": "/tmp/demo-proj",
   "files": [
-   "pfm/internal/inject/engine.go",
+   "pfm/internal/call/engine.go",
    "pfm/internal/agentopen/agentopen.go"
   ],
-  "command": "head -15 pfm/internal/inject/engine.go pfm/internal/agentopen/agentopen.go",
+  "command": "head -15 pfm/internal/call/engine.go pfm/internal/agentopen/agentopen.go",
   "parts": [
    {
     "program": "head",
@@ -3191,7 +3191,7 @@
     "conditional": false,
     "files": [
      {
-      "path": "/tmp/demo-proj/pfm/internal/inject/engine.go",
+      "path": "/tmp/demo-proj/pfm/internal/call/engine.go",
       "action": "read-range",
       "range": "1,15",
       "exists": true
