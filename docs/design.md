@@ -44,7 +44,7 @@ The repository is a one-plugin marketplace. `.claude-plugin/marketplace.json` at
 | `.claude-plugin/icon.svg` | the plugin's icon |
 | `hooks/hooks.json` | the registration below |
 | `libexec/callmeter` | the POSIX sh wrapper every hook and both skills run |
-| `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's |
+| `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's at each release commit; later commits leave them as released |
 | `skills/report/SKILL.md` | `/callmeter:report {topic} [flags]`, which runs the wrapper's `report` |
 | `skills/callmeter/SKILL.md`, `skills/callmeter/schema.md` | `/callmeter:callmeter`: how a model reads the store directly, read-only, with SQL or Python (where it lives, safe reads, units, joins, tested recipes), and every table's columns; it runs the wrapper only for a `report` the user asked for or agreed to, since a report run prunes |
 | `README.md`, `LICENSE` | what an installed plugin shows |
@@ -91,7 +91,7 @@ The binary's CLI:
 - `callmeter version`: `callmeter {version}`, set at build by `-ldflags "-X main.version={v}"`, default `dev`.
 - `callmeter help`, `-h`, `--help`: usage on stdout, exit 0; no argument or an unknown subcommand: usage on stderr, exit 2.
 
-Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the committed `SHA256SUMS` reproduces from source.
+Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the `SHA256SUMS` committed with a release reproduces from that release's source; `scripts/release-check.sh --release` compares them, a plain `scripts/release-check.sh` does not.
 
 ## What the harness gives a hook
 

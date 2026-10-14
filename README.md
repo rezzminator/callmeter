@@ -269,6 +269,7 @@ cmd/callmeter/            the binary
 internal/callmeter/       the store, with cmdparse/, callclass/, report/, command/
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
+internal/releasecheck/    tests of scripts/release-check.sh
 internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
@@ -289,7 +290,7 @@ scripts/release-check.sh
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
 
 ## 🎓 Built with Professor
 
