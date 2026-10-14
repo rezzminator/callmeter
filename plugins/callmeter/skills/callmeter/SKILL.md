@@ -176,6 +176,17 @@ FROM events e WHERE e.session_id = :sid AND e.event = 'UserPromptSubmit'
 GROUP BY e.prompt_id ORDER BY min(e.ts) DESC LIMIT 20;
 ```
 
+## Classify calls
+
+`callmeter classify` labels tool calls by what they did, for counting reading against editing. It reads one JSON object per stdin line and touches no store:
+
+```sh
+printf '%s\n' '{"id":"1","tool":"Bash","command":"sed -i s/a/b/ f.txt && go test ./...","cwd":"/tmp"}' | callmeter classify
+# {"id":"1","class":"edit","classes":["edit","test"],"status":"ok"}
+```
+
+`class` is the first of `edit test git housekeeping search read capture wait spawn other` that the call holds; `classes` lists all it holds; `status` is `ok` or the cause the command could not be fully parsed. `edit` means the call authored file content; output redirected into a file the command did not author is `capture`. A project's own names come from `--rules FILE`, a JSON file with `tools` (tool name to class), `wrappers` (`program` and the `after` words before a command string) and `tests` (`program` and the `args` that make it a test); a bad file stops the run with its path and cause. Feed it calls from a transcript (`tool_use` blocks) or from the `calls` table (`tool`, `input`'s command, `cwd`).
+
 ## Python
 
 For loops, percentiles or joins with files, use the standard library; check that pandas is installed before reaching for it.

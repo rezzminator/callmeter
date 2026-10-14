@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/rezzminator/callmeter/internal/runner"
 )
@@ -52,11 +53,24 @@ type PythonRunner interface {
 	Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, error)
 }
 
-// Python3 runs the embedded scanner as `{Program} -c {script}`, one process
-// per batch. A nil Runner is runner.Real; an empty Program is "python3".
+// Python3 runs the embedded scanner as `{Program} -I -c {script}`, one process
+// per batch, bounded by Timeout. A nil Runner is runner.Real; an empty Program is "python3".
 type Python3 struct {
 	Runner  runner.Runner
 	Program string
+	// Timeout bounds one batch's run; zero is DefaultPythonTimeout.
+	Timeout time.Duration
+}
+
+// DefaultPythonTimeout bounds a scan that sets no Timeout: far past a real
+// batch, short of a hang.
+const DefaultPythonTimeout = 2 * time.Minute
+
+func (p Python3) timeout() time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return DefaultPythonTimeout
 }
 
 // Resolve returns the interpreter path, or an error wrapping ErrNoPython.
@@ -106,9 +120,37 @@ func (p Python3) Analyze(ctx context.Context, snippets []Snippet) ([]PyResult, e
 	if err != nil {
 		return nil, fmt.Errorf("cmdparse: encode %d python snippets: %w", len(snippets), err)
 	}
-	res, err := cmdRunner.Run(ctx, []string{path, "-c", pyscanScript}, runner.RunOptions{Stdin: input})
-	if err != nil {
-		return nil, fmt.Errorf("cmdparse: run %s: %w", path, err)
+	// -I: isolated mode, so neither the working directory nor the PYTHON*
+	// environment puts a module of the caller's on the scanner's import path.
+	bound := p.timeout()
+	runCtx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	type ran struct {
+		res runner.RunResult
+		err error
+	}
+	done := make(chan ran, 1)
+	go func() {
+		res, err := cmdRunner.Run(runCtx, []string{path, "-I", "-c", pyscanScript}, runner.RunOptions{Stdin: input})
+		done <- ran{res, err}
+	}()
+	var res runner.RunResult
+	select {
+	case r := <-done:
+		// a process killed at the deadline answers with exit -1 and no error
+		if errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf("cmdparse: %s timed out after %s scanning %d snippets", path, bound, len(snippets))
+		}
+		if r.err != nil {
+			return nil, fmt.Errorf("cmdparse: run %s: %w", path, r.err)
+		}
+		res = r.res
+	case <-runCtx.Done():
+		// the runner has not returned (a child still holds its pipes): stop waiting
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("cmdparse: run %s: %w", path, ctx.Err())
+		}
+		return nil, fmt.Errorf("cmdparse: %s timed out after %s scanning %d snippets", path, bound, len(snippets))
 	}
 	if res.ExitCode != 0 {
 		return nil, fmt.Errorf("cmdparse: %s exited %d: %s", path, res.ExitCode, strings.TrimSpace(string(res.Stderr)))

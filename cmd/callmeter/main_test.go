@@ -338,10 +338,37 @@ func TestUsageErrorsExitTwoWithUsageOnStderr(t *testing.T) {
 func TestHelpPrintsUsageOnStdout(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
 		code, stdout, stderr := newCLI(t).run("", arg)
-		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|redact|version|help}") ||
+		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|classify|redact|version|help}") ||
 			!strings.Contains(stdout, "usage: callmeter report") {
 			t.Errorf("callmeter %s = %d, stdout %q, stderr %q; want 0 and the usage on stdout", arg, code, stdout, stderr)
 		}
+	}
+}
+
+func TestClassifyLabelsCallsFromStdinWithoutAStore(t *testing.T) {
+	c := newCLI(t)
+	code, stdout, stderr := c.run(`{"id":"1","tool":"Bash","command":"sed -i '' s/a/b/ f.txt && go test ./...","cwd":"/tmp"}`+"\n", "classify")
+	want := `{"id":"1","class":"edit","classes":["edit","test"],"status":"ok"}` + "\n"
+	if code != 0 || stdout != want || stderr != "" {
+		t.Fatalf("callmeter classify = %d, stdout %q, stderr %q; want 0 and %q", code, stdout, stderr, want)
+	}
+}
+
+func TestClassifyRulesFlagReachesTheClassifier(t *testing.T) {
+	c := newCLI(t)
+	rules := filepath.Join(t.TempDir(), "rules.json")
+	if err := os.WriteFile(rules, []byte(`{"tests": [{"program": "mytool", "args": ["verify"]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"id":"1","tool":"Bash","command":"mytool verify","cwd":"/tmp"}` + "\n"
+	code, stdout, stderr := c.run(line, "classify", "--rules", rules)
+	want := `{"id":"1","class":"test","classes":["test"],"status":"ok"}` + "\n"
+	if code != 0 || stdout != want || stderr != "" {
+		t.Fatalf("callmeter classify --rules = %d, stdout %q, stderr %q; want 0 and %q", code, stdout, stderr, want)
+	}
+	code, stdout, stderr = c.run(line, "classify", "--rules", rules+".absent")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, rules+".absent") {
+		t.Fatalf("callmeter classify --rules <absent> = %d, stdout %q, stderr %q; want 1, no output and the path", code, stdout, stderr)
 	}
 }
 

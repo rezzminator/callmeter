@@ -1,0 +1,1261 @@
+[
+ {
+  "name": "cat of a rules test program is a read, not a test",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "cat scripts/sandbox.sh",
+  "rules": true
+ },
+ {
+  "name": "log read and a python script run captured to a notes file",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "read",
+   "capture"
+  ],
+  "command": "cat logs/parity-red.log; python3 tools/trace.py check /tmp/run1 --hops > notes/out.txt"
+ },
+ {
+  "name": "cat > file_test.go heredoc is an edit, not a test",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "cd pkg/digest && cat > parse_test.go <<'EOF'\npackage digest\n\nimport \"testing\"\n\nfunc TestParse(t *testing.T) {}\nEOF"
+ },
+ {
+  "name": "sed -n and grep on a test file inspect it",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "search",
+   "read"
+  ],
+  "command": "cd wt/pkg && sed -n 100,175p internal/launch/no_launch_test.go; grep -n \"golines\\|max-len\" -r .golangci* Makefile | head"
+ },
+ {
+  "name": "tail head ls of a gate log inspect it",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "tail -c 6000 /tmp/tasks/a1.output; echo ======; head -c 5000 notes/gate.md; ls -la returns"
+ },
+ {
+  "name": "docker info and sed -n of a check script inspect them",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "sed -n 1,30p scripts/check-app.sh | head -40; ls .claude/scripts | head -30; docker info 2>&1 | head -3"
+ },
+ {
+  "name": "a go test run captured to a red log is a test",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "go test ./internal/x/ -run TestY -count=1 > /tmp/red.log 2>&1; echo rc=$?"
+ },
+ {
+  "name": "unittest run captured to a file then searched",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "search",
+   "capture"
+  ],
+  "command": "/usr/bin/python3 -I -B -m unittest discover -s tests -p test_fx.py -k test_f1_ > /tmp/red/F1.txt 2>&1; result=$?; rg -n 'AssertionError|Ran ' /tmp/red/F1.txt; test \"$result\" -ne 0"
+ },
+ {
+  "name": "a driver script captured to a variable-named file is a capture",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "read",
+   "capture"
+  ],
+  "command": "E=/tmp/f/measure; $E/capture.sh quiet quiet-2b > $E/driver.out 2>&1; rc=$?; tail -5 $E/driver.log; exit $rc"
+ },
+ {
+  "name": "a status echo teed into a log is a capture, not an edit",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "search",
+   "read",
+   "capture"
+  ],
+  "command": "(mytool install --yes > logs/install.log 2>&1; echo \"install rc=$?\" | tee -a logs/install.log); tail -12 logs/install.log | cut -c1-220; git worktree list | grep -c demo; git branch --list 'feature/demo'"
+ },
+ {
+  "name": "mkdir plus cat heredoc creating a script is an edit",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "housekeeping"
+  ],
+  "command": "mkdir -p jobs/x/r2/runs; cat > jobs/x/r2/run_suite.sh <<'EOF'\n#!/bin/sh\n# usage: run_suite.sh LABEL\nD=/tmp/runs\nEOF"
+ },
+ {
+  "name": "sqlite3 immutable select captured to a file is a read",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "read",
+   "capture"
+  ],
+  "command": "sqlite3 \"file:/tmp/snap/c.db?immutable=1\" \"select count(*) from calls\" > /tmp/counts.txt"
+ },
+ {
+  "name": "curl output captured to a file",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "curl -s https://example.test/x.json > /tmp/x.json"
+ },
+ {
+  "name": "a status echo appended to a log is a capture",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "echo \"rc=$?\" >> /tmp/run.log"
+ },
+ {
+  "name": "cat of two files into a third is a capture of a read",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "read",
+   "capture"
+  ],
+  "command": "cat a.txt b.txt > all.txt"
+ },
+ {
+  "name": "tee of a test run into a log, tail filters the pipe",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "go test ./... 2>&1 | tee /tmp/run/test.log | tail -20"
+ },
+ {
+  "name": "python heredoc replacing text through a path variable is an edit",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "cd pkg/engine && python3 - <<'EOF'\np='internal/config/targets.go'\ns=open(p).read()\ndoc='''// readTargets returns the targets file.\n'''\nassert s.count(doc)==1\ns=s.replace(doc,'',1)\nopen(p,'w').write(s)\nEOF"
+ },
+ {
+  "name": "python heredoc with an apostrophe and a > in its body is an edit",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "python3 - <<'EOF'\np = 'notes/a.md'\ns = open(p).read()\n# it's a note: keep a > b ordering\ns = s.replace(\"x\", \"it's\")\nopen(p, 'w').write(s)\nEOF"
+ },
+ {
+  "name": "python heredoc helper function writing through a parameter",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "W=wt/pkg; cd $W && python3 - <<'EOF'\ndef sub(path, old, new, count=1):\n    s=open(path).read()\n    assert s.count(old)==count, (path, old)\n    open(path,'w').write(s.replace(old,new))\nsub('internal/launch/a.go','x','y')\nEOF"
+ },
+ {
+  "name": "python heredoc with pathlib write_text",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "cd pkg/assets && python3 - <<'PY'\nimport pathlib\np = pathlib.Path(\"converter.py\")\ns = p.read_text()\np.write_text(s.replace(\"a\", \"b\"))\nPY"
+ },
+ {
+  "name": "python -c writing a file",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "python3 -c \"p='x.txt'; open(p,'a').write('line')\""
+ },
+ {
+  "name": "perl -pi rewrites files in place",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "perl -pi -e 's/foo/bar/g' src/a.txt src/b.txt"
+ },
+ {
+  "name": "node -e writes a file",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "node -e \"require('fs').writeFileSync('out.json', JSON.stringify({a:1}))\""
+ },
+ {
+  "name": "node heredoc appends a file",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "node - <<'EOF'\nconst fs = require('fs');\nfs.appendFileSync('log.txt', 'x');\nEOF"
+ },
+ {
+  "name": "gofmt -w formats in place",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "gofmt -w internal/x/y.go"
+ },
+ {
+  "name": "gofmt -l only lists",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "gofmt -l internal/"
+ },
+ {
+  "name": "a python script file run is not known to do anything",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "python3 tools/render.py --in a.md"
+ },
+ {
+  "name": "python heredoc that only reads, with > in a comprehension, is a read",
+  "covers": "X-but-heredoc-body-has->",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "python3 - <<'EOF'\nimport json\nrows = json.load(open('r.json'))\nbig = [r for r in rows if r['n'] > 3]\nprint(len(big))\nEOF"
+ },
+ {
+  "name": "python heredoc that only prints, apostrophe in body, is not an edit",
+  "covers": "X-but-heredoc-body-has->",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "python3 - <<'EOF'\nprint(\"it's fine\", 3 > 2)\nEOF"
+ },
+ {
+  "name": "cat heredoc to stdout with a > in its body writes nothing",
+  "covers": "X-but-heredoc-body-has->",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "cat <<'EOF'\nstep 1 > step 2\nEOF"
+ },
+ {
+  "name": "sed -i with a > inside its quoted script is an edit",
+  "covers": "X-but-heredoc-body-has->",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "sed -i '' -e 's/a>b/c/' -e '/^x$/d' pkg/a.go"
+ },
+ {
+  "name": "sed -i then a go test: the edit is not hidden",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "search",
+   "read"
+  ],
+  "command": "cd jobs/x; sed -i '' 's/^needs: \\[3-r\\]$/needs: [3-b, 3-r]/' 4-r.md; head -6 4-r.md | tail -2; node tools/index.mjs jobs/x 2>&1 | grep -v \"^| [1-3]-\""
+ },
+ {
+  "name": "cp backup, sed -i, go test",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "test",
+   "housekeeping"
+  ],
+  "command": "cp files.go /tmp/files.go.good; sed -i '' 's|a|b|' files.go && go test ./pkg/ -count=1"
+ },
+ {
+  "name": "sed -i on a script then a wrapped run captured to a log",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "housekeeping",
+   "capture"
+  ],
+  "command": "sed -i '' 's# | tail -60##' /tmp/t/gotest.sh; ./scripts/sandbox.sh box sim 'bash /t/gotest.sh red' > /tmp/l/red-run.log 2>&1; cp /tmp/t/red.log /tmp/t/red.keep",
+  "rules": true
+ },
+ {
+  "name": "make build then make test captured",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "make build && make test > /tmp/build.log"
+ },
+ {
+  "name": "the affected-test script is a test by its name",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "scripts/test-app.sh internal/x/y_test.go::TestFoo"
+ },
+ {
+  "name": "a rules test program run with a gate word is a test",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "./scripts/sandbox.sh box gate",
+  "rules": true
+ },
+ {
+  "name": "pytest run is a test",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "pytest -q tests/test_a.py::test_b"
+ },
+ {
+  "name": "npm run build and npm test",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "npm run build && npm test"
+ },
+ {
+  "name": "apply_patch heredoc is an edit",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "apply_patch <<'EOF'\n*** Begin Patch\n*** End Patch\nEOF"
+ },
+ {
+  "name": "git apply authors a patch",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "git apply fix.patch"
+ },
+ {
+  "name": "git apply --check only checks",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git apply --check fix.patch"
+ },
+ {
+  "name": "prettier --write edits, --check tests",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "test"
+  ],
+  "command": "prettier --write src/a.ts; prettier --check src"
+ },
+ {
+  "name": "jq to a temp then mv over the original is an in-place edit",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "housekeeping",
+   "read",
+   "capture"
+  ],
+  "command": "jq '.k = 1' cfg.json > cfg.json.tmp && mv cfg.json.tmp cfg.json"
+ },
+ {
+  "name": "cat heredoc piped into tee authors a file",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "cat <<'EOF' | tee notes/plan.md\n# Plan\nEOF"
+ },
+ {
+  "name": "printf into a file authors it",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "printf '%s\\n' \"line\" > conf/a.txt"
+ },
+ {
+  "name": "git add -N then a diff is git state",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git",
+   "read"
+  ],
+  "command": "git add -N pkg/a.go pkg/a_test.go && git diff abc123 --stat -- pkg/a.go pkg/a_test.go"
+ },
+ {
+  "name": "git checkout of a file is git state",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git",
+   "read"
+  ],
+  "command": "cd pkg && git checkout -q HEAD -- cmd/x.go 2>&1 | head -2; git diff --stat -- cmd/x.go | tail -1; git show HEAD:pkg/cmd/x.go | wc -l"
+ },
+ {
+  "name": "git commit",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git",
+   "read"
+  ],
+  "command": "git commit -m \"fix: x\" && git log --oneline | head -3"
+ },
+ {
+  "name": "git -C status and stash list read",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git -C /repo/.worktrees/w status --short; git -C /repo stash list"
+ },
+ {
+  "name": "mkdir rm chmod ln touch are housekeeping",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "housekeeping"
+  ],
+  "command": "mkdir -p /tmp/a/b && rm -rf /tmp/a/old && chmod +x run.sh && ln -sf a b && touch c"
+ },
+ {
+  "name": "a bare mv is housekeeping",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "housekeeping"
+  ],
+  "command": "mv build.log.tmp build.log"
+ },
+ {
+  "name": "sleep is a wait",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "wait"
+  ],
+  "command": "sleep 30"
+ },
+ {
+  "name": "an until poll loop is a wait",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "wait"
+  ],
+  "command": "until [ -f /tmp/done ]; do sleep 5; done"
+ },
+ {
+  "name": "grep piped to head is a search",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "search"
+  ],
+  "command": "grep -rn Foo src | head"
+ },
+ {
+  "name": "a shell syntax error is other with the cause named",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "echo 'unterminated",
+  "status": "error"
+ },
+ {
+  "name": "an empty command is other",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": ""
+ },
+ {
+  "name": "tool Edit is edit",
+  "covers": "tools",
+  "tool": "Edit",
+  "classes": [
+   "edit"
+  ]
+ },
+ {
+  "name": "tool Write is edit",
+  "covers": "tools",
+  "tool": "Write",
+  "classes": [
+   "edit"
+  ]
+ },
+ {
+  "name": "tool MultiEdit is edit",
+  "covers": "tools",
+  "tool": "MultiEdit",
+  "classes": [
+   "edit"
+  ]
+ },
+ {
+  "name": "tool NotebookEdit is edit",
+  "covers": "tools",
+  "tool": "NotebookEdit",
+  "classes": [
+   "edit"
+  ]
+ },
+ {
+  "name": "tool Read is read",
+  "covers": "tools",
+  "tool": "Read",
+  "classes": [
+   "read"
+  ]
+ },
+ {
+  "name": "tool Grep is search",
+  "covers": "tools",
+  "tool": "Grep",
+  "classes": [
+   "search"
+  ]
+ },
+ {
+  "name": "tool Glob is search",
+  "covers": "tools",
+  "tool": "Glob",
+  "classes": [
+   "search"
+  ]
+ },
+ {
+  "name": "tool Agent is spawn",
+  "covers": "tools",
+  "tool": "Agent",
+  "classes": [
+   "spawn"
+  ]
+ },
+ {
+  "name": "tool SendMessage is spawn",
+  "covers": "tools",
+  "tool": "SendMessage",
+  "classes": [
+   "spawn"
+  ]
+ },
+ {
+  "name": "tool Monitor is wait",
+  "covers": "tools",
+  "tool": "Monitor",
+  "classes": [
+   "wait"
+  ]
+ },
+ {
+  "name": "tool Skill is other",
+  "covers": "tools",
+  "tool": "Skill",
+  "classes": [
+   "other"
+  ]
+ },
+ {
+  "name": "tool mcp__x__unknown is other",
+  "covers": "tools",
+  "tool": "mcp__x__unknown",
+  "classes": [
+   "other"
+  ]
+ },
+ {
+  "name": "a rules wrapper runs a go test with -C",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "./scripts/sandbox.sh box run \"go -C app test ./internal/x/ -count=1\" 2>&1 | tail -30",
+  "rules": true
+ },
+ {
+  "name": "a rules wrapper running a test, its output captured",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "search",
+   "capture"
+  ],
+  "command": "cd /repo && ./scripts/sandbox.sh box run \"set -o pipefail; go -C app test ./internal/y/ -run 'TestZ' -count=1 2>&1 | grep -E '^(ok|FAIL)'\" > $L/green.log 2>&1; echo $?",
+  "rules": true
+ },
+ {
+  "name": "a rules wrapper runs a search",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "search"
+  ],
+  "command": "./scripts/sandbox.sh box sim \"grep -rn needle app | head\"",
+  "rules": true
+ },
+ {
+  "name": "docker run bash -c wraps a test",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "docker run --rm -v \"$p:$p:ro\" -w \"$w\" img bash -c \"go test ./...\""
+ },
+ {
+  "name": "python compileall is a test",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "cd /w && /usr/bin/python3 -I -m compileall -q pkg tests > /tmp/static.log 2>&1"
+ },
+ {
+  "name": "a rules test program given a flag is a test",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "cd /w && bash infra/lanes/lanes.sh --lanes M > /tmp/lane.log 2>&1; echo \"lane rc=$?\" >> /tmp/lane.log",
+  "rules": true
+ },
+ {
+  "name": "git -C over a loop variable of two values still reads",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "for p in alpha beta; do git -C $p rev-parse HEAD; done"
+ },
+ {
+  "name": "git -C over a loop variable of two values still changes state",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "git"
+  ],
+  "command": "for p in alpha beta; do git -C $p checkout main; done"
+ },
+ {
+  "name": "git hash-object prints an id",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git hash-object notes.txt"
+ },
+ {
+  "name": "git hash-object -w writes an object",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "git"
+  ],
+  "command": "git hash-object -w notes.txt"
+ },
+ {
+  "name": "git merge-tree and ls-remote only read",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git merge-tree --write-tree HEAD other 2>&1 | head -40; git ls-remote origin | head -3"
+ },
+ {
+  "name": "git archive to a file reads the repository",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git archive --format=tar -o /tmp/snap.tar HEAD"
+ },
+ {
+  "name": "python heredoc writes through a path expression",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "python3 -I - <<'PY'\nfrom pathlib import Path\nroot = Path('/tmp/proj')\nout = {'a': 1}\n(root / 'notes' / 'plan.json').write_text(str(out))\nprint('written')\nPY"
+ },
+ {
+  "name": "echo lines grouped into one appended file",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "read"
+  ],
+  "command": "F=/tmp/batch\nT=$(date +%s)\n{\necho -e \"1-a\\tworker\\t$T\"\necho -e \"1-b\\tworker\\t$T\"\n} >> \"$F/workers.tsv\"\ncat \"$F/workers.tsv\""
+ },
+ {
+  "name": "python -W flag value does not hide -m unittest",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "/usr/bin/python3 -I -B -W ignore -m unittest discover -s tests -k smoke 2>&1 | tail -3"
+ },
+ {
+  "name": "a rules wrapper run by bash with the check script it runs",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "read",
+   "capture"
+  ],
+  "command": "bash scripts/sandbox.sh box run 'bash scripts/check-all.sh a b' > /tmp/out.log 2>&1; rc=$?; tail -n 70 /tmp/out.log; exit \"$rc\"",
+  "rules": true
+ },
+ {
+  "name": "a lock runner before a rules wrapper lints",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "search"
+  ],
+  "command": "/tmp/bin/lock shared -- scripts/sandbox.sh box run 'cd app && golangci-lint run ./... 2>&1 | grep -B1 -A2 shadow' 2>&1 | tail -8",
+  "rules": true
+ },
+ {
+  "name": "checks.sh under env is a check run",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "W=/tmp/wt; (cd \"$W\" && env TMPDIR=/tmp/scratch scripts/checks.sh)"
+ },
+ {
+  "name": "node --test runs the tests of a directory",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "node --test src/commands/ 2>&1 | tail -30"
+ },
+ {
+  "name": "a test run piped to tee after a banner echo is a capture, not an edit",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "echo '== run'; go test ./... 2>&1 | tee /tmp/t.log"
+ },
+ {
+  "name": "tee fed a heredoc authors its file",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "tee notes/a.txt <<'EOF'\nhi\nEOF"
+ },
+ {
+  "name": "tee fed a here-string authors its file",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "tee notes/a.txt <<< 'hi'"
+ },
+ {
+  "name": "cat copying stdin from a file into another is a capture, not an edit",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "cat < a.txt > b.txt"
+ },
+ {
+  "name": "find -exec sed -i edits every match",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "search"
+  ],
+  "command": "find . -name '*.go' -exec sed -i 's/a/b/' {} +"
+ },
+ {
+  "name": "find -execdir rm deletes every match",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "housekeeping",
+   "search"
+  ],
+  "command": "find . -name '*.tmp' -execdir rm {} \\;"
+ },
+ {
+  "name": "bare git stash stashes the working tree",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git"
+  ],
+  "command": "git stash"
+ },
+ {
+  "name": "git stash -u stashes untracked files too",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git"
+  ],
+  "command": "git stash -u"
+ },
+ {
+  "name": "git stash list only lists",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git stash list"
+ },
+ {
+  "name": "git tag -a creates an annotated tag",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "git"
+  ],
+  "command": "git tag -a v1 -m 'first'"
+ },
+ {
+  "name": "git branch -a lists every branch",
+  "covers": "X-but-git-state",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "git branch -a"
+ },
+ {
+  "name": "echo of single-quoted backticks into a file authors it",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "echo '- run `make` first' >> README.md"
+ },
+ {
+  "name": "echo of a braced exit status into a log is a capture",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "echo \"rc=${?}\" >> /tmp/run.log"
+ },
+ {
+  "name": "a captured log moved into a directory is housekeeping, not an edit",
+  "covers": "X-but-housekeeping",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "housekeeping",
+   "capture"
+  ],
+  "command": "go test ./... > /tmp/t.log 2>&1; mv /tmp/t.log out/"
+ },
+ {
+  "name": "jq output moved over its own input is an in-place edit",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit",
+   "housekeeping",
+   "read",
+   "capture"
+  ],
+  "command": "jq '.a = 1' conf.json > /tmp/c.json && mv /tmp/c.json conf.json"
+ },
+ {
+  "name": "perl -M module flag carrying an i is no in-place edit",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "perl -Mstrict -ne 'print if /x/' f.txt"
+ },
+ {
+  "name": "ruby -r library flag carrying an i is no in-place edit",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "ruby -rdigest -e 'p 1'"
+ },
+ {
+  "name": "a group of echoes appended to an unresolved log authors it",
+  "covers": "?-but-script-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "{ echo a; echo b; } >> \"$LOG\""
+ },
+ {
+  "name": "a group running tests redirected to a file is a capture",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "test",
+   "capture"
+  ],
+  "command": "{ go test ./...; echo done; } > /tmp/t.log"
+ },
+ {
+  "name": "bun test runs the tests",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "bun test"
+ },
+ {
+  "name": "deno test runs the tests",
+  "covers": "replay-sample",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "deno test"
+ },
+ {
+  "name": "deno fmt rewrites files",
+  "covers": "T-but-edit",
+  "tool": "Bash",
+  "classes": [
+   "edit"
+  ],
+  "command": "deno fmt"
+ },
+ {
+  "name": "echo with only stderr redirected writes no authored file",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "echo note 2> err.log"
+ },
+ {
+  "name": "a bare truncating redirect before an echo is no edit",
+  "covers": "X-but-output-capture",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "> out.txt; echo hi"
+ },
+ {
+  "name": "a rules wrapper is not looked through without the rules",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "capture"
+  ],
+  "command": "scripts/sandbox.sh box run \"go -C app test ./x/\" > /tmp/o.log 2>&1"
+ },
+ {
+  "name": "a rules test word runs a test",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "scripts/sandbox.sh gate",
+  "rules": true
+ },
+ {
+  "name": "a rules test word is no test without the rules",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "scripts/sandbox.sh gate"
+ },
+ {
+  "name": "a rules test program with a word it does not list is no test",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "scripts/sandbox.sh shell",
+  "rules": true
+ },
+ {
+  "name": "a rules test program with a verb",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "mytool doctor --json",
+  "rules": true
+ },
+ {
+  "name": "a rules test program with an install verb is no test",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "mytool install --yes",
+  "rules": true
+ },
+ {
+  "name": "a rules test program run by bash",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "bash scripts/sandbox.sh verify",
+  "rules": true
+ },
+ {
+  "name": "a rules wrapper with another word after the program is not a wrapper",
+  "covers": "rules",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "scripts/sandbox.sh box shell \"go -C app test ./x/\"",
+  "rules": true
+ },
+ {
+  "name": "a rules tool maps to spawn",
+  "covers": "rules",
+  "tool": "mcp__x__start",
+  "classes": [
+   "spawn"
+  ],
+  "rules": true
+ },
+ {
+  "name": "a rules tool maps to wait",
+  "covers": "rules",
+  "tool": "mcp__x__poll",
+  "classes": [
+   "wait"
+  ],
+  "rules": true
+ },
+ {
+  "name": "a rules tool is other without the rules",
+  "covers": "rules",
+  "tool": "mcp__x__start",
+  "classes": [
+   "other"
+  ]
+ },
+ {
+  "name": "a rules tool entry beats the built-in mapping",
+  "covers": "rules",
+  "tool": "LS",
+  "classes": [
+   "search"
+  ],
+  "rules": true
+ },
+ {
+  "name": "the built-in mapping stands without the rules",
+  "covers": "rules",
+  "tool": "LS",
+  "classes": [
+   "read"
+  ]
+ },
+ {
+  "name": "an unquoted wrapped search carrying a test word is a search, not a test",
+  "covers": "rules-wrapper",
+  "tool": "Bash",
+  "classes": [
+   "search"
+  ],
+  "command": "./scripts/sandbox.sh box run rg -n build src",
+  "rules": true
+ },
+ {
+  "name": "an interpreter before a rules wrapper running a search with a test word is a search",
+  "covers": "rules-wrapper",
+  "tool": "Bash",
+  "classes": [
+   "search"
+  ],
+  "command": "bash scripts/sandbox.sh box run rg -n build src",
+  "rules": true
+ },
+ {
+  "name": "a lock runner before a rules test program is a test",
+  "covers": "rules-test",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "/tmp/bin/lock shared -- scripts/sandbox.sh box gate",
+  "rules": true
+ },
+ {
+  "name": "cat of a rules test program with a test word is a read",
+  "covers": "T-but-inspection",
+  "tool": "Bash",
+  "classes": [
+   "read"
+  ],
+  "command": "cat scripts/sandbox.sh test",
+  "rules": true
+ },
+ {
+  "name": "echo of a usage line naming a rules wrapper runs nothing",
+  "covers": "rules-wrapper",
+  "tool": "Bash",
+  "classes": [
+   "other"
+  ],
+  "command": "echo usage: sandbox.sh box run rm -rf x",
+  "rules": true
+ },
+ {
+  "name": "grep for a rules test program with a test word is a search",
+  "covers": "rules-test",
+  "tool": "Bash",
+  "classes": [
+   "search"
+  ],
+  "command": "grep -rn 'sandbox.sh box gate' docs",
+  "rules": true
+ },
+ {
+  "name": "a docker bash -c inside a rules wrapper is looked into",
+  "covers": "nested-wrapper",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "./scripts/sandbox.sh box run 'docker exec c bash -c \"go test ./...\"'",
+  "rules": true
+ },
+ {
+  "name": "a docker bash -c inside a docker bash -c is looked into",
+  "covers": "nested-wrapper",
+  "tool": "Bash",
+  "classes": [
+   "test"
+  ],
+  "command": "docker run img bash -c 'docker run img2 bash -c \"go test ./...\"'"
+ },
+ {
+  "name": "copying a rules test program into a directory named like a test word is housekeeping",
+  "covers": "rules-test",
+  "tool": "Bash",
+  "classes": [
+   "housekeeping"
+  ],
+  "command": "cp scripts/sandbox.sh test",
+  "rules": true
+ }
+]

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1207,5 +1208,109 @@ func TestCallmeterCLIReportCostRejectsAnUnknownView(t *testing.T) {
 	code, stdout, stderr := fixture.run("report", "cost", "--view", "nope")
 	if code != 2 || stdout != "" || !strings.Contains(stderr, `--view "nope" is none of chat, agent, call`) {
 		t.Errorf("report cost --view nope = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}
+
+func TestCallmeterCLIClassifyLabelsCallsInOrder(t *testing.T) {
+	t.Parallel()
+	in := strings.Join([]string{
+		`{"id":"a","tool":"Bash","command":"go test ./... > /tmp/red.log 2>&1","cwd":"/tmp"}`,
+		``,
+		`{"id":"b","tool":"Bash","command":"python3 - <<'EOF'\np = 'x.go'\nopen(p, 'w').write('y')\nEOF","cwd":"/tmp"}`,
+		`{"id":"c","tool":"Edit"}`,
+		`{"id":"d","tool":"Bash","command":"git commit -m x"}`,
+	}, "\n")
+	var stdout, stderr bytes.Buffer
+	code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	want := `{"id":"a","class":"test","classes":["test","capture"],"status":"ok"}
+{"id":"b","class":"edit","classes":["edit"],"status":"ok"}
+{"id":"c","class":"edit","classes":["edit"],"status":"ok"}
+{"id":"d","class":"git","classes":["git"],"status":"ok"}
+`
+	if stdout.String() != want {
+		t.Errorf("stdout =\n%s\nwant\n%s", stdout.String(), want)
+	}
+}
+
+func TestCallmeterCLIClassifyRefusesBadInput(t *testing.T) {
+	t.Parallel()
+	for name, in := range map[string]string{
+		"not json":      "{nope",
+		"missing id":    `{"tool":"Read"}`,
+		"duplicate ids": `{"id":"a","tool":"Read"}` + "\n" + `{"id":"a","tool":"Edit"}`,
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+		if code != 1 || stderr.Len() == 0 || stdout.Len() != 0 {
+			t.Errorf("%s: exit %d stdout %q stderr %q, want exit 1, a message, no output", name, code, stdout.String(), stderr.String())
+		}
+	}
+	var stderr bytes.Buffer
+	if code := Classify([]string{"classify", "x"}, strings.NewReader(""), io.Discard, &stderr, func(string) string { return "" }); code != 2 {
+		t.Errorf("extra arg: exit %d, want 2", code)
+	}
+}
+
+func TestCallmeterCLIClassifyLoadsARulesFile(t *testing.T) {
+	t.Parallel()
+	rules := filepath.Join(t.TempDir(), "rules.json")
+	body := `{"tools": {"mcp__x__start": "spawn"}, "wrappers": [{"program": "box", "after": ["run"]}], "tests": [{"program": "mytool", "args": ["verify"]}]}`
+	if err := os.WriteFile(rules, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in := strings.Join([]string{
+		`{"id":"a","tool":"Bash","command":"mytool verify","cwd":"/tmp"}`,
+		`{"id":"b","tool":"Bash","command":"box run 'grep -rn x .'","cwd":"/tmp"}`,
+		`{"id":"c","tool":"mcp__x__start"}`,
+	}, "\n")
+	want := `{"id":"a","class":"test","classes":["test"],"status":"ok"}
+{"id":"b","class":"search","classes":["search"],"status":"ok"}
+{"id":"c","class":"spawn","classes":["spawn"],"status":"ok"}
+`
+	for _, args := range [][]string{{"classify", "--rules", rules}, {"classify", "--rules=" + rules}} {
+		var stdout, stderr bytes.Buffer
+		code := Classify(args, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+		if code != 0 || stdout.String() != want || stderr.Len() != 0 {
+			t.Errorf("%v = %d, stdout %q, stderr %q; want 0 and %q", args, code, stdout.String(), stderr.String(), want)
+		}
+	}
+	// without the file the same calls are labelled by the neutral defaults
+	var stdout bytes.Buffer
+	if code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, io.Discard, func(string) string { return "" }); code != 0 ||
+		strings.Contains(stdout.String(), `"class":"test"`) || strings.Contains(stdout.String(), `"class":"spawn"`) {
+		t.Errorf("neutral run = %d, stdout %q; want no test and no spawn", code, stdout.String())
+	}
+}
+
+func TestCallmeterCLIClassifyRefusesABadRulesFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, tc := range []struct{ name, path, cause string }{
+		{"unreadable", filepath.Join(dir, "absent.json"), "no such file"},
+		{"malformed", write("malformed.json", `{"tools":`), "unexpected EOF"},
+		{"unknown class", write("class.json", `{"tools": {"mcp__x__go": "edits"}}`), `unknown class "edits"`},
+		{"unknown field", write("field.json", `{"wrapper": []}`), `unknown field "wrapper"`},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Classify([]string{"classify", "--rules", tc.path}, strings.NewReader(`{"id":"a","tool":"Read"}`), &stdout, &stderr, func(string) string { return "" })
+		if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.path) || !strings.Contains(stderr.String(), tc.cause) {
+			t.Errorf("%s: exit %d stdout %q stderr %q; want exit 1, no output, the path and %q", tc.name, code, stdout.String(), stderr.String(), tc.cause)
+		}
+	}
+	for _, args := range [][]string{{"classify", "--rules"}, {"classify", "--rules="}, {"classify", "--rules", "a", "--rules", "b"}, {"classify", "--rule", "a"}} {
+		var stderr bytes.Buffer
+		if code := Classify(args, strings.NewReader(""), io.Discard, &stderr, func(string) string { return "" }); code != 2 || !strings.Contains(stderr.String(), "usage: callmeter classify") {
+			t.Errorf("%v: exit %d stderr %q, want 2 and the usage", args, code, stderr.String())
+		}
 	}
 }

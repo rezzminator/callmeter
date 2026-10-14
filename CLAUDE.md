@@ -9,7 +9,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - manifest: the plugin's version and author · `plugins/callmeter/.claude-plugin/plugin.json`
 - hooks: every registered event runs the wrapper with `hook`, async · `plugins/callmeter/hooks/hooks.json`
 - wrapper: the POSIX sh entry every hook and both skills run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
-- binary: the Go program behind `callmeter {hook|report|version}` · `cmd/callmeter/main.go`
+- binary: the Go program behind `callmeter {hook|report|classify|redact|version}` · `cmd/callmeter/main.go`
 - `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset · `internal/paths/paths.go`
 - settings file: the one optional config, `retention_days` alone; absent keeps every row forever, and only `callmeter report` reads it · `{CALLMETER_HOME}/config.json`, `internal/config/config.go` · design `docs/design.md` § Where the store lives
 - binary cache: the installed binary per plugin version · `{CALLMETER_HOME}/bin/{version}/callmeter`
@@ -18,6 +18,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - seat: one Claude Code config dir; every seat writes the one store, its rows told apart by `seat_dir` · design `docs/design.md` § Where the store lives
 - `hookentry`: the `callmeter hook` handler, with the captured payload fixtures · `internal/hookentry/`
 - cmdparse: the Bash command parser filling `command_parts` · `internal/callmeter/cmdparse/` · design `docs/design.md` § Parsing a command
+- callclass: the call classifier behind `callmeter classify`, labelling a tool call `edit`, `test`, `git`, `housekeeping`, `search`, `read`, `capture`, `wait`, `spawn` or `other` from cmdparse's parts, plus the optional `--rules` file naming a project's wrappers, test programs and tool classes · `internal/callmeter/callclass/` · design `docs/design.md` § Classifying a call
 - reports: `callmeter report {name}`, read by the report skill · `internal/callmeter/report/`, `plugins/callmeter/skills/report/SKILL.md` · design `docs/design.md` § Reports
 - `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs and clears `PFM_COST_LEDGER_DIR` and `PFM_HOME` · `internal/testjail/testjail.go`
 - cost ledger: pfm's per-call price files `{session_id}.jsonl` in `$PFM_COST_LEDGER_DIR`, else `{PFM_HOME or HOME}/.local/state/pfm/cost-ledger`, read at report time as optional data · `internal/callmeter/ledger.go`; `requests.api_request_id` links a row to transcripts

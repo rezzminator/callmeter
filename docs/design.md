@@ -16,6 +16,7 @@ Decisions live in this file. A change lands here first, then in the code. How it
 - [The store](#the-store)
 - [The cost ledger](#the-cost-ledger)
 - [Parsing a command](#parsing-a-command)
+- [Classifying a call](#classifying-a-call)
 - [Reports](#reports)
 - [Corpus findings and fixes](#corpus-findings-and-fixes)
 - [Build decisions](#build-decisions)
@@ -341,6 +342,45 @@ From the parsed commands, a file is attributed to a call when an argument, an as
 One Bash call returns one output: the bytes of a compound command belong to the call, never split across its parts.
 
 A static parse cannot know which branch ran, so every file a part names in a read mode (`read-whole`, `read-range`, `search`) is attributed as read, whether or not its branch ran; the call's bytes are measured at its end either way. What the parse does know is where the part sits: `command_parts.conditional` is 1 for a part inside an `if` branch or the `else` chain (an `elif` condition included), a `case` arm, or on the right-hand side of `&&` or `||`, and 0 otherwise; the first `if` condition and the `case` word run unconditionally. A Bash call's read of a file is certain when any unconditional part of that call names the file, conditional otherwise. A file test (`[`, `test`, `[[ ]]`) reads nothing and attributes no file. The `files` report shows `READS` (every attributed read), then `CERTAIN` and `CONDITIONAL`, so a file that ranks high only through guarded reads (`if [ -f x ]; then cat x; fi`) shows as such, and `EXECS`, the calls that ran the file (`exec`), never a read. A `stat` or `write` attribution is no read; an `unknown` one counts nowhere, and a note names how many there were.
+
+## Classifying a call
+
+`callmeter classify` labels tool calls by what they did, for a reader that counts reading against editing. It reads JSON lines `{id, tool, command, cwd}` on stdin, writes `{id, class, classes, status}` lines in the same order, and touches no store: the labelling is `internal/callmeter/callclass`, built on [Parsing a command](#parsing-a-command), never on a substring of the command text.
+
+| Class | A call that |
+| --- | --- |
+| `edit` | authors file content, wherever the file lives: the `Edit`, `Write`, `MultiEdit`, `NotebookEdit` tools; `echo` or `printf` of literal text, or `cat` reading a heredoc or here-string, its standard output redirected into a file (as the first command of a redirected `{ …; }` group or compound command too); `tee` fed a heredoc, a here-string or such text by the part before it; `sed -i`, `perl -i`, `patch`, `yq -i`, also run by `find -exec`; an `mv` or `cp` of a file an earlier part captured from the very file it moves over; a script that opens a file for writing (Python found by its own `ast`, `node -e` by its source) |
+| `test` | runs a test, build, typecheck, lint or gate: `go test`, `pytest`, `make test`, a script named as a test, and the programs a rules file names as tests |
+| `git` | changes repository state (`add`, `commit`, `checkout`, `reset`, `merge`, `worktree add`, a bare `stash`, `tag -a`…); `git diff`, `log`, `show`, `stash list` and the other readers are `read` |
+| `housekeeping` | moves, copies, removes or creates files (`mkdir`, `rm`, `mv`, `cp`, `chmod`, `ln`, `touch`, `find -delete`, `find -exec rm`) |
+| `search` | `grep`, `rg`, `find`, and the `Grep` and `Glob` tools |
+| `read` | the `Read` tool and commands that only print or inspect |
+| `capture` | redirects a command's output (a test run, a `jq`, a `sed -n`, `$?`) into a file the command did not author |
+| `wait` | `sleep`, polling, monitor and task-output tools |
+| `spawn` | starts or messages a sub-agent or chat (`Agent`, `Task`, `SendMessage`, and the tools a rules file maps to `spawn`) |
+| `other` | none of these: a script or program the parse cannot see into, an unknown tool |
+
+`classes` lists every class a call holds, in the order above, and `class` is the first of them: a call that edits and tests is an `edit`, so an edit is never hidden behind a test. A call counts once per class however many files it touches. A wrapper's command (`docker run … bash -c '…'`, or a wrapper a rules file names) is judged as a command of its own and its parts join the call's, and a wrapper inside it is looked into the same way, up to three wrappers deep. The built-in defaults are neutral: the Claude Code tools, the common runners and toolchains, and `docker`/`podman` `bash -c`. A project adds its own through a rules file (below). `status` is `ok`, or the cause a command could not be fully parsed (`error`, `python-error`, `python-unavailable`, `script-body`, an `unparsed` language other than `node -e`); the call is then labelled from the parts that did parse, `other` when none did. Known limits, each `other` or `capture` rather than a guess: a `sed` or `jq` that transforms into a new file is a capture, a project script or a `subprocess` inside Python is not looked into, and an unquoted heredoc body is not stored.
+
+### The rules file
+
+`callmeter classify --rules FILE` adds a project's own names to the neutral defaults; the zero rule set (no flag) adds nothing. The file is one JSON object, decoded strictly:
+
+```json
+{
+  "tools":    {"mcp__x__start": "spawn"},
+  "wrappers": [{"program": "box", "after": ["run"]}],
+  "tests":    [{"program": "mytool", "args": ["verify", "lint"]}]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `tools` | a tool name mapped to a class (one of the ten); an entry beats the built-in mapping. `Bash` is judged by its command and cannot be mapped |
+| `wrappers` | the words after the consecutive `after` words of the program's arguments are a command string, parsed as shell and judged as a command of its own, its parts joining the call's; those words are no arguments of the wrapper, so a `tests` rule for the same program reads only the words before `after` |
+| `tests` | the program run with any listed word among the arguments after it is a `test` |
+
+`program` is a bare name and matches the command's own name or the name of any of its arguments, so an interpreter or a lock runner in front of it (`bash box run '…'`, `lock -- box gate`) still matches; a command that only prints, reads, searches or moves its arguments (`echo`, `printf`, the read, search and housekeeping programs but `env` and `command`) runs none of them, so `echo usage: box run rm x` and `grep 'box gate' docs` match nothing. A file that cannot be read, is not a regular file (a FIFO, `/dev/stdin`) or is over 1 MiB, is not valid JSON or has bytes after it, holds an unknown field or class, an empty name or word, a second document or no rule at all stops the run with exit 1 and `callmeter classify: rules {path}: {cause}`; it is never read as an empty rule set. Every other rule of the classifier is built in.
 
 ## Reports
 

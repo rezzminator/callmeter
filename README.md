@@ -145,6 +145,8 @@ claude-haiku-4-5-20251001  general-purpose  6         58     33030       41033  
 
 Every report, column and note is specified in [docs/design.md § Reports](./docs/design.md#reports).
 
+`callmeter classify` is not a report: it labels tool calls fed on stdin as JSON lines (`edit`, `test`, `git`, `housekeeping`, `search`, `read`, `capture`, `wait`, `spawn`, `other`) from the commands the calls ran, for a script that counts reading against editing. `--rules FILE` adds a project's own tool names, wrapper programs and test programs to the built-in defaults. It touches no store. See [docs/design.md § Classifying a call](./docs/design.md#classifying-a-call).
+
 ## 🔎 Ask the store your own questions
 
 A question no report answers (which sub-agent peaked highest, what a whole agent tree cost, what one agent spent its time on) goes to the store itself. The `callmeter` skill teaches Claude to read it safely: read-only with a busy timeout, millisecond UTC times, the main chat as `agent_id IS NULL`, content stored only as byte counts, and tested SQL and Python recipes over every table. Ask in plain words, or load it yourself:
@@ -264,7 +266,7 @@ Contributions are welcome: read [CONTRIBUTING.md](./CONTRIBUTING.md), then pick 
 
 ```text
 cmd/callmeter/            the binary
-internal/callmeter/       the store, with cmdparse/, report/, command/
+internal/callmeter/       the store, with cmdparse/, callclass/, report/, command/
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
 internal/…                clock, sqlitedb, runner, testjail, paths, config, applog

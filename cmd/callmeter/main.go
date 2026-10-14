@@ -22,9 +22,10 @@ import (
 // version is set at build time: -ldflags "-X main.version={v}".
 var version = "dev"
 
-const usage = `usage: callmeter {hook|report|redact|version|help}
+const usage = `usage: callmeter {hook|report|classify|redact|version|help}
   hook      record the hook payload on stdin into the call store
   report    print a report over the call store
+  classify  label the tool calls on stdin by what they did (edit, test, git, ...), optionally with a rules file; touches no store
   redact    rewrite the rows already stored under the privacy rules (never automatic)
   version   print the version
   help      print this text
@@ -51,6 +52,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.
 			return runHook(stdin, stderr, getenv)
 		case "report":
 			return runReport(args, stdout, stderr, getenv)
+		case "classify":
+			return command.Classify(args, stdin, stdout, stderr, getenv)
 		case "redact":
 			return command.Redact(args, stdout, stderr, getenv)
 		case "version":
