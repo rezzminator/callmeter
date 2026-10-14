@@ -224,7 +224,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
@@ -1048,6 +1048,7 @@ func makeVersionOneStore(t *testing.T, path string) {
 		"DROP TABLE IF EXISTS compactions", "DROP TABLE IF EXISTS session_costs", "DROP TABLE IF EXISTS stop_hooks",
 		"DROP TABLE IF EXISTS stop_hook_runs", "DROP TABLE IF EXISTS turn_durations", "DROP INDEX IF EXISTS calls_request",
 		"DROP VIEW IF EXISTS request_cache", "DROP TABLE IF EXISTS request_iterations", "DROP INDEX IF EXISTS requests_session_agent_ts",
+		"DROP INDEX IF EXISTS events_agent_ts",
 		"INSERT INTO requests (request_id, session_id, ts, model, output_tokens) VALUES ('msg_old', 'sess_old', 5, 'm', 9)",
 	} {
 		if _, err := old.DB().Exec(statement); err != nil {
@@ -1075,7 +1076,7 @@ func TestOpenCompletesAVersionOneStore(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes after the reopen = %s, want %s", gotIndexes, wantIndexes)

@@ -387,6 +387,22 @@ func (t *Tx) RecoverAgentStop(ctx context.Context, stop AgentStop) (bool, error)
 	return inserted, nil
 }
 
+// rebuiltAgentStopSQL selects the event_id of an agent's rebuilt SubagentStop
+// of one turn: ?1 the agent, ?2 RecoveredDetail, ?3 the hook's ts. Every
+// lookup is by agent_id and ts, so it searches events_agent_ts; without that
+// index each was a walk of every SubagentStart and SubagentStop ever stored,
+// with the write lock held.
+const rebuiltAgentStopSQL = `SELECT event_id FROM events WHERE event = 'SubagentStop' AND agent_id = ?1 AND detail = ?2
+		AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts <= ?3)
+		AND ts < (SELECT COALESCE(MIN(ts), 9223372036854775807) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts > ?3)`
+
+// dropRecoveredAgentStopSQL are the two deletes of DropRecoveredAgentStop, the
+// turns row first, each taking rebuiltAgentStopSQL's arguments.
+var dropRecoveredAgentStopSQL = []string{
+	`DELETE FROM turns WHERE event_id IN (` + rebuiltAgentStopSQL + `)`,
+	`DELETE FROM events WHERE event_id IN (` + rebuiltAgentStopSQL + `)`,
+}
+
 // DropRecoveredAgentStop deletes the agent's rebuilt SubagentStop
 // (RecoverAgentStop) of the turn a SubagentStop hook delivered at hookTS
 // ends, its turns row with its events row: the hook's own row replaces them,
@@ -394,13 +410,7 @@ func (t *Tx) RecoverAgentStop(ctx context.Context, stop AgentStop) (bool, error)
 // (RecoveredDetail) from that turn's start, the agent's latest SubagentStart
 // at or before hookTS, to its next start goes.
 func (t *Tx) DropRecoveredAgentStop(ctx context.Context, agentID string, hookTS int64) error {
-	rebuilt := `SELECT event_id FROM events WHERE event = 'SubagentStop' AND agent_id = ?1 AND detail = ?2
-		AND ts >= (SELECT COALESCE(MAX(ts), 0) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts <= ?3)
-		AND ts < (SELECT COALESCE(MIN(ts), 9223372036854775807) FROM events WHERE agent_id = ?1 AND event = 'SubagentStart' AND ts > ?3)`
-	for _, statement := range []string{
-		`DELETE FROM turns WHERE event_id IN (` + rebuilt + `)`,
-		`DELETE FROM events WHERE event_id IN (` + rebuilt + `)`,
-	} {
+	for _, statement := range dropRecoveredAgentStopSQL {
 		if _, err := t.tx.ExecContext(ctx, statement, agentID, RecoveredDetail, hookTS); err != nil {
 			return fmt.Errorf("callmeter store %s: drop the rebuilt SubagentStop of agent %q: %w", t.path, agentID, err)
 		}
@@ -589,6 +599,11 @@ func (turn *agentTurn) fillEmpty(edge agentEdge) {
 	}
 }
 
+// agentEdgesSQL lists an agent's SubagentStart and SubagentStop events in
+// order: ?1 the agent, ?2 and ?3 the two events. It searches events_agent_ts.
+const agentEdgesSQL = `SELECT event_id, event, ts, session_id, agent_type, prompt_id FROM events
+		WHERE agent_id = ? AND event IN (?, ?) ORDER BY ts, event_id`
+
 // RebuildAgentTurns rewrites the agent_turns rows of agentID from its events,
 // ordered by (ts, event_id) and walked once: a start opens a turn (a turn
 // still open stays with stopped NULL), a stop closes the open turn, and a stop
@@ -598,10 +613,7 @@ func (t *Tx) RebuildAgentTurns(ctx context.Context, agentID string) error {
 	if agentID == "" {
 		return fmt.Errorf("callmeter store %s: rebuild agent turns without an agent_id", t.path)
 	}
-	rows, err := t.tx.QueryContext(ctx,
-		`SELECT event_id, event, ts, session_id, agent_type, prompt_id FROM events
-		WHERE agent_id = ? AND event IN (?, ?) ORDER BY ts, event_id`,
-		agentID, EventSubagentStart, EventSubagentStop)
+	rows, err := t.tx.QueryContext(ctx, agentEdgesSQL, agentID, EventSubagentStart, EventSubagentStop)
 	if err != nil {
 		return fmt.Errorf("callmeter store %s: list start and stop events of agent %q: %w", t.path, agentID, err)
 	}

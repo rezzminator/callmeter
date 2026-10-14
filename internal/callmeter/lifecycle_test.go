@@ -1118,3 +1118,49 @@ func TestTurnEndMatchesPromptAndTimestamp(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentLookupsSearchTheAgentIndex: the statements that find an agent's
+// SubagentStart and SubagentStop events (RebuildAgentTurns, both deletes of
+// DropRecoveredAgentStop) run in a SubagentStart/SubagentStop hook's write
+// transaction, so each must search events_agent_ts for the agent. Before the
+// index they walked every SubagentStop (events_event_ts) and read each row, a
+// lock hold that grew with the store (2026-10-13: 23 hooks gave up on
+// a busy store).
+func TestAgentLookupsSearchTheAgentIndex(t *testing.T) {
+	store := openTestStore(t)
+	statements := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"RebuildAgentTurns select", agentEdgesSQL, []any{"a1", EventSubagentStart, EventSubagentStop}},
+		{"DropRecoveredAgentStop turns delete", dropRecoveredAgentStopSQL[0], []any{"a1", RecoveredDetail, int64(10)}},
+		{"DropRecoveredAgentStop events delete", dropRecoveredAgentStopSQL[1], []any{"a1", RecoveredDetail, int64(10)}},
+	}
+	for _, tc := range statements {
+		rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+tc.query, tc.args...)
+		if err != nil {
+			t.Fatalf("%s: explain: %v", tc.name, err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				_ = rows.Close()
+				t.Fatalf("%s: scan plan: %v", tc.name, err)
+			}
+			plan = append(plan, detail)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("%s: read plan: %v", tc.name, err)
+		}
+		joined := strings.Join(plan, "\n")
+		if !strings.Contains(joined, "USING INDEX events_agent_ts") && !strings.Contains(joined, "USING COVERING INDEX events_agent_ts") {
+			t.Errorf("%s plan = %v, want a search of events_agent_ts", tc.name, plan)
+		}
+		if strings.Contains(joined, "events_event_ts") {
+			t.Errorf("%s plan = %v, want no walk of every event of one name (events_event_ts)", tc.name, plan)
+		}
+	}
+}

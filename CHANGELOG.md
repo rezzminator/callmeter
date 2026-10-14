@@ -2,6 +2,11 @@
 
 Every release of callmeter. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `v<version>`, with a GitHub release carrying the section below and the four platform binaries.
 
+## [Unreleased]
+
+### Fixed
+- A `SubagentStart` or `SubagentStop` hook no longer holds the store's write lock for a time that grows with the store. Its lookups of the agent's own start and stop events (`RebuildAgentTurns`, and the rebuilt-stop delete of `DropRecoveredAgentStop`) had no index by agent, so each read every `SubagentStart` and `SubagentStop` event ever stored; with a cold page cache one hold measured over a second, and a burst of sub-agent hooks queued on the lock until some gave up at the 5 s busy timeout (`terminated by store busy`, each left in `missed.log` and as a `faults` row, none silent). The store gains the index `events_agent_ts`, added to an existing store by the next open that can take the write lock; a hook that could not wait and lost its event stays lost.
+
 ## [0.3.0] — 2026-10-11
 
 ### Added
