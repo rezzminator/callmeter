@@ -14,7 +14,7 @@ func TestMain(m *testing.M) { os.Exit(Run(m)) }
 var jailVars = []string{
 	"HOME", "TMPDIR", "CALLMETER_HOME", "XDG_STATE_HOME",
 	"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN",
-	"PFM_COST_LEDGER_DIR", "PFM_HOME",
+	"PFM_COST_LEDGER_DIR", "PFM_HOME", "CALLMETER_RETENTION_DAYS",
 }
 
 func preserveJailVars(t *testing.T) {
@@ -106,6 +106,23 @@ func TestRunPassesTheCodeThroughAndRemovesTheJail(t *testing.T) {
 	root := filepath.Dir(seenHome)
 	if _, err := os.Stat(root); !os.IsNotExist(err) {
 		t.Fatalf("jail root %s still exists after run (stat error %v)", root, err)
+	}
+}
+
+// TestRunClearsASettingExportedInTheCallersShell: a variable a user exports to
+// set a callmeter option never reaches a jailed test.
+func TestRunClearsASettingExportedInTheCallersShell(t *testing.T) {
+	preserveJailVars(t)
+	t.Setenv("CALLMETER_RETENTION_DAYS", "30")
+	var seen string
+	if code := run(func() int {
+		seen = os.Getenv("CALLMETER_RETENTION_DAYS")
+		return 0
+	}, canonicalTmp(t)); code != 0 {
+		t.Fatalf("run returned %d, want 0", code)
+	}
+	if seen != "" {
+		t.Errorf("CALLMETER_RETENTION_DAYS = %q inside the jail, want empty", seen)
 	}
 }
 

@@ -10,7 +10,7 @@ Answer a question from the SQLite store the callmeter hooks fill, read-only, wit
 
 ## Open the store
 
-The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it, which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
+The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it (or `CALLMETER_RETENTION_DAYS`), which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
 
 Shell state does not survive between Bash calls: define the helper in the same command that uses it. A function, because zsh does not word-split a command stored in a variable:
 

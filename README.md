@@ -207,17 +207,20 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 | `CALLMETER_HOME` | where the store, logs and binary cache live; default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
 | `CALLMETER_BIN` | an executable the wrapper runs instead of resolving one (development) |
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
+| `CALLMETER_RETENTION_DAYS` | the environment form of the `retention_days` setting below; takes precedence over `config.json` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
 Settings live in an optional `config.json` under `CALLMETER_HOME`. Without it every default applies.
 
-| Key | Effect |
-| --- | --- |
-| `retention_days` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
+| Key | Environment variable | Effect |
+| --- | --- | --- |
+| `retention_days` | `CALLMETER_RETENTION_DAYS` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
 
 ```json
 { "retention_days": 90 }
 ```
+
+The variable beats `config.json`, which beats the default; unset or blank counts as absent, and a value is read with the key's own grammar (one integer from `0` to `36500`, whitespace around it trimmed; `0` overrides a file's window and keeps every row). A variable that is not such an integer is reported by its name on stderr and the default applies: the report runs and keeps every row, never falling back to the file's window.
 
 A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
 

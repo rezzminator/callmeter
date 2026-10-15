@@ -224,6 +224,59 @@ func TestCallmeterCLIReportRefusesABadConfigBeforeTouchingTheStore(t *testing.T)
 	}
 }
 
+// withEnv is the lab with one more variable set.
+func (fixture lab) withEnv(name, value string) lab {
+	base := fixture.getenv
+	fixture.getenv = func(key string) string {
+		if key == name {
+			return value
+		}
+		return base(key)
+	}
+	return fixture
+}
+
+// TestCallmeterCLIReportReadsRetentionFromTheEnvironment: CALLMETER_RETENTION_DAYS
+// beats config.json, and a bad value is reported by its name on stderr while the
+// report runs with the default, keeping every row, never with the file's window.
+func TestCallmeterCLIReportReadsRetentionFromTheEnvironment(t *testing.T) {
+	for name, c := range map[string]struct {
+		file, env string
+		calls     int
+		quiet     bool
+	}{
+		"env prunes with no file":          {"", "30", 1, true},
+		"env 0 keeps what the file prunes": {`{"retention_days": 30}`, "0", 2, true},
+		"env beats the file":               {`{"retention_days": 9999}`, "30", 1, true},
+		"blank env leaves the file":        {`{"retention_days": 30}`, "  ", 1, true},
+		"bad env keeps every row":          {`{"retention_days": 30}`, "monthly", 2, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newLab(t).withEnv("CALLMETER_RETENTION_DAYS", c.env)
+			fixture.seedAgedReads(t)
+			if c.file != "" {
+				fixture.writeConfig(t, c.file)
+			}
+			code, stdout, stderr := fixture.run("report", "files")
+			if code != 0 {
+				t.Fatalf("report files = %d, want 0\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+			if got := fixture.storedCalls(t); got != c.calls {
+				t.Errorf("store holds %d calls, want %d (env %q, file %q)", got, c.calls, c.env, c.file)
+			}
+			if c.quiet && stderr != "" {
+				t.Errorf("stderr = %q, want it quiet", stderr)
+			}
+			if !c.quiet && !strings.Contains(stderr, "CALLMETER_RETENTION_DAYS \"monthly\"") {
+				t.Errorf("stderr = %q, want a line naming CALLMETER_RETENTION_DAYS and its value", stderr)
+			}
+			if !c.quiet && !strings.Contains(stdout, "window: all time") {
+				t.Errorf("stdout = %q, want the default whole-store window after a bad variable", stdout)
+			}
+		})
+	}
+}
+
 func TestCallmeterCLIReportWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
 	fixture := newLab(t)
 	code, stdout, stderr := fixture.run("report", "files")

@@ -4,6 +4,9 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+### Added
+- `CALLMETER_RETENTION_DAYS`, the environment form of `config.json`'s `retention_days`: the same integer from 0 to 36500, read by `callmeter report` ahead of the file (the variable beats the file, the file beats the default of keeping every row). Unset or blank counts as absent. A value that is not such an integer is reported on stderr by the variable's name and in the plugin's error log as an error row with event `config-env-invalid`, and the default stands: the report runs and prunes nothing, never with the file's window. A `config.json` the report cannot trust still stops it, whatever the variable holds.
+
 ### Fixed
 - A `SubagentStart` or `SubagentStop` hook no longer holds the store's write lock for a time that grows with the store. Its lookups of the agent's own start and stop events (`RebuildAgentTurns`, and the rebuilt-stop delete of `DropRecoveredAgentStop`) had no index by agent, so each read every `SubagentStart` and `SubagentStop` event ever stored; with a cold page cache one hold measured over a second. Every other writer waits on that lock, and a hook still waiting at the 5 s busy timeout gives up (`terminated by store busy`, each left in `missed.log` and as a `faults` row, none silent); the 2026-10-13 burst of those errors is consistent with this cause, not proven by it. The store gains the index `events_agent_ts`, added to an existing store by the next open that can take the write lock; a hook that could not wait and lost its event stays lost.
 

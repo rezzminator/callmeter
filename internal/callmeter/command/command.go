@@ -171,11 +171,16 @@ func reportAction(
 		pluginLog(stderr, getenv, "error", "store-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
-	cfg, err := config.Load(paths.Config(home))
+	cfg, envErr, err := config.Resolve(paths.Config(home), getenv)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
 		pluginLog(stderr, getenv, "error", "config-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
+	}
+	if envErr != nil {
+		// A bad variable never stops the report: the default (keep every row) stands.
+		fmt.Fprintf(stderr, "callmeter: %v; using the default, keeping every row\n", envErr)
+		pluginLog(stderr, getenv, "error", "config-env-invalid", "internal/callmeter/command/command.go#reportAction", envErr.Error())
 	}
 	before := filter.Since
 	filter.Since = windowSince(filter.Since, values.since, cfg.RetentionDays, now, stderr)
@@ -407,7 +412,7 @@ func buildFilter(values *flagValues, now time.Time, stderr io.Writer) (report.Fi
 }
 
 // windowSince bounds a report's since by the retention window in days, from
-// config.json; 0 keeps every row, so since stands. With a window, an unset
+// CALLMETER_RETENTION_DAYS or else config.json (config.Resolve); 0 keeps every row, so since stands. With a window, an unset
 // since is its start and one older than it is clamped to it with one stderr
 // note, since the store holds nothing before it. raw is the --since text.
 func windowSince(since time.Time, raw string, retentionDays int, now time.Time, stderr io.Writer) time.Time {

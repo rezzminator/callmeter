@@ -12,6 +12,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - binary: the Go program behind `callmeter {hook|report|classify|redact|version}` · `cmd/callmeter/main.go`
 - `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset · `internal/paths/paths.go`
 - settings file: the one optional config, `retention_days` alone; absent keeps every row forever, and only `callmeter report` reads it · `{CALLMETER_HOME}/config.json`, `internal/config/config.go` · design `docs/design.md` § Where the store lives
+- option variable: `CALLMETER_{OPTION}`, a settings-file option in upper snake (`CALLMETER_RETENTION_DAYS`), read over `config.json` by `config.Resolve`, the single reader, which only `callmeter report` calls · `internal/config/config.go`
 - binary cache: the installed binary per plugin version · `{CALLMETER_HOME}/bin/{version}/callmeter`
 - `missed.log`: one line per hook the wrapper could not hand to the binary, counted on the binary's next run · `{CALLMETER_HOME}/missed.log`
 - store: SQLite rows per tool call, request, agent, turn, event and command part · `{CALLMETER_HOME}/callmeter.db`, schema `internal/callmeter/store.go` · design `docs/design.md` § The store
@@ -77,4 +78,6 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 - `plugins/callmeter/` holds only what installs: manifest, hooks, wrapper, skills; every other file lives outside it.
 - A store change (a table, a column, a unit, a NULL meaning) updates `plugins/callmeter/skills/callmeter/schema.md` and any recipe in its `SKILL.md` that it touches, each recipe re-run against a snapshot.
+- An option variable beats `config.json`, which beats the default; unset or blank is absent; it takes the option's own grammar (`retention_days`: one integer 0 to 36500, 0 keeps every row); a bad one is reported by its name (stderr and a `config-env-invalid` error row) and the default applies, while an untrusted `config.json` still stops the report.
+- A new option adds its variable and its entry in the README Configuration tables' variable column.
 - Text the model reads (the skills, report output, hook output) stays unbranded; Professor's credit lives only in the READMEs and the `author` and `keywords` of the manifest and the marketplace.

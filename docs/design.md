@@ -171,7 +171,7 @@ One command, `callmeter hook`, reached through the wrapper and registered on eve
 
 The store is `{CALLMETER_HOME}/callmeter.db`, where `CALLMETER_HOME` is `${CALLMETER_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/callmeter}` (`XDG_STATE_HOME` counts only when absolute). Beside it: `config.json` (the optional settings, below), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (written only by a prune) and the binary cache `bin/{version}/callmeter`. Under `go test`, resolving `CALLMETER_HOME` with the variable unset is an error, never the real home.
 
-`{CALLMETER_HOME}/config.json` is the one settings file (`internal/config`), read only by `callmeter report`: `{"retention_days": N}`, an integer from 0 to 36500 whose 0 or absence keeps every row forever. A missing file is the defaults. A file that cannot be read, is empty, is not one JSON object, names an unknown key or holds a value out of range stops the report with a line naming the file before the store is opened, since a misspelled key must never read as "keep" or "drop". The hooks never read it.
+`{CALLMETER_HOME}/config.json` is the one settings file (`internal/config`), read only by `callmeter report`: `{"retention_days": N}`, an integer from 0 to 36500 whose 0 or absence keeps every row forever. A missing file is the defaults. A file that cannot be read, is empty, is not one JSON object, names an unknown key or holds a value out of range stops the report with a line naming the file before the store is opened, since a misspelled key must never read as "keep" or "drop". The hooks never read it. `CALLMETER_RETENTION_DAYS` overrides the key (`config.Resolve`): the same one integer from 0 to 36500, unset or blank counted as absent; a bad value is a reported `config-env-invalid` error naming the variable while the report runs on with the default (keep every row), not the file's value, and a file the report cannot trust still stops it.
 
 This deviates from Claude Code's plugin convention on purpose. The store lives at `CALLMETER_HOME`, never `${CLAUDE_PLUGIN_DATA}`, because plugin data is per seat (`{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`, observed on Claude Code 2.1.286) and pfm runs several seats whose calls belong in one store, and because the CLI and pfm must find the store without plugin env. One machine, one store: every seat's sessions land in the same file, told apart by `seat_dir`.
 
@@ -529,7 +529,7 @@ Claude Code 2.1.286, as a plugin: a per-event verification capture (every hook e
 
 ## Open items
 
-- Retention: **Decided.** Keep every row by default; `retention_days` in `config.json` opts into a window. With one set, every report prunes older rows, archiving them first (the archive drops `calls.input`, `calls.error`, `faults.error` and `events.detail`); the hook never prunes and never reads the config.
+- Retention: **Decided.** Keep every row by default; `retention_days` in `config.json`, or `CALLMETER_RETENTION_DAYS` over it, opts into a window. With one set, every report prunes older rows, archiving them first (the archive drops `calls.input`, `calls.error`, `faults.error` and `events.detail`); the hook never prunes and never reads the config.
 - The store's location: **Decided.** `CALLMETER_HOME`, one store per machine across seats ([Where the store lives](#where-the-store-lives)).
 - `node -e` parsing: **Decided.** It stays unparsed in this version: a named gap, counted in every report that counts commands and in `faults`.
 - `BASH_MAX_OUTPUT_LENGTH`: **Decided.** Unchanged.
