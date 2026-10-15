@@ -49,9 +49,11 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## Dev install
 
+- On a Professor alpha host whose `claude.plugins` names callmeter bare or is unset, `pfm install` owns this install: it builds the binary into the binary cache, keeping the replaced one as `callmeter.prev`, then refreshes the marketplace copy; the steps below are for a host without it.
 - Marketplace copy: `~/.local/share/callmeter-dev`, the `callmeter-dev` directory marketplace.
 - Plugin cache: `~/.claude/plugins/cache/callmeter-dev/callmeter/{version}`
 - Binary cache: `~/.local/state/callmeter/bin/{version}/callmeter`
+- Deploy order: the new version's binary into the binary cache first, then the marketplace copy; a plugin version without its cached binary falls through to the download, which an unreleased version's `SHA256SUMS` rejects, and its hooks drop events.
 - A binary fix deploys to every live hook by atomically replacing the cached binary: build beside it, then `mv -f` onto it.
 - A `hooks.json` change also needs the marketplace copy and the plugin cache refreshed, then `/reload-plugins`.
 - Refresh the marketplace with `claude plugin marketplace update callmeter-dev` exactly as written: a `CLAUDE_CONFIG_DIR` override pointing at `~/.claude` makes `claude` write `.claude.json` and `backups/` into the shared store, and `pfm`'s store-guard hook denies it.
