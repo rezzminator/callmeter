@@ -3584,22 +3584,21 @@ func TestCallmeterPluginLogRows(t *testing.T) {
 			if code := Callmeter(strings.NewReader(lab.rewrite(hookPayload(t, "SessionStart", nil))), &stderr, mapEnv(env)); code != 0 {
 				t.Fatalf("SessionStart code=%d", code)
 			}
-			assertPluginEvent(t, dir, "info.jsonl", "info", "logger-ready", "internal/hookentry/callmeter.go#SessionStart", true)
 			payload := lab.rewrite(hookPayload(t, "PostToolUse", map[string]any{"session_id": dropKey}))
 			if code := Callmeter(strings.NewReader(payload), &stderr, mapEnv(env)); code != 0 {
 				t.Fatalf("bad payload code=%d", code)
 			}
-			assertPluginEvent(t, dir, "errors.jsonl", "error", "payload-unparsable", "internal/hookentry/callmeter.go#payload", false)
+			assertPluginEvent(t, dir, "errors.jsonl", "error", "payload-unparsable", "internal/hookentry/callmeter.go#payload")
 			lab.env = env
 			lab.logPath = paths.Log(lab.root)
 			lab.write(lab.transcript(cmSessionB), []byte("this line is not JSON, yet names "+cmBatchLead+"\n"))
 			lab.feed(lab.payloads("probe5.jsonl")[3])
-			assertPluginEvent(t, dir, "warnings.jsonl", "warning", "transcript-unreadable", "internal/hookentry/callmeter.go#transcript", false)
+			assertPluginEvent(t, dir, "warnings.jsonl", "warning", "transcript-unreadable", "internal/hookentry/callmeter.go#transcript")
 		})
 	}
 }
 
-func assertPluginEvent(t *testing.T, dir, file, level, event, where string, ready bool) {
+func assertPluginEvent(t *testing.T, dir, file, level, event, where string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(dir, file))
 	if err != nil {
@@ -3621,19 +3620,6 @@ func assertPluginEvent(t *testing.T, dir, file, level, event, where string, read
 		found++
 		if row["plugin"] != "callmeter" || row["level"] != level || row["where"] != where {
 			t.Fatalf("wrong plugin row: %v", row)
-		}
-		if ready {
-			detail, ok := row["detail"].(map[string]any)
-			if !ok {
-				t.Fatalf("ready detail = %v", row["detail"])
-			}
-			source := "fallback"
-			if strings.Contains(dir, "shared") {
-				source = "PLUGIN_LOG_DIR"
-			}
-			if detail["version"] != "dev" || detail["dir_source"] != source || row["session"] != cmSessionA {
-				t.Fatalf("ready metadata = %v", row)
-			}
 		}
 	}
 	if found != 1 {

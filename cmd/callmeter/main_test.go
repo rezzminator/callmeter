@@ -476,44 +476,6 @@ func TestRedactWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
 	}
 }
 
-func TestHookLoggerReadyUsesLinkedVersion(t *testing.T) {
-	c := newCLI(t)
-	previous := version
-	version = "0.4.0"
-	t.Cleanup(func() { version = previous })
-	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "hookentry", "testdata", "verify", "payloads.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, `"hook_event_name":"SessionStart"`) {
-			payload = line
-			break
-		}
-	}
-	if payload == "" {
-		t.Fatal("captured SessionStart missing")
-	}
-	payload = strings.ReplaceAll(strings.ReplaceAll(payload, "/tmp/demo-home", c.user), "/tmp/demo-proj", filepath.Join(filepath.Dir(c.state), "proj"))
-	code, stdout, stderr := c.run(payload, "hook")
-	if code != 0 || stdout != "" || stderr != "" {
-		t.Fatalf("hook=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	raw, err := os.ReadFile(filepath.Join(c.state, "logs", "info.jsonl"))
-	if err != nil {
-		t.Fatalf("linked-version readiness row missing: %v", err)
-	}
-	var row map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
-		t.Fatal(err)
-	}
-	detail, ok := row["detail"].(map[string]any)
-	if !ok || row["event"] != "logger-ready" || row["level"] != "info" || detail["version"] != "0.4.0" || detail["dir_source"] != "fallback" {
-		t.Fatalf("linked-version readiness row=%v", row)
-	}
-}
-
 func assertMainPluginEvent(t *testing.T, home, event, where string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(home, "logs", "errors.jsonl"))

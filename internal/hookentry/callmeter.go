@@ -154,11 +154,6 @@ var closeStore = func(s *callmeter.Store) error { return s.Close() }
 // that can take neither the event nor its fault the line `store unavailable:
 // {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
-	return CallmeterVersion(input, stderr, getenv, "dev")
-}
-
-// CallmeterVersion records a hook with the binary's linked plugin version.
-func CallmeterVersion(input io.Reader, stderr io.Writer, getenv paths.Getenv, version string) int {
 	home, err := paths.Home(getenv)
 	if err != nil {
 		// No home, so no log file either: stderr only.
@@ -197,7 +192,7 @@ func CallmeterVersion(input io.Reader, stderr io.Writer, getenv paths.Getenv, ve
 		applog.Failure(stderr, sink, "seat", "", "", err)
 	}
 	return runCallmeter(withTerminationState(context.Background(), state), input, stderr, callmeterFiles{
-		store: paths.Store(home), log: sink.Log, levels: sink.Levels, version: version, missed: paths.Missed(home),
+		store: paths.Store(home), log: sink.Log, levels: sink.Levels, missed: paths.Missed(home),
 	}, clock.Real, seat, getenv)
 }
 
@@ -404,11 +399,10 @@ func signalName(sig os.Signal) string {
 
 // callmeterFiles are the files of one run under $CALLMETER_HOME.
 type callmeterFiles struct {
-	store   string // callmeter.db
-	log     string // callmeter.log; "" = stderr only
-	levels  string // explicit level output, empty when disabled
-	version string // linked plugin version; dev in package tests
-	missed  string // the wrapper's missed.log, ingested on every run
+	store  string // callmeter.db
+	log    string // callmeter.log; "" = stderr only
+	levels string // explicit level output, empty when disabled
+	missed string // the wrapper's missed.log, ingested on every run
 }
 
 func runCallmeter(
@@ -442,17 +436,6 @@ func runCallmeter(
 		payloadErr = fmt.Errorf("decode hook payload (%d bytes): %w", len(raw), err)
 	} else {
 		run.state.setPayload(run.payload.HookEventName, run.payload.SessionID)
-	}
-	if payloadErr == nil && run.payload.HookEventName == callmeter.EventSessionStart {
-		version := files.version
-		if version == "" {
-			version = "dev"
-		}
-		source := "fallback"
-		if getenv("PLUGIN_LOG_DIR") != "" {
-			source = "PLUGIN_LOG_DIR"
-		}
-		applog.Level(stderr, run.sink, applog.Row{Level: "info", Event: "logger-ready", Msg: "plugin logger ready", Where: "internal/hookentry/callmeter.go#SessionStart", Session: run.payload.SessionID, Detail: map[string]string{"version": version, "dir_source": source}})
 	}
 	store, err := callmeter.OpenDBWaiting(ctx, files.store, storeWait(run.payload.HookEventName))
 	if err != nil {

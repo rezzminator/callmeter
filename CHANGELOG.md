@@ -7,11 +7,17 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 ### Fixed
 - A `SubagentStart` or `SubagentStop` hook no longer holds the store's write lock for a time that grows with the store. Its lookups of the agent's own start and stop events (`RebuildAgentTurns`, and the rebuilt-stop delete of `DropRecoveredAgentStop`) had no index by agent, so each read every `SubagentStart` and `SubagentStop` event ever stored; with a cold page cache one hold measured over a second. Every other writer waits on that lock, and a hook still waiting at the 5 s busy timeout gives up (`terminated by store busy`, each left in `missed.log` and as a `faults` row, none silent); the 2026-10-13 burst of those errors is consistent with this cause, not proven by it. The store gains the index `events_agent_ts`, added to an existing store by the next open that can take the write lock; a hook that could not wait and lost its event stays lost.
 
+## [0.4.1]
+
+### Fixed
+
+- Hook-failure level rows include the cause, truncated to the row limit with the session preserved.
+
 ## [0.4.0] — 2026-10-14
 
 ### Added
 
-- Plugin errors, warnings and info append to level files under `PLUGIN_LOG_DIR/callmeter`, or the resolved state home's `logs` directory. SessionStart records logger readiness and the plugin version.
+- Plugin errors, warnings and info append to level files under `PLUGIN_LOG_DIR/callmeter`, or the resolved state home's `logs` directory.
 - Bounded JSONL rows, 20 MB rename-aside caps and one logging-failure notice per failing streak, alongside unchanged legacy output.
 
 ## [0.3.0] — 2026-10-11

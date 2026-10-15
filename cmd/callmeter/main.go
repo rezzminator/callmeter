@@ -33,9 +33,7 @@ const usage = `usage: callmeter {hook|report|classify|redact|version|help}
 ` + command.Usage
 
 // hook is the hook entry; a variable so a test can make it panic.
-var hook = func(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
-	return hookentry.CallmeterVersion(input, stderr, getenv, version)
-}
+var hook = hookentry.Callmeter
 
 // report is the report entry; a variable so a test can make it panic.
 var report = command.CLI
