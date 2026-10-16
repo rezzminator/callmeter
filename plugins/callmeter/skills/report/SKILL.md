@@ -15,13 +15,14 @@ The topics are `files`, `writes`, `commands`, `context`, `sequences`, `faults`, 
 
 1. The user's arguments are: `$ARGUMENTS`
 2. With no argument, list the 21 topics above with their flags and run nothing.
-3. Otherwise run this with the Bash tool, the arguments passed through as given:
+3. Arguments that open with no topic are a question: load `/callmeter:callmeter`, which reads the store directly, and answer it there; run nothing here.
+4. Otherwise run this with the Bash tool, the arguments passed through as given:
 
    ```
    "${CLAUDE_PLUGIN_ROOT}/libexec/callmeter" report $ARGUMENTS
    ```
 
-4. Show its stdout unchanged.
-5. On exit code 1 or 2, show its stderr verbatim and stop.
+5. Show its stdout unchanged.
+6. On exit code 1 or 2, show its stderr verbatim and stop.
 
-The report runs through the command above only; a question no topic answers goes to `/callmeter:callmeter`, which reads the store directly. A `note:` line naming `callmeter redact` is for the user to act on: never run that command yourself.
+The report runs through the command above only. A `note:` line naming `callmeter redact` is for the user to act on: never run that command yourself.
