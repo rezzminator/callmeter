@@ -78,9 +78,11 @@ type RecoverSummary struct {
 }
 
 // SkippedRead is one Skipped entry: a transcript of Session at Path that
-// recovery could not use, and why.
+// recovery could not use at Stage (the read it was in, a short fixed label),
+// and why.
 type SkippedRead struct {
 	Session, Path string
+	Stage         string
 	Err           error
 }
 
@@ -89,6 +91,11 @@ func (e *SkippedRead) Error() string {
 }
 
 func (e *SkippedRead) Unwrap() error { return e.Err }
+
+// StageSanitizeInput is the SkippedRead.Stage of a rebuilt call whose
+// transcript input SanitizeInput refused: the transcript was read, its input
+// was not taken.
+const StageSanitizeInput = "sanitize call input"
 
 // The tails of the transcript faults RecoverQuiet records for what it read in
 // full and could not fill (agentTurnMarker, stopReplyMarker, turnEndMarker,
@@ -557,14 +564,14 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		seatDir = *session.seatDir
 	}
 	session.transcript = ResolveTranscript(session.transcript, seatDir, session.id)
-	skip := func(path string, err error) {
-		summary.Skipped = append(summary.Skipped, &SkippedRead{Session: session.id, Path: path, Err: err})
+	skip := func(stage, path string, err error) {
+		summary.Skipped = append(summary.Skipped, &SkippedRead{Session: session.id, Path: path, Stage: stage, Err: err})
 	}
 	// Liveness, on disk: any transcript written since the cutoff means the
 	// session is still running (or its message still streaming).
 	subagents, err := SubagentTranscripts(session.transcript)
 	if err != nil {
-		skip(session.transcript, err)
+		skip("list sub-agent transcripts", session.transcript, err)
 		return nil
 	}
 	files := []string{session.transcript}
@@ -582,7 +589,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 			continue
 		}
 		if err != nil {
-			skip(file, fmt.Errorf("stat transcript: %w", err))
+			skip("stat transcript", file, fmt.Errorf("stat transcript: %w", err))
 			return nil
 		}
 		if !info.ModTime().Before(cutoff) {
@@ -604,7 +611,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 		}
 		found, err := FindRequests(transcript, ids)
 		if err != nil {
-			skip(transcript, err)
+			skip("find requests", transcript, err)
 			return nil
 		}
 		pendingReads = append(pendingReads, pendingRead{agentID: agentID, pending: pending, found: found})
@@ -657,7 +664,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 			continue
 		}
 		if err != nil {
-			skip(transcript, err)
+			skip("find tool results", transcript, err)
 			continue
 		}
 		for _, id := range ids {
@@ -716,7 +723,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 				agentID = subagents[i-1]
 				agentType, parent, err := SubagentMeta(session.transcript, agentID)
 				if err != nil && !errors.Is(err, fs.ErrNotExist) {
-					skip(file, err)
+					skip("read sub-agent metadata", file, err)
 				}
 				metas[agentID] = subagentMeta{agentType: agentType, parent: parent}
 			}
@@ -727,7 +734,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 			}
 			if err != nil {
 				complete = false
-				skip(file, err)
+				skip("read transcript", file, err)
 				continue
 			}
 			requests := read.Requests
@@ -735,7 +742,7 @@ func (s *Store) recoverSession(ctx context.Context, session quietSession, now, c
 			if i == 0 {
 				notices, err = ReadTaskNotices(file)
 				if err != nil {
-					skip(file, err)
+					skip("read task notices", file, err)
 					complete = false
 				}
 			}
@@ -1025,7 +1032,7 @@ func (s *Store) marksToWrite(ctx context.Context, sessionID string, since int64,
 // Skipped entry, and then no call is marked. A persisted output under
 // tool-results/ is named by its transcript tool_result line, so a call with no
 // such line has none to read.
-func (s *Store) callsToMark(ctx context.Context, sessionID string, files []string, settled map[string]bool, rebuilt []openCall, skip func(string, error)) ([]string, map[string]Result, error) {
+func (s *Store) callsToMark(ctx context.Context, sessionID string, files []string, settled map[string]bool, rebuilt []openCall, skip func(string, string, error)) ([]string, map[string]Result, error) {
 	open, err := s.unmarkedOpenCalls(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -1048,7 +1055,7 @@ func (s *Store) callsToMark(ctx context.Context, sessionID string, files []strin
 				continue
 			}
 			if err != nil {
-				skip(file, err)
+				skip("find open-call results", file, err)
 				return nil, nil, nil
 			}
 			for id, result := range results {
@@ -1085,7 +1092,7 @@ type subagentMeta struct {
 // call with no row, and a hook may be lost): RebuiltCall's row, its input only
 // through SanitizeInput. An input SanitizeInput refuses is left out and named
 // as a Skipped entry; the row is written all the same.
-func (s *Store) rebuiltCalls(ctx context.Context, session quietSession, uses []rebuildUse, metas map[string]subagentMeta, skip func(string, error)) ([]Call, error) {
+func (s *Store) rebuiltCalls(ctx context.Context, session quietSession, uses []rebuildUse, metas map[string]subagentMeta, skip func(string, string, error)) ([]Call, error) {
 	if len(uses) == 0 {
 		return nil, nil
 	}
@@ -1123,7 +1130,7 @@ func (s *Store) rebuiltCalls(ctx context.Context, session quietSession, uses []r
 		if len(u.use.Input) > 0 {
 			input, err := SanitizeInput(u.use.Name, u.use.Input)
 			if err != nil {
-				skip(session.transcript, fmt.Errorf("call %s: sanitize its transcript input: %w", u.use.ID, err))
+				skip(StageSanitizeInput, session.transcript, fmt.Errorf("call %s: sanitize its transcript input: %w", u.use.ID, err))
 			} else {
 				call.Input = Ptr(input)
 			}
@@ -1141,7 +1148,7 @@ func (s *Store) rebuiltCalls(ctx context.Context, session quietSession, uses []r
 // result's toolUseResult. Sizes and labels only. A call with no result stays
 // unsized for the call marker; a transcript that cannot be read is named
 // through skip and leaves its calls unsized.
-func sizeRebuilt(session quietSession, uses []rebuildUse, calls []Call, skip func(string, error)) {
+func sizeRebuilt(session quietSession, uses []rebuildUse, calls []Call, skip func(string, string, error)) {
 	agentOf := map[string]string{}
 	for _, u := range uses {
 		agentOf[u.use.ID] = u.agentID
@@ -1168,7 +1175,7 @@ func sizeRebuilt(session quietSession, uses []rebuildUse, calls []Call, skip fun
 			continue
 		}
 		if err != nil {
-			skip(transcript, err)
+			skip("find call results", transcript, err)
 			continue
 		}
 		for id, result := range found {
@@ -1285,7 +1292,7 @@ func (s *Store) agentParents(ctx context.Context, sessionID string, metas map[st
 // RecoverAgentStop) use only the agent's own transcript totals
 // (ReadAgentTotals). A transcript whose totals cannot be read is a
 // Skipped entry, and its turn is neither.
-func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript string, ends, notices map[string][]int64, skip func(string, error)) (mark []openAgentTurn, settle []AgentStop, err error) {
+func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript string, ends, notices map[string][]int64, skip func(string, string, error)) (mark []openAgentTurn, settle []AgentStop, err error) {
 	turns, err := s.unmarkedOpenAgentTurns(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -1316,7 +1323,7 @@ func (s *Store) agentStopsToMark(ctx context.Context, sessionID, transcript stri
 			continue
 		}
 		if err != nil {
-			skip(path, err)
+			skip("read agent turn totals", path, err)
 			continue
 		}
 		settle = append(settle, AgentStop{AgentID: turn.agentID, Seq: turn.seq, TS: end, Totals: totals})
@@ -1478,7 +1485,7 @@ func (s *Store) markEnd(ctx context.Context, sessionID string, summary *RecoverS
 // the transcript was read without error, so a zero end is what the transcript
 // shows; a transcript that is gone is none and not read; one that cannot be
 // read is a Skipped entry, none and not read.
-func (s *Store) lostTurnEnd(ctx context.Context, sessionID, transcript string, skip func(string, error)) (end TurnEnd, read bool, err error) {
+func (s *Store) lostTurnEnd(ctx context.Context, sessionID, transcript string, skip func(string, string, error)) (end TurnEnd, read bool, err error) {
 	var missing int
 	if err := s.db.QueryRowContext(ctx, `SELECT `+turnEndUnmarked("?1"), sessionID).Scan(&missing); err != nil {
 		return TurnEnd{}, false, fmt.Errorf("callmeter store %s: read the turn end of session %q: %w", s.path, sessionID, err)
@@ -1491,7 +1498,7 @@ func (s *Store) lostTurnEnd(ctx context.Context, sessionID, transcript string, s
 		return TurnEnd{}, false, nil
 	}
 	if err != nil {
-		skip(transcript, err)
+		skip("read turn end", transcript, err)
 		return TurnEnd{}, false, nil
 	}
 	return end, true, nil

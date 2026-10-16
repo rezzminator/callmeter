@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1400,10 +1401,41 @@ func TestCallmeterCLIPluginLogsSkippedRecovery(t *testing.T) {
 			if row["level"] != "warning" || row["where"] != "internal/callmeter/command/command.go#reportAction" {
 				t.Fatalf("wrong recovery row: %v", row)
 			}
+			detail, _ := row["detail"].(map[string]any)
+			if row["session"] != "sess-bad" || detail["stage"] == "" || detail["stage"] == nil || detail["reason"] != "malformed" {
+				t.Fatalf("recovery row says no session, stage or reason: %v", row)
+			}
+			if strings.Contains(string(raw), transcript) {
+				t.Fatalf("recovery row quotes the transcript path: %s", raw)
+			}
 		}
 	}
 	if !found {
 		t.Fatalf("no recover-skipped row: %s", raw)
+	}
+}
+
+// TestSkippedDetailNamesOnlyAStageAndAReason: a skipped transcript read is
+// logged with the stage that skipped it and a reason from a fixed vocabulary,
+// never the path or the error text, which may quote transcript content.
+func TestSkippedDetailNamesOnlyAStageAndAReason(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+		want map[string]string
+	}{
+		{"absent", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "find tool results", Err: fmt.Errorf("open: %w", fs.ErrNotExist)}, map[string]string{"stage": "find tool results", "reason": "not found"}},
+		{"denied", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "stat transcript", Err: fmt.Errorf("stat: %w", fs.ErrPermission)}, map[string]string{"stage": "stat transcript", "reason": "permission denied"}},
+		{"malformed", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "find requests", Err: fmt.Errorf("decode: %w", &json.SyntaxError{})}, map[string]string{"stage": "find requests", "reason": "malformed"}},
+		{"refused input", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: callmeter.StageSanitizeInput, Err: fmt.Errorf("sanitize: %w", &json.SyntaxError{})}, map[string]string{"stage": callmeter.StageSanitizeInput, "reason": "refused"}},
+		{"other", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "read turn end", Err: errors.New("secret prompt text")}, map[string]string{"stage": "read turn end", "reason": "unreadable"}},
+		{"not a read", errors.New("secret prompt text"), map[string]string{"reason": "unreadable"}},
+	} {
+		got := skippedDetail(tc.err)
+		if !maps.Equal(got, tc.want) {
+			t.Errorf("%s: skippedDetail = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

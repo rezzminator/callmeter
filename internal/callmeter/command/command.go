@@ -243,7 +243,12 @@ func reportAction(
 	recovery := recoveryNotes(recovered.Skipped)
 	for _, skipped := range recovered.Skipped {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: skipped: %v\n", skipped)
-		pluginLog(stderr, getenv, "warning", "recover-skipped", "internal/callmeter/command/command.go#reportAction", skipped.Error())
+		row := applog.Row{Level: "warning", Event: "recover-skipped", Where: "internal/callmeter/command/command.go#reportAction", Detail: skippedDetail(skipped)}
+		var read *callmeter.SkippedRead
+		if errors.As(skipped, &read) {
+			row.Session = read.Session
+		}
+		pluginLogRow(stderr, getenv, row)
 	}
 	if _, err := report.EnsureParsed(ctx, db, getenv("HOME"), nil); err != nil {
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)
@@ -436,16 +441,48 @@ func pluginLog(stderr io.Writer, getenv paths.Getenv, level, event, where, msg s
 	pluginLogRow(stderr, getenv, applog.Row{Level: level, Event: event, Msg: msg, Where: where})
 }
 
+// logLabels is a detail of fixed-vocabulary labels, safe to log at error and
+// warning level: no producer text, no path.
+type logLabels map[string]string
+
 func pluginLogRow(stderr io.Writer, getenv paths.Getenv, row applog.Row) {
 	// Producer errors may quote rules, config or transcript contents. Keep the
 	// operation category and provenance here; the existing CLI diagnostic is unchanged.
+	// Only logLabels, fixed-vocabulary labels a producer built, pass as detail.
 	if row.Level == "error" || row.Level == "warning" {
 		row.Msg = strings.ReplaceAll(row.Event, "-", " ")
-		row.Detail = nil
+		if _, labels := row.Detail.(logLabels); !labels {
+			row.Detail = nil
+		}
 	}
 	home, err := paths.Home(getenv)
 	if err != nil {
 		home = ""
 	} // the caller reports its own resolution error
 	applog.Level(stderr, applog.ResolveSink(getenv, home), row)
+}
+
+// skippedDetail says why recovery skipped a transcript read, in labels only:
+// the stage of the read (SkippedRead.Stage) and a reason from a fixed
+// vocabulary. The path and the error text stay out, since the error may quote
+// transcript content (the plugin log strips them for the same reason).
+func skippedDetail(err error) logLabels {
+	detail := logLabels{"reason": "unreadable"}
+	var read *callmeter.SkippedRead
+	if errors.As(err, &read) && read.Stage != "" {
+		detail["stage"] = read.Stage
+	}
+	var syntax *json.SyntaxError
+	var typed *json.UnmarshalTypeError
+	switch {
+	case read != nil && read.Stage == callmeter.StageSanitizeInput:
+		detail["reason"] = "refused" // read in full; its input was not taken
+	case errors.Is(err, fs.ErrNotExist):
+		detail["reason"] = "not found"
+	case errors.Is(err, fs.ErrPermission):
+		detail["reason"] = "permission denied"
+	case errors.As(err, &syntax), errors.As(err, &typed):
+		detail["reason"] = "malformed"
+	}
+	return detail
 }

@@ -4,6 +4,12 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-10-16
+
+### Fixed
+- A hook that gave up on a locked store after its full busy wait (up to 5 s) logged the plugin error row `store-busy-gave-up` with nothing saying the gap was already counted: its event goes unrecorded, and the `terminated by store busy` line it leaves in `missed.log` becomes a `terminated` fault at the next ingest, so the reports show it. That row is now a warning whose message says the event went unrecorded and is counted as a `terminated` fault from `missed.log`; it stays an error only when the line could not be appended too, the one case where the loss is not counted.
+- The plugin warning `recover-skipped` (a transcript read that quiet-session recovery skipped) carried no detail. It now carries the session and, as `detail`, the `stage` of the read that was skipped and a `reason` from a fixed set (`not found`, `permission denied`, `malformed`, `refused` for a call input recovery read but would not store, `unreadable`); the transcript path and the error text stay out of the plugin log, as before. The `callmeter report` stderr line is unchanged.
+
 ## [0.4.2] — 2026-10-16
 
 ### Added

@@ -1691,8 +1691,9 @@ func (run *callmeterRun) giveUp(hold termHold, toolUseID string, cause error) {
 }
 
 // leaveMissedLine appends the run's own missed.log line with reason, accounts
-// the run for and stops its store work (gaveUp); a failed append is said.
-func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string) {
+// the run for and stops its store work (gaveUp); a failed append is said, and
+// reported false: the event is then lost uncounted, no fault will name it.
+func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string) (appended bool) {
 	session := run.payload.SessionID
 	err := AppendMissed(run.missed, run.payload.HookEventName, session, reason, clock.Real.Now())
 	if err != nil {
@@ -1701,16 +1702,26 @@ func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string
 	hold.account()
 	run.accounted = true
 	run.gaveUp = true
+	return err == nil
 }
 
 // giveUpBusy ends a run whose store stayed locked for its whole wait before
 // its event was accounted for: the failure is said, one missed.log line
 // `terminated by store busy` carries the event and session so report-time
 // recovery still sees them (IngestMissed, endLost), and the run is accounted
-// for and writes nothing more (gaveUp). hold is the caller's, as in faultHeld.
+// for and writes nothing more (gaveUp). The event itself is not recorded and
+// nothing replays it; the line only counts it, as a `terminated` fault at the
+// next ingest, so the gap shows in the reports. The plugin log row is therefore
+// a warning saying the event went unrecorded and is counted when that line
+// landed; when the append failed too the loss is not even counted and the row
+// stays an error. hold is the caller's, as in faultHeld.
 func (run *callmeterRun) giveUpBusy(hold termHold, stage, toolUseID string, cause error) {
-	applog.FailureAt(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause, applog.Row{Event: "store-busy-gave-up", Where: "internal/hookentry/callmeter.go#giveUpBusy"})
-	run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
+	queued := run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
+	row := applog.Row{Event: "store-busy-gave-up", Where: "internal/hookentry/callmeter.go#giveUpBusy"}
+	if queued {
+		row.Level, row.Msg = "warning", "store busy, event unrecorded, counted as a terminated fault from missed.log"
+	}
+	applog.FailureAt(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause, row)
 }
 
 func presentString(value string) *string {

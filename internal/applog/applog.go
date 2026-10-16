@@ -47,6 +47,9 @@ func FailureAt(stderr io.Writer, sink Sink, stage, session, target string, cause
 	if metadata.Event != "" {
 		row.Event = metadata.Event
 	}
+	if metadata.Msg != "" {
+		row.Msg = metadata.Msg
+	}
 	if metadata.Where != "" {
 		row.Where = metadata.Where
 	}
