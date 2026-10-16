@@ -1,0 +1,16 @@
+{
+  "tools": {
+    "mcp__x__start": "spawn",
+    "mcp__x__poll": "wait",
+    "LS": "search"
+  },
+  "wrappers": [
+    {"program": "sandbox.sh", "after": ["box", "run"]},
+    {"program": "sandbox.sh", "after": ["box", "sim"]}
+  ],
+  "tests": [
+    {"program": "sandbox.sh", "args": ["verify", "test", "cover", "all", "gate", "e2e", "build", "typecheck"]},
+    {"program": "lanes.sh", "args": ["--lanes"]},
+    {"program": "mytool", "args": ["check", "doctor"]}
+  ]
+}

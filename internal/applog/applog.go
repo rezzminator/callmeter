@@ -29,12 +29,36 @@ type line struct {
 }
 
 // Failure reports that stage failed for session and target: one line on
-// stderr, one JSON line appended to logPath (directory 0700, file 0600). Past
-// 10 MiB the log is first renamed to logPath+".1". A failure to write the log
-// is one more stderr line, never a panic and never an error to the caller. An
-// empty logPath writes the stderr line only.
-func Failure(stderr io.Writer, logPath, stage, session, target string, cause error) {
+// stderr, one JSON line appended to sink.Log (directory 0700, file 0600),
+// then a plugin level row. Past 10 MiB the legacy log is renamed to .1. A
+// legacy write failure is one extra stderr line; a plugin write failure is
+// one notice per failing streak. Empty paths disable their respective output.
+func Failure(stderr io.Writer, sink Sink, stage, session, target string, cause error) {
+	FailureAt(stderr, sink, stage, session, target, cause, Row{})
+}
+
+// FailureAt preserves Failure's existing output while classifying a site whose
+// legacy stage is shared by several different events.
+func FailureAt(stderr io.Writer, sink Sink, stage, session, target string, cause error, metadata Row) {
+	row := failureRow(stage, session, target, cause)
+	if metadata.Level != "" {
+		row.Level = metadata.Level
+	}
+	if metadata.Event != "" {
+		row.Event = metadata.Event
+	}
+	if metadata.Msg != "" {
+		row.Msg = metadata.Msg
+	}
+	if metadata.Where != "" {
+		row.Where = metadata.Where
+	}
+	if metadata.Session != "" {
+		row.Session = metadata.Session
+	}
 	fmt.Fprintf(stderr, "callmeter: %s: session %q call %q: %v\n", stage, session, target, cause)
+	defer Level(stderr, sink, row)
+	logPath := sink.Log
 	if logPath == "" {
 		return
 	}

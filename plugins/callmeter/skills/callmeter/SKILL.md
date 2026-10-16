@@ -10,7 +10,7 @@ Answer a question from the SQLite store the callmeter hooks fill, read-only, wit
 
 ## Open the store
 
-The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it, which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
+The store is `{CALLMETER_HOME}/callmeter.db`, `CALLMETER_HOME` defaulting to `$XDG_STATE_HOME/callmeter` when that variable is an absolute path, else `~/.local/state/callmeter`: one file per machine, every Claude Code config dir writing into it. No row is deleted unless the user set `retention_days` in `config.json` beside it (or `CALLMETER_RETENTION_DAYS`), which moves older rows to `archive.db`; an earlier version pruned at 30 days, so an `archive.db` may hold history the store no longer has. Hooks write to it concurrently in WAL mode; every read carries a busy timeout so a moment of contention waits instead of failing. A read that still fails is reported as the error it is, never as an empty store.
 
 Shell state does not survive between Bash calls: define the helper in the same command that uses it. A function, because zsh does not word-split a command stored in a variable:
 
@@ -175,6 +175,17 @@ SELECT e.prompt_id, datetime(min(e.ts)/1000, 'unixepoch') AS first_utc, count(*)
 FROM events e WHERE e.session_id = :sid AND e.event = 'UserPromptSubmit'
 GROUP BY e.prompt_id ORDER BY min(e.ts) DESC LIMIT 20;
 ```
+
+## Classify calls
+
+`callmeter classify` labels tool calls by what they did, for counting reading against editing. It reads one JSON object per stdin line and touches no store:
+
+```sh
+printf '%s\n' '{"id":"1","tool":"Bash","command":"sed -i s/a/b/ f.txt && go test ./...","cwd":"/tmp"}' | callmeter classify
+# {"id":"1","class":"edit","classes":["edit","test"],"status":"ok"}
+```
+
+`class` is the first of `edit test git housekeeping search read capture wait spawn other` that the call holds; `classes` lists all it holds; `status` is `ok` or the cause the command could not be fully parsed. `edit` means the call authored file content; output redirected into a file the command did not author is `capture`. A project's own names come from `--rules FILE`, a JSON file with `tools` (tool name to class), `wrappers` (`program` and the `after` words before a command string) and `tests` (`program` and the `args` that make it a test); a bad file stops the run with its path and cause. Feed it calls from a transcript (`tool_use` blocks) or from the `calls` table (`tool`, `input`'s command, `cwd`).
 
 ## Python
 

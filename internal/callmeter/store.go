@@ -222,6 +222,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_session_ts ON events(session_id, ts);
 CREATE INDEX IF NOT EXISTS events_event_ts ON events(event, ts);
+CREATE INDEX IF NOT EXISTS events_agent_ts ON events(agent_id, ts);
 CREATE TABLE IF NOT EXISTS sessions (
 	session_id TEXT PRIMARY KEY,
 	first_ts INTEGER,

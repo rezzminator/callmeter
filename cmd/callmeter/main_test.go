@@ -190,6 +190,10 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") || !strings.Contains(stderr, "goroutine ") {
 				t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
 			}
+			assertMainPluginEvent(t, c.state, "hook-panic", "cmd/callmeter/main.go#leavePanicLine")
+			if tc.unwritable {
+				assertMainPluginEvent(t, c.state, "append-missed", "cmd/callmeter/main.go#leavePanicLine")
+			}
 			missed, err := os.ReadFile(paths.Missed(c.state))
 			if tc.unwritable {
 				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.state)) {
@@ -338,10 +342,37 @@ func TestUsageErrorsExitTwoWithUsageOnStderr(t *testing.T) {
 func TestHelpPrintsUsageOnStdout(t *testing.T) {
 	for _, arg := range []string{"help", "-h", "--help"} {
 		code, stdout, stderr := newCLI(t).run("", arg)
-		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|redact|version|help}") ||
+		if code != 0 || stderr != "" || !strings.Contains(stdout, "usage: callmeter {hook|report|classify|redact|version|help}") ||
 			!strings.Contains(stdout, "usage: callmeter report") {
 			t.Errorf("callmeter %s = %d, stdout %q, stderr %q; want 0 and the usage on stdout", arg, code, stdout, stderr)
 		}
+	}
+}
+
+func TestClassifyLabelsCallsFromStdinWithoutAStore(t *testing.T) {
+	c := newCLI(t)
+	code, stdout, stderr := c.run(`{"id":"1","tool":"Bash","command":"sed -i '' s/a/b/ f.txt && go test ./...","cwd":"/tmp"}`+"\n", "classify")
+	want := `{"id":"1","class":"edit","classes":["edit","test"],"status":"ok"}` + "\n"
+	if code != 0 || stdout != want || stderr != "" {
+		t.Fatalf("callmeter classify = %d, stdout %q, stderr %q; want 0 and %q", code, stdout, stderr, want)
+	}
+}
+
+func TestClassifyRulesFlagReachesTheClassifier(t *testing.T) {
+	c := newCLI(t)
+	rules := filepath.Join(t.TempDir(), "rules.json")
+	if err := os.WriteFile(rules, []byte(`{"tests": [{"program": "mytool", "args": ["verify"]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"id":"1","tool":"Bash","command":"mytool verify","cwd":"/tmp"}` + "\n"
+	code, stdout, stderr := c.run(line, "classify", "--rules", rules)
+	want := `{"id":"1","class":"test","classes":["test"],"status":"ok"}` + "\n"
+	if code != 0 || stdout != want || stderr != "" {
+		t.Fatalf("callmeter classify --rules = %d, stdout %q, stderr %q; want 0 and %q", code, stdout, stderr, want)
+	}
+	code, stdout, stderr = c.run(line, "classify", "--rules", rules+".absent")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, rules+".absent") {
+		t.Fatalf("callmeter classify --rules <absent> = %d, stdout %q, stderr %q; want 1, no output and the path", code, stdout, stderr)
 	}
 }
 
@@ -442,5 +473,57 @@ func TestRedactWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(c.store()); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("redact created the store: %v", err)
+	}
+}
+
+func assertMainPluginEvent(t *testing.T, home, event, where string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, "logs", "errors.jsonl"))
+	if err != nil {
+		t.Fatalf("panic plugin row missing: %v", err)
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row["event"] == event {
+			count++
+			if row["level"] != "error" || row["where"] != where {
+				t.Fatalf("panic row=%v", row)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("%s rows=%d, want one", event, count)
+	}
+}
+
+func TestHookPanicHomeResolutionLevelWhere(t *testing.T) {
+	dir := t.TempDir()
+	previous := hook
+	hook = func(io.Reader, io.Writer, paths.Getenv) int { panic("boom") }
+	t.Cleanup(func() { hook = previous })
+	var out, stderr bytes.Buffer
+	env := func(key string) string {
+		if key == "PLUGIN_LOG_DIR" {
+			return dir
+		}
+		return ""
+	}
+	if code := run([]string{"hook"}, strings.NewReader(""), &out, &stderr, env); code != 0 {
+		t.Fatalf("panic code=%d", code)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["event"] != "hook-terminated" || row["where"] != "cmd/callmeter/main.go#leavePanicLine" {
+		t.Fatalf("home-resolution panic provenance=%v", row)
 	}
 }

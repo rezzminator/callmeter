@@ -16,6 +16,7 @@ Decisions live in this file. A change lands here first, then in the code. How it
 - [The store](#the-store)
 - [The cost ledger](#the-cost-ledger)
 - [Parsing a command](#parsing-a-command)
+- [Classifying a call](#classifying-a-call)
 - [Reports](#reports)
 - [Corpus findings and fixes](#corpus-findings-and-fixes)
 - [Build decisions](#build-decisions)
@@ -43,7 +44,7 @@ The repository is a one-plugin marketplace. `.claude-plugin/marketplace.json` at
 | `.claude-plugin/icon.svg` | the plugin's icon |
 | `hooks/hooks.json` | the registration below |
 | `libexec/callmeter` | the POSIX sh wrapper every hook and both skills run |
-| `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's |
+| `libexec/SHA256SUMS` | the release assets' sums, equal to a fresh reproducible build's at each release commit; later commits leave them as released |
 | `skills/report/SKILL.md` | `/callmeter:report {topic} [flags]`, which runs the wrapper's `report` |
 | `skills/callmeter/SKILL.md`, `skills/callmeter/schema.md` | `/callmeter:callmeter`: how a model reads the store directly, read-only, with SQL or Python (where it lives, safe reads, units, joins, tested recipes), and every table's columns; it runs the wrapper only for a `report` the user asked for or agreed to, since a report run prunes |
 | `README.md`, `LICENSE` | what an installed plugin shows |
@@ -90,7 +91,7 @@ The binary's CLI:
 - `callmeter version`: `callmeter {version}`, set at build by `-ldflags "-X main.version={v}"`, default `dev`.
 - `callmeter help`, `-h`, `--help`: usage on stdout, exit 0; no argument or an unknown subcommand: usage on stderr, exit 2.
 
-Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the committed `SHA256SUMS` reproduces from source.
+Release assets are raw binaries `callmeter_{version}_{os}_{arch}` for linux/amd64, linux/arm64, darwin/amd64 and darwin/arm64 under the tag `v{version}`, built with `CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version={v}"` on Go 1.27.1 exactly, so the `SHA256SUMS` committed with a release reproduces from that release's source; `scripts/release-check.sh --release` compares them, a plain `scripts/release-check.sh` does not.
 
 ## What the harness gives a hook
 
@@ -170,7 +171,7 @@ One command, `callmeter hook`, reached through the wrapper and registered on eve
 
 The store is `{CALLMETER_HOME}/callmeter.db`, where `CALLMETER_HOME` is `${CALLMETER_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/callmeter}` (`XDG_STATE_HOME` counts only when absolute). Beside it: `config.json` (the optional settings, below), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (written only by a prune) and the binary cache `bin/{version}/callmeter`. Under `go test`, resolving `CALLMETER_HOME` with the variable unset is an error, never the real home.
 
-`{CALLMETER_HOME}/config.json` is the one settings file (`internal/config`), read only by `callmeter report`: `{"retention_days": N}`, an integer from 0 to 36500 whose 0 or absence keeps every row forever. A missing file is the defaults. A file that cannot be read, is empty, is not one JSON object, names an unknown key or holds a value out of range stops the report with a line naming the file before the store is opened, since a misspelled key must never read as "keep" or "drop". The hooks never read it.
+`{CALLMETER_HOME}/config.json` is the one settings file (`internal/config`), read only by `callmeter report`: `{"retention_days": N}`, an integer from 0 to 36500 whose 0 or absence keeps every row forever. A missing file is the defaults. A file that cannot be read, is empty, is not one JSON object, names an unknown key or holds a value out of range stops the report with a line naming the file before the store is opened, since a misspelled key must never read as "keep" or "drop". The hooks never read it. `CALLMETER_RETENTION_DAYS` overrides the key (`config.Resolve`): the same one integer from 0 to 36500, unset or blank counted as absent; a bad value is a reported `config-env-invalid` error naming the variable while the report runs on with the default (keep every row), not the file's value, and a file the report cannot trust still stops it.
 
 This deviates from Claude Code's plugin convention on purpose. The store lives at `CALLMETER_HOME`, never `${CLAUDE_PLUGIN_DATA}`, because plugin data is per seat (`{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`, observed on Claude Code 2.1.286) and pfm runs several seats whose calls belong in one store, and because the CLI and pfm must find the store without plugin env. One machine, one store: every seat's sessions land in the same file, told apart by `seat_dir`.
 
@@ -208,7 +209,7 @@ Every table is created `IF NOT EXISTS`, its columns in the order listed.
 
 One view, `request_cache`, computed at read time and never stored: per request that is not pending and has a `ts`, against the previous request of its party (`session_id`, `agent_id`): `gap_ms`, `entry_ttl` (the latest earlier cache write's lifetime by its 5 m / 1 h split: `5m`, `1h`, `mixed`), `expected_read` (the previous `context_tokens`), `outcome` (`first`, `hit` at 95 % of the expected read, `partial` at 50 %, `miss`; NULL when a count is unknown) and `cause` for a partial or miss (`model_changed`, `compacted`, `expired`, else `unknown`). It reads only `callmeter.db`: no persistent object of the store refers to an attached database, so a plain `sqlite3` or Python open finds a working store; it uses no window function, since a SQLite that cannot parse one view (window functions need 3.25) cannot read any table of the file.
 
-Indexes: `calls_session_agent_ts(session_id, agent_id, ts)`, `calls_ts(ts)`, `calls_file_path(file_path)`, `calls_prompt(prompt_id)`, `calls_request(request_id)` (each request's recount and each call's re-point; without it each was a scan of `calls` under the write lock), `requests_session_agent_pending(session_id, agent_id, pending)`, `requests_session_agent_ts(session_id, agent_id, ts)` (each `request_cache` row's look back at its party), `turns_session_ts(session_id, ts)`, `events_session_ts(session_id, ts)`, `events_event_ts(event, ts)`, `compactions_session_ts(session_id, ts)`, `stop_hooks_session_ts(session_id, ts)`, `turn_durations_session_ts(session_id, ts)`.
+Indexes: `calls_session_agent_ts(session_id, agent_id, ts)`, `calls_ts(ts)`, `calls_file_path(file_path)`, `calls_prompt(prompt_id)`, `calls_request(request_id)` (each request's recount and each call's re-point; without it each was a scan of `calls` under the write lock), `requests_session_agent_pending(session_id, agent_id, pending)`, `requests_session_agent_ts(session_id, agent_id, ts)` (each `request_cache` row's look back at its party), `turns_session_ts(session_id, ts)`, `events_session_ts(session_id, ts)`, `events_event_ts(event, ts)`, `events_agent_ts(agent_id, ts)` (each `SubagentStart` and `SubagentStop` hook's lookup of its agent's events, in the write transaction: `RebuildAgentTurns` and `DropRecoveredAgentStop`; without it each walked every `SubagentStop` and `SubagentStart` ever stored with the write lock held, a hold that grew with the store and ran to over a second on a cold page cache, while every other writer waited on the lock), `compactions_session_ts(session_id, ts)`, `stop_hooks_session_ts(session_id, ts)`, `turn_durations_session_ts(session_id, ts)`.
 
 - The transcript metrics are Claude Code's own, copied, never computed. `requests.thinking_tokens` is the thinking part of `output_tokens` (a subset of it, never added to it), NULL when the transcript carried no split: absence is never 0. `session_costs` holds one row per session, Claude Code's latest cumulative `cost-state` (the last one in the transcript wins), so `api_ms`, `api_no_retry_ms`, `tool_ms` and `wall_ms` are running totals. A `turn_durations` row attaches to the `turns` row of the same `session_id` and `prompt_id` with the greatest `ts` at or before its own. `stop_hook_runs.name` is derived, never the command text ([Privacy](#privacy)), and `duration_ms` is NULL for an async hook, which reports none: such a run is counted, never timed.
 
@@ -341,6 +342,45 @@ From the parsed commands, a file is attributed to a call when an argument, an as
 One Bash call returns one output: the bytes of a compound command belong to the call, never split across its parts.
 
 A static parse cannot know which branch ran, so every file a part names in a read mode (`read-whole`, `read-range`, `search`) is attributed as read, whether or not its branch ran; the call's bytes are measured at its end either way. What the parse does know is where the part sits: `command_parts.conditional` is 1 for a part inside an `if` branch or the `else` chain (an `elif` condition included), a `case` arm, or on the right-hand side of `&&` or `||`, and 0 otherwise; the first `if` condition and the `case` word run unconditionally. A Bash call's read of a file is certain when any unconditional part of that call names the file, conditional otherwise. A file test (`[`, `test`, `[[ ]]`) reads nothing and attributes no file. The `files` report shows `READS` (every attributed read), then `CERTAIN` and `CONDITIONAL`, so a file that ranks high only through guarded reads (`if [ -f x ]; then cat x; fi`) shows as such, and `EXECS`, the calls that ran the file (`exec`), never a read. A `stat` or `write` attribution is no read; an `unknown` one counts nowhere, and a note names how many there were.
+
+## Classifying a call
+
+`callmeter classify` labels tool calls by what they did, for a reader that counts reading against editing. It reads JSON lines `{id, tool, command, cwd}` on stdin, writes `{id, class, classes, status}` lines in the same order, and touches no store: the labelling is `internal/callmeter/callclass`, built on [Parsing a command](#parsing-a-command), never on a substring of the command text.
+
+| Class | A call that |
+| --- | --- |
+| `edit` | authors file content, wherever the file lives: the `Edit`, `Write`, `MultiEdit`, `NotebookEdit` tools; `echo` or `printf` of literal text, or `cat` reading a heredoc or here-string, its standard output redirected into a file (as the first command of a redirected `{ …; }` group or compound command too); `tee` fed a heredoc, a here-string or such text by the part before it; `sed -i`, `perl -i`, `patch`, `yq -i`, also run by `find -exec`; an `mv` or `cp` of a file an earlier part captured from the very file it moves over; a script that opens a file for writing (Python found by its own `ast`, `node -e` by its source) |
+| `test` | runs a test, build, typecheck, lint or gate: `go test`, `pytest`, `make test`, a script named as a test, and the programs a rules file names as tests |
+| `git` | changes repository state (`add`, `commit`, `checkout`, `reset`, `merge`, `worktree add`, a bare `stash`, `tag -a`…); `git diff`, `log`, `show`, `stash list` and the other readers are `read` |
+| `housekeeping` | moves, copies, removes or creates files (`mkdir`, `rm`, `mv`, `cp`, `chmod`, `ln`, `touch`, `find -delete`, `find -exec rm`) |
+| `search` | `grep`, `rg`, `find`, and the `Grep` and `Glob` tools |
+| `read` | the `Read` tool and commands that only print or inspect |
+| `capture` | redirects a command's output (a test run, a `jq`, a `sed -n`, `$?`) into a file the command did not author |
+| `wait` | `sleep`, polling, monitor and task-output tools |
+| `spawn` | starts or messages a sub-agent or chat (`Agent`, `Task`, `SendMessage`, and the tools a rules file maps to `spawn`) |
+| `other` | none of these: a script or program the parse cannot see into, an unknown tool |
+
+`classes` lists every class a call holds, in the order above, and `class` is the first of them: a call that edits and tests is an `edit`, so an edit is never hidden behind a test. A call counts once per class however many files it touches. A wrapper's command (`docker run … bash -c '…'`, or a wrapper a rules file names) is judged as a command of its own and its parts join the call's, and a wrapper inside it is looked into the same way, up to three wrappers deep. The built-in defaults are neutral: the Claude Code tools, the common runners and toolchains, and `docker`/`podman` `bash -c`. A project adds its own through a rules file (below). `status` is `ok`, or the cause a command could not be fully parsed (`error`, `python-error`, `python-unavailable`, `script-body`, an `unparsed` language other than `node -e`); the call is then labelled from the parts that did parse, `other` when none did. Known limits, each `other` or `capture` rather than a guess: a `sed` or `jq` that transforms into a new file is a capture, a project script or a `subprocess` inside Python is not looked into, and an unquoted heredoc body is not stored.
+
+### The rules file
+
+`callmeter classify --rules FILE` adds a project's own names to the neutral defaults; the zero rule set (no flag) adds nothing. The file is one JSON object, decoded strictly:
+
+```json
+{
+  "tools":    {"mcp__x__start": "spawn"},
+  "wrappers": [{"program": "box", "after": ["run"]}],
+  "tests":    [{"program": "mytool", "args": ["verify", "lint"]}]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `tools` | a tool name mapped to a class (one of the ten); an entry beats the built-in mapping. `Bash` is judged by its command and cannot be mapped |
+| `wrappers` | the words after the consecutive `after` words of the program's arguments are a command string, parsed as shell and judged as a command of its own, its parts joining the call's; those words are no arguments of the wrapper, so a `tests` rule for the same program reads only the words before `after` |
+| `tests` | the program run with any listed word among the arguments after it is a `test` |
+
+`program` is a bare name and matches the command's own name or the name of any of its arguments, so an interpreter or a lock runner in front of it (`bash box run '…'`, `lock -- box gate`) still matches; a command that only prints, reads, searches or moves its arguments (`echo`, `printf`, the read, search and housekeeping programs but `env` and `command`) runs none of them, so `echo usage: box run rm x` and `grep 'box gate' docs` match nothing. A file that cannot be read, is not a regular file (a FIFO, `/dev/stdin`) or is over 1 MiB, is not valid JSON or has bytes after it, holds an unknown field or class, an empty name or word, a second document or no rule at all stops the run with exit 1 and `callmeter classify: rules {path}: {cause}`; it is never read as an empty rule set. Every other rule of the classifier is built in.
 
 ## Reports
 
@@ -489,7 +529,7 @@ Claude Code 2.1.286, as a plugin: a per-event verification capture (every hook e
 
 ## Open items
 
-- Retention: **Decided.** Keep every row by default; `retention_days` in `config.json` opts into a window. With one set, every report prunes older rows, archiving them first (the archive drops `calls.input`, `calls.error`, `faults.error` and `events.detail`); the hook never prunes and never reads the config.
+- Retention: **Decided.** Keep every row by default; `retention_days` in `config.json`, or `CALLMETER_RETENTION_DAYS` over it, opts into a window. With one set, every report prunes older rows, archiving them first (the archive drops `calls.input`, `calls.error`, `faults.error` and `events.detail`); the hook never prunes and never reads the config.
 - The store's location: **Decided.** `CALLMETER_HOME`, one store per machine across seats ([Where the store lives](#where-the-store-lives)).
 - `node -e` parsing: **Decided.** It stays unparsed in this version: a named gap, counted in every report that counts commands and in `faults`.
 - `BASH_MAX_OUTPUT_LENGTH`: **Decided.** Unchanged.

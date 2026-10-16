@@ -322,7 +322,16 @@ func (p *callParser) redirFiles(redirs []*syntax.Redirect) []FileRef {
 	var files []FileRef
 	for _, r := range redirs {
 		var action string
+		fd := "1"
+		if r.N != nil {
+			fd = r.N.Value
+		}
 		switch r.Op {
+		case syntax.Hdoc, syntax.DashHdoc, syntax.WordHdoc:
+			if r.N == nil || fd == "0" {
+				p.stdinText = true
+			}
+			continue
 		case syntax.RdrOut, syntax.AppOut, syntax.RdrClob, syntax.RdrAll, syntax.AppAll:
 			action = ActionWrite
 		case syntax.RdrIn:
@@ -336,6 +345,10 @@ func (p *callParser) redirFiles(redirs []*syntax.Redirect) []FileRef {
 		for _, a := range p.args(r.Word) {
 			if a.resolved && strings.HasPrefix(filepath.Clean(a.text), "/dev/") {
 				continue
+			}
+			if action == ActionWrite {
+				p.redirects = append(p.redirects, a.text)
+				p.stdout = p.stdout || fd == "1" || r.Op == syntax.RdrAll || r.Op == syntax.AppAll
 			}
 			files = append(files, p.named([]arg{a}, action, "")...)
 		}

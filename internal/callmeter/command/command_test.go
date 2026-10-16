@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -218,6 +220,59 @@ func TestCallmeterCLIReportRefusesABadConfigBeforeTouchingTheStore(t *testing.T)
 			}
 			if n := fixture.storedCalls(t); n != 2 {
 				t.Errorf("store holds %d calls after a refused report, want 2 untouched", n)
+			}
+		})
+	}
+}
+
+// withEnv is the lab with one more variable set.
+func (fixture lab) withEnv(name, value string) lab {
+	base := fixture.getenv
+	fixture.getenv = func(key string) string {
+		if key == name {
+			return value
+		}
+		return base(key)
+	}
+	return fixture
+}
+
+// TestCallmeterCLIReportReadsRetentionFromTheEnvironment: CALLMETER_RETENTION_DAYS
+// beats config.json, and a bad value is reported by its name on stderr while the
+// report runs with the default, keeping every row, never with the file's window.
+func TestCallmeterCLIReportReadsRetentionFromTheEnvironment(t *testing.T) {
+	for name, c := range map[string]struct {
+		file, env string
+		calls     int
+		quiet     bool
+	}{
+		"env prunes with no file":          {"", "30", 1, true},
+		"env 0 keeps what the file prunes": {`{"retention_days": 30}`, "0", 2, true},
+		"env beats the file":               {`{"retention_days": 9999}`, "30", 1, true},
+		"blank env leaves the file":        {`{"retention_days": 30}`, "  ", 1, true},
+		"bad env keeps every row":          {`{"retention_days": 30}`, "monthly", 2, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newLab(t).withEnv("CALLMETER_RETENTION_DAYS", c.env)
+			fixture.seedAgedReads(t)
+			if c.file != "" {
+				fixture.writeConfig(t, c.file)
+			}
+			code, stdout, stderr := fixture.run("report", "files")
+			if code != 0 {
+				t.Fatalf("report files = %d, want 0\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+			if got := fixture.storedCalls(t); got != c.calls {
+				t.Errorf("store holds %d calls, want %d (env %q, file %q)", got, c.calls, c.env, c.file)
+			}
+			if c.quiet && stderr != "" {
+				t.Errorf("stderr = %q, want it quiet", stderr)
+			}
+			if !c.quiet && !strings.Contains(stderr, "CALLMETER_RETENTION_DAYS \"monthly\"") {
+				t.Errorf("stderr = %q, want a line naming CALLMETER_RETENTION_DAYS and its value", stderr)
+			}
+			if !c.quiet && !strings.Contains(stdout, "window: all time") {
+				t.Errorf("stdout = %q, want the default whole-store window after a bad variable", stdout)
 			}
 		})
 	}
@@ -1207,5 +1262,249 @@ func TestCallmeterCLIReportCostRejectsAnUnknownView(t *testing.T) {
 	code, stdout, stderr := fixture.run("report", "cost", "--view", "nope")
 	if code != 2 || stdout != "" || !strings.Contains(stderr, `--view "nope" is none of chat, agent, call`) {
 		t.Errorf("report cost --view nope = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}
+
+func TestCallmeterCLIClassifyLabelsCallsInOrder(t *testing.T) {
+	t.Parallel()
+	in := strings.Join([]string{
+		`{"id":"a","tool":"Bash","command":"go test ./... > /tmp/red.log 2>&1","cwd":"/tmp"}`,
+		``,
+		`{"id":"b","tool":"Bash","command":"python3 - <<'EOF'\np = 'x.go'\nopen(p, 'w').write('y')\nEOF","cwd":"/tmp"}`,
+		`{"id":"c","tool":"Edit"}`,
+		`{"id":"d","tool":"Bash","command":"git commit -m x"}`,
+	}, "\n")
+	var stdout, stderr bytes.Buffer
+	code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+	if code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	want := `{"id":"a","class":"test","classes":["test","capture"],"status":"ok"}
+{"id":"b","class":"edit","classes":["edit"],"status":"ok"}
+{"id":"c","class":"edit","classes":["edit"],"status":"ok"}
+{"id":"d","class":"git","classes":["git"],"status":"ok"}
+`
+	if stdout.String() != want {
+		t.Errorf("stdout =\n%s\nwant\n%s", stdout.String(), want)
+	}
+}
+
+func TestCallmeterCLIClassifyRefusesBadInput(t *testing.T) {
+	t.Parallel()
+	for name, in := range map[string]string{
+		"not json":      "{nope",
+		"missing id":    `{"tool":"Read"}`,
+		"duplicate ids": `{"id":"a","tool":"Read"}` + "\n" + `{"id":"a","tool":"Edit"}`,
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+		if code != 1 || stderr.Len() == 0 || stdout.Len() != 0 {
+			t.Errorf("%s: exit %d stdout %q stderr %q, want exit 1, a message, no output", name, code, stdout.String(), stderr.String())
+		}
+	}
+	var stderr bytes.Buffer
+	if code := Classify([]string{"classify", "x"}, strings.NewReader(""), io.Discard, &stderr, func(string) string { return "" }); code != 2 {
+		t.Errorf("extra arg: exit %d, want 2", code)
+	}
+}
+
+func TestCallmeterCLIClassifyLoadsARulesFile(t *testing.T) {
+	t.Parallel()
+	rules := filepath.Join(t.TempDir(), "rules.json")
+	body := `{"tools": {"mcp__x__start": "spawn"}, "wrappers": [{"program": "box", "after": ["run"]}], "tests": [{"program": "mytool", "args": ["verify"]}]}`
+	if err := os.WriteFile(rules, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in := strings.Join([]string{
+		`{"id":"a","tool":"Bash","command":"mytool verify","cwd":"/tmp"}`,
+		`{"id":"b","tool":"Bash","command":"box run 'grep -rn x .'","cwd":"/tmp"}`,
+		`{"id":"c","tool":"mcp__x__start"}`,
+	}, "\n")
+	want := `{"id":"a","class":"test","classes":["test"],"status":"ok"}
+{"id":"b","class":"search","classes":["search"],"status":"ok"}
+{"id":"c","class":"spawn","classes":["spawn"],"status":"ok"}
+`
+	for _, args := range [][]string{{"classify", "--rules", rules}, {"classify", "--rules=" + rules}} {
+		var stdout, stderr bytes.Buffer
+		code := Classify(args, strings.NewReader(in), &stdout, &stderr, func(string) string { return "" })
+		if code != 0 || stdout.String() != want || stderr.Len() != 0 {
+			t.Errorf("%v = %d, stdout %q, stderr %q; want 0 and %q", args, code, stdout.String(), stderr.String(), want)
+		}
+	}
+	// without the file the same calls are labelled by the neutral defaults
+	var stdout bytes.Buffer
+	if code := Classify([]string{"classify"}, strings.NewReader(in), &stdout, io.Discard, func(string) string { return "" }); code != 0 ||
+		strings.Contains(stdout.String(), `"class":"test"`) || strings.Contains(stdout.String(), `"class":"spawn"`) {
+		t.Errorf("neutral run = %d, stdout %q; want no test and no spawn", code, stdout.String())
+	}
+}
+
+func TestCallmeterCLIClassifyRefusesABadRulesFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, tc := range []struct{ name, path, cause string }{
+		{"unreadable", filepath.Join(dir, "absent.json"), "no such file"},
+		{"malformed", write("malformed.json", `{"tools":`), "unexpected EOF"},
+		{"unknown class", write("class.json", `{"tools": {"mcp__x__go": "edits"}}`), `unknown class "edits"`},
+		{"unknown field", write("field.json", `{"wrapper": []}`), `unknown field "wrapper"`},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Classify([]string{"classify", "--rules", tc.path}, strings.NewReader(`{"id":"a","tool":"Read"}`), &stdout, &stderr, func(string) string { return "" })
+		if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.path) || !strings.Contains(stderr.String(), tc.cause) {
+			t.Errorf("%s: exit %d stdout %q stderr %q; want exit 1, no output, the path and %q", tc.name, code, stdout.String(), stderr.String(), tc.cause)
+		}
+	}
+	for _, args := range [][]string{{"classify", "--rules"}, {"classify", "--rules="}, {"classify", "--rules", "a", "--rules", "b"}, {"classify", "--rule", "a"}} {
+		var stderr bytes.Buffer
+		if code := Classify(args, strings.NewReader(""), io.Discard, &stderr, func(string) string { return "" }); code != 2 || !strings.Contains(stderr.String(), "usage: callmeter classify") {
+			t.Errorf("%v: exit %d stderr %q, want 2 and the usage", args, code, stderr.String())
+		}
+	}
+}
+
+func TestCallmeterCLIPluginLogsSkippedRecovery(t *testing.T) {
+	fixture := newLab(t)
+	dir := t.TempDir()
+	oldEnv := fixture.getenv
+	fixture.getenv = func(key string) string {
+		if key == "PLUGIN_LOG_DIR" {
+			return dir
+		}
+		return oldEnv(key)
+	}
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+	transcript := filepath.Join(t.TempDir(), "projects", "-tmp-demo-proj", "sess-bad.jsonl")
+	fixture.seedQuiet(t, "sess-bad", "toolu_bad", transcript, `{"type":"user","message":{"content":[{"type":"tool_result" toolu_bad`)
+	code, _, stderr := fixture.run("report", "files")
+	if code != 0 || !strings.Contains(stderr, "recover quiet sessions: skipped:") {
+		t.Fatalf("report=%d, stderr=%q", code, stderr)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "warnings.jsonl"))
+	if err != nil {
+		t.Fatalf("recovery warning missing: %v", err)
+	}
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if row["event"] == "recover-skipped" {
+			found = true
+			if row["level"] != "warning" || row["where"] != "internal/callmeter/command/command.go#reportAction" {
+				t.Fatalf("wrong recovery row: %v", row)
+			}
+			detail, _ := row["detail"].(map[string]any)
+			if row["session"] != "sess-bad" || detail["stage"] == "" || detail["stage"] == nil || detail["reason"] != "malformed" {
+				t.Fatalf("recovery row says no session, stage or reason: %v", row)
+			}
+			if strings.Contains(string(raw), transcript) {
+				t.Fatalf("recovery row quotes the transcript path: %s", raw)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no recover-skipped row: %s", raw)
+	}
+}
+
+// TestSkippedDetailNamesOnlyAStageAndAReason: a skipped transcript read is
+// logged with the stage that skipped it and a reason from a fixed vocabulary,
+// never the path or the error text, which may quote transcript content.
+func TestSkippedDetailNamesOnlyAStageAndAReason(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		err  error
+		want map[string]string
+	}{
+		{"absent", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "find tool results", Err: fmt.Errorf("open: %w", fs.ErrNotExist)}, map[string]string{"stage": "find tool results", "reason": "not found"}},
+		{"denied", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "stat transcript", Err: fmt.Errorf("stat: %w", fs.ErrPermission)}, map[string]string{"stage": "stat transcript", "reason": "permission denied"}},
+		{"malformed", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "find requests", Err: fmt.Errorf("decode: %w", &json.SyntaxError{})}, map[string]string{"stage": "find requests", "reason": "malformed"}},
+		{"refused input", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: callmeter.StageSanitizeInput, Err: fmt.Errorf("sanitize: %w", &json.SyntaxError{})}, map[string]string{"stage": callmeter.StageSanitizeInput, "reason": "refused"}},
+		{"other", &callmeter.SkippedRead{Session: "s", Path: "/x/secret.jsonl", Stage: "read turn end", Err: errors.New("secret prompt text")}, map[string]string{"stage": "read turn end", "reason": "unreadable"}},
+		{"not a read", errors.New("secret prompt text"), map[string]string{"reason": "unreadable"}},
+	} {
+		got := skippedDetail(tc.err)
+		if !maps.Equal(got, tc.want) {
+			t.Errorf("%s: skippedDetail = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestCallmeterCLIPluginLogLevels(t *testing.T) {
+	for _, tc := range []struct {
+		name                             string
+		args                             []string
+		input, file, event, level, where string
+		code                             int
+	}{
+		{"usage", []string{"report", "not-a-topic"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/command.go#reportAction", 2},
+		{"input", []string{"classify"}, "not json", "errors.jsonl", "payload-unparsable", "error", "internal/callmeter/command/classify.go#Classify", 1},
+		{"redact", []string{"redact", "extra"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/redact.go#Redact", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			env := mapEnv(map[string]string{"PLUGIN_LOG_DIR": dir, "CALLMETER_HOME": filepath.Join(dir, "state")})
+			var out, stderr bytes.Buffer
+			code := 0
+			switch tc.args[0] {
+			case "classify":
+				code = Classify(tc.args, strings.NewReader(tc.input), &out, &stderr, env)
+			case "redact":
+				code = Redact(tc.args, &out, &stderr, env)
+			default:
+				code = CLI(tc.args, &out, &stderr, env)
+			}
+			if code != tc.code || stderr.Len() == 0 {
+				t.Fatalf("code=%d stderr=%q", code, stderr.String())
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, "callmeter", tc.file))
+			if err != nil {
+				t.Fatalf("CLI %s event missing: %v", tc.event, err)
+			}
+			var row map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+				t.Fatal(err)
+			}
+			if row["level"] != tc.level || row["event"] != tc.event || row["where"] != tc.where {
+				t.Fatalf("CLI row=%v", row)
+			}
+		})
+	}
+}
+
+func TestCallmeterCLIPluginLogExcludesRulesBody(t *testing.T) {
+	dir := t.TempDir()
+	rules := filepath.Join(dir, "rules.json")
+	if err := os.WriteFile(rules, []byte(`{"tools":{"Read":"PRIVATE_FILE_BODY"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env := mapEnv(map[string]string{"PLUGIN_LOG_DIR": dir, "CALLMETER_HOME": filepath.Join(dir, "state")})
+	var stderr bytes.Buffer
+	code := Classify([]string{"classify", "--rules", rules}, strings.NewReader(`{"id":"one","tool":"Read"}`), io.Discard, &stderr, env)
+	if code != 1 || !strings.Contains(stderr.String(), "PRIVATE_FILE_BODY") {
+		t.Fatalf("legacy result=%d stderr=%s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("PRIVATE_FILE_BODY")) {
+		t.Fatalf("persisted rules body: %s", raw)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["event"] != "classify-failed" || row["msg"] == "" {
+		t.Fatalf("safe diagnostic missing: %v", row)
 	}
 }

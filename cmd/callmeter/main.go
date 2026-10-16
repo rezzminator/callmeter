@@ -22,9 +22,10 @@ import (
 // version is set at build time: -ldflags "-X main.version={v}".
 var version = "dev"
 
-const usage = `usage: callmeter {hook|report|redact|version|help}
+const usage = `usage: callmeter {hook|report|classify|redact|version|help}
   hook      record the hook payload on stdin into the call store
   report    print a report over the call store
+  classify  label the tool calls on stdin by what they did (edit, test, git, ...), optionally with a rules file; touches no store
   redact    rewrite the rows already stored under the privacy rules (never automatic)
   version   print the version
   help      print this text
@@ -51,6 +52,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.
 			return runHook(stdin, stderr, getenv)
 		case "report":
 			return runReport(args, stdout, stderr, getenv)
+		case "classify":
+			return command.Classify(args, stdin, stdout, stderr, getenv)
 		case "redact":
 			return command.Redact(args, stdout, stderr, getenv)
 		case "version":
@@ -63,6 +66,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.
 		fmt.Fprintf(stderr, "callmeter: unknown command %q\n", args[0])
 	}
 	fmt.Fprintln(stderr, usage)
+	applog.Level(stderr, applog.ResolveSink(getenv, homeForLog(getenv)), applog.Row{Level: "info", Event: "usage-refused", Msg: "unknown or missing command", Where: "cmd/callmeter/main.go#run"})
 	return 2
 }
 
@@ -72,12 +76,8 @@ func runReport(args []string, stdout, stderr io.Writer, getenv paths.Getenv) (co
 		if recovered := recover(); recovered != nil {
 			stack := debug.Stack()
 			fmt.Fprintf(stderr, "callmeter: report panicked: %v\n%s", recovered, stack)
-			logPath := ""
-			if home, err := paths.Home(getenv); err == nil {
-				logPath = paths.Log(home)
-			}
-			applog.Failure(stderr, logPath, "report", "", "",
-				fmt.Errorf("report panicked: %v\n%s", recovered, stack))
+			applog.FailureAt(stderr, applog.ResolveSink(getenv, homeForLog(getenv)), "report", "", "",
+				fmt.Errorf("report panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#runReport"})
 			code = 1
 		}
 	}()
@@ -112,19 +112,18 @@ func runHook(stdin io.Reader, stderr io.Writer, getenv paths.Getenv) (code int) 
 func leavePanicLine(prefix []byte, recovered any, stack []byte, accounted bool, stderr io.Writer, getenv paths.Getenv) {
 	home, err := paths.Home(getenv)
 	if err != nil {
-		applog.Failure(stderr, "", callmeter.StageTerminated, "", "", fmt.Errorf("resolve callmeter home: %w", err))
+		applog.FailureAt(stderr, applog.ResolveSink(getenv, ""), callmeter.StageTerminated, "", "", fmt.Errorf("resolve callmeter home: %w", err), applog.Row{Where: "cmd/callmeter/main.go#leavePanicLine"})
 		return
 	}
 	event, session := panicIDs(prefix)
-	logPath := paths.Log(home)
 	if !accounted {
 		if err := hookentry.AppendMissed(
 			paths.Missed(home), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
-			applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "", err)
+			applog.FailureAt(stderr, applog.ResolveSink(getenv, home), callmeter.StageTerminated, session, "", err, applog.Row{Event: "append-missed", Where: "cmd/callmeter/main.go#leavePanicLine"})
 		}
 	}
-	applog.Failure(stderr, logPath, callmeter.StageTerminated, session, "",
-		fmt.Errorf("hook panicked: %v\n%s", recovered, stack))
+	applog.FailureAt(stderr, applog.ResolveSink(getenv, home), callmeter.StageTerminated, session, "",
+		fmt.Errorf("hook panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#leavePanicLine"})
 }
 
 // payloadPrefixLimit bounds what runHook keeps of the payload for panicIDs:
@@ -174,4 +173,13 @@ func panicIDs(prefix []byte) (event, session string) {
 		}
 	}
 	return event, session
+}
+
+// homeForLog never resolves a real home behind the test jail.
+func homeForLog(getenv paths.Getenv) string {
+	home, err := paths.Home(getenv)
+	if err != nil {
+		return ""
+	}
+	return home
 }

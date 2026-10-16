@@ -7,7 +7,7 @@
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 [![CI](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.3-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -145,20 +145,14 @@ claude-haiku-4-5-20251001  general-purpose  6         58     33030       41033  
 
 Every report, column and note is specified in [docs/design.md § Reports](./docs/design.md#reports).
 
+`callmeter classify` is not a report: it labels tool calls fed on stdin as JSON lines (`edit`, `test`, `git`, `housekeeping`, `search`, `read`, `capture`, `wait`, `spawn`, `other`) from the commands the calls ran, for a script that counts reading against editing. `--rules FILE` adds a project's own tool names, wrapper programs and test programs to the built-in defaults. It touches no store. See [docs/design.md § Classifying a call](./docs/design.md#classifying-a-call).
+
 ## 🔎 Ask the store your own questions
 
 A question no report answers (which sub-agent peaked highest, what a whole agent tree cost, what one agent spent its time on) goes to the store itself. The `callmeter` skill teaches Claude to read it safely: read-only with a busy timeout, millisecond UTC times, the main chat as `agent_id IS NULL`, content stored only as byte counts, and tested SQL and Python recipes over every table. Ask in plain words, or load it yourself:
 
 ```text
 /callmeter:callmeter which of my sub-agents in this session hit the highest context?
-```
-
-## 🎬 Watch what happened
-
-`/callmeter:ultimate-visualization [focus]` has Claude explore the store and publish one animated Artifact of what happened in the past, in a form it chooses: an open greenfield, seen as the work and its flow, never as a file. The skill carries its own build discipline, so it needs nothing beyond Claude Code and its Artifact tool, and the page it publishes carries structure, timing and counts only: no commands, paths or prompts.
-
-```text
-/callmeter:ultimate-visualization the sub-agents of the last two days
 ```
 
 ## 📒 What it records
@@ -213,21 +207,26 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 | `CALLMETER_HOME` | where the store, logs and binary cache live; default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
 | `CALLMETER_BIN` | an executable the wrapper runs instead of resolving one (development) |
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
+| `CALLMETER_RETENTION_DAYS` | the environment form of the `retention_days` setting below; takes precedence over `config.json` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
 Settings live in an optional `config.json` under `CALLMETER_HOME`. Without it every default applies.
 
-| Key | Effect |
-| --- | --- |
-| `retention_days` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
+| Key | Environment variable | Effect |
+| --- | --- | --- |
+| `retention_days` | `CALLMETER_RETENTION_DAYS` | how many days of rows the store keeps, an integer from `0` to `36500`. `0` or absent (the default) keeps every row forever. A positive value makes each report first move rows older than that to `archive.db`, which drops their `calls.input`, `calls.error`, `faults.error` and `events.detail` for good; `--since` then defaults to, and is clamped to, that window. |
 
 ```json
 { "retention_days": 90 }
 ```
 
+The variable beats `config.json`, which beats the default; unset or blank counts as absent, and a value is read with the key's own grammar (one integer from `0` to `36500`, whitespace around it trimmed; `0` overrides a file's window and keeps every row). A variable that is not such an integer is reported by its name on stderr and the default applies: the report runs and keeps every row, never falling back to the file's window.
+
 A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
 
 Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
+
+Plugin errors, warnings and info also append to `errors.jsonl`, `warnings.jsonl` and `info.jsonl` under `$PLUGIN_LOG_DIR/callmeter` when set, otherwise `$CALLMETER_HOME/logs` (the resolved state home). Each level file past 20 MB moves aside to `.1`, with a `log-capped` warning; rows are bounded to 4096 bytes. A failed write is one additional stderr notice per failing streak and never changes the hook result. The existing `callmeter.log` stays unchanged.
 
 ## ❓ FAQ
 
@@ -272,9 +271,10 @@ Contributions are welcome: read [CONTRIBUTING.md](./CONTRIBUTING.md), then pick 
 
 ```text
 cmd/callmeter/            the binary
-internal/callmeter/       the store, with cmdparse/, report/, command/
+internal/callmeter/       the store, with cmdparse/, callclass/, report/, command/
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
+internal/releasecheck/    tests of scripts/release-check.sh
 internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
@@ -295,7 +295,7 @@ scripts/release-check.sh
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
 
 ## 🎓 Built with Professor
 

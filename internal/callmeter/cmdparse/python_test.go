@@ -2,10 +2,12 @@ package cmdparse
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rezzminator/callmeter/internal/runner"
 )
@@ -202,5 +204,71 @@ func TestPythonCodeWithAnUnresolvedExpansionIsUnparsed(t *testing.T) {
 	parts := parseOne(t, cwd, `N=5 && python3 -c "print($N/1000)"`, nil)
 	if len(parts) != 1 || parts[0].Lang != LangPython || parts[0].Status != StatusOK {
 		t.Fatalf("parts = %+v, want one ok python part for a literal variable", parts)
+	}
+}
+
+// argvRunner records the argv it is asked to run and answers one empty result
+// per snippet, as a scanner that found nothing would.
+type argvRunner struct{ argv []string }
+
+func (a *argvRunner) Run(_ context.Context, argv []string, opts runner.RunOptions) (runner.RunResult, error) {
+	a.argv = argv
+	var snippets []Snippet
+	if err := json.Unmarshal(opts.Stdin, &snippets); err != nil {
+		return runner.RunResult{ExitCode: -1}, err
+	}
+	out := make([]PyResult, len(snippets))
+	for i, s := range snippets {
+		out[i] = PyResult{ID: s.ID}
+	}
+	raw, err := json.Marshal(out)
+	return runner.RunResult{Stdout: raw}, err
+}
+
+func (a *argvRunner) LookPath(name string) (string, error) { return "/fake/" + name, nil }
+
+// The scanner runs in isolated mode: the working directory a hook runs in and
+// the PYTHON* environment never reach the interpreter's import path.
+func TestPython3RunsTheScannerIsolated(t *testing.T) {
+	t.Parallel()
+	rec := &argvRunner{}
+	if _, err := (Python3{Runner: rec}).Analyze(context.Background(), []Snippet{{ID: "a", Code: "print(1)"}}); err != nil {
+		t.Fatalf("Analyze: %v", err)
+	}
+	if len(rec.argv) != 4 || rec.argv[0] != "/fake/python3" || rec.argv[1] != "-I" || rec.argv[2] != "-c" {
+		t.Fatalf("argv = %q, want [/fake/python3 -I -c <script>]", rec.argv)
+	}
+}
+
+// An interpreter that never answers is cut off at the timeout: the part is a
+// python-error naming the cause, never a hang and never a part with no files.
+func TestPython3TimeoutIsAPythonError(t *testing.T) {
+	t.Parallel()
+	cwd := fixture(t)
+	program := filepath.Join(cwd, "hung-python")
+	if err := os.WriteFile(program, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan []Part, 1)
+	go func() {
+		done <- parseOne(t, cwd, `python3 -c "print(1)"`, Python3{Program: program, Timeout: 300 * time.Millisecond})
+	}()
+	select {
+	case parts := <-done:
+		if len(parts) != 1 || parts[0].Status != StatusPythonError || !strings.Contains(parts[0].Error, "timed out after 300ms") || len(parts[0].Files) != 0 {
+			t.Fatalf("part = %+v, want python-error \"timed out after 300ms\" and no files", parts)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ParseBatch still running 10s after a 300ms python timeout")
+	}
+}
+
+func TestPython3TimeoutDefaults(t *testing.T) {
+	t.Parallel()
+	if got := (Python3{}).timeout(); got != DefaultPythonTimeout {
+		t.Errorf("zero Timeout = %s, want %s", got, DefaultPythonTimeout)
+	}
+	if got := (Python3{Timeout: time.Second}).timeout(); got != time.Second {
+		t.Errorf("Timeout 1s = %s", got)
 	}
 }

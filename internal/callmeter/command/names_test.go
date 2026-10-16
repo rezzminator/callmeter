@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,14 @@ func TestTranscriptNamesUnreadableTranscriptReturnsItsError(t *testing.T) {
 
 func TestTranscriptNamesTellsStderrOncePerSession(t *testing.T) {
 	fixture := newNamesLab(t)
+	levels := t.TempDir()
+	getenv := fixture.names.getenv
+	fixture.names.getenv = func(key string) string {
+		if key == "PLUGIN_LOG_DIR" {
+			return levels
+		}
+		return getenv(key)
+	}
 	unreadable := filepath.Join(fixture.seat, "projects", "-work", "sess-bad.jsonl")
 	if err := os.MkdirAll(unreadable, 0o700); err != nil {
 		t.Fatal(err)
@@ -167,6 +176,18 @@ func TestTranscriptNamesTellsStderrOncePerSession(t *testing.T) {
 	if len(lines) != 1 || !strings.HasPrefix(lines[0], "callmeter: chat name: session sess-bad: ") ||
 		!strings.Contains(lines[0], unreadable) {
 		t.Errorf("stderr = %q, want one session error line naming the transcript", stderr.String())
+	}
+
+	raw, err := os.ReadFile(filepath.Join(levels, "callmeter", "warnings.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["session"] != "sess-bad" || row["event"] != "transcript-unreadable" {
+		t.Fatalf("chat warning = %v, want known session", row)
 	}
 }
 

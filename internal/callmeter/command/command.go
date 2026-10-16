@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
 	"github.com/rezzminator/callmeter/internal/clock"
@@ -54,6 +55,7 @@ func CLI(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 		fmt.Fprintf(stderr, "callmeter: unknown action %q\n", args[0])
 	}
 	fmt.Fprintln(stderr, Usage)
+	pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/command.go#CLI", "unknown or missing action")
 	return 2
 }
 
@@ -135,6 +137,9 @@ func reportAction(
 	flags, values := newFlags("callmeter report", stderr)
 	positional, code, ok := parseFlagsAnywhere(flags, args)
 	if !ok {
+		if code != 0 {
+			pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/command.go#reportAction", "invalid report flags or filters")
+		}
 		return code
 	}
 	var topic topicFunc
@@ -144,28 +149,44 @@ func reportAction(
 	if topic == nil {
 		fmt.Fprintf(stderr, "callmeter report: want one topic, got %q\n", positional)
 		flags.Usage()
+		pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/command.go#reportAction", "report requires one known topic")
 		return 2
 	}
 	now := clock.Real.Now()
 	filter, code, ok := buildFilter(values, now, stderr)
 	if !ok {
+		if code != 0 {
+			pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/command.go#reportAction", "invalid report flags or filters")
+		}
 		return code
 	}
 	quiet, ok := quietAfter(getenv, stderr)
 	if !ok {
+		pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/command.go#reportAction", "invalid quiet-after duration")
 		return 2
 	}
 	home, err := paths.Home(getenv)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
+		pluginLog(stderr, getenv, "error", "store-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
-	cfg, err := config.Load(paths.Config(home))
+	cfg, envErr, err := config.Resolve(paths.Config(home), getenv)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
+		pluginLog(stderr, getenv, "error", "config-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
+	if envErr != nil {
+		// A bad variable never stops the report: the default (keep every row) stands.
+		fmt.Fprintf(stderr, "callmeter: %v; using the default, keeping every row\n", envErr)
+		pluginLog(stderr, getenv, "error", "config-env-invalid", "internal/callmeter/command/command.go#reportAction", envErr.Error())
+	}
+	before := filter.Since
 	filter.Since = windowSince(filter.Since, values.since, cfg.RetentionDays, now, stderr)
+	if !before.IsZero() && !before.Equal(filter.Since) {
+		pluginLog(stderr, getenv, "info", "retention-clamped", "internal/callmeter/command/command.go#windowSince", "report window clamped to configured retention")
+	}
 	path := paths.Store(home)
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		// No store to ingest into: the lines still waiting in missed.log and its
@@ -173,10 +194,12 @@ func reportAction(
 		counts, err := callmeter.CountMissed(paths.Missed(home))
 		if err != nil {
 			fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", err)
+			pluginLog(stderr, getenv, "error", "missed-count-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 			return 1
 		}
 		if err := printNoStore(stdout, values.json, positional[0], path, missedNotes(counts)); err != nil {
 			fmt.Fprintf(stderr, "callmeter: report %s: %v\n", positional[0], err)
+			pluginLog(stderr, getenv, "error", "report-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 			return 1
 		}
 		return 0
@@ -184,11 +207,13 @@ func reportAction(
 	db, err := callmeter.OpenDB(ctx, path)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: cannot open store %s: %v\n", path, err)
+		pluginLog(stderr, getenv, "error", "store-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
 			fmt.Fprintf(stderr, "callmeter: close store: %v\n", err)
+			pluginLog(stderr, getenv, "error", "store-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 			if exitCode == 0 {
 				exitCode = 1
 			}
@@ -198,10 +223,12 @@ func reportAction(
 	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
 	if _, err := db.IngestMissed(ctx, paths.Missed(home)); err != nil {
 		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
+		pluginLog(stderr, getenv, "error", "missed-ingest-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	if _, err := report.PruneExpired(ctx, db, now); err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
+		pluginLog(stderr, getenv, "warning", "prune-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	// Sessions gone quiet are settled from their transcripts before the topic
@@ -210,20 +237,29 @@ func reportAction(
 	recovered, err := db.RecoverQuiet(ctx, now, quiet)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: %v\n", err)
+		pluginLog(stderr, getenv, "warning", "recover-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	recovery := recoveryNotes(recovered.Skipped)
 	for _, skipped := range recovered.Skipped {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: skipped: %v\n", skipped)
+		row := applog.Row{Level: "warning", Event: "recover-skipped", Where: "internal/callmeter/command/command.go#reportAction", Detail: skippedDetail(skipped)}
+		var read *callmeter.SkippedRead
+		if errors.As(skipped, &read) {
+			row.Session = read.Session
+		}
+		pluginLogRow(stderr, getenv, row)
 	}
 	if _, err := report.EnsureParsed(ctx, db, getenv("HOME"), nil); err != nil {
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)
+		pluginLog(stderr, getenv, "error", "parse-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	// Calls no transcript records come in from the optional cost ledger, and every
 	// settled request gets its price, before the topic reads the store.
 	if _, _, err := db.PriceUnpriced(ctx); err != nil {
 		fmt.Fprintf(stderr, "callmeter: price requests: %v\n", err)
+		pluginLog(stderr, getenv, "error", "price-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	filter.Ledger = ingestLedger(ctx, db, getenv, now, stderr)
@@ -246,6 +282,7 @@ func reportAction(
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: report %s: %v\n", positional[0], err)
+		pluginLog(stderr, getenv, "error", "report-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
 	}
 	return 0
@@ -263,6 +300,7 @@ func ingestLedger(ctx context.Context, db *callmeter.Store, getenv paths.Getenv,
 	summary, err := db.IngestLedger(ctx, dir, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: cost ledger: %v\n", err)
+		pluginLog(stderr, getenv, "warning", "ledger-unreadable", "internal/callmeter/command/command.go#ingestLedger", err.Error())
 		summary.Err = err.Error()
 	}
 	return &summary
@@ -379,7 +417,7 @@ func buildFilter(values *flagValues, now time.Time, stderr io.Writer) (report.Fi
 }
 
 // windowSince bounds a report's since by the retention window in days, from
-// config.json; 0 keeps every row, so since stands. With a window, an unset
+// CALLMETER_RETENTION_DAYS or else config.json (config.Resolve); 0 keeps every row, so since stands. With a window, an unset
 // since is its start and one older than it is clamped to it with one stderr
 // note, since the store holds nothing before it. raw is the --since text.
 func windowSince(since time.Time, raw string, retentionDays int, now time.Time, stderr io.Writer) time.Time {
@@ -396,4 +434,55 @@ func windowSince(since time.Time, raw string, retentionDays int, now time.Time, 
 		return floor
 	}
 	return since
+}
+
+// pluginLog adds metadata beside existing CLI output, never changing it.
+func pluginLog(stderr io.Writer, getenv paths.Getenv, level, event, where, msg string) {
+	pluginLogRow(stderr, getenv, applog.Row{Level: level, Event: event, Msg: msg, Where: where})
+}
+
+// logLabels is a detail of fixed-vocabulary labels, safe to log at error and
+// warning level: no producer text, no path.
+type logLabels map[string]string
+
+func pluginLogRow(stderr io.Writer, getenv paths.Getenv, row applog.Row) {
+	// Producer errors may quote rules, config or transcript contents. Keep the
+	// operation category and provenance here; the existing CLI diagnostic is unchanged.
+	// Only logLabels, fixed-vocabulary labels a producer built, pass as detail.
+	if row.Level == "error" || row.Level == "warning" {
+		row.Msg = strings.ReplaceAll(row.Event, "-", " ")
+		if _, labels := row.Detail.(logLabels); !labels {
+			row.Detail = nil
+		}
+	}
+	home, err := paths.Home(getenv)
+	if err != nil {
+		home = ""
+	} // the caller reports its own resolution error
+	applog.Level(stderr, applog.ResolveSink(getenv, home), row)
+}
+
+// skippedDetail says why recovery skipped a transcript read, in labels only:
+// the stage of the read (SkippedRead.Stage) and a reason from a fixed
+// vocabulary. The path and the error text stay out, since the error may quote
+// transcript content (the plugin log strips them for the same reason).
+func skippedDetail(err error) logLabels {
+	detail := logLabels{"reason": "unreadable"}
+	var read *callmeter.SkippedRead
+	if errors.As(err, &read) && read.Stage != "" {
+		detail["stage"] = read.Stage
+	}
+	var syntax *json.SyntaxError
+	var typed *json.UnmarshalTypeError
+	switch {
+	case read != nil && read.Stage == callmeter.StageSanitizeInput:
+		detail["reason"] = "refused" // read in full; its input was not taken
+	case errors.Is(err, fs.ErrNotExist):
+		detail["reason"] = "not found"
+	case errors.Is(err, fs.ErrPermission):
+		detail["reason"] = "permission denied"
+	case errors.As(err, &syntax), errors.As(err, &typed):
+		detail["reason"] = "malformed"
+	}
+	return detail
 }

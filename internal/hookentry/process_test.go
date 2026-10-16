@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
@@ -576,7 +577,7 @@ func (lab *callmeterLab) terminate(state *terminationState, sig os.Signal, stder
 func (lab *callmeterLab) terminateWithExit(state *terminationState, sig os.Signal, stderr io.Writer, exit func(int)) {
 	signals := make(chan os.Signal, 1)
 	signals <- sig
-	go terminateOnSignal(signals, nil, state, lab.missed, lab.logPath, stderr, exit)
+	go terminateOnSignal(signals, nil, state, lab.missed, applog.Sink{Log: lab.logPath}, stderr, exit)
 }
 
 // await returns the handler's exit code, failing when it does not exit.
@@ -984,6 +985,85 @@ func TestProcessStoreBusySessionEndLeavesAMissedLine(t *testing.T) {
 	}
 }
 
+// levelRows reads the rows of one plugin level file under dir, nil when the
+// file does not exist.
+func levelRows(t *testing.T, dir, file string) []map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", file))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	var rows []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("%s row %q: %v", file, line, err)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// TestProcessStoreBusyGiveUpLogLevelFollowsTheMissedLine: a hook that gives up
+// on a locked store logs `store-busy-gave-up` as a warning saying its
+// unrecorded event is counted as a terminated fault when its missed.log line
+// landed, since that line makes the gap show in the reports; when the line
+// could not be appended the loss is not counted and the row stays an error.
+func TestProcessStoreBusyGiveUpLogLevelFollowsTheMissedLine(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "callmeter")
+	buildCallmeter(ctx, t, binary)
+
+	for _, queued := range []bool{true, false} {
+		t.Run(fmt.Sprintf("queued=%t", queued), func(t *testing.T) {
+			scene := newSignalScene(t, binary)
+			levels := filepath.Join(scene.lab.root, "levels")
+			scene.env = append(scene.env, "PLUGIN_LOG_DIR="+levels)
+			start, end := scene.payload(t, "SessionStart"), scene.payload(t, "SessionEnd")
+			wantQuietExit(t, scene.start(t, start))
+			if !queued {
+				if err := os.MkdirAll(paths.Missed(scene.home), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			release := scene.holdStoreExclusive(t)
+			defer release()
+			wantQuietExit(t, scene.start(t, end))
+
+			gaveUp := func(file string) (rows []map[string]any) {
+				for _, row := range levelRows(t, levels, file) {
+					if row["event"] == "store-busy-gave-up" {
+						rows = append(rows, row)
+					}
+				}
+				return rows
+			}
+			wantFile, otherFile, wantLevel := "warnings.jsonl", "errors.jsonl", "warning"
+			if !queued {
+				wantFile, otherFile, wantLevel = otherFile, wantFile, "error"
+			}
+			rows := gaveUp(wantFile)
+			if len(rows) != 1 || rows[0]["level"] != wantLevel {
+				t.Fatalf("store-busy-gave-up rows in %s = %v, want exactly one at level %s", wantFile, rows, wantLevel)
+			}
+			if other := gaveUp(otherFile); len(other) != 0 {
+				t.Errorf("store-busy-gave-up rows in %s = %v, want none", otherFile, other)
+			}
+			msg, _ := rows[0]["msg"].(string)
+			if queued != strings.Contains(msg, "counted as a terminated fault") {
+				t.Errorf("msg %q: says counted as a terminated fault = %t, want %t", msg, !queued, queued)
+			}
+			if strings.Contains(msg, "replay") {
+				t.Errorf("msg %q claims a replay: nothing replays a missed.log line, it only becomes a fault", msg)
+			}
+		})
+	}
+}
+
 // TestIngestCommitWaitsForTheTerminationHold: the hook's missed.log ingest
 // commits and moves its claim under the signal state's lock, so a signal
 // handler holding it (about to exit) never sees faults committed whose claim
@@ -1364,5 +1444,48 @@ func TestProcessPruneLetsASessionEndLand(t *testing.T) {
 	}
 	if got := scene.lab.count("SELECT COUNT(*) FROM events WHERE event = ?", callmeter.EventSessionEnd); got != 1 {
 		t.Errorf("SessionEnd events after prune = %d, want 1", got)
+	}
+}
+
+func TestTerminationAppendFailureKeepsKnownLevelSession(t *testing.T) {
+	root := t.TempDir()
+	missed := filepath.Join(root, "missed.log")
+	if err := os.Mkdir(missed, 0700); err != nil {
+		t.Fatal(err)
+	}
+	sink := applog.Sink{Log: filepath.Join(root, "callmeter.log"), Levels: filepath.Join(root, "levels")}
+	state := &terminationState{event: "PreToolUse", session: "known-session"}
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGTERM
+	var stderr bytes.Buffer
+	code := -1
+	terminateOnSignal(signals, nil, state, missed, sink, &stderr, func(c int) { code = c })
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.HasPrefix(stderr.String(), "callmeter: terminated: session \"\" call \"\": ") || strings.Count(stderr.String(), "\n") != 1 {
+		t.Fatalf("legacy stderr = %q", stderr.String())
+	}
+	raw, err := os.ReadFile(sink.Log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if session, ok := legacy["session"]; ok && session != "" {
+		t.Fatalf("legacy session changed: %v", legacy)
+	}
+	raw, err = os.ReadFile(filepath.Join(sink.Levels, "errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
+		t.Fatal(err)
+	}
+	if row["session"] != "known-session" || row["event"] != "append-missed" {
+		t.Fatalf("missed append row = %v, want known session", row)
 	}
 }

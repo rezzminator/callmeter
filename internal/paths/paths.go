@@ -14,6 +14,10 @@ import (
 // EnvHome names the variable that overrides the state home.
 const EnvHome = "CALLMETER_HOME"
 
+// EnvRetentionDays names the variable that overrides config.json's
+// retention_days.
+const EnvRetentionDays = "CALLMETER_RETENTION_DAYS"
+
 // Getenv reads one environment variable: os.Getenv in production, a map
 // lookup in a test.
 type Getenv func(string) string

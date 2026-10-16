@@ -25,11 +25,13 @@ const RedactUsage = `usage: callmeter redact
 func Redact(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 	if len(args) != 1 || args[0] != "redact" {
 		fmt.Fprintln(stderr, RedactUsage)
+		pluginLog(stderr, getenv, "info", "usage-refused", "internal/callmeter/command/redact.go#Redact", "invalid redact arguments")
 		return 2
 	}
 	home, err := paths.Home(getenv)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter redact: %v\n", err)
+		pluginLog(stderr, getenv, "error", "redact-failed", "internal/callmeter/command/redact.go#Redact", err.Error())
 		return 1
 	}
 	path := paths.Store(home)
@@ -38,12 +40,14 @@ func Redact(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 		return 0
 	} else if err != nil {
 		fmt.Fprintf(stderr, "callmeter redact: store %s: %v\n", path, err)
+		pluginLog(stderr, getenv, "error", "store-failed", "internal/callmeter/command/redact.go#Redact", err.Error())
 		return 1
 	}
 	ctx := context.Background()
 	db, err := callmeter.OpenDB(ctx, path)
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter redact: %v\n", err)
+		pluginLog(stderr, getenv, "error", "redact-failed", "internal/callmeter/command/redact.go#Redact", err.Error())
 		return 1
 	}
 	counts, err := db.Redact(ctx)
@@ -52,6 +56,7 @@ func Redact(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter redact: %v\n", err)
+		pluginLog(stderr, getenv, "error", "redact-failed", "internal/callmeter/command/redact.go#Redact", err.Error())
 		return 1
 	}
 	fmt.Fprintf(stdout, "callmeter redact: %s\n", path)

@@ -23,7 +23,7 @@ func readLines(t *testing.T, path string) []string {
 func TestFailureWritesTheStderrLineAndOneJSONLine(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "state", "callmeter.log")
 	var stderr bytes.Buffer
-	Failure(&stderr, logPath, "store", "sess-1", "toolu_9", errors.New("disk full"))
+	Failure(&stderr, Sink{Log: logPath}, "store", "sess-1", "toolu_9", errors.New("disk full"))
 
 	want := `callmeter: store: session "sess-1" call "toolu_9": disk full` + "\n"
 	if got := stderr.String(); got != want {
@@ -61,8 +61,8 @@ func TestFailureLogModesAndAppend(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	logPath := filepath.Join(dir, "callmeter.log")
 	var stderr bytes.Buffer
-	Failure(&stderr, logPath, "parse", "s", "t1", errors.New("one"))
-	Failure(&stderr, logPath, "parse", "s", "t2", errors.New("two"))
+	Failure(&stderr, Sink{Log: logPath}, "parse", "s", "t1", errors.New("one"))
+	Failure(&stderr, Sink{Log: logPath}, "parse", "s", "t2", errors.New("two"))
 
 	if got := len(readLines(t, logPath)); got != 2 {
 		t.Fatalf("log has %d lines, want 2 appended", got)
@@ -93,7 +93,7 @@ func TestFailureRotatesAnOversizeLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
-	Failure(&stderr, logPath, "store", "s", "t", errors.New("after"))
+	Failure(&stderr, Sink{Log: logPath}, "store", "s", "t", errors.New("after"))
 
 	rotated, err := os.Stat(logPath + ".1")
 	if err != nil {
@@ -118,7 +118,7 @@ func TestFailureKeepsALogAtTheCeiling(t *testing.T) {
 	if err := os.Truncate(logPath, maxLogBytes); err != nil {
 		t.Fatal(err)
 	}
-	Failure(&bytes.Buffer{}, logPath, "store", "s", "t", errors.New("x"))
+	Failure(&bytes.Buffer{}, Sink{Log: logPath}, "store", "s", "t", errors.New("x"))
 	if _, err := os.Stat(logPath + ".1"); !os.IsNotExist(err) {
 		t.Fatalf("a log of exactly 10 MiB rotated (stat error %v), want it kept until past the ceiling", err)
 	}
@@ -134,7 +134,7 @@ func TestFailureLogWriteErrorIsOneMoreStderrLine(t *testing.T) {
 	}
 	logPath := filepath.Join(blocker, "sub", "callmeter.log")
 	var stderr bytes.Buffer
-	Failure(&stderr, logPath, "store", "s", "t", errors.New("boom"))
+	Failure(&stderr, Sink{Log: logPath}, "store", "s", "t", errors.New("boom"))
 
 	lines := strings.Split(strings.TrimSuffix(stderr.String(), "\n"), "\n")
 	if len(lines) != 2 {
@@ -153,7 +153,7 @@ func TestFailureLogWriteErrorIsOneMoreStderrLine(t *testing.T) {
 func TestFailureWithNoLogPathWritesOnlyStderr(t *testing.T) {
 	t.Chdir(t.TempDir())
 	var stderr bytes.Buffer
-	Failure(&stderr, "", "store", "", "", errors.New("resolve callmeter home: unset"))
+	Failure(&stderr, Sink{}, "store", "", "", errors.New("resolve callmeter home: unset"))
 
 	if got := strings.Count(stderr.String(), "\n"); got != 1 {
 		t.Fatalf("stderr = %q, want exactly one line", stderr.String())

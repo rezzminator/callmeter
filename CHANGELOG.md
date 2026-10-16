@@ -2,6 +2,35 @@
 
 Every release of callmeter. Versions follow [semantic versioning](https://semver.org); each release is the `main` commit tagged `v<version>`, with a GitHub release carrying the section below and the four platform binaries.
 
+## [Unreleased]
+
+## [0.4.3] — 2026-10-16
+
+### Fixed
+- A hook that gave up on a locked store after its full busy wait (up to 5 s) logged the plugin error row `store-busy-gave-up` with nothing saying the gap was already counted: its event goes unrecorded, and the `terminated by store busy` line it leaves in `missed.log` becomes a `terminated` fault at the next ingest, so the reports show it. That row is now a warning whose message says the event went unrecorded and is counted as a `terminated` fault from `missed.log`; it stays an error only when the line could not be appended too, the one case where the loss is not counted.
+- The plugin warning `recover-skipped` (a transcript read that quiet-session recovery skipped) carried no detail. It now carries the session and, as `detail`, the `stage` of the read that was skipped and a `reason` from a fixed set (`not found`, `permission denied`, `malformed`, `refused` for a call input recovery read but would not store, `unreadable`); the transcript path and the error text stay out of the plugin log, as before. The `callmeter report` stderr line is unchanged.
+
+## [0.4.2] — 2026-10-16
+
+### Added
+- `CALLMETER_RETENTION_DAYS`, the environment form of `config.json`'s `retention_days`: the same integer from 0 to 36500, read by `callmeter report` ahead of the file (the variable beats the file, the file beats the default of keeping every row). Unset or blank counts as absent. A value that is not such an integer is reported on stderr by the variable's name and in the plugin's error log as an error row with event `config-env-invalid`, and the default stands: the report runs and prunes nothing, never with the file's window. A `config.json` the report cannot trust still stops it, whatever the variable holds.
+
+### Fixed
+- A `SubagentStart` or `SubagentStop` hook no longer holds the store's write lock for a time that grows with the store. Its lookups of the agent's own start and stop events (`RebuildAgentTurns`, and the rebuilt-stop delete of `DropRecoveredAgentStop`) had no index by agent, so each read every `SubagentStart` and `SubagentStop` event ever stored; with a cold page cache one hold measured over a second. Every other writer waits on that lock, and a hook still waiting at the 5 s busy timeout gives up (`terminated by store busy`, each left in `missed.log` and as a `faults` row, none silent); the 2026-10-13 burst of those errors is consistent with this cause, not proven by it. The store gains the index `events_agent_ts`, added to an existing store by the next open that can take the write lock; a hook that could not wait and lost its event stays lost.
+
+## [0.4.1]
+
+### Fixed
+
+- Hook-failure level rows include the cause, truncated to the row limit with the session preserved.
+
+## [0.4.0] — 2026-10-14
+
+### Added
+
+- Plugin errors, warnings and info append to level files under `PLUGIN_LOG_DIR/callmeter`, or the resolved state home's `logs` directory.
+- Bounded JSONL rows, 20 MB rename-aside caps and one logging-failure notice per failing streak, alongside unchanged legacy output.
+
 ## [0.3.0] — 2026-10-11
 
 ### Added

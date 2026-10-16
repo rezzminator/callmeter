@@ -661,7 +661,7 @@ func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {
 // TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME is a regular file,
 // so neither the store, the log nor missed.log can be created: exit 0, a
 // stderr line for the store error and one for the failed missed.log append,
-// each followed by its failed log append, no panic.
+// each followed by its failed log append, plus one plugin-log notice, no panic.
 func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	lab := newCallmeterLab(t)
 	blocker := filepath.Join(lab.root, "a-file")
@@ -672,6 +672,19 @@ func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	notices := 0
+	legacy := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(line, "callmeter: plugin log "+filepath.Join(blocker, "logs")+": ") {
+			notices++
+			continue
+		}
+		legacy = append(legacy, line)
+	}
+	if notices != 1 {
+		t.Errorf("plugin log notices=%d, want exactly one for this failing streak", notices)
+	}
+	lines = legacy
 	if len(lines) != 4 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
 		!strings.Contains(lines[0], "toolu_01UGaJs715PJE1hKtJWM2ANC") ||
 		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) ||
@@ -3274,9 +3287,6 @@ func TestAppendMissedNamesItsWriter(t *testing.T) {
 // cost-state. A second Stop over the same transcript writes no duplicate row,
 // and none of the hook commands' text is stored.
 func TestCallmeterStopWritesTheTranscriptMarks(t *testing.T) {
-	settle := agentSettle
-	agentSettle = 0 // the fixture's last reply is a tool_use: do not wait for a final one
-	t.Cleanup(func() { agentSettle = settle })
 	const (
 		prompt1 = "af8da24f-ac08-45b1-9c9e-b2015b11f360"
 		prompt2 = "11111111-2222-4333-8444-555555555555"
@@ -3558,4 +3568,61 @@ func TestCallmeterSessionEndIngestStaysInsideItsBudget(t *testing.T) {
 			t.Errorf("ledger requests after a Stop = %d, want 2", n)
 		}
 	})
+}
+
+func TestCallmeterPluginLogRows(t *testing.T) {
+	for _, override := range []bool{true, false} {
+		t.Run(fmt.Sprintf("override=%t", override), func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			env := map[string]string{paths.EnvHome: lab.root, "HOME": lab.home}
+			dir := filepath.Join(lab.root, "logs")
+			if override {
+				env["PLUGIN_LOG_DIR"] = filepath.Join(lab.root, "shared")
+				dir = filepath.Join(env["PLUGIN_LOG_DIR"], "callmeter")
+			}
+			var stderr bytes.Buffer
+			if code := Callmeter(strings.NewReader(lab.rewrite(hookPayload(t, "SessionStart", nil))), &stderr, mapEnv(env)); code != 0 {
+				t.Fatalf("SessionStart code=%d", code)
+			}
+			payload := lab.rewrite(hookPayload(t, "PostToolUse", map[string]any{"session_id": dropKey}))
+			if code := Callmeter(strings.NewReader(payload), &stderr, mapEnv(env)); code != 0 {
+				t.Fatalf("bad payload code=%d", code)
+			}
+			assertPluginEvent(t, dir, "errors.jsonl", "error", "payload-unparsable", "internal/hookentry/callmeter.go#payload")
+			lab.env = env
+			lab.logPath = paths.Log(lab.root)
+			lab.write(lab.transcript(cmSessionB), []byte("this line is not JSON, yet names "+cmBatchLead+"\n"))
+			lab.feed(lab.payloads("probe5.jsonl")[3])
+			assertPluginEvent(t, dir, "warnings.jsonl", "warning", "transcript-unreadable", "internal/hookentry/callmeter.go#transcript")
+		})
+	}
+}
+
+func assertPluginEvent(t *testing.T, dir, file, level, event, where string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, file))
+	if err != nil {
+		t.Fatalf("plugin event %s missing: %v", event, err)
+	}
+	rows := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	found := 0
+	for _, line := range rows {
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if len(line)+1 > 4096 {
+			t.Fatalf("oversize row %d", len(line)+1)
+		}
+		if row["event"] != event {
+			continue
+		}
+		found++
+		if row["plugin"] != "callmeter" || row["level"] != level || row["where"] != where {
+			t.Fatalf("wrong plugin row: %v", row)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("%s rows=%d, want exactly one", event, found)
+	}
 }

@@ -128,6 +128,23 @@ type Part struct {
 	Status      string
 	Error       string
 	Conditional bool
+	// Redirects holds, as written, the target of each `>`, `>>`, `>|`, `&>` and
+	// `&>>` redirection of the part, /dev/* excluded, resolved or not; a
+	// redirection of a group or a compound command (`{ a; b; } > f`) is carried
+	// by the group's first command. StdoutRedirect is true when one of them
+	// takes the standard output (not `2>` alone). StdinText is true when a
+	// heredoc or a here-string is the part's standard input. ArgsKnown holds,
+	// per Args word, whether the parse resolved it (false: the word is its
+	// source as written, an expansion the parse could not know); nil when not
+	// recorded. ScriptWrites is true when the script the part ran opens a file
+	// for writing: a Python snippet that calls open() with a literal write mode
+	// or write_text/write_bytes, a node snippet that calls a write API of fs.
+	// All five are read by callclass and none is stored in command_parts.
+	Redirects      []string
+	StdoutRedirect bool
+	StdinText      bool
+	ArgsKnown      []bool
+	ScriptWrites   bool
 }
 
 // ParseBatch parses every call and returns its parts keyed by Call.ID. The
@@ -201,6 +218,7 @@ func ParseBatch(ctx context.Context, calls []Call, py PythonRunner) (map[string]
 			// The snippet's strings resolve in the directory its part ran in.
 			p.dir = pp.dir
 			part.Files = mergeFiles(append(part.Files, p.pyFiles(res)...))
+			part.ScriptWrites = pyWrites(res)
 			p.flushNotes(part)
 		}
 		out[call.ID] = p.parts
@@ -222,8 +240,15 @@ type callParser struct {
 	snippets  []Snippet
 	pyParts   map[string]pyPart // snippet id → its part
 	notes     []string          // stat failures for the part being built
-	printer   *syntax.Printer
-	cond      int // depth of branches, case arms and && / || right-hand sides
+	redirects []string          // redirect targets seen since the last emitted part
+	stdout    bool              // one of redirects takes the standard output
+	stdinText bool              // a heredoc or here-string seen since the last emitted part
+	// group holds the redirect targets of an enclosing group or compound
+	// command, carried by the first command emitted inside it.
+	group       []string
+	groupStdout bool
+	printer     *syntax.Printer
+	cond        int // depth of branches, case arms and && / || right-hand sides
 	// dir is the absolute directory relative paths resolve against: the
 	// call's cwd, moved by each literal `cd`. Empty after a `cd` to a target
 	// the parse cannot know: a relative path then attributes nothing.
@@ -301,14 +326,34 @@ func (p *callParser) visit(node syntax.Node) bool {
 			p.declStmt(cmd, x.Redirs)
 			return false
 		}
+		if len(x.Redirs) > 0 && x.Cmd != nil {
+			// The group's redirections apply to the commands inside it: the
+			// first of them carries the targets.
+			// An inner group with no command passes the outer targets on.
+			outer, outerStdout := p.group, p.groupStdout
+			targets, stdout := p.redirectOnly(x.Redirs, false)
+			p.group, p.groupStdout = append(slices.Clip(outer), targets...), outerStdout || stdout
+			syntax.Walk(x.Cmd, p.visit)
+			if len(p.group) > 0 {
+				p.group, p.groupStdout = outer, outerStdout
+			}
+			for _, r := range x.Redirs {
+				syntax.Walk(r, p.visit)
+			}
+			return false
+		}
 		if len(x.Redirs) > 0 {
-			p.redirectOnly(x.Redirs)
+			p.redirectOnly(x.Redirs, true)
 		}
 	case *syntax.Subshell:
 		p.subshell(func() { p.walkStmts(x.Stmts) })
 		return false
 	case *syntax.CmdSubst:
-		p.subshell(func() { p.walkStmts(x.Stmts) })
+		// A substitution's output is captured: it never carries a group's targets.
+		p.captured(func() { p.subshell(func() { p.walkStmts(x.Stmts) }) })
+		return false
+	case *syntax.ProcSubst:
+		p.captured(func() { p.subshell(func() { p.walkStmts(x.Stmts) }) })
 		return false
 	case *syntax.BinaryCmd:
 		if x.Op == syntax.Pipe || x.Op == syntax.PipeAll {
@@ -386,6 +431,15 @@ func (p *callParser) subshell(walk func()) {
 	walk()
 }
 
+// captured walks a command whose output the shell captures, holding back an
+// enclosing group's targets for the group's own first command.
+func (p *callParser) captured(walk func()) {
+	group, groupStdout := p.group, p.groupStdout
+	p.group, p.groupStdout = nil, false
+	walk()
+	p.group, p.groupStdout = group, groupStdout
+}
+
 func (p *callParser) walkStmts(stmts []*syntax.Stmt) {
 	for _, stmt := range stmts {
 		syntax.Walk(stmt, p.visit)
@@ -441,6 +495,14 @@ func (p *callParser) assign(a *syntax.Assign) {
 
 func (p *callParser) emit(part Part) int {
 	part.Seq = len(p.parts)
+	part.Redirects, p.redirects = p.redirects, nil
+	part.StdoutRedirect, p.stdout = p.stdout, false
+	part.StdinText, p.stdinText = p.stdinText, false
+	if len(p.group) > 0 && part.Program != "" {
+		part.Redirects = append(part.Redirects, p.group...)
+		part.StdoutRedirect = part.StdoutRedirect || p.groupStdout
+		p.group, p.groupStdout = nil, false
+	}
 	part.Conditional = p.cond > 0
 	if part.Status == "" && part.Lang != LangPython {
 		part.Status = StatusOK
@@ -463,12 +525,13 @@ func (p *callParser) flushNotes(part *Part) {
 }
 
 func (p *callParser) callStmt(cmd *syntax.CallExpr, redirs []*syntax.Redirect) {
+	p.clearRedirects()
 	if len(cmd.Args) == 0 {
 		for _, a := range cmd.Assigns {
 			p.assign(a)
 		}
 		if len(redirs) > 0 {
-			p.redirectOnly(redirs)
+			p.redirectOnly(redirs, true)
 		}
 		return
 	}
@@ -480,7 +543,7 @@ func (p *callParser) callStmt(cmd *syntax.CallExpr, redirs []*syntax.Redirect) {
 		// Every word expanded to nothing (`"${empty[@]}"`): no program runs,
 		// only the redirections open their files. unwrapProgram needs a word.
 		if len(redirs) > 0 {
-			p.redirectOnly(redirs)
+			p.redirectOnly(redirs, true)
 		}
 		return
 	}
@@ -517,7 +580,7 @@ func (p *callParser) callStmt(cmd *syntax.CallExpr, redirs []*syntax.Redirect) {
 		p.python(program, rest, lead, redirs)
 	case (base == "node" || base == "nodejs") && hasAny(texts, "-e", "--eval", "-p", "--print"):
 		files := slices.Concat(lead, p.redirFiles(redirs))
-		p.emit(Part{Lang: LangNode, Program: program, Args: texts, Status: StatusUnparsed, Files: files})
+		p.emit(Part{Lang: LangNode, Program: program, Args: texts, Status: StatusUnparsed, Files: files, ScriptWrites: p.nodeWrites(rest, redirs)})
 	default:
 		// Under xargs the words after the program are not its operands as
 		// written (a replace string `{}`, input appended): only an existing
@@ -526,7 +589,12 @@ func (p *callParser) callStmt(cmd *syntax.CallExpr, redirs []*syntax.Redirect) {
 		attributed := p.attribute(base, rest)
 		p.existingOnly = false
 		files := append(append(lead, attributed...), p.redirFiles(redirs)...)
-		p.emit(Part{Lang: LangSh, Program: program, Args: texts, Files: files})
+		writes := (base == "node" || base == "nodejs") && p.nodeWrites(rest, redirs)
+		known := make([]bool, len(rest))
+		for i, a := range rest {
+			known[i] = a.resolved
+		}
+		p.emit(Part{Lang: LangSh, Program: program, Args: texts, ArgsKnown: known, Files: files, ScriptWrites: writes})
 	}
 }
 
@@ -542,6 +610,7 @@ func underXargs(stripped []arg) bool {
 }
 
 func (p *callParser) declStmt(cmd *syntax.DeclClause, redirs []*syntax.Redirect) {
+	p.clearRedirects()
 	var texts []string
 	for _, a := range cmd.Args {
 		p.assign(a)
@@ -550,10 +619,25 @@ func (p *callParser) declStmt(cmd *syntax.DeclClause, redirs []*syntax.Redirect)
 	p.emit(Part{Lang: LangSh, Program: cmd.Variant.Value, Args: texts, Files: p.redirFiles(redirs)})
 }
 
-func (p *callParser) redirectOnly(redirs []*syntax.Redirect) {
-	if files := p.redirFiles(redirs); len(files) > 0 {
+// redirectOnly emits the files of redirections that run no program of their
+// own and returns their write targets. keep leaves the targets on the emitted
+// part (a bare `> f`); a group's part passes them on instead (keep false).
+func (p *callParser) redirectOnly(redirs []*syntax.Redirect, keep bool) ([]string, bool) {
+	p.clearRedirects()
+	files := p.redirFiles(redirs)
+	targets, stdout := p.redirects, p.stdout
+	if !keep {
+		p.clearRedirects()
+	}
+	if len(files) > 0 {
 		p.emit(Part{Lang: LangSh, Files: files})
 	}
+	p.clearRedirects()
+	return targets, stdout
+}
+
+func (p *callParser) clearRedirects() {
+	p.redirects, p.stdout, p.stdinText = nil, false, false
 }
 
 var pythonName = regexp.MustCompile(`^python(3(\.\d+)?)?$`)
