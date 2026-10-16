@@ -4,6 +4,8 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-10-16
+
 ### Added
 - `CALLMETER_RETENTION_DAYS`, the environment form of `config.json`'s `retention_days`: the same integer from 0 to 36500, read by `callmeter report` ahead of the file (the variable beats the file, the file beats the default of keeping every row). Unset or blank counts as absent. A value that is not such an integer is reported on stderr by the variable's name and in the plugin's error log as an error row with event `config-env-invalid`, and the default stands: the report runs and prunes nothing, never with the file's window. A `config.json` the report cannot trust still stops it, whatever the variable holds.
 
