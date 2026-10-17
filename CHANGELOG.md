@@ -4,6 +4,11 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-10-17
+
+### Changed
+- `/callmeter:report` with arguments that open with no topic treats them as a question: it loads `/callmeter:callmeter`, which reads the store directly, and runs no report.
+
 ## [0.4.3] — 2026-10-16
 
 ### Fixed
