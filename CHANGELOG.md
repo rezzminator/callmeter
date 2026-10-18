@@ -4,6 +4,12 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.5-dev.2] — 2026-10-18
+
+### Fixed
+- A recorded async hook (every event but `SessionStart`, `SessionEnd` and `StopFailure`) waits up to 120 s for a concurrent writer, where it gave up after 5 s: a report's write transaction on a large store can hold the write lock longer than that, and the hooks that met it lost their events (`store-busy-gave-up`, each left as a `terminated by store busy` line in `missed.log`). Claude Code never waits on an async hook, and a signal still ends the wait at once. The sync hooks keep their bounds (`SessionEnd` and `StopFailure` 800 ms, `SessionStart` 5 s), as does an event no hook is known to run.
+- A `SessionEnd` that ran out of its 1.2 s budget before every transcript read, an expected outcome that report-time recovery completes, no longer logs the plugin warning `transcript-unreadable`: its plugin log row is the info row `session-end-budget-spent`. Its `faults` row and message are unchanged.
+
 ## [0.4.5-dev.1] — 2026-10-18
 
 ### Changed

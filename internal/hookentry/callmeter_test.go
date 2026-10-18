@@ -2762,6 +2762,30 @@ func TestCallmeterSessionEndReadsASettledAgentLast(t *testing.T) {
 	}
 }
 
+// TestCallmeterSessionEndBudgetSpentIsNotAWarning: SessionEnd leaving transcript
+// reads to report-time recovery when its 1.2 s budget runs out is an expected,
+// documented outcome (docs/testing.md, reconcile): its faults row stands for the
+// reports, and its plugin log row is info, never a transcript-unreadable warning.
+func TestCallmeterSessionEndBudgetSpentIsNotAWarning(t *testing.T) {
+	saved := sessionEndBudget
+	sessionEndBudget = 0
+	t.Cleanup(func() { sessionEndBudget = saved })
+	lab := newCallmeterLab(t)
+	lab.logPath = paths.Log(lab.root)
+	main := lab.transcript(cmSessionA)
+	lab.write(main, []byte(sweepEntry("msg_mainreply01", "01", `"end_turn"`, 5, `{"type":"text","text":"ok"}`)))
+	lab.feed(hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main}))
+	if n := lab.count("SELECT count(*) FROM faults WHERE stage = ? AND instr(error, 'SessionEnd spent its') > 0",
+		callmeter.StageTranscript); n != 1 {
+		t.Errorf("budget-spent faults rows = %d, want 1: %v", n, lab.row("SELECT stage, error FROM faults"))
+	}
+	assertPluginEvent(t, filepath.Join(lab.root, "logs"), "info.jsonl", "info", "session-end-budget-spent",
+		"internal/hookentry/callmeter.go#sessionEndBudget")
+	if raw, err := os.ReadFile(filepath.Join(lab.root, "logs", "warnings.jsonl")); err == nil {
+		t.Errorf("warnings.jsonl holds rows, want none:\n%s", raw)
+	}
+}
+
 // TestCallmeterSessionEndStopsReadingAtItsBudget: SessionEnd commits its event
 // first, then reads transcripts only within sessionEndBudget; a read the budget
 // cuts off is a transcript fault naming the count, never silence. Serial: it
@@ -3090,6 +3114,33 @@ func TestHookTimeoutsAgreeWithHooksJSON(t *testing.T) {
 						event, storeWait(event), storeWaitReserve, got, timeout)
 				}
 			}
+		}
+	}
+}
+
+// TestStoreWaitBounds: a recorded async hook, which no one waits on, waits
+// callmeter.AsyncBusyTimeout for a concurrent writer, so a write lock held past
+// callmeter.BusyTimeout loses it no event; a sync hook keeps half its timeout
+// less the reserve, and an event no hook is known to run the strictest bound.
+func TestStoreWaitBounds(t *testing.T) {
+	cases := []struct {
+		event string
+		want  time.Duration
+	}{
+		{"PreToolUse", callmeter.AsyncBusyTimeout},
+		{"PostToolUse", callmeter.AsyncBusyTimeout},
+		{"PostToolBatch", callmeter.AsyncBusyTimeout},
+		{"Stop", callmeter.AsyncBusyTimeout},
+		{callmeter.EventSubagentStop, callmeter.AsyncBusyTimeout},
+		{callmeter.EventSessionStart, callmeter.BusyTimeout},
+		{callmeter.EventSessionEnd, (2*time.Second - storeWaitReserve) / 2},
+		{callmeter.EventStopFailure, (2*time.Second - storeWaitReserve) / 2},
+		{"NoSuchEvent", (2*time.Second - storeWaitReserve) / 2},
+		{"", (2*time.Second - storeWaitReserve) / 2},
+	}
+	for _, tc := range cases {
+		if got := storeWait(tc.event); got != tc.want {
+			t.Errorf("storeWait(%q) = %v, want %v", tc.event, got, tc.want)
 		}
 	}
 }

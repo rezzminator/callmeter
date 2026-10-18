@@ -1162,6 +1162,63 @@ func TestProcessSignalOnABusyStoreBeatsTheKill(t *testing.T) {
 	}
 }
 
+// asyncLockHold is how long TestProcessAsyncHooksOutwaitALongWriteLock holds the
+// store's write lock: past callmeter.BusyTimeout, which an async hook used to
+// give up at.
+const asyncLockHold = callmeter.BusyTimeout + 1500*time.Millisecond
+
+// TestProcessAsyncHooksOutwaitALongWriteLock: async hooks started while a
+// writer holds the store's write lock past callmeter.BusyTimeout (a report's
+// write transaction on a large store) wait it out. Once the lock frees every
+// process has exited 0 with nothing on stdout, recorded its event, and left
+// neither a `terminated by store busy` line in missed.log nor a
+// failure on stderr (the store-busy-gave-up row's source).
+func TestProcessAsyncHooksOutwaitALongWriteLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	binary := filepath.Join(t.TempDir(), "callmeter")
+	buildCallmeter(ctx, t, binary)
+	scene := newSignalScene(t, binary)
+	events := []string{"PreToolUse", "PostToolUse", "UserPromptSubmit", "PostToolBatch"}
+	release := scene.holdStore(t)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+	var procs []*hookProcess
+	for _, event := range events {
+		procs = append(procs, scene.start(t, scene.payload(t, event)))
+	}
+	time.Sleep(asyncLockHold)
+	release()
+	released = true
+	for i, proc := range procs {
+		t.Run(events[i], func(t *testing.T) { wantQuietExit(t, proc) })
+	}
+	if got := scene.missedLines(t); got != "" {
+		t.Errorf("missed.log = %q, want none: no async hook gave its event up", got)
+	}
+	for i, proc := range procs {
+		if proc.stderr.Len() != 0 {
+			t.Errorf("%s said on stderr: %q", events[i], proc.stderr)
+		}
+	}
+	for table, event := range map[string]string{"calls": "", "events": "UserPromptSubmit"} {
+		query := "SELECT COUNT(*) FROM " + table
+		if event != "" {
+			query += " WHERE event = '" + event + "'"
+		}
+		if n := scene.lab.count(query); n == 0 {
+			t.Errorf("%s holds no row after the lock freed", table)
+		}
+	}
+	if n := scene.lab.count("SELECT COUNT(*) FROM faults WHERE stage IN ('store', 'terminated')"); n != 0 {
+		t.Errorf("%d store or terminated faults:\n%s", n, strings.Join(scene.lab.dump()["faults"], "\n"))
+	}
+}
+
 // batchStall is the gate of callmeter_test_stall, a SQL function a test's
 // trigger calls inside a run's batch: with no gate it returns at once,
 // otherwise it closes entered once and returns when release closes.

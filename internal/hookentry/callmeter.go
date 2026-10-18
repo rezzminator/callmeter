@@ -551,18 +551,24 @@ const storeWaitReserve = 400 * time.Millisecond
 // records it, otherwise the strictest bound there is: an undecoded or unknown
 // event may be any hook. The wait is half the timeout less the reserve, so a
 // statement that succeeds after a full wait and the next that then fails still
-// end inside it, and never more than callmeter.BusyTimeout.
+// end inside it, and never more than callmeter.BusyTimeout, except for a
+// recorded async event, which no one waits on and which waits up to
+// callmeter.AsyncBusyTimeout: a write lock held past BusyTimeout (a report on a
+// large store) must not cost it its event.
 func storeWait(event string) time.Duration {
 	timeout, ok := hookTimeouts[event]
+	limit := callmeter.BusyTimeout
 	if !ok {
 		timeout = asyncHookTimeout
-		if !recordedEvent(event) {
+		if recordedEvent(event) {
+			limit = callmeter.AsyncBusyTimeout
+		} else {
 			for _, bound := range hookTimeouts {
 				timeout = min(timeout, bound)
 			}
 		}
 	}
-	return min((timeout-storeWaitReserve)/2, callmeter.BusyTimeout)
+	return min((timeout-storeWaitReserve)/2, limit)
 }
 
 // recordedEvent reports whether callmeter records the hook event name: one of
@@ -645,9 +651,7 @@ func (run *callmeterRun) record() {
 			run.sweepSession(true)
 			run.recoverTurnEnd()
 			if run.skipped > 0 {
-				run.fault(callmeter.StageTranscript, "", fmt.Errorf(
-					"SessionEnd spent its %v budget: %d transcript reads skipped, their requests and calls left as their hooks wrote them",
-					sessionEndBudget, run.skipped))
+				run.fault(callmeter.StageTranscript, "", &sessionEndBudgetSpent{budget: sessionEndBudget, skipped: run.skipped})
 			}
 		}
 		run.endsTurn = p.HookEventName == callmeter.EventStopFailure
@@ -655,6 +659,20 @@ func (run *callmeterRun) record() {
 	if run.batches == 0 {
 		run.write(p.ToolUseID, nil) // this run's own rows: events, turns, the session
 	}
+}
+
+// sessionEndBudgetSpent is the fault of a SessionEnd whose budget ran out
+// before every transcript read: an expected outcome, the skipped reads left to
+// report-time recovery, so its plugin log row is info, not a warning
+// (faultHeld). Its faults row and message are the same as ever.
+type sessionEndBudgetSpent struct {
+	budget  time.Duration
+	skipped int
+}
+
+func (e *sessionEndBudgetSpent) Error() string {
+	return fmt.Sprintf("SessionEnd spent its %v budget: %d transcript reads skipped, their requests and calls left as their hooks wrote them",
+		e.budget, e.skipped)
 }
 
 // sessionEndBudget bounds SessionEnd's transcript reads, which start after its
@@ -1631,7 +1649,11 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 		return
 	}
 	session := run.payload.SessionID
-	applog.Failure(run.stderr, run.sink, stage, session, toolUseID, cause)
+	var row applog.Row
+	if errors.As(cause, new(*sessionEndBudgetSpent)) {
+		row = applog.Row{Level: "info", Event: "session-end-budget-spent", Where: "internal/hookentry/callmeter.go#sessionEndBudget"}
+	}
+	applog.FailureAt(run.stderr, run.sink, stage, session, toolUseID, cause, row)
 	if run.store == nil { // no store opened (OpenDBWaiting), or it closed
 		take()
 		run.giveUp(*hold, toolUseID, cause)
