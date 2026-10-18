@@ -5,7 +5,7 @@
 # one:
 #   - plugins/callmeter/.claude-plugin/plugin.json  "version"   (the reference)
 #   - .claude-plugin/marketplace.json               the plugin entry's "version"
-#   - README.md                                     the badge/version-{X}- badge
+#   - README.md                                     the badge/version-{X}- badge (`--` for a dash)
 #   - CHANGELOG.md                                  a `## [{X}]` heading
 # --release also requires the CHANGELOG heading to carry a date,
 # `## [{X}] — YYYY-MM-DD`, and the committed SHA256SUMS to equal what a fresh
@@ -69,7 +69,9 @@ disagree() {
 market_version="$(json_version "$marketplace")"
 [[ "$market_version" == "$version" ]] || disagree "$marketplace" "${market_version:-nothing}"
 
-badge_version="$(sed -n 's/.*badge\/version-\([0-9][0-9A-Za-z.+_]*\)-.*/\1/p' "$root/$readme" | head -n 1)"
+# shields.io writes a literal dash as `--`, so a prerelease badge reads
+# `version-0.4.5--dev.1-blue`; the single dash ends the version.
+badge_version="$(sed -En 's/.*badge\/version-([0-9]([0-9A-Za-z.+_]|--)*)-.*/\1/p' "$root/$readme" | head -n 1 | sed 's/--/-/g')"
 [[ "$badge_version" == "$version" ]] || disagree "$readme badge" "${badge_version:-nothing}"
 
 heading_re="^## \\[$(printf '%s' "$version" | sed 's/[.[\*^$]/\\&/g')\\]"

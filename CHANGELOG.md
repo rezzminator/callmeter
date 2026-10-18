@@ -4,6 +4,14 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.5-dev.1] — 2026-10-18
+
+### Changed
+- The version moves off 0.4.4 so an installed copy refreshes its cached binary checksums (`libexec/SHA256SUMS`).
+
+### Fixed
+- `scripts/release-check.sh` reads a prerelease README badge: shields.io writes its dash as `--` (`version-0.4.5--dev.1-blue`), which the check decodes instead of stopping at the first dash.
+
 ## [0.4.4] — 2026-10-17
 
 ### Changed
