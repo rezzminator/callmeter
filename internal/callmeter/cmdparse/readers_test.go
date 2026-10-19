@@ -158,6 +158,84 @@ func TestShellAttribution(t *testing.T) {
 	}
 }
 
+func TestWholeFileReaders(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		command string
+		want    []string
+	}{
+		{"less a", []string{"a"}},
+		{"more a b", []string{"a", "b"}},
+		{"nl a", []string{"a"}},
+		{"bat -n a", []string{"a"}},
+		{"less -- -f", []string{"-f"}},
+		{"bat -n -", nil},
+		{"bat -l a b", []string{"b"}},
+		{"bat -pla b", []string{"b"}},
+		{"bat --language a b", []string{"b"}},
+		{"bat --language=a b", []string{"b"}},
+		{"bat -r 1:10 b", []string{"b"}},
+		{"bat --line-range=1:10 b", []string{"b"}},
+		{"bat cache --build", nil},
+		{"nl -b a b", []string{"b"}},
+		{"nl -ba b", []string{"b"}},
+		{"nl -w 3 b", []string{"b"}},
+		{"nl --number-separator a b", []string{"b"}},
+		{"less -p a b", []string{"b"}},
+		{"less +G b", []string{"b"}},
+		{"more +10 b", []string{"b"}},
+		{"more -n 10 b", []string{"b"}},
+		{"bat -- -l a", []string{"-l", "a"}},
+		{"less -- +G a", []string{"+G", "a"}},
+		{"bat -l", nil},
+		{"nl --number-separator", nil},
+		{`awk '{print}' a b`, []string{"a", "b"}},
+		{`awk a b`, []string{"b"}}, // Even an existing file is program text here.
+		{`awk -f prog.awk a`, []string{"prog.awk", "a"}},
+		{`awk -fprog.awk a b`, []string{"prog.awk", "a", "b"}},
+		{`awk -f prog.awk -f other.awk a`, []string{"prog.awk", "other.awk", "a"}},
+		{`awk -v x=a -F b '{print}' a`, []string{"a"}},
+		{`awk -vx=a -Fb '{print}' a b`, []string{"a", "b"}},
+		{`awk -v x=a -F b -f prog.awk a`, []string{"prog.awk", "a"}},
+		{`awk -- '{print}' -f a`, []string{"-f", "a"}},
+		{`awk -f prog.awk -- -v a`, []string{"prog.awk", "-v", "a"}},
+		{`awk '{print}' -f a`, []string{"-f", "a"}}, // Options end at the program operand.
+		{`awk '{print}' x=a a`, []string{"a"}},
+		{`awk -f prog.awk x=a a`, []string{"prog.awk", "a"}},
+		{`awk -f prog.awk`, []string{"prog.awk"}},
+		{`awk '{print}' -`, nil},
+		{`awk -f`, nil},
+		{`awk -v`, nil},
+		{`awk -F`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.command, func(t *testing.T) {
+			t.Parallel()
+			cwd := fixture(t, "a", "b", "prog.awk", "other.awk", "x=a", "-f", "-v", "-l", "+G")
+			var want []FileRef
+			for _, name := range tc.want {
+				want = append(want, ref(cwd, name, ActionReadWhole, ""))
+			}
+			assertFiles(t, parseOne(t, cwd, tc.command, nil), want)
+		})
+	}
+}
+
+func TestReaderUnresolvedOptionsStayUnknown(t *testing.T) {
+	t.Parallel()
+	for _, command := range []string{"awk $opts a b", "awk -- $program a b", "bat $opts a b"} {
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			cwd := fixture(t, "a", "b")
+			parts := parseOne(t, cwd, command, nil)
+			assertFiles(t, parts, []FileRef{ref(cwd, "a", ActionUnknown, ""), ref(cwd, "b", ActionUnknown, "")})
+			if len(parts) != 1 || !strings.Contains(parts[0].Error, "unresolved expansion") {
+				t.Fatalf("parts = %+v, want visible unresolved-expansion note", parts)
+			}
+		})
+	}
+}
+
 // A known reader or writer naming a path that does not exist yet (a scratch
 // file, a heredoc's write target) attributes it with Exists false; the corpus
 // lost every `cat > f <<EOF` write. An unknown program's words, a metadata
