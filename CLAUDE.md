@@ -28,7 +28,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
 - version places: the manifest, the marketplace entry, the README badge and the `CHANGELOG.md` heading, kept in agreement · `scripts/release-check.sh`
-- release: tag `v{version}` on `main` builds and publishes the four binaries · `.github/workflows/release.yml`, `scripts/build-release.sh`
+- release: merging the `develop` -> `main` pull request tags `v{version}` on the merge commit and publishes the four binaries; no tag is pushed by hand · `.github/workflows/release.yml`, `scripts/build-release.sh`
 - testing manual: what a change owes in tests, and every run command · `docs/testing.md`
 
 # Runtime
@@ -41,12 +41,13 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - Leak gate: `scripts/leak-check.sh`; in a worktree, `LEAK_TERMS={checkout}/scripts/leak-terms.txt scripts/leak-check.sh`.
 - Validate: `claude plugin validate --strict .` (the marketplace) and `claude plugin validate --strict plugins/callmeter` (the plugin)
 - Version places: `scripts/release-check.sh`
+- Release check: `make release-check`, after `git fetch origin main`, runs every check the release pull request runs: `make check`, `make leak`, `make release`; `make release` fails on `develop` between releases by design (undated heading, stale `SHA256SUMS`).
 - e2e: `CALLMETER_E2E=1 go test ./e2e/... -count=1`; real Claude Code, costs tokens.
 - Scratch: `/tmp/callmeter/{purpose}/`
 
 ## CI
 
-- `.github/workflows/ci.yml` on every push to `{develop|main}` and every pull request: gofmt, vet, tests, both validates, the leak gate.
+- `.github/workflows/release.yml` on every pull request to `main`, never on a push: `check` (gofmt, vet, tests, both validates, the leak gate) and `release` (the version moved past main's, `scripts/release-check.sh --release`, non-empty CHANGELOG notes), each a `make` target; merging it runs `publish`, which tags `v{version}` and publishes.
 
 ## Dev install
 
@@ -72,7 +73,11 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 ## Git
 
 - Git writes go through the `gitter` agent.
-- Work lands on `develop`; `main` moves only by release.
+- Work lands on `develop`; `develop` is protected by the ruleset `develop keeps its history`: never force-push or delete it.
+- `main` is protected by `main is release-only`: it moves only by merging the `develop` -> `main` pull request with a merge commit, after `check` and `release` pass; never a direct push, never an admin override.
+- Every pull request merged into `main` publishes: its version moves past main's, and a pre-release version (`-dev.N`) is bumped to the real release version in that pull request.
+- Before opening it: `git fetch origin main`, then `make release-check` passes.
+- After the merge, the `publish` job tags `v{version}` on the merge commit and creates the GitHub release; nobody pushes a tag by hand.
 
 ## Plugin
 

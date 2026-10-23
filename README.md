@@ -6,7 +6,7 @@
 
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
-[![CI](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml)
+[![CI](https://github.com/rezzminator/callmeter/actions/workflows/release.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/release.yml)
 [![Version](https://img.shields.io/badge/version-0.4.5--dev.3-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
@@ -292,10 +292,11 @@ scripts/leak-check.sh
 claude plugin validate --strict .
 claude plugin validate --strict plugins/callmeter
 scripts/release-check.sh
+make release-check                                # every check of a release pull request
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `scripts/release-check.sh --release`, and is tagged `v{version}` on `main`; `release.yml` builds the four binaries and publishes them.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
 
 ## 🎓 Built with Professor
 
