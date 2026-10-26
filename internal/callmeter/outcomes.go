@@ -152,11 +152,11 @@ func BashCommand(input json.RawMessage) (string, error) {
 }
 
 // TestRunnerOf names the test runner a shell command starts: go, pytest, npm,
-// vitest or cargo, "" when none. It reads the first segment (split on `;`,
-// `&&`, `||`, `|`, `&` and a newline, never inside quotes) whose leading words —
-// after NAME=value assignments and env, timeout or nice wrappers — are
-// `go [-C dir] test`, `pytest`,
-// `python[3] -m pytest`, `npm test`, `npm run test`, `npm t`, `[npx ]vitest` or
+// pnpm, yarn, bun, vitest, jest or cargo, "" when none. It reads the first
+// segment (split on `;`, `&&`, `||`, `|`, `&` and a newline, never inside quotes)
+// whose leading words — after NAME=value assignments and env, timeout or nice
+// wrappers — are `go [-C dir] test`, `pytest`, `python[3] -m pytest`,
+// `{npm,pnpm,yarn,bun} [run] test`, `npm t`, `[npx ]{vitest,jest}` or
 // `cargo test`. A runner's name mentioned as an argument (`echo go test`) is
 // not a run.
 func TestRunnerOf(command string) string {
@@ -245,10 +245,15 @@ unwrap:
 		return "go"
 	case at(0) == "pytest", pythonCommand.MatchString(at(0)) && at(1) == "-m" && at(2) == "pytest":
 		return "pytest"
-	case at(0) == "npm" && (at(1) == "test" || at(1) == "t" || at(1) == "run" && at(2) == "test"):
+	case at(0) == "npm" && at(1) == "t":
 		return "npm"
-	case at(0) == "vitest", at(0) == "npx" && at(1) == "vitest":
-		return "vitest"
+	case (at(0) == "npm" || at(0) == "pnpm" || at(0) == "yarn" || at(0) == "bun") &&
+		(at(1) == "test" || at(1) == "run" && at(2) == "test"):
+		return at(0)
+	case at(0) == "vitest" || at(0) == "jest":
+		return at(0)
+	case at(0) == "npx" && (at(1) == "vitest" || at(1) == "jest"):
+		return at(1)
 	case at(0) == "cargo" && at(1) == "test":
 		return "cargo"
 	}

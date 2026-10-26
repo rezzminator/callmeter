@@ -119,3 +119,42 @@ func TestReleaseCheckComparesSumsOnlyForARelease(t *testing.T) {
 		})
 	}
 }
+
+// TestReleaseCheckReadsAPrereleaseBadge: shields.io writes a literal dash in a
+// badge as `--`, so a prerelease version such as 0.4.5-dev.1 sits in the
+// README as `badge/version-0.4.5--dev.1-blue`; the check decodes it and agrees.
+func TestReleaseCheckReadsAPrereleaseBadge(t *testing.T) {
+	const pre = "9.9.10-dev.1"
+	tests := []struct {
+		name     string
+		badge    string
+		wantCode int
+		wantOut  string
+	}{
+		{"an escaped prerelease badge agrees", "9.9.10--dev.1", 0, "ok: " + pre},
+		{"a badge naming only the release disagrees", "9.9.10", 1, "README.md badge says '9.9.10'"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			root := tree(t, staleSums, "## ["+pre+"]")
+			files := map[string]string{
+				"plugins/callmeter/.claude-plugin/plugin.json": `{"name":"callmeter","version":"` + pre + `"}`,
+				".claude-plugin/marketplace.json":              `{"plugins":[{"name":"callmeter","version":"` + pre + `"}]}`,
+				"README.md":                                    "[![Version](https://img.shields.io/badge/version-" + tc.badge + "-blue)](./CHANGELOG.md)\n",
+			}
+			for rel, body := range files {
+				if err := os.WriteFile(filepath.Join(root, rel), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			code, out := run(t, root)
+			if code != tc.wantCode {
+				t.Fatalf("exit %d, want %d; output:\n%s", code, tc.wantCode, out)
+			}
+			if !strings.Contains(out, tc.wantOut) {
+				t.Fatalf("output lacks %q:\n%s", tc.wantOut, out)
+			}
+		})
+	}
+}

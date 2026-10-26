@@ -27,6 +27,10 @@ func (p *callParser) attribute(program string, args []arg) []FileRef {
 		return nil
 	case "cat", "wc":
 		return p.named(operands(args), ActionReadWhole, "")
+	case "less", "more", "nl", "bat":
+		return p.wholeReader(program, args)
+	case "awk":
+		return p.awk(args)
 	case "head", "tail":
 		return p.headTail(program, args)
 	case "sed":
@@ -56,6 +60,60 @@ func operands(args []arg) []arg {
 		}
 	}
 	return out
+}
+
+// wholeReader removes option values and pager commands before attributing
+// operands. Like cat, these readers use whole-file attribution even when their
+// display options select only part of the input.
+func (p *callParser) wholeReader(program string, args []arg) []FileRef {
+	var short, long string
+	switch program {
+	case "less":
+		short = "bDhjkoOpPtTxyz#"
+		long = "buffers color jump-target lesskey-file log-file LOG-FILE pattern prompt tag tag-file tabs max-forw-scroll window shift"
+	case "more":
+		short, long = "n", "lines"
+	case "nl":
+		short = "bdfhilnsvw"
+		long = "body-numbering section-delimiter footer-numbering header-numbering line-increment join-blank-lines number-format number-separator starting-line-number number-width"
+	case "bat":
+		short = "lrmH"
+		long = "language line-range map-syntax highlight-line tabs terminal-width color theme style wrap paging pager italic decorations file-name diff-context config-file"
+		if len(args) > 0 && args[0].resolved && args[0].text == "cache" {
+			return nil // A cache subcommand reads no displayed file operand.
+		}
+	}
+	var files []arg
+	flags := true
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case flags && !a.resolved:
+			p.notes = append(p.notes, program+" options contain an unresolved expansion; files left unknown")
+			return p.plain(args, ActionUnknown)
+		case flags && a.text == "--":
+			flags = false
+		case flags && (program == "less" || program == "more") && strings.HasPrefix(a.text, "+"):
+			// +G, +10 and +/pattern are initial pager commands.
+		case flags && strings.HasPrefix(a.text, "--"):
+			name, _, joined := strings.Cut(a.text[2:], "=")
+			if !joined && slices.Contains(strings.Fields(long), name) && i+1 < len(args) {
+				i++
+			}
+		case flags && len(a.text) > 1 && a.text[0] == '-':
+			for j := 1; j < len(a.text); j++ {
+				if strings.IndexByte(short, a.text[j]) >= 0 {
+					if j == len(a.text)-1 && i+1 < len(args) {
+						i++
+					}
+					break
+				}
+			}
+		default:
+			files = append(files, a)
+		}
+	}
+	return p.named(files, ActionReadWhole, "")
 }
 
 // findStarts returns find's starting points: after its leading -H/-L/-P
@@ -166,6 +224,52 @@ func (p *callParser) headTail(program string, args []arg) []FileRef {
 		rng = "bytes " + rng
 	}
 	return p.named(files, ActionReadRange, rng)
+}
+
+// awk reads its -f program files and its data operands. Without -f, the first
+// operand is program text; -v and -F consume values, not files. Options end at
+// -- or the first operand, and data assignments name no file.
+func (p *callParser) awk(args []arg) []FileRef {
+	var files []arg
+	haveProgram, flags := false, true
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case (flags || !haveProgram) && !a.resolved:
+			p.notes = append(p.notes, "awk options or program contain an unresolved expansion; files left unknown")
+			return p.plain(args, ActionUnknown)
+		case flags && a.text == "--":
+			flags = false
+		case flags && len(a.text) > 1 && a.text[0] == '-':
+			switch a.text[1] {
+			case 'f', 'v', 'F':
+				value := a
+				if len(a.text) > 2 {
+					value.text = a.text[2:]
+				} else {
+					if i+1 >= len(args) {
+						continue
+					}
+					i++
+					value = args[i]
+				}
+				if a.text[1] == 'f' {
+					haveProgram = true
+					files = append(files, value)
+				}
+			}
+		default:
+			flags = false
+			if !haveProgram {
+				haveProgram = true
+				continue
+			}
+			if !assignWord.MatchString(a.text) {
+				files = append(files, a)
+			}
+		}
+	}
+	return p.named(files, ActionReadWhole, "")
 }
 
 var sedRange = regexp.MustCompile(`^\s*(\d+|\$)(?:\s*,\s*(\d+|\$))?\s*p\s*(?:;\s*\d*\s*q\s*)?;?\s*$`)

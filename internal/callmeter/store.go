@@ -31,6 +31,14 @@ const SchemaVersion = 1
 // caller sets no tighter bound (OpenDBWaiting).
 const BusyTimeout = 5 * time.Second
 
+// AsyncBusyTimeout is how long a statement of a recorded async hook waits on a
+// concurrent writer: Claude Code never waits on such a hook, and a report's
+// write transaction on a large store can hold the lock for longer than
+// BusyTimeout, so a hook that gave up at BusyTimeout lost its event. A sync
+// hook, or an event no hook of the plugin is known to run, keeps BusyTimeout
+// or the tighter bound its own timeout sets (hookentry.storeWait).
+const AsyncBusyTimeout = 120 * time.Second
+
 // SourceHook is the source a hook's write sets: the hook wrote the row.
 const SourceHook = "hook"
 

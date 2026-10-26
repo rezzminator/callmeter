@@ -4,6 +4,17 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-10-27
+
+### Fixed
+
+- A recorded async hook (every event but `SessionStart`, `SessionEnd` and `StopFailure`) waits up to 120 s for a concurrent writer, where it gave up after 5 s: a report's write transaction on a large store can hold the write lock longer than that, and the hooks that met it lost their events (`store-busy-gave-up`, each left as a `terminated by store busy` line in `missed.log`). Claude Code never waits on an async hook, and a signal still ends the wait at once. The sync hooks keep their bounds (`SessionEnd` and `StopFailure` 800 ms, `SessionStart` 5 s), as does an event no hook is known to run.
+- A `SessionEnd` that ran out of its 1.2 s budget before every transcript read, an expected outcome that report-time recovery completes, no longer logs the plugin warning `transcript-unreadable`: its plugin log row is the info row `session-end-budget-spent`. Its `faults` row and message are unchanged.
+- `less`, `more`, `nl` and `bat` attribute the files they name as whole reads, as `cat` does, where their operands were `unknown` (#1). Their separated and joined value-taking options are consumed, never read as files; a `less` or `more` `+command` (`+G`, `+/pattern`) is no file unless it follows `--`, and a `bat cache` subcommand attributes no displayed file. A reader option holding an unresolved expansion leaves the existing argument files `unknown` with a parser note.
+- `awk` attributes the files it reads: its `-f` program files and its data operands, never the inline program text, the values of `-v` and `-F`, a data assignment `x=value` or the standard input `-`. The joined `-fprog.awk`, `-vx=a` and `-F,` forms read as the split ones, `--` ends the options and options stop at the first operand; an option or the program text holding an unresolved expansion leaves the existing argument files `unknown` with a parser note (#3). `cmdparse.Version` moves from 7 to 8, so the next report parses historical commands again and refreshes their stored parts.
+- The outcomes report names the test runner for `jest` and `npx jest` (`jest`) and for `pnpm`, `yarn` and `bun` `test` or `run test` (each runner named for its manager); a runner's name given as an argument of another command is not a run (#2).
+- `scripts/release-check.sh` reads a prerelease README badge: shields.io writes its dash as `--` (`version-0.4.5--dev.1-blue`), which the check decodes instead of stopping at the first dash.
+
 ## [0.4.4] — 2026-10-17
 
 ### Changed
