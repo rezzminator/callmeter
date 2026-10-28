@@ -42,10 +42,9 @@ func tree(t *testing.T, committed, changelogHeading string) string {
 		"scripts/release-check.sh":                     string(src),
 		"scripts/build-release.sh":                     stubBuild,
 		"plugins/callmeter/.claude-plugin/plugin.json": `{"name":"callmeter","version":"` + version + `"}`,
-		".claude-plugin/marketplace.json":              `{"plugins":[{"name":"callmeter","version":"` + version + `"}]}`,
-		"README.md":                                    "[![Version](https://img.shields.io/badge/version-" + version + "-blue)](./CHANGELOG.md)\n",
-		"CHANGELOG.md":                                 "# Changelog\n\n" + changelogHeading + "\n",
-		"plugins/callmeter/libexec/SHA256SUMS":         committed,
+		"README.md":                            "[![Version](https://img.shields.io/badge/version-" + version + "-blue)](./CHANGELOG.md)\n",
+		"CHANGELOG.md":                         "# Changelog\n\n" + changelogHeading + "\n",
+		"plugins/callmeter/libexec/SHA256SUMS": committed,
 	}
 	for rel, body := range files {
 		p := filepath.Join(root, rel)
@@ -140,8 +139,7 @@ func TestReleaseCheckReadsAPrereleaseBadge(t *testing.T) {
 			root := tree(t, staleSums, "## ["+pre+"]")
 			files := map[string]string{
 				"plugins/callmeter/.claude-plugin/plugin.json": `{"name":"callmeter","version":"` + pre + `"}`,
-				".claude-plugin/marketplace.json":              `{"plugins":[{"name":"callmeter","version":"` + pre + `"}]}`,
-				"README.md":                                    "[![Version](https://img.shields.io/badge/version-" + tc.badge + "-blue)](./CHANGELOG.md)\n",
+				"README.md": "[![Version](https://img.shields.io/badge/version-" + tc.badge + "-blue)](./CHANGELOG.md)\n",
 			}
 			for rel, body := range files {
 				if err := os.WriteFile(filepath.Join(root, rel), []byte(body), 0o644); err != nil {

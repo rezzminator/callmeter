@@ -36,7 +36,7 @@ Decisions live in this file. A change lands here first, then in the code. How it
 
 ## The plugin
 
-The repository is a one-plugin marketplace. `.claude-plugin/marketplace.json` at the root lists the plugin `callmeter`, sourced as a `git-subdir` of this repository at `plugins/callmeter`, ref `main`. Only what installs lives under `plugins/callmeter/`:
+The repository has no marketplace of its own. Professor's marketplace lists the plugin `callmeter`, sourced as a `git-subdir` of this repository at `plugins/callmeter`, ref `main`; it installs as `callmeter@professor`. Only what installs lives under `plugins/callmeter/`:
 
 | Path | Holds |
 | --- | --- |

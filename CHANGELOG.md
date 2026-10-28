@@ -4,6 +4,10 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+### Changed
+
+- Installs as `callmeter@professor` from the professor marketplace; this repository's own marketplace file is gone, and the release check no longer reads it.
+
 ## [0.4.5] — 2026-10-27
 
 ### Fixed

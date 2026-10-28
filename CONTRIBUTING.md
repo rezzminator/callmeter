@@ -35,7 +35,6 @@ Work lands on `develop`, the default branch; open pull requests against it. `mai
 go test ./...
 go vet ./...
 gofmt -l .                                   # prints nothing
-claude plugin validate --strict .
 claude plugin validate --strict plugins/callmeter
 ```
 
@@ -48,7 +47,7 @@ claude plugin validate --strict plugins/callmeter
 
 ## CI and the leak gate
 
-CI (`.github/workflows/release.yml`) runs on every pull request to `main`: gofmt, vet, the tests, both plugin validates and the leak gate (`scripts/leak-check.sh`), and on a release pull request the release checks; `make release-check` runs the same checks locally. The leak gate reads its private term list from a repository secret, and GitHub gives no secrets to pull requests from forks, so CI skips that one step on a fork's pull request: a maintainer runs it before merging.
+CI (`.github/workflows/release.yml`) runs on every pull request to `main`: gofmt, vet, the tests, the plugin validate and the leak gate (`scripts/leak-check.sh`), and on a release pull request the release checks; `make release-check` runs the same checks locally. The leak gate reads its private term list from a repository secret, and GitHub gives no secrets to pull requests from forks, so CI skips that one step on a fork's pull request: a maintainer runs it before merging.
 
 To run it yourself, put your own username and host name in `scripts/leak-terms.txt` (gitignored), one lowercase regex per line, then run `scripts/leak-check.sh`.
 

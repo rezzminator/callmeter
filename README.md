@@ -289,14 +289,13 @@ go test ./internal/<pkg>/ -run <Test> -count=1   # affected
 go test ./...                                     # full
 go vet ./... && gofmt -l .                        # lint; gofmt prints nothing
 scripts/leak-check.sh
-claude plugin validate --strict .
 claude plugin validate --strict plugins/callmeter
 scripts/release-check.sh
 make release-check                                # every check of a release pull request
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
 
 ## 🎓 Built with Professor
 
