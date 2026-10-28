@@ -5,7 +5,6 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 # Vocabulary
 
 - plugin: what installs into Claude Code · `plugins/callmeter/`
-- marketplace: the plugin listing · `.claude-plugin/marketplace.json`
 - manifest: the plugin's version and author · `plugins/callmeter/.claude-plugin/plugin.json`
 - hooks: every registered event runs the wrapper with `hook`, async · `plugins/callmeter/hooks/hooks.json`
 - wrapper: the POSIX sh entry every hook and both skills run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
@@ -27,7 +26,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - e2e: real `claude -p` runs reading the store they wrote · `e2e/`
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
-- version places: the manifest, the marketplace entry, the README badge and the `CHANGELOG.md` heading, kept in agreement · `scripts/release-check.sh`
+- version places: the manifest, the README badge and the `CHANGELOG.md` heading, kept in agreement · `scripts/release-check.sh`
 - release: merging the `develop` -> `main` pull request tags `v{version}` on the merge commit and publishes the four binaries; no tag is pushed by hand · `.github/workflows/release.yml`, `scripts/build-release.sh`
 - testing manual: what a change owes in tests, and every run command · `docs/testing.md`
 
@@ -39,7 +38,7 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - Full: `go test ./...`
 - Lint: `go vet ./...`, and `"$(go env GOROOT)/bin/gofmt" -l .` printing nothing: the toolchain's own gofmt, since a `gofmt` on `PATH` from another Go formats differently.
 - Leak gate: `scripts/leak-check.sh`; in a worktree, `LEAK_TERMS={checkout}/scripts/leak-terms.txt scripts/leak-check.sh`.
-- Validate: `claude plugin validate --strict .` (the marketplace) and `claude plugin validate --strict plugins/callmeter` (the plugin)
+- Validate: `claude plugin validate --strict plugins/callmeter`
 - Version places: `scripts/release-check.sh`
 - Release check: `make release-check`, after `git fetch origin main`, runs every check the release pull request runs: `make check`, `make leak`, `make release`; `make release` fails on `develop` between releases by design (undated heading, stale `SHA256SUMS`).
 - e2e: `CALLMETER_E2E=1 go test ./e2e/... -count=1`; real Claude Code, costs tokens.
@@ -47,18 +46,18 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## CI
 
-- `.github/workflows/release.yml` on every pull request to `main`, never on a push: `check` (gofmt, vet, tests, both validates, the leak gate) and `release` (the version moved past main's, `scripts/release-check.sh --release`, non-empty CHANGELOG notes), each a `make` target; merging it runs `publish`, which tags `v{version}` and publishes.
+- `.github/workflows/release.yml` on every pull request to `main`, never on a push: `check` (gofmt, vet, tests, the plugin validate, the leak gate) and `release` (the version moved past main's, `scripts/release-check.sh --release`, non-empty CHANGELOG notes), each a `make` target; merging it runs `publish`, which tags `v{version}` and publishes.
 
 ## Dev install
 
-- On a Professor alpha host whose `claude.plugins` names callmeter bare or is unset, `pfm install` owns this install: it builds the binary into the binary cache, keeping the replaced one as `callmeter.prev`, then refreshes the marketplace copy; the steps below are for a host without it.
-- Marketplace copy: `~/.local/share/callmeter-dev`, the `callmeter-dev` directory marketplace.
-- Plugin cache: `~/.claude/plugins/cache/callmeter-dev/callmeter/{version}`
+- On a Professor alpha host whose `claude.plugins` names callmeter bare or is unset, `pfm install` owns this install: it builds the binary into the binary cache, keeping the replaced one as `callmeter.prev`, then refreshes the plugin copy; the steps below are for a host without it.
+- Plugin copy: `~/.local/share/professor-dev/plugins/callmeter`, in the `professor` directory marketplace.
+- Plugin cache: `~/.claude/plugins/cache/professor/callmeter/{version}`
 - Binary cache: `~/.local/state/callmeter/bin/{version}/callmeter`
-- Deploy order: the new version's binary into the binary cache first, then the marketplace copy; a plugin version without its cached binary falls through to the download, which an unreleased version's `SHA256SUMS` rejects, and its hooks drop events.
+- Deploy order: the new version's binary into the binary cache first, then the plugin copy; a plugin version without its cached binary falls through to the download, which an unreleased version's `SHA256SUMS` rejects, and its hooks drop events.
 - A binary fix deploys to every live hook by atomically replacing the cached binary: build beside it, then `mv -f` onto it.
-- A `hooks.json` change also needs the marketplace copy and the plugin cache refreshed, then `/reload-plugins`.
-- Refresh the marketplace with `claude plugin marketplace update callmeter-dev` exactly as written: a `CLAUDE_CONFIG_DIR` override pointing at `~/.claude` makes `claude` write `.claude.json` and `backups/` into the shared store, and `pfm`'s store-guard hook denies it.
+- A `hooks.json` change also needs the plugin copy and the plugin cache refreshed, then `/reload-plugins`.
+- Refresh the marketplace with `claude plugin marketplace update professor` exactly as written: a `CLAUDE_CONFIG_DIR` override pointing at `~/.claude` makes `claude` write `.claude.json` and `backups/` into the shared store, and `pfm`'s store-guard hook denies it.
 
 # Rules
 
@@ -85,4 +84,4 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - A store change (a table, a column, a unit, a NULL meaning) updates `plugins/callmeter/skills/callmeter/schema.md` and any recipe in its `SKILL.md` that it touches, each recipe re-run against a snapshot.
 - An option variable beats `config.json`, which beats the default; unset or blank is absent; it takes the option's own grammar (`retention_days`: one integer 0 to 36500, 0 keeps every row); a bad one is reported by its name (stderr and a `config-env-invalid` error row) and the default applies, while an untrusted `config.json` still stops the report.
 - A new option adds its variable and its entry in the README Configuration tables' variable column.
-- Text the model reads (the skills, report output, hook output) stays unbranded; Professor's credit lives only in the READMEs and the `author` and `keywords` of the manifest and the marketplace.
+- Text the model reads (the skills, report output, hook output) stays unbranded; Professor's credit lives only in the READMEs and the `author` and `keywords` of the manifest.
