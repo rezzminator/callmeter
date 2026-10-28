@@ -9,11 +9,11 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - hooks: every registered event runs the wrapper with `hook`, async · `plugins/callmeter/hooks/hooks.json`
 - wrapper: the POSIX sh entry every hook and both skills run; resolves the binary as `$CALLMETER_BIN`, then the binary cache, then a checksum-verified download pinned in `plugins/callmeter/libexec/SHA256SUMS` · `plugins/callmeter/libexec/callmeter` · design `docs/design.md` § The wrapper
 - binary: the Go program behind `callmeter {hook|report|classify|redact|version}` · `cmd/callmeter/main.go`
-- `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset · `internal/paths/paths.go`
+- `CALLMETER_HOME`: the store's directory, `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` when unset; it places the store, settings and binary cache, never the logs · `internal/paths/paths.go`
 - settings file: the one optional config, `retention_days` alone; absent keeps every row forever, and only `callmeter report` reads it · `{CALLMETER_HOME}/config.json`, `internal/config/config.go` · design `docs/design.md` § Where the store lives
 - option variable: `CALLMETER_{OPTION}`, a settings-file option in upper snake (`CALLMETER_RETENTION_DAYS`), read over `config.json` by `config.Resolve`, the single reader, which only `callmeter report` calls · `internal/config/config.go`
 - binary cache: the installed binary per plugin version · `{CALLMETER_HOME}/bin/{version}/callmeter`
-- `missed.log`: one line per hook the wrapper could not hand to the binary, counted on the binary's next run · `{CALLMETER_HOME}/missed.log`
+- `missed.log`: one line per hook the wrapper could not hand to the binary, counted on the binary's next run · `missed.log` in the plugin log directory, `$PLUGIN_LOG_DIR/callmeter`, else `~/.local/state/callmeter/logs`
 - store: SQLite rows per tool call, request, agent, turn, event and command part · `{CALLMETER_HOME}/callmeter.db`, schema `internal/callmeter/store.go` · design `docs/design.md` § The store
 - seat: one Claude Code config dir; every seat writes the one store, its rows told apart by `seat_dir` · design `docs/design.md` § Where the store lives
 - `hookentry`: the `callmeter hook` handler, with the captured payload fixtures · `internal/hookentry/`

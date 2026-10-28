@@ -274,7 +274,7 @@ Every number the `cost` topic prints, with its source:
 | `SIDE USD` | `SUM(cost_usd_micros)` over the chat's rows with `source = 'ledger'` |
 | `LEDGER USD`, `TABLE USD` | the same sum split by `cost_source` |
 
-The price list is a copy of pfm's `internal/pricing/prices.json` rates for the Claude models, and the OpenAI rows below (callmeter is standalone and cannot import it); a price change is a new callmeter release, and a request already priced is re-priced only when its row is written again. USD per million tokens, which is micros per token (`in / out / cached`, then the long tier above 272 000 context tokens):
+The price list is callmeter's own copy of the Claude models' list rates, plus the OpenAI rows below (callmeter is standalone and imports no price table); a price change is a new callmeter release, and a request already priced is re-priced only when its row is written again. USD per million tokens, which is micros per token (`in / out / cached`, then the long tier above 272 000 context tokens):
 
 | Model | Short tier | Long tier |
 | --- | --- | --- |
@@ -485,7 +485,7 @@ Decided while building, one line each, file named:
 - It changes nothing a model sees: no hook output, no added context, no blocked call.
 - No account join: a call is tied to the seat it ran under (`seat_dir`), never to an account name.
 - No guard-fire rows and no receiver id for chat-to-chat messages.
-- No Codex or OpenCode recording; that belongs to a later pfm flight.
+- No Codex or OpenCode recording.
 - No `node -e` parsing: an unparsed, counted gap.
 - No cache cause the stored columns cannot prove: a changed prompt prefix or thinking block is `unknown` in `request_cache`. No `turn_after_thinking` cause: no stored column proves it.
 - No Windows: the wrapper is POSIX sh and the binaries are built for darwin and linux only.
