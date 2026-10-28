@@ -21,10 +21,11 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/clock"
+	"github.com/rezzminator/callmeter/internal/faultlog"
 	"github.com/rezzminator/callmeter/internal/paths"
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // callmeterPayload is the part of a hook's stdin callmeter reads, across the
@@ -100,7 +101,7 @@ type callmeterResponse struct {
 type callmeterRun struct {
 	ctx     context.Context
 	stderr  io.Writer
-	sink    applog.Sink // legacy log and level files
+	sink    faultlog.Sink // legacy log and level files
 	getenv  paths.Getenv
 	state   *terminationState // shared with the signal handler; nil = none installed
 	store   *callmeter.Store
@@ -154,13 +155,13 @@ var closeStore = func(s *callmeter.Store) error { return s.Close() }
 // that can take neither the event nor its fault the line `store unavailable:
 // {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
+	sink := faultlog.ResolveSink(getenv)
 	home, err := paths.Home(getenv)
 	if err != nil {
-		// No home, so no log file either: stderr only.
-		applog.Failure(stderr, applog.ResolveSink(getenv, ""), callmeter.StageStore, "", "", fmt.Errorf("resolve callmeter home: %w", err))
+		faultlog.Failure(stderr, sink, callmeter.StageStore, "", "", fmt.Errorf("resolve callmeter home: %w", err))
 		return 0
 	}
-	sink := applog.ResolveSink(getenv, home)
+	missed := paths.Missed(sink.Levels)
 	state := &terminationState{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -185,14 +186,14 @@ func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 		signal.Stop(signals)
 		close(done)
 	}()
-	go terminateOnSignal(signals, done, state, paths.Missed(home), sink, stderr, os.Exit)
+	go terminateOnSignal(signals, done, state, missed, sink, stderr, os.Exit)
 	seat, err := resolveCallmeterSeat(getenv)
 	if err != nil {
 		// The rows still land, without their seat; the gap is said, not hidden.
-		applog.Failure(stderr, sink, "seat", "", "", err)
+		faultlog.Failure(stderr, sink, "seat", "", "", err)
 	}
 	return runCallmeter(withTerminationState(context.Background(), state), input, stderr, callmeterFiles{
-		store: paths.Store(home), log: sink.Log, levels: sink.Levels, missed: paths.Missed(home),
+		store: paths.Store(home), log: sink.Log, levels: sink.Levels, missed: missed,
 	}, clock.Real, seat, getenv)
 }
 
@@ -304,7 +305,7 @@ func terminateOnSignal(
 	done <-chan struct{},
 	state *terminationState,
 	missed string,
-	sink applog.Sink,
+	sink faultlog.Sink,
 	stderr io.Writer,
 	exit func(int),
 ) {
@@ -316,11 +317,11 @@ func terminateOnSignal(
 			defer state.mu.Unlock()
 			if !state.accounted && !wrote {
 				if err := AppendMissed(missed, state.event, state.session, callmeter.PanicReason, clock.Real.Now()); err != nil {
-					applog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "", err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
+					faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "", err, pluginlog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
 				}
 			}
-			applog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "",
-				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
+			faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, state.session, "",
+				fmt.Errorf("signal handler panicked: %v\n%s", recovered, stack), pluginlog.Row{Event: "hook-panic", Where: "internal/hookentry/callmeter.go#terminateOnSignal"})
 			exit(0)
 		}
 	}()
@@ -335,7 +336,7 @@ func terminateOnSignal(
 	if !state.accounted {
 		if err := AppendMissed(
 			missed, state.event, state.session, callmeter.TerminatedReason+signalName(sig), clock.Real.Now()); err != nil {
-			applog.FailureAt(stderr, sink, callmeter.StageTerminated, "", "", err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal", Session: state.session})
+			faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, "", "", err, pluginlog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#terminateOnSignal", Session: state.session})
 		} else {
 			wrote = true
 		}
@@ -353,10 +354,13 @@ func terminateOnSignal(
 // break the line (missedEvent). It creates the file and its directory when
 // absent: one write, so concurrent appenders never interleave a line.
 func AppendMissed(path, event, session, reason string, now time.Time) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if path == "" {
+		return errors.New("no missed.log: no plugin log directory (PLUGIN_LOG_DIR or HOME)")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create the directory of %s: %w", path, err)
 	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
@@ -414,15 +418,11 @@ func runCallmeter(
 	seat callmeterSeat,
 	getenv paths.Getenv,
 ) int {
-	if files.levels == "" {
-		home := ""
-		if files.log != "" {
-			home = filepath.Dir(files.log)
-		}
-		files.levels = applog.LevelDir(getenv, home)
+	if files.levels == "" && files.log != "" {
+		files.levels = filepath.Dir(files.log)
 	}
 	run := &callmeterRun{
-		ctx: ctx, stderr: stderr, sink: applog.Sink{Log: files.log, Levels: files.levels}, getenv: getenv, now: timing.Now().UnixMilli(), seat: seat,
+		ctx: ctx, stderr: stderr, sink: faultlog.Sink{Log: files.log, Levels: files.levels}, getenv: getenv, now: timing.Now().UnixMilli(), seat: seat,
 		state: terminationStateOf(ctx), missed: files.missed,
 	}
 	raw, readErr := io.ReadAll(input)
@@ -515,10 +515,10 @@ func (run *callmeterRun) ingestLedger() {
 	sum, err := run.store.IngestLedgerSession(ctx, dir, run.payload.SessionID, time.UnixMilli(run.now))
 	switch {
 	case !run.deadline.IsZero() && errors.Is(err, context.DeadlineExceeded):
-		applog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "",
+		faultlog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "",
 			fmt.Errorf("cost ledger: %s budget spent during the ingest, its bytes wait for the next hook: %w", run.payload.HookEventName, err))
 	case err != nil && callmeter.IsBusy(err):
-		applog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
+		faultlog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
 	case err != nil:
 		run.faultOnce(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
 	case sum.Faults > 0:
@@ -1624,7 +1624,7 @@ func (run *callmeterRun) faultOnce(stage, toolUseID string, cause error) {
 
 func (run *callmeterRun) faultRow(once bool, stage, toolUseID string, cause error) {
 	if run.gaveUp {
-		applog.Failure(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause)
+		faultlog.Failure(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause)
 		return
 	}
 	var hold termHold
@@ -1649,11 +1649,11 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 		return
 	}
 	session := run.payload.SessionID
-	var row applog.Row
+	var row pluginlog.Row
 	if errors.As(cause, new(*sessionEndBudgetSpent)) {
-		row = applog.Row{Level: "info", Event: "session-end-budget-spent", Where: "internal/hookentry/callmeter.go#sessionEndBudget"}
+		row = pluginlog.Row{Level: "info", Event: "session-end-budget-spent", Where: "internal/hookentry/callmeter.go#sessionEndBudget"}
 	}
-	applog.FailureAt(run.stderr, run.sink, stage, session, toolUseID, cause, row)
+	faultlog.FailureAt(run.stderr, run.sink, stage, session, toolUseID, cause, row)
 	if run.store == nil { // no store opened (OpenDBWaiting), or it closed
 		take()
 		run.giveUp(*hold, toolUseID, cause)
@@ -1667,7 +1667,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 		// out without the hold, a signal meanwhile decided at once.
 		written, err := run.store.AddFaultIfFree(run.ctx, fault)
 		if err != nil {
-			applog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
+			faultlog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
 		}
 		switch {
 		case written: // the row stands, whatever failed after its commit
@@ -1684,7 +1684,7 @@ func (run *callmeterRun) faultHeld(hold *termHold, held, once bool, stage, toolU
 	}
 	err := run.store.AddFaultHeld(run.ctx, fault, take)
 	if err != nil {
-		applog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
+		faultlog.Failure(run.stderr, run.sink, callmeter.StageStore, session, toolUseID, err)
 		take()
 		run.giveUp(*hold, toolUseID, err)
 		return
@@ -1719,7 +1719,7 @@ func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string
 	session := run.payload.SessionID
 	err := AppendMissed(run.missed, run.payload.HookEventName, session, reason, clock.Real.Now())
 	if err != nil {
-		applog.FailureAt(run.stderr, run.sink, callmeter.StageTerminated, session, toolUseID, err, applog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#leaveMissedLine"})
+		faultlog.FailureAt(run.stderr, run.sink, callmeter.StageTerminated, session, toolUseID, err, pluginlog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#leaveMissedLine"})
 	}
 	hold.account()
 	run.accounted = true
@@ -1739,11 +1739,11 @@ func (run *callmeterRun) leaveMissedLine(hold termHold, toolUseID, reason string
 // stays an error. hold is the caller's, as in faultHeld.
 func (run *callmeterRun) giveUpBusy(hold termHold, stage, toolUseID string, cause error) {
 	queued := run.leaveMissedLine(hold, toolUseID, callmeter.TerminatedByStoreBusy)
-	row := applog.Row{Event: "store-busy-gave-up", Where: "internal/hookentry/callmeter.go#giveUpBusy"}
+	row := pluginlog.Row{Event: "store-busy-gave-up", Where: "internal/hookentry/callmeter.go#giveUpBusy"}
 	if queued {
 		row.Level, row.Msg = "warning", "store busy, event unrecorded, counted as a terminated fault from missed.log"
 	}
-	applog.FailureAt(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause, row)
+	faultlog.FailureAt(run.stderr, run.sink, stage, run.payload.SessionID, toolUseID, cause, row)
 }
 
 func presentString(value string) *string {

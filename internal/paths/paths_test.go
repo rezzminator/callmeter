@@ -81,13 +81,37 @@ func TestFilesUnderHome(t *testing.T) {
 	home := "/x/cm"
 	for name, tt := range map[string]struct{ got, want string }{
 		"store":    {Store(home), "/x/cm/callmeter.db"},
-		"log":      {Log(home), "/x/cm/callmeter.log"},
-		"missed":   {Missed(home), "/x/cm/missed.log"},
 		"config":   {Config(home), "/x/cm/config.json"},
 		"bincache": {BinCache(home, "0.1.0"), "/x/cm/bin/0.1.0/callmeter"},
 	} {
 		if tt.got != tt.want {
 			t.Errorf("%s = %q, want %q", name, tt.got, tt.want)
+		}
+	}
+}
+
+// TestLogsLiveInThePluginLogDirectory: callmeter.log and missed.log sit in
+// $PLUGIN_LOG_DIR/callmeter, else $HOME/.local/state/callmeter/logs, never
+// under CALLMETER_HOME; with neither set there is no log file.
+func TestLogsLiveInThePluginLogDirectory(t *testing.T) {
+	for name, tt := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"shared":  {map[string]string{"PLUGIN_LOG_DIR": "/l", "HOME": "/h", "CALLMETER_HOME": "/x/cm"}, "/l/callmeter"},
+		"home":    {map[string]string{"HOME": "/h", "CALLMETER_HOME": "/x/cm"}, "/h/.local/state/callmeter/logs"},
+		"neither": {map[string]string{"CALLMETER_HOME": "/x/cm"}, ""},
+	} {
+		dir := LogDir(func(key string) string { return tt.env[key] })
+		if dir != tt.want {
+			t.Errorf("%s: LogDir = %q, want %q", name, dir, tt.want)
+		}
+		wantLog, wantMissed := "", ""
+		if tt.want != "" {
+			wantLog, wantMissed = tt.want+"/callmeter.log", tt.want+"/missed.log"
+		}
+		if Log(dir) != wantLog || Missed(dir) != wantMissed {
+			t.Errorf("%s: Log, Missed = %q, %q, want %q, %q", name, Log(dir), Missed(dir), wantLog, wantMissed)
 		}
 	}
 }

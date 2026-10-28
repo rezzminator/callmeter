@@ -63,7 +63,7 @@ const unparsedLimit = 200
 // a handle opened before the claim's rename lands there, and the first ingest
 // after the grace writes the lines past the bytes read in its own transaction
 // and removes the file after its commit. A failed commit leaves every file for
-// the next run. A path with no file is 0, nil.
+// the next run. A path with no file is 0, nil; an empty path is an error.
 func (s *Store) IngestMissed(ctx context.Context, path string) (int, error) {
 	return s.IngestMissedHeld(ctx, path, nil)
 }
@@ -73,6 +73,9 @@ func (s *Store) IngestMissed(ctx context.Context, path string) (int, error) {
 // the files are moved or removed: a hook holds its signal handler off across
 // commit and move, so a signal there waits for both.
 func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (release func())) (n int, err error) {
+	if path == "" {
+		return 0, errNoMissedLog
+	}
 	own, err := claimMissed(path)
 	if err != nil {
 		return 0, err
@@ -326,6 +329,10 @@ func lockClaim(file string) (*os.File, []byte, os.FileInfo, error) {
 	return held, data, opened, nil
 }
 
+// errNoMissedLog refuses a missed.log path that resolved to nothing: no plugin
+// log directory, so there is no file to read, never "." in its place.
+var errNoMissedLog = errors.New("callmeter missed log: no plugin log directory (PLUGIN_LOG_DIR or HOME)")
+
 // CountMissed counts, read-only, the lines of path (missed.log) and of every
 // claim {path}.ingest-* a run left, by the stage IngestMissed would give their
 // faults (StageBinary or StageTerminated, an unparsed line StageBinary): what
@@ -333,6 +340,9 @@ func lockClaim(file string) (*os.File, []byte, os.FileInfo, error) {
 // claim {path}.done-* is not counted: its lines went into a store. A file gone
 // between its listing and its read counts nothing.
 func CountMissed(path string) (map[string]int, error) {
+	if path == "" {
+		return nil, errNoMissedLog
+	}
 	claims, err := ingestFiles(path, ingestInfix)
 	if err != nil {
 		return nil, err

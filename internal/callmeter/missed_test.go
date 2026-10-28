@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// missedPath is a missed.log beside the store, as the wrapper writes it.
+// missedPath is a missed.log in the test store's own directory.
 func missedPath(store *Store) string {
 	return filepath.Join(filepath.Dir(store.path), "missed.log")
 }
@@ -181,6 +181,20 @@ func TestIngestMissedAbsentFileIsZero(t *testing.T) {
 	}
 	if got := count(t, store, "faults"); got != 0 {
 		t.Errorf("faults holds %d rows, want 0", got)
+	}
+}
+
+// TestMissedEmptyPathIsRefused: with no plugin log directory the missed.log
+// path is "", which is a failure to say, never the working directory's files.
+func TestMissedEmptyPathIsRefused(t *testing.T) {
+	store := openTestStore(t)
+	t.Chdir(t.TempDir())
+	writeMissed(t, "missed.log", "1700000000\tPreToolUse\tbinary missing\n")
+	if n, err := store.IngestMissed(context.Background(), ""); err == nil {
+		t.Errorf("IngestMissed(\"\") = %d, nil; want an error", n)
+	}
+	if counts, err := CountMissed(""); err == nil {
+		t.Errorf("CountMissed(\"\") = %v, nil; want an error", counts)
 	}
 }
 

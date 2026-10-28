@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
+	"github.com/rezzminator/callmeter/internal/faultlog"
 	"github.com/rezzminator/callmeter/internal/paths"
 	"github.com/rezzminator/callmeter/internal/runner"
 	"github.com/rezzminator/callmeter/internal/sqlitedb"
@@ -130,7 +130,7 @@ func TestProcessConcurrentHooks(t *testing.T) {
 		t.Errorf("%d store faults under %d concurrent processes:\n%s",
 			n, hookProcesses, strings.Join(lab.dump()["faults"], "\n"))
 	}
-	missed, err := os.ReadFile(paths.Missed(callmeterHome))
+	missed, err := os.ReadFile(paths.Missed(lab.logs()))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("read missed.log: %v", err)
 	}
@@ -275,6 +275,7 @@ type signalScene struct {
 	lab    *callmeterLab
 	binary string
 	home   string // CALLMETER_HOME
+	logs   string // the plugin log directory: callmeter.log, missed.log
 	env    []string
 }
 
@@ -288,11 +289,12 @@ func newSignalScene(t *testing.T, binary string) *signalScene {
 		t.Fatalf("copy the S2 home: %v", err)
 	}
 	home := filepath.Join(lab.root, "callmeter-home")
+	logs := lab.logs()
 	lab.storePath = paths.Store(home)
-	lab.missed = paths.Missed(home)
-	lab.logPath = paths.Log(home)
+	lab.missed = paths.Missed(logs)
+	lab.logPath = paths.Log(logs)
 	return &signalScene{
-		lab: lab, binary: binary, home: home,
+		lab: lab, binary: binary, home: home, logs: logs,
 		env: append(os.Environ(),
 			"CALLMETER_HOME="+home, "HOME="+lab.home, "CLAUDE_CONFIG_DIR="+filepath.Join(lab.home, ".claude")),
 	}
@@ -412,7 +414,7 @@ func (proc *hookProcess) exit(t *testing.T) int {
 // missedLines is the content of the scene's missed.log, "" when there is none.
 func (scene *signalScene) missedLines(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(paths.Missed(scene.home))
+	data, err := os.ReadFile(paths.Missed(scene.logs))
 	if errors.Is(err, os.ErrNotExist) {
 		return ""
 	}
@@ -530,14 +532,14 @@ func TestProcessSignalledHook(t *testing.T) {
 
 	t.Run("missed.log cannot be written", func(t *testing.T) {
 		scene := newSignalScene(t, binary)
-		if err := os.MkdirAll(paths.Missed(scene.home), 0o755); err != nil { // a directory where the file goes
+		if err := os.MkdirAll(paths.Missed(scene.logs), 0o700); err != nil { // a directory where the file goes
 			t.Fatalf("make missed.log a directory: %v", err)
 		}
 		proc := scene.start(t, "")
 		time.Sleep(signalDelay)
 		proc.signal(t, syscall.SIGTERM)
 		wantQuietExit(t, proc)
-		logged, err := os.ReadFile(paths.Log(scene.home))
+		logged, err := os.ReadFile(paths.Log(scene.logs))
 		if err != nil {
 			t.Fatalf("read callmeter.log: %v", err)
 		}
@@ -548,14 +550,14 @@ func TestProcessSignalledHook(t *testing.T) {
 		}
 	})
 
-	t.Run("home cannot be written", func(t *testing.T) {
+	t.Run("log directory cannot be written", func(t *testing.T) {
 		scene := newSignalScene(t, binary)
 		parent := filepath.Join(scene.lab.root, "not-a-directory")
 		if err := os.WriteFile(parent, nil, 0o644); err != nil {
 			t.Fatalf("write %s: %v", parent, err)
 		}
-		scene.home = filepath.Join(parent, "home") // creating it fails whoever runs the test
-		scene.env = append(scene.env, "CALLMETER_HOME="+scene.home)
+		// creating it fails whoever runs the test
+		scene.env = append(scene.env, "PLUGIN_LOG_DIR="+filepath.Join(parent, "logs"))
 		proc := scene.start(t, "")
 		time.Sleep(signalDelay)
 		proc.signal(t, syscall.SIGTERM)
@@ -577,7 +579,7 @@ func (lab *callmeterLab) terminate(state *terminationState, sig os.Signal, stder
 func (lab *callmeterLab) terminateWithExit(state *terminationState, sig os.Signal, stderr io.Writer, exit func(int)) {
 	signals := make(chan os.Signal, 1)
 	signals <- sig
-	go terminateOnSignal(signals, nil, state, lab.missed, applog.Sink{Log: lab.logPath}, stderr, exit)
+	go terminateOnSignal(signals, nil, state, lab.missed, faultlog.Sink{Log: lab.logPath, Levels: filepath.Dir(lab.logPath)}, stderr, exit)
 }
 
 // await returns the handler's exit code, failing when it does not exit.
@@ -644,7 +646,7 @@ func TestTerminationAfterRecordingWritesNoLine(t *testing.T) {
 // decoded or its name would break the line, followed by the payload's session
 // id as a fourth field, the wrapper's layout, so a killed SessionEnd names its
 // session; a session id outside the field's alphabet is left out, never
-// written to break the line. The home is created when absent.
+// written to break the line. The log directory is created 0700 when absent.
 func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
 	pid := fmt.Sprintf(" (pid %d)", os.Getpid())
 	for name, run := range map[string]struct{ event, session, want string }{
@@ -666,9 +668,9 @@ func TestTerminationBeforeRecordingWritesTheLine(t *testing.T) {
 			if got := scene.missedLines(t); !missedLine.MatchString(got) || !strings.HasSuffix(got, run.want) {
 				t.Errorf("missed.log = %q, want one line ending %q", got, run.want)
 			}
-			info, err := os.Stat(scene.home)
-			if err != nil || info.Mode().Perm() != 0o755 {
-				t.Errorf("home = %v, %v; want it created 0755", info, err)
+			info, err := os.Stat(scene.logs)
+			if err != nil || info.Mode().Perm() != 0o700 {
+				t.Errorf("log directory = %v, %v; want it created 0700", info, err)
 			}
 			if stderr.Len() != 0 {
 				t.Errorf("handler stderr = %q, want nothing said for a line that was written", stderr.String())
@@ -972,7 +974,7 @@ func TestProcessStoreBusySessionEndLeavesAMissedLine(t *testing.T) {
 				t.Errorf("events holds %d SessionEnd rows, want none for the run that gave up", n)
 			}
 			store := scene.lab.db()
-			if _, err := store.IngestMissed(ctx, paths.Missed(scene.home)); err != nil {
+			if _, err := store.IngestMissed(ctx, paths.Missed(scene.logs)); err != nil {
 				t.Fatalf("ingest missed.log: %v", err)
 			}
 			if _, err := store.RecoverQuiet(ctx, time.Now().Add(time.Hour), 0); err != nil {
@@ -1023,10 +1025,12 @@ func TestProcessStoreBusyGiveUpLogLevelFollowsTheMissedLine(t *testing.T) {
 			scene := newSignalScene(t, binary)
 			levels := filepath.Join(scene.lab.root, "levels")
 			scene.env = append(scene.env, "PLUGIN_LOG_DIR="+levels)
+			scene.logs = filepath.Join(levels, "callmeter")
+			scene.lab.missed, scene.lab.logPath = paths.Missed(scene.logs), paths.Log(scene.logs)
 			start, end := scene.payload(t, "SessionStart"), scene.payload(t, "SessionEnd")
 			wantQuietExit(t, scene.start(t, start))
 			if !queued {
-				if err := os.MkdirAll(paths.Missed(scene.home), 0o700); err != nil {
+				if err := os.MkdirAll(paths.Missed(scene.logs), 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1074,6 +1078,9 @@ func TestIngestCommitWaitsForTheTerminationHold(t *testing.T) {
 	lab := scene.lab
 	payload := "not a hook payload"
 	lab.count("SELECT COUNT(*) FROM faults") // the store exists before the run
+	if err := os.MkdirAll(filepath.Dir(lab.missed), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(lab.missed, []byte("1790000001\tStop\tbinary exited 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1510,7 +1517,7 @@ func TestTerminationAppendFailureKeepsKnownLevelSession(t *testing.T) {
 	if err := os.Mkdir(missed, 0700); err != nil {
 		t.Fatal(err)
 	}
-	sink := applog.Sink{Log: filepath.Join(root, "callmeter.log"), Levels: filepath.Join(root, "levels")}
+	sink := faultlog.Sink{Log: filepath.Join(root, "callmeter.log"), Levels: filepath.Join(root, "levels")}
 	state := &terminationState{event: "PreToolUse", session: "known-session"}
 	signals := make(chan os.Signal, 1)
 	signals <- syscall.SIGTERM

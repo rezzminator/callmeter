@@ -10,9 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
+	"github.com/rezzminator/callmeter/internal/faultlog"
 	"github.com/rezzminator/callmeter/internal/paths"
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // eventStop is the main chat's turn end.
@@ -349,7 +350,7 @@ func (run *callmeterRun) sessionOf() callmeter.Session {
 	host, err := os.Hostname()
 	if err != nil {
 		// The session row lands without its host; the gap is said, not hidden.
-		applog.FailureAt(run.stderr, run.sink, "host", p.SessionID, "", fmt.Errorf("read the host name: %w", err), applog.Row{Level: "warning", Event: "host-unreadable", Where: "internal/hookentry/lifecycle.go#sessionOf"})
+		faultlog.FailureAt(run.stderr, run.sink, "host", p.SessionID, "", fmt.Errorf("read the host name: %w", err), pluginlog.Row{Level: "warning", Event: "host-unreadable", Where: "internal/hookentry/lifecycle.go#sessionOf"})
 	} else {
 		s.Host = presentString(host)
 	}

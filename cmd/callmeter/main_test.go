@@ -49,6 +49,10 @@ func newCLI(t *testing.T) cli {
 
 func (c cli) store() string { return paths.Store(c.state) }
 
+// logs is the plugin log directory the run's HOME gives: callmeter.log,
+// missed.log and the level files.
+func (c cli) logs() string { return filepath.Join(c.user, ".local", "state", "callmeter", "logs") }
+
 func (c cli) run(stdin string, args ...string) (code int, stdout, stderr string) {
 	c.t.Helper()
 	env := map[string]string{paths.EnvHome: c.state, "HOME": c.user}
@@ -121,7 +125,7 @@ func TestHookPayloadWithoutSessionIsLoggedAndFaulted(t *testing.T) {
 	if n := c.count("SELECT count(*) FROM faults WHERE stage = 'payload'"); n != 1 {
 		t.Errorf("payload faults = %d, want 1", n)
 	}
-	logged, err := os.ReadFile(paths.Log(c.state))
+	logged, err := os.ReadFile(paths.Log(c.logs()))
 	if err != nil || !strings.Contains(string(logged), `"step":"payload"`) {
 		t.Errorf("callmeter.log = %q (%v), want a JSON line for the payload fault", logged, err)
 	}
@@ -169,7 +173,7 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			c := newCLI(t)
 			c.seed() // a store for the report to read, through the real hook
 			if tc.unwritable {
-				if err := os.Mkdir(paths.Missed(c.state), 0o755); err != nil {
+				if err := os.MkdirAll(paths.Missed(c.logs()), 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -190,14 +194,14 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			if code != 0 || stdout != "" || !strings.Contains(stderr, "hook panicked: boom") || !strings.Contains(stderr, "goroutine ") {
 				t.Fatalf("hook that panics = %d, stdout %q, stderr %q; want 0, no stdout, the panic said", code, stdout, stderr)
 			}
-			assertMainPluginEvent(t, c.state, "hook-panic", "cmd/callmeter/main.go#leavePanicLine")
+			assertMainPluginEvent(t, c.logs(), "hook-panic", "cmd/callmeter/main.go#leavePanicLine")
 			if tc.unwritable {
-				assertMainPluginEvent(t, c.state, "append-missed", "cmd/callmeter/main.go#leavePanicLine")
+				assertMainPluginEvent(t, c.logs(), "append-missed", "cmd/callmeter/main.go#leavePanicLine")
 			}
-			missed, err := os.ReadFile(paths.Missed(c.state))
+			missed, err := os.ReadFile(paths.Missed(c.logs()))
 			if tc.unwritable {
-				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.state)) {
-					t.Errorf("unwritable missed.log: read error %v, append error said %v", err, strings.Contains(stderr, "open "+paths.Missed(c.state)))
+				if err == nil || !strings.Contains(stderr, "open "+paths.Missed(c.logs())) {
+					t.Errorf("unwritable missed.log: read error %v, append error said %v", err, strings.Contains(stderr, "open "+paths.Missed(c.logs())))
 				}
 				return
 			}
@@ -205,7 +209,7 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 				if !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
 					t.Fatalf("accounted panic left %d bytes in missed.log (%v), want no line", len(missed), err)
 				}
-				if logged, err := os.ReadFile(paths.Log(c.state)); err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
+				if logged, err := os.ReadFile(paths.Log(c.logs())); err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
 					t.Errorf("callmeter.log = %q (%v), want one line saying the accounted panic", logged, err)
 				}
 				code, stdout, stderr = c.run("", "report", "files")
@@ -218,7 +222,7 @@ func TestHookPanicStillExitsZero(t *testing.T) {
 			if err != nil || !regexp.MustCompile(`^[0-9]+`+regexp.QuoteMeta(tc.line)+`$`).Match(missed) {
 				t.Fatalf("missed.log = %q (%v), want exactly one line {secs}%q", missed, err, tc.line)
 			}
-			logged, err := os.ReadFile(paths.Log(c.state))
+			logged, err := os.ReadFile(paths.Log(c.logs()))
 			if err != nil || strings.Count(string(logged), "hook panicked: boom") != 1 {
 				t.Errorf("callmeter.log = %q (%v), want one line saying the panic", logged, err)
 			}
@@ -250,6 +254,9 @@ func TestReportPanicExitsOne(t *testing.T) {
 				if !noHome && name == paths.EnvHome {
 					return c.state
 				}
+				if !noHome && name == "HOME" {
+					return c.user
+				}
 				return ""
 			}
 			var stdout, stderr bytes.Buffer
@@ -261,7 +268,7 @@ func TestReportPanicExitsOne(t *testing.T) {
 				strings.Count(stderr.String(), "callmeter: report: session \"\" call \"\": report panicked: boom\ngoroutine ") != 1 {
 				t.Error("stderr lacks the report panic prefix, stack or single report failure")
 			}
-			logged, err := os.ReadFile(paths.Log(c.state))
+			logged, err := os.ReadFile(paths.Log(c.logs()))
 			if noHome {
 				if !errors.Is(err, fs.ErrNotExist) {
 					t.Errorf("no-home panic created a log or returned unexpected error: %v", err)
@@ -476,9 +483,9 @@ func TestRedactWithoutStoreSaysSoAndCreatesNothing(t *testing.T) {
 	}
 }
 
-func assertMainPluginEvent(t *testing.T, home, event, where string) {
+func assertMainPluginEvent(t *testing.T, logs, event, where string) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(home, "logs", "errors.jsonl"))
+	raw, err := os.ReadFile(filepath.Join(logs, "errors.jsonl"))
 	if err != nil {
 		t.Fatalf("panic plugin row missing: %v", err)
 	}
@@ -500,7 +507,10 @@ func assertMainPluginEvent(t *testing.T, home, event, where string) {
 	}
 }
 
-func TestHookPanicHomeResolutionLevelWhere(t *testing.T) {
+// TestHookPanicWithoutAHomeStillLogs: with no CALLMETER_HOME and no HOME the
+// store is unresolvable, yet PLUGIN_LOG_DIR alone places the panic's
+// missed.log line and its level row.
+func TestHookPanicWithoutAHomeStillLogs(t *testing.T) {
 	dir := t.TempDir()
 	previous := hook
 	hook = func(io.Reader, io.Writer, paths.Getenv) int { panic("boom") }
@@ -515,15 +525,9 @@ func TestHookPanicHomeResolutionLevelWhere(t *testing.T) {
 	if code := run([]string{"hook"}, strings.NewReader(""), &out, &stderr, env); code != 0 {
 		t.Fatalf("panic code=%d", code)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "callmeter", "errors.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var row map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(raw), &row); err != nil {
-		t.Fatal(err)
-	}
-	if row["event"] != "hook-terminated" || row["where"] != "cmd/callmeter/main.go#leavePanicLine" {
-		t.Fatalf("home-resolution panic provenance=%v", row)
+	logs := filepath.Join(dir, "callmeter")
+	assertMainPluginEvent(t, logs, "hook-panic", "cmd/callmeter/main.go#leavePanicLine")
+	if missed, err := os.ReadFile(paths.Missed(logs)); err != nil || !strings.Contains(string(missed), "\tunknown\tpanic (pid ") {
+		t.Fatalf("missed.log = %q (%v), want the panic line", missed, err)
 	}
 }

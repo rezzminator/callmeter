@@ -9,6 +9,13 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 - Installs as `callmeter@professor` from the professor marketplace; this repository's own marketplace file is gone, and the release check no longer reads it.
 - The cost ledger is read only from `CALLMETER_COST_LEDGER_DIR`. callmeter no longer reads `PFM_COST_LEDGER_DIR` or `PFM_HOME`, and no longer looks at a default `~/.local/state/pfm/cost-ledger`: with the variable unset, no ledger is read, and the `cost` report notes `side calls are not counted: no cost ledger is set; CALLMETER_COST_LEDGER_DIR names its directory`. A tool that writes a ledger sets the variable in Claude Code's environment.
 - `scripts/reconcile` (development only) searches `~/.claude/projects` and the `projects` directory of every seat the snapshot records, where it searched a fixed list of seat directories, when `--projects` is not given.
+- `callmeter.log` and `missed.log` moved out of the store's directory into the plugin log directory beside the level files: `$PLUGIN_LOG_DIR/callmeter/{name}`, else `~/.local/state/callmeter/logs/{name}`. `CALLMETER_HOME` and `XDG_STATE_HOME` now place only the store, its settings and the binary cache. Migration: lines left in `{CALLMETER_HOME}/missed.log` by an older version are no longer counted; move the file (and any `missed.log.ingest-*` claim) into the new directory before the next run to keep them, and read older `callmeter.log` lines in its old place. The level files no longer fall back to `$CALLMETER_HOME/logs`.
+- The plugin level files are written through the shared plugin log library (vendored as `internal/pluginlog`): a full level file now keeps five generations (`.1` to `.5`), and a row that cannot be written is held for the next write instead of lost.
+- The wrapper creates the log directory 0700 and `missed.log` 0600, as the binary now does too (it made them 0755 and 0644).
+
+### Fixed
+
+- A warning or info outcome of a hook step (an unreadable transcript, a busy store whose loss is counted, a spent `SessionEnd` budget) no longer prints a line to stderr: only an error row's line, and one notice per failing log-write streak, reach the screen. Every outcome is still logged.
 
 ## [0.4.5] — 2026-10-27
 

@@ -11,12 +11,13 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/command"
 	"github.com/rezzminator/callmeter/internal/clock"
+	"github.com/rezzminator/callmeter/internal/faultlog"
 	"github.com/rezzminator/callmeter/internal/hookentry"
 	"github.com/rezzminator/callmeter/internal/paths"
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // version is set at build time: -ldflags "-X main.version={v}".
@@ -66,7 +67,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.
 		fmt.Fprintf(stderr, "callmeter: unknown command %q\n", args[0])
 	}
 	fmt.Fprintln(stderr, usage)
-	applog.Level(stderr, applog.ResolveSink(getenv, homeForLog(getenv)), applog.Row{Level: "info", Event: "usage-refused", Msg: "unknown or missing command", Where: "cmd/callmeter/main.go#run"})
+	faultlog.Level(stderr, faultlog.ResolveSink(getenv), pluginlog.Row{Level: "info", Event: "usage-refused", Msg: "unknown or missing command", Where: "cmd/callmeter/main.go#run"})
 	return 2
 }
 
@@ -76,8 +77,8 @@ func runReport(args []string, stdout, stderr io.Writer, getenv paths.Getenv) (co
 		if recovered := recover(); recovered != nil {
 			stack := debug.Stack()
 			fmt.Fprintf(stderr, "callmeter: report panicked: %v\n%s", recovered, stack)
-			applog.FailureAt(stderr, applog.ResolveSink(getenv, homeForLog(getenv)), "report", "", "",
-				fmt.Errorf("report panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#runReport"})
+			faultlog.FailureAt(stderr, faultlog.ResolveSink(getenv), "report", "", "",
+				fmt.Errorf("report panicked: %v\n%s", recovered, stack), pluginlog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#runReport"})
 			code = 1
 		}
 	}()
@@ -107,23 +108,19 @@ func runHook(stdin io.Reader, stderr io.Writer, getenv paths.Getenv) (code int) 
 }
 
 // leavePanicLine appends the missed.log line, unless the run's event was
-// accounted for, and the log line of a recovered hook panic; with no home
-// resolvable, stderr is all there is.
+// accounted for, and the log line of a recovered hook panic; with no plugin
+// log directory resolvable, stderr is all there is.
 func leavePanicLine(prefix []byte, recovered any, stack []byte, accounted bool, stderr io.Writer, getenv paths.Getenv) {
-	home, err := paths.Home(getenv)
-	if err != nil {
-		applog.FailureAt(stderr, applog.ResolveSink(getenv, ""), callmeter.StageTerminated, "", "", fmt.Errorf("resolve callmeter home: %w", err), applog.Row{Where: "cmd/callmeter/main.go#leavePanicLine"})
-		return
-	}
+	sink := faultlog.ResolveSink(getenv)
 	event, session := panicIDs(prefix)
 	if !accounted {
 		if err := hookentry.AppendMissed(
-			paths.Missed(home), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
-			applog.FailureAt(stderr, applog.ResolveSink(getenv, home), callmeter.StageTerminated, session, "", err, applog.Row{Event: "append-missed", Where: "cmd/callmeter/main.go#leavePanicLine"})
+			paths.Missed(sink.Levels), event, session, callmeter.PanicReason, clock.Real.Now()); err != nil {
+			faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, session, "", err, pluginlog.Row{Event: "append-missed", Where: "cmd/callmeter/main.go#leavePanicLine"})
 		}
 	}
-	applog.FailureAt(stderr, applog.ResolveSink(getenv, home), callmeter.StageTerminated, session, "",
-		fmt.Errorf("hook panicked: %v\n%s", recovered, stack), applog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#leavePanicLine"})
+	faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, session, "",
+		fmt.Errorf("hook panicked: %v\n%s", recovered, stack), pluginlog.Row{Event: "hook-panic", Where: "cmd/callmeter/main.go#leavePanicLine"})
 }
 
 // payloadPrefixLimit bounds what runHook keeps of the payload for panicIDs:
@@ -173,13 +170,4 @@ func panicIDs(prefix []byte) (event, session string) {
 		}
 	}
 	return event, session
-}
-
-// homeForLog never resolves a real home behind the test jail.
-func homeForLog(getenv paths.Getenv) string {
-	home, err := paths.Home(getenv)
-	if err != nil {
-		return ""
-	}
-	return home
 }
