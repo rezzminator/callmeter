@@ -782,6 +782,25 @@ func TestCallmeterCLIReportMissedLogFailureIsAStderrLineAndExit1(t *testing.T) {
 	}
 }
 
+// TestCallmeterCLIReportWithLoggingOffNeedsNoMissedLog: with neither
+// PLUGIN_LOG_DIR nor HOME, logging is off and no missed.log can exist; the
+// report runs on the store, or says there is none, and exits 0 either way.
+func TestCallmeterCLIReportWithLoggingOffNeedsNoMissedLog(t *testing.T) {
+	for _, seeded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("store %v", seeded), func(t *testing.T) {
+			fixture := newLab(t)
+			if seeded {
+				fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+			}
+			fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath)})
+			code, stdout, stderr := fixture.run("report", "files")
+			if code != 0 || strings.Contains(stderr, "missed") {
+				t.Fatalf("report files with logging off = %d, want 0 and no missed.log failure\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+		})
+	}
+}
+
 // seedQuiet records a session whose hooks stopped after one PreToolUse two
 // hours ago, with a transcript holding lines, last written two hours ago too.
 func (fixture lab) seedQuiet(t *testing.T, session, toolUseID, transcript string, lines ...string) {

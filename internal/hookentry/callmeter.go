@@ -460,8 +460,11 @@ func runCallmeter(
 	// second wait could outlast a sync hook's timeout. The signal handler
 	// is held off from the commit until the claim is moved, so a signal there
 	// leaves no committed claim in place to be ingested again.
-	if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
-		run.fault(callmeter.StageStore, "", fmt.Errorf("ingest %s: %w", files.missed, err))
+	// No plugin log directory: logging is off, so no missed.log can exist to ingest.
+	if files.missed != "" {
+		if _, err := store.IngestMissedHeld(ctx, files.missed, func() func() { return run.state.hold().release }); err != nil {
+			run.fault(callmeter.StageStore, "", fmt.Errorf("ingest %s: %w", files.missed, err))
+		}
 	}
 	if run.gaveUp {
 		return 0

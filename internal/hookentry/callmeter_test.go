@@ -650,6 +650,22 @@ func TestCallmeterEntryUsesHome(t *testing.T) {
 	}
 }
 
+// TestCallmeterEntryLoggingOffRecordsWithoutAStoreFault: with neither
+// PLUGIN_LOG_DIR nor HOME, logging is off and there is no missed.log to
+// ingest: the call is recorded clean, with no store fault and a quiet stderr.
+func TestCallmeterEntryLoggingOffRecordsWithoutAStoreFault(t *testing.T) {
+	lab := newCallmeterLab(t)
+	var stderr bytes.Buffer
+	if code := Callmeter(strings.NewReader(lab.payloads("probe5.jsonl")[1]), &stderr, mapEnv(map[string]string{paths.EnvHome: lab.root})); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if strings.Contains(stderr.String(), "missed") {
+		t.Errorf("stderr = %q, want no missed.log fault with logging off", stderr.String())
+	}
+	lab.storePath = paths.Store(lab.root)
+	expect(t, "Bash call", lab.call("toolu_014w33S7y4Hmv2iQj3NzzEWV"), map[string]any{"tool": "Bash"})
+}
+
 // TestCallmeterEntryHomeUnresolvableIsSaidOnStderr: with no home to resolve
 // the hook still exits 0 and says why on stderr; there is no log file to write.
 func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {

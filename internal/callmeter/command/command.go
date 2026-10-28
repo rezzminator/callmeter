@@ -189,14 +189,19 @@ func reportAction(
 		pluginLog(stderr, getenv, "info", "retention-clamped", "internal/callmeter/command/command.go#windowSince", "report window clamped to configured retention")
 	}
 	path := paths.Store(home)
+	// No plugin log directory: logging is off, so no missed.log can exist to count or ingest.
+	missed := paths.Missed(paths.LogDir(getenv))
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		// No store to ingest into: the lines still waiting in missed.log and its
 		// claims are lost events, counted read-only and named as a failure.
-		counts, err := callmeter.CountMissed(paths.Missed(paths.LogDir(getenv)))
-		if err != nil {
-			fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", err)
-			pluginLog(stderr, getenv, "error", "missed-count-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-			return 1
+		counts := map[string]int{}
+		if missed != "" {
+			var countErr error
+			if counts, countErr = callmeter.CountMissed(missed); countErr != nil {
+				fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", countErr)
+				pluginLog(stderr, getenv, "error", "missed-count-failed", "internal/callmeter/command/command.go#reportAction", countErr.Error())
+				return 1
+			}
 		}
 		if err := printNoStore(stdout, values.json, positional[0], path, missedNotes(counts)); err != nil {
 			fmt.Fprintf(stderr, "callmeter: report %s: %v\n", positional[0], err)
@@ -222,10 +227,12 @@ func reportAction(
 	}()
 	db.SetRetention(cfg.Retention())
 	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
-	if _, err := db.IngestMissed(ctx, paths.Missed(paths.LogDir(getenv))); err != nil {
-		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
-		pluginLog(stderr, getenv, "error", "missed-ingest-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-		return 1
+	if missed != "" {
+		if _, err := db.IngestMissed(ctx, missed); err != nil {
+			fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
+			pluginLog(stderr, getenv, "error", "missed-ingest-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
+			return 1
+		}
 	}
 	if _, err := report.PruneExpired(ctx, db, now); err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
