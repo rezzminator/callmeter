@@ -15,8 +15,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/paths"
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // idLen is how many characters of a session id name a chat that has no title.
@@ -69,7 +69,7 @@ func (names *transcriptNames) nameOf(sessionID string) (name string, err error) 
 		}
 		names.told[sessionID] = true
 		fmt.Fprintf(names.stderr, "callmeter: chat name: session %s: %v\n", sessionID, err)
-		pluginLogRow(names.stderr, names.getenv, applog.Row{Level: "warning", Event: "transcript-unreadable", Where: "internal/callmeter/command/names.go#nameOf", Msg: err.Error(), Session: sessionID})
+		pluginLogRow(names.stderr, names.getenv, pluginlog.Row{Level: "warning", Event: "transcript-unreadable", Where: "internal/callmeter/command/names.go#nameOf", Msg: err.Error(), Session: sessionID})
 	}()
 	fallback := sessionID
 	if runes := []rune(sessionID); len(runes) > idLen {

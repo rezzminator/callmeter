@@ -17,12 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rezzminator/callmeter/internal/applog"
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/callmeter/report"
 	"github.com/rezzminator/callmeter/internal/clock"
 	"github.com/rezzminator/callmeter/internal/config"
+	"github.com/rezzminator/callmeter/internal/faultlog"
 	"github.com/rezzminator/callmeter/internal/paths"
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // Usage is the report action's usage text.
@@ -191,7 +192,7 @@ func reportAction(
 	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		// No store to ingest into: the lines still waiting in missed.log and its
 		// claims are lost events, counted read-only and named as a failure.
-		counts, err := callmeter.CountMissed(paths.Missed(home))
+		counts, err := callmeter.CountMissed(paths.Missed(paths.LogDir(getenv)))
 		if err != nil {
 			fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", err)
 			pluginLog(stderr, getenv, "error", "missed-count-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
@@ -221,7 +222,7 @@ func reportAction(
 	}()
 	db.SetRetention(cfg.Retention())
 	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
-	if _, err := db.IngestMissed(ctx, paths.Missed(home)); err != nil {
+	if _, err := db.IngestMissed(ctx, paths.Missed(paths.LogDir(getenv))); err != nil {
 		fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
 		pluginLog(stderr, getenv, "error", "missed-ingest-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 		return 1
@@ -243,7 +244,7 @@ func reportAction(
 	recovery := recoveryNotes(recovered.Skipped)
 	for _, skipped := range recovered.Skipped {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: skipped: %v\n", skipped)
-		row := applog.Row{Level: "warning", Event: "recover-skipped", Where: "internal/callmeter/command/command.go#reportAction", Detail: skippedDetail(skipped)}
+		row := pluginlog.Row{Level: "warning", Event: "recover-skipped", Where: "internal/callmeter/command/command.go#reportAction", Detail: skippedDetail(skipped)}
 		var read *callmeter.SkippedRead
 		if errors.As(skipped, &read) {
 			row.Session = read.Session
@@ -438,14 +439,14 @@ func windowSince(since time.Time, raw string, retentionDays int, now time.Time, 
 
 // pluginLog adds metadata beside existing CLI output, never changing it.
 func pluginLog(stderr io.Writer, getenv paths.Getenv, level, event, where, msg string) {
-	pluginLogRow(stderr, getenv, applog.Row{Level: level, Event: event, Msg: msg, Where: where})
+	pluginLogRow(stderr, getenv, pluginlog.Row{Level: level, Event: event, Msg: msg, Where: where})
 }
 
 // logLabels is a detail of fixed-vocabulary labels, safe to log at error and
 // warning level: no producer text, no path.
 type logLabels map[string]string
 
-func pluginLogRow(stderr io.Writer, getenv paths.Getenv, row applog.Row) {
+func pluginLogRow(stderr io.Writer, getenv paths.Getenv, row pluginlog.Row) {
 	// Producer errors may quote rules, config or transcript contents. Keep the
 	// operation category and provenance here; the existing CLI diagnostic is unchanged.
 	// Only logLabels, fixed-vocabulary labels a producer built, pass as detail.
@@ -455,11 +456,7 @@ func pluginLogRow(stderr io.Writer, getenv paths.Getenv, row applog.Row) {
 			row.Detail = nil
 		}
 	}
-	home, err := paths.Home(getenv)
-	if err != nil {
-		home = ""
-	} // the caller reports its own resolution error
-	applog.Level(stderr, applog.ResolveSink(getenv, home), row)
+	faultlog.Level(stderr, faultlog.ResolveSink(getenv), row)
 }
 
 // skippedDetail says why recovery skipped a transcript read, in labels only:

@@ -28,7 +28,8 @@
 # Under `hook` this script never fails a call and never writes to stdout: any
 # failure exits 0 and appends one `{unix seconds}<TAB>{hook_event_name or unknown}<TAB>{reason}`
 # line, followed by `<TAB>{session_id}` when the payload carries one, to
-# {CALLMETER_HOME}/missed.log, which the binary counts on its next run. A line
+# missed.log in the plugin log directory ($PLUGIN_LOG_DIR/callmeter, else
+# $HOME/.local/state/callmeter/logs), which the binary counts on its next run. A line
 # that cannot be appended goes to stderr as `callmeter: missed: {event} {reason}`
 # plus ` {session}` when there is one; the exit stays 0.
 # Under any other subcommand a failure is `callmeter: binary unavailable: {reason}`
@@ -144,18 +145,19 @@ payload_fields() {
 
 # log_missed REASON appends the missed line with reason `{reason} (pid $$)`
 # for this hook. A line that cannot
-# be appended (no home, a home that cannot be made, a missed.log that cannot be
-# opened or written) goes to stderr instead as
+# be appended (no log directory, one that cannot be made, a missed.log that
+# cannot be opened or written) goes to stderr instead as
 # `callmeter: missed: {event} {reason}`, followed by ` {session}` when the
 # payload carries one, so the reason is never silently lost. Returns 0.
 log_missed() {
   payload_fields
-  if [ -n "$home" ]; then
-    if [ -d "$home" ] || mkdir -p "$home" 2>/dev/null; then
+  # The log directory is 0700 and missed.log 0600, as every plugin log file.
+  if [ -n "$logs" ]; then
+    if [ -d "$logs" ] || (umask 077 && mkdir -p "$logs") 2>/dev/null; then
       if [ -n "$session" ]; then
-        { printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" "$session" >>"$home/missed.log"; } 2>/dev/null && return 0
+        (umask 077 && printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" "$session" >>"$logs/missed.log") 2>/dev/null && return 0
       else
-        { printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" >>"$home/missed.log"; } 2>/dev/null && return 0
+        (umask 077 && printf '%s\t%s\t%s\n' "$(date +%s)" "$event" "$1 (pid $$)" >>"$logs/missed.log") 2>/dev/null && return 0
       fi
     fi
   fi
@@ -205,6 +207,16 @@ if [ -z "$home" ]; then
   if [ -n "$xdg" ]; then
     home=$xdg/callmeter
   fi
+fi
+
+# logs: the plugin log directory, where missed.log goes: $PLUGIN_LOG_DIR/callmeter,
+# else $HOME/.local/state/callmeter/logs. Empty when neither is set.
+if [ -n "${PLUGIN_LOG_DIR-}" ]; then
+  logs=${PLUGIN_LOG_DIR%/}/callmeter
+elif [ -n "${HOME-}" ]; then
+  logs=${HOME%/}/.local/state/callmeter/logs
+else
+  logs=
 fi
 
 # 1. the override

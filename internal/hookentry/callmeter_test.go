@@ -52,6 +52,11 @@ type callmeterLab struct {
 	seatDir   *string           // the seat the hook runs from; nil = unresolved
 }
 
+// logs is the plugin log directory the lab's HOME gives the Callmeter entry.
+func (lab *callmeterLab) logs() string {
+	return filepath.Join(lab.home, ".local", "state", "callmeter", "logs")
+}
+
 func newCallmeterLab(t *testing.T) *callmeterLab {
 	t.Helper()
 	root := t.TempDir()
@@ -618,7 +623,7 @@ func TestCallmeterPanicAfterTheEventCommitsIsAccounted(t *testing.T) {
 	if n := lab.count("SELECT count(*) FROM events WHERE event = 'SessionStart'"); n != 1 {
 		t.Errorf("committed events = %d, want 1", n)
 	}
-	if missed, err := os.ReadFile(paths.Missed(lab.root)); !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
+	if missed, err := os.ReadFile(paths.Missed(lab.logs())); !errors.Is(err, fs.ErrNotExist) && (err != nil || len(missed) != 0) {
 		t.Errorf("missed.log has %d bytes (%v), want no line", len(missed), err)
 	}
 }
@@ -658,16 +663,18 @@ func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {
 	}
 }
 
-// TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME is a regular file,
-// so neither the store, the log nor missed.log can be created: exit 0, a
-// stderr line for the store error and one for the failed missed.log append,
-// each followed by its failed log append, plus one plugin-log notice, no panic.
+// TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME and PLUGIN_LOG_DIR
+// are a regular file, so neither the store, the log nor missed.log can be
+// created: exit 0, a stderr line for the store error and one for the failed
+// missed.log append, each followed by its failed log append, plus one
+// plugin-log notice, no panic.
 func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	lab := newCallmeterLab(t)
 	blocker := filepath.Join(lab.root, "a-file")
 	lab.write(blocker, []byte("a file where the home should be"))
+	logs := filepath.Join(blocker, "callmeter")
 	var stderr bytes.Buffer
-	env := mapEnv(map[string]string{paths.EnvHome: blocker, "HOME": lab.home})
+	env := mapEnv(map[string]string{paths.EnvHome: blocker, "HOME": lab.home, "PLUGIN_LOG_DIR": blocker})
 	if code := Callmeter(strings.NewReader(lab.payloads("probe5.jsonl")[0]), &stderr, env); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -675,7 +682,7 @@ func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	notices := 0
 	legacy := make([]string, 0, len(lines))
 	for _, line := range lines {
-		if strings.HasPrefix(line, "callmeter: plugin log "+filepath.Join(blocker, "logs")+": ") {
+		if strings.HasPrefix(line, "callmeter: plugin log "+logs+" failed: ") {
 			notices++
 			continue
 		}
@@ -687,10 +694,10 @@ func TestCallmeterEntryStoreUnopenableIsSaid(t *testing.T) {
 	lines = legacy
 	if len(lines) != 4 || !strings.HasPrefix(lines[0], "callmeter: store: ") ||
 		!strings.Contains(lines[0], "toolu_01UGaJs715PJE1hKtJWM2ANC") ||
-		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(blocker)) ||
+		!strings.HasPrefix(lines[1], "callmeter: log "+paths.Log(logs)) ||
 		!strings.HasPrefix(lines[2], "callmeter: "+callmeter.StageTerminated+": ") ||
-		!strings.Contains(lines[2], paths.Missed(blocker)) ||
-		!strings.HasPrefix(lines[3], "callmeter: log "+paths.Log(blocker)) {
+		!strings.Contains(lines[2], paths.Missed(logs)) ||
+		!strings.HasPrefix(lines[3], "callmeter: log "+paths.Log(logs)) {
 		t.Errorf("stderr = %q, want the store error and the failed missed.log append, each then the failed log append", stderr.String())
 	}
 }
@@ -712,7 +719,7 @@ func TestCallmeterEntryPayloadWithoutSessionIsLogged(t *testing.T) {
 	if !strings.Contains(stderr.String(), "carries no session_id") {
 		t.Errorf("stderr = %q, want the missing session_id said", stderr.String())
 	}
-	assertLogged(t, paths.Log(lab.root), callmeter.StagePayload)
+	assertLogged(t, paths.Log(lab.logs()), callmeter.StagePayload)
 	if n := lab.count("SELECT count(*) FROM calls"); n != 0 {
 		t.Errorf("calls = %d, want 0", n)
 	}
@@ -731,7 +738,7 @@ func TestCallmeterEntryGarbageStdinIsAPayloadFault(t *testing.T) {
 	if n := lab.count("SELECT count(*) FROM faults WHERE stage = ?", callmeter.StagePayload); n != 1 {
 		t.Errorf("payload faults = %d, want 1", n)
 	}
-	assertLogged(t, paths.Log(lab.root), callmeter.StagePayload)
+	assertLogged(t, paths.Log(lab.logs()), callmeter.StagePayload)
 }
 
 // TestCallmeterEntrySeatUnresolvableStillRecords: with no HOME the seat cannot
@@ -739,7 +746,7 @@ func TestCallmeterEntryGarbageStdinIsAPayloadFault(t *testing.T) {
 func TestCallmeterEntrySeatUnresolvableStillRecords(t *testing.T) {
 	lab := newCallmeterLab(t)
 	var stderr bytes.Buffer
-	env := mapEnv(map[string]string{paths.EnvHome: lab.root})
+	env := mapEnv(map[string]string{paths.EnvHome: lab.root, "PLUGIN_LOG_DIR": filepath.Join(lab.root, "shared")})
 	if code := Callmeter(strings.NewReader(lab.payloads("probe5.jsonl")[1]), &stderr, env); code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
@@ -749,7 +756,7 @@ func TestCallmeterEntrySeatUnresolvableStillRecords(t *testing.T) {
 	if !strings.Contains(stderr.String(), "resolve seat dir") {
 		t.Errorf("stderr = %q, want the unresolved seat said", stderr.String())
 	}
-	assertLogged(t, paths.Log(lab.root), "seat")
+	assertLogged(t, paths.Log(filepath.Join(lab.root, "shared", "callmeter")), "seat")
 }
 
 // assertLogged is one ERROR JSON line with step stage and a session field in
@@ -2771,7 +2778,7 @@ func TestCallmeterSessionEndBudgetSpentIsNotAWarning(t *testing.T) {
 	sessionEndBudget = 0
 	t.Cleanup(func() { sessionEndBudget = saved })
 	lab := newCallmeterLab(t)
-	lab.logPath = paths.Log(lab.root)
+	lab.logPath = paths.Log(lab.logs())
 	main := lab.transcript(cmSessionA)
 	lab.write(main, []byte(sweepEntry("msg_mainreply01", "01", `"end_turn"`, 5, `{"type":"text","text":"ok"}`)))
 	lab.feed(hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main}))
@@ -2779,9 +2786,9 @@ func TestCallmeterSessionEndBudgetSpentIsNotAWarning(t *testing.T) {
 		callmeter.StageTranscript); n != 1 {
 		t.Errorf("budget-spent faults rows = %d, want 1: %v", n, lab.row("SELECT stage, error FROM faults"))
 	}
-	assertPluginEvent(t, filepath.Join(lab.root, "logs"), "info.jsonl", "info", "session-end-budget-spent",
+	assertPluginEvent(t, lab.logs(), "info.jsonl", "info", "session-end-budget-spent",
 		"internal/hookentry/callmeter.go#sessionEndBudget")
-	if raw, err := os.ReadFile(filepath.Join(lab.root, "logs", "warnings.jsonl")); err == nil {
+	if raw, err := os.ReadFile(filepath.Join(lab.logs(), "warnings.jsonl")); err == nil {
 		t.Errorf("warnings.jsonl holds rows, want none:\n%s", raw)
 	}
 }
@@ -3330,6 +3337,25 @@ func TestAppendMissedNamesItsWriter(t *testing.T) {
 	}
 }
 
+// TestAppendMissedIsPrivateAndNeedsAPath: missed.log sits in the plugin log
+// directory, created 0700, the file 0600; an unresolved path is refused.
+func TestAppendMissedIsPrivateAndNeedsAPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "logs")
+	path := filepath.Join(dir, "missed.log")
+	if err := AppendMissed(path, "Stop", "", callmeter.PanicReason, time.Unix(1790000001, 0)); err != nil {
+		t.Fatal(err)
+	}
+	for target, want := range map[string]fs.FileMode{dir: 0o700, path: 0o600} {
+		info, err := os.Stat(target)
+		if err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s mode = %v (%v), want %o", target, info, err, want)
+		}
+	}
+	if err := AppendMissed("", "Stop", "", callmeter.PanicReason, time.Unix(1790000001, 0)); err == nil {
+		t.Error(`AppendMissed("") = nil, want a refusal`)
+	}
+}
+
 // TestCallmeterStopWritesTheTranscriptMarks: a Stop whose transcript holds the
 // numbers Claude Code writes beside the messages (real Claude Code 2.1.289
 // lines, testdata/callmeter/demo-home/.../marks-transcript.jsonl) stores each
@@ -3626,7 +3652,7 @@ func TestCallmeterPluginLogRows(t *testing.T) {
 		t.Run(fmt.Sprintf("override=%t", override), func(t *testing.T) {
 			lab := newCallmeterLab(t)
 			env := map[string]string{paths.EnvHome: lab.root, "HOME": lab.home}
-			dir := filepath.Join(lab.root, "logs")
+			dir := lab.logs()
 			if override {
 				env["PLUGIN_LOG_DIR"] = filepath.Join(lab.root, "shared")
 				dir = filepath.Join(env["PLUGIN_LOG_DIR"], "callmeter")
@@ -3641,7 +3667,7 @@ func TestCallmeterPluginLogRows(t *testing.T) {
 			}
 			assertPluginEvent(t, dir, "errors.jsonl", "error", "payload-unparsable", "internal/hookentry/callmeter.go#payload")
 			lab.env = env
-			lab.logPath = paths.Log(lab.root)
+			lab.logPath = paths.Log(dir)
 			lab.write(lab.transcript(cmSessionB), []byte("this line is not JSON, yet names "+cmBatchLead+"\n"))
 			lab.feed(lab.payloads("probe5.jsonl")[3])
 			assertPluginEvent(t, dir, "warnings.jsonl", "warning", "transcript-unreadable", "internal/hookentry/callmeter.go#transcript")
@@ -3675,5 +3701,42 @@ func assertPluginEvent(t *testing.T, dir, file, level, event, where string) {
 	}
 	if found != 1 {
 		t.Fatalf("%s rows=%d, want exactly one", event, found)
+	}
+}
+
+// TestCallmeterEntryLogsLiveInThePluginLogDirectory: callmeter.log, the level
+// rows and the missed.log ingest sit in the plugin log directory,
+// $PLUGIN_LOG_DIR/callmeter, else $HOME/.local/state/callmeter/logs, never
+// under CALLMETER_HOME, which places only the store.
+func TestCallmeterEntryLogsLiveInThePluginLogDirectory(t *testing.T) {
+	for _, tc := range []struct{ name, shared string }{{"home", ""}, {"shared", "shared-logs"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			env := map[string]string{paths.EnvHome: lab.root, "HOME": lab.home}
+			dir := filepath.Join(lab.home, ".local", "state", "callmeter", "logs")
+			if tc.shared != "" {
+				env["PLUGIN_LOG_DIR"] = filepath.Join(lab.root, tc.shared)
+				dir = filepath.Join(lab.root, tc.shared, "callmeter")
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			lab.write(filepath.Join(dir, "missed.log"), []byte("1790000001\tStop\tbinary exited 1\n"))
+			var stderr bytes.Buffer
+			if code := Callmeter(strings.NewReader("\x00\xffnot json at all"), &stderr, mapEnv(env)); code != 0 {
+				t.Fatalf("exit code = %d, want 0", code)
+			}
+			assertLogged(t, filepath.Join(dir, "callmeter.log"), callmeter.StagePayload)
+			assertPluginEvent(t, dir, "errors.jsonl", "error", "payload-unparsable", "internal/hookentry/callmeter.go#payload")
+			for _, stale := range []string{filepath.Join(lab.root, "callmeter.log"), filepath.Join(lab.root, "logs")} {
+				if _, err := os.Stat(stale); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("%s exists (stat %v), want nothing logged under CALLMETER_HOME", stale, err)
+				}
+			}
+			lab.storePath = paths.Store(lab.root)
+			if n := lab.count("SELECT count(*) FROM faults WHERE stage = ?", callmeter.StageBinary); n != 1 {
+				t.Errorf("binary faults = %d, want the plugin log directory's missed.log line ingested", n)
+			}
+		})
 	}
 }

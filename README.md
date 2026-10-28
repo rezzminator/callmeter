@@ -204,7 +204,8 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 
 | Variable | Effect |
 | --- | --- |
-| `CALLMETER_HOME` | where the store, logs and binary cache live; default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
+| `CALLMETER_HOME` | where the store, settings and binary cache live (never the logs); default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
+| `PLUGIN_LOG_DIR` | the shared plugin log root: callmeter's logs go to `$PLUGIN_LOG_DIR/callmeter`; default `~/.local/state/callmeter/logs` |
 | `CALLMETER_BIN` | an executable the wrapper runs instead of resolving one (development) |
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
 | `CALLMETER_RETENTION_DAYS` | the environment form of the `retention_days` setting below; takes precedence over `config.json` |
@@ -224,9 +225,9 @@ The variable beats `config.json`, which beats the default; unset or blank counts
 
 A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
 
-Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
+Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
 
-Plugin errors, warnings and info also append to `errors.jsonl`, `warnings.jsonl` and `info.jsonl` under `$PLUGIN_LOG_DIR/callmeter` when set, otherwise `$CALLMETER_HOME/logs` (the resolved state home). Each level file past 20 MB moves aside to `.1`, with a `log-capped` warning; rows are bounded to 4096 bytes. A failed write is one additional stderr notice per failing streak and never changes the hook result. The existing `callmeter.log` stays unchanged.
+Logs live in the plugin log directory, `$PLUGIN_LOG_DIR/callmeter` when that variable is set, else `~/.local/state/callmeter/logs`; with neither `PLUGIN_LOG_DIR` nor `HOME` there is none, and logging is off. In it: `callmeter.log` (one JSON line per failed hook step), `missed.log` (the hooks that could not be recorded, counted by the next run) and the level files `errors.jsonl`, `warnings.jsonl` and `info.jsonl`, written through the shared plugin log library. A level file past 20 MB moves aside to `.1` (five generations kept), with a `log-capped` warning; rows are bounded to 4096 bytes. Only an error reaches the screen: a failed hook step's error row is one stderr line, a warning or info row never is, and a failing log write is one stderr notice per failing streak; none of it changes the hook result.
 
 ## ❓ FAQ
 
@@ -247,7 +248,7 @@ No. The wrapper is POSIX sh, and binaries are released for macOS and Linux on am
 <details>
 <summary>What happens when a hook cannot run?</summary>
 
-The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `{CALLMETER_HOME}/missed.log`; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. Each missed reason is `{reason} (pid N)`, naming the wrapper's or binary's own pid; the tab-separated layout stays the same. Distinct writers' same-second lines remain distinct faults, while replaying identical bytes adds none. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
+The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `missed.log` in the plugin log directory; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. Each missed reason is `{reason} (pid N)`, naming the wrapper's or binary's own pid; the tab-separated layout stays the same. Distinct writers' same-second lines remain distinct faults, while replaying identical bytes adds none. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
 
 </details>
 
@@ -275,7 +276,7 @@ internal/callmeter/       the store, with cmdparse/, callclass/, report/, comman
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
 internal/releasecheck/    tests of scripts/release-check.sh
-internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
+internal/…                clock, sqlitedb, runner, testjail, paths, config, faultlog, pluginlog (vendored)
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/
