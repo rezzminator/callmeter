@@ -137,6 +137,21 @@ func (w *world) lower(session string) int64 {
 // is still compared.
 const firstRowGrace = 10_000
 
+// defaultProjects is Claude Code's default projects dir, then the projects
+// dir of every seat the snapshot records, in name order.
+func defaultProjects(seats map[string]bool) ([]string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("resolve home for the default projects dirs: %w", err)
+	}
+	projects := []string{filepath.Join(home, ".claude", "projects")}
+	for seat := range seats {
+		projects = append(projects, filepath.Join(seat, "projects"))
+	}
+	sort.Strings(projects[1:])
+	return projects, nil
+}
+
 // diskIndex maps a session id to its main transcript, over every projects dir,
 // symlinks resolved so a dir shared by several seats is listed once.
 func diskIndex(projects []string) (map[string]string, error) {

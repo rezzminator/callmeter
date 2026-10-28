@@ -156,16 +156,14 @@ func TestCostLedger(t *testing.T) {
 		values map[string]string
 		want   string
 	}{
-		{"named", map[string]string{"PFM_COST_LEDGER_DIR": "/ledger", "HOME": "/h"}, "/ledger"},
-		{"default under HOME", map[string]string{"HOME": "/h"}, "/h/.local/state/pfm/cost-ledger"},
-		{"default under PFM_HOME", map[string]string{"HOME": "/h", "PFM_HOME": "/p"}, "/p/.local/state/pfm/cost-ledger"},
+		{"named", map[string]string{"CALLMETER_COST_LEDGER_DIR": "/ledger", "HOME": "/h"}, "/ledger"},
+		// No default: callmeter reads a ledger only where its own variable
+		// names one, never at a path another tool happens to write.
+		{"unset", map[string]string{"HOME": "/h", "PFM_HOME": "/p", "PFM_COST_LEDGER_DIR": "/elsewhere"}, ""},
+		{"no HOME", nil, ""},
 	} {
-		got, err := CostLedger(env(tc.values))
-		if err != nil || got != tc.want {
-			t.Errorf("%s: CostLedger = %q, %v; want %q", tc.name, got, err, tc.want)
+		if got := CostLedger(env(tc.values)); got != tc.want {
+			t.Errorf("%s: CostLedger = %q; want %q", tc.name, got, tc.want)
 		}
-	}
-	if got, err := CostLedger(env(nil)); err == nil || got != "" {
-		t.Errorf("CostLedger without HOME = %q, %v; want an error: no ledger directory can be named", got, err)
 	}
 }

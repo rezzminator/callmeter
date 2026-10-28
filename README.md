@@ -116,7 +116,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
 | `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
-| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
+| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when a cost ledger is set (`CALLMETER_COST_LEDGER_DIR`) |
 | `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
@@ -158,7 +158,7 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
-- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from pfm's cost ledger when it is present.
+- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from the cost ledger when one is set.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
 - `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.
@@ -207,6 +207,7 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 | `CALLMETER_HOME` | where the store, logs and binary cache live; default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
 | `CALLMETER_BIN` | an executable the wrapper runs instead of resolving one (development) |
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
+| `CALLMETER_COST_LEDGER_DIR` | an absolute directory of cost-ledger files (`{session_id}.jsonl`, one line per model call with Claude Code's own price) that another tool writes; callmeter reads it as optional data, so calls no transcript records are counted and requests carry Claude Code's price. Unset (the default): no ledger is read |
 | `CALLMETER_RETENTION_DAYS` | the environment form of the `retention_days` setting below; takes precedence over `config.json` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
@@ -233,7 +234,7 @@ Plugin errors, warnings and info also append to `errors.jsonl`, `warnings.jsonl`
 <details>
 <summary>Why not store it in the plugin's data directory?</summary>
 
-Claude Code gives each plugin a data directory per seat: `{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`. If you run several config dirs (several accounts, or a fleet controller such as Professor), each would get its own store, and calls that belong together would be split. The `callmeter` CLI and other tools also need to find the store without any plugin environment. So the store lives at `CALLMETER_HOME`, one per machine, and each row records the seat it came from.
+Claude Code gives each plugin a data directory per seat: `{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`. If you run several config dirs (several accounts, or a fleet controller), each would get its own store, and calls that belong together would be split. The `callmeter` CLI and other tools also need to find the store without any plugin environment. So the store lives at `CALLMETER_HOME`, one per machine, and each row records the seat it came from.
 
 </details>
 
@@ -248,13 +249,6 @@ No. The wrapper is POSIX sh, and binaries are released for macOS and Linux on am
 <summary>What happens when a hook cannot run?</summary>
 
 The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `{CALLMETER_HOME}/missed.log`; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. Each missed reason is `{reason} (pid N)`, naming the wrapper's or binary's own pid; the tab-separated layout stays the same. Distinct writers' same-second lines remain distinct faults, while replaying identical bytes adds none. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
-
-</details>
-
-<details>
-<summary>I use Professor, which has its own recorder. Will calls be counted twice?</summary>
-
-Professor's built-in recorder writes its own store, so the two never mix rows, but both hooks run on every call. Run one recorder per chat: either the plugin or Professor's built-in hook, not both.
 
 </details>
 

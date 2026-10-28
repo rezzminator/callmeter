@@ -158,7 +158,7 @@ session-unrecorded | cc9fabfb | no-hook: the settingsources probe's project-only
 # The round-1 B1 `claude -p` probe (entrypoint sdk-cli, 27 lines over 3 s).
 session-unrecorded | f55c2fe1 | probe: the round-1 B1 `claude -p` run recorded in its own scratch CALLMETER_HOME, since deleted
 
-# Test chats (2026-10-01 21:09-23:49 UTC, cwd the professor checkout): their
+# Test chats (2026-10-01 21:09-23:49 UTC, cwd a repository checkout): their
 # transcripts were deleted after the run under the 2026-10-02 test-chat ruling
 # ("delete what it leaves"); each one's session-env and scratch directories
 # remain. Every row of theirs is unmatched for that one reason.

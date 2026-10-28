@@ -3410,7 +3410,7 @@ func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	lab.env["PFM_COST_LEDGER_DIR"] = dir
+	lab.env[paths.EnvCostLedgerDir] = dir
 	file := filepath.Join(dir, cmSessionA+".jsonl")
 	lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"))
 	main := lab.transcript(cmSessionA)
@@ -3446,7 +3446,7 @@ func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
 
 	// A ledger directory that is a file is a fault, not a failed hook; the
 	// hook's own rows land.
-	lab.env["PFM_COST_LEDGER_DIR"] = main
+	lab.env[paths.EnvCostLedgerDir] = main
 	before := lab.count("SELECT COUNT(*) FROM turns")
 	lab.feedAt(at+4000, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-3"}))
 	if got := lab.count("SELECT COUNT(*) FROM turns"); got != before+1 {
@@ -3461,7 +3461,7 @@ func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
 	if err := os.MkdirAll(subDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	sub.env["PFM_COST_LEDGER_DIR"] = subDir
+	sub.env[paths.EnvCostLedgerDir] = subDir
 	sub.write(filepath.Join(subDir, session+".jsonl"), []byte(strings.Replace(ledgerLine(9, 9999), cmSessionA, session, 1)+"\n"))
 	sub.feed(scripted[5], asyncAgentResult(t, scripted[9]))
 	if n := sub.count("SELECT COUNT(*) FROM requests WHERE source = 'ledger'"); n != 0 {
@@ -3499,7 +3499,7 @@ func TestCallmeterALedgerErrorIsOneFaultPerSession(t *testing.T) {
 		}))
 	}
 
-	lab.env["PFM_COST_LEDGER_DIR"] = notDirs[0]
+	lab.env[paths.EnvCostLedgerDir] = notDirs[0]
 	stop(1, cmSessionA)
 	stop(2, cmSessionA)
 	lab.feedAt(at+3000, hookPayload(t, callmeter.EventSubagentStop, map[string]any{"transcript_path": main}))
@@ -3511,7 +3511,7 @@ func TestCallmeterALedgerErrorIsOneFaultPerSession(t *testing.T) {
 			strings.Count(string(logged), "cost ledger:"), err)
 	}
 
-	lab.env["PFM_COST_LEDGER_DIR"] = notDirs[1]
+	lab.env[paths.EnvCostLedgerDir] = notDirs[1]
 	stop(4, cmSessionA)
 	stop(5, cmSessionA)
 	if n := lab.ledgerFaults(cmSessionA); n != 2 {
@@ -3543,7 +3543,7 @@ func TestCallmeterSessionEndIngestStaysInsideItsBudget(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		lab.env["PFM_COST_LEDGER_DIR"] = dir
+		lab.env[paths.EnvCostLedgerDir] = dir
 		file = filepath.Join(dir, cmSessionA+".jsonl")
 		lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"))
 		main = lab.transcript(cmSessionA)

@@ -292,10 +292,9 @@ func reportAction(
 // stderr line and a summary naming the failure, never "no ledger": the reports
 // still run, and the cost topic says its side calls are not counted.
 func ingestLedger(ctx context.Context, db *callmeter.Store, getenv paths.Getenv, now time.Time, stderr io.Writer) *callmeter.LedgerSummary {
-	dir, err := paths.CostLedger(getenv)
-	if err != nil {
-		// No home to look under: there is no default ledger to read.
-		return &callmeter.LedgerSummary{}
+	dir := paths.CostLedger(getenv)
+	if dir == "" {
+		return &callmeter.LedgerSummary{} // no ledger is set
 	}
 	summary, err := db.IngestLedger(ctx, dir, now)
 	if err != nil {

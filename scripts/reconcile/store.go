@@ -98,7 +98,8 @@ type storeData struct {
 	faults       []sFault
 	maxParser    int64
 	latest       int64
-	earliest     int64 // the earliest session's first row; 0: no session
+	earliest     int64           // the earliest session's first row; 0: no session
+	seats        map[string]bool // every sessions.seat_dir the snapshot records
 }
 
 type sPart struct {
@@ -119,19 +120,23 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 	d := &storeData{
 		sessions: map[string]*sSession{}, calls: map[string]*sCall{}, requests: map[string]*sRequest{},
 		agents: map[string]*sAgent{}, turns: map[string][]sTurn{}, parts: map[string][]sPart{},
-		turnSessions: map[string]bool{},
+		turnSessions: map[string]bool{}, seats: map[string]bool{},
 	}
 	steps := []struct {
 		name, query string
 		scan        func(*sql.Rows) error
 	}{
-		{"sessions", `SELECT session_id, COALESCE(first_ts,0), COALESCE(model,''), COALESCE(start_source,''), COALESCE(transcript_path,''), COALESCE(end_reason,''), COALESCE(last_ts,0) FROM sessions`,
+		{"sessions", `SELECT session_id, COALESCE(first_ts,0), COALESCE(model,''), COALESCE(start_source,''), COALESCE(transcript_path,''), COALESCE(end_reason,''), COALESCE(last_ts,0), COALESCE(seat_dir,'') FROM sessions`,
 			func(r *sql.Rows) error {
 				s := &sSession{}
-				if err := r.Scan(&s.id, &s.firstTS, &s.model, &s.startSource, &s.transcriptPath, &s.endReason, &s.lastTS); err != nil {
+				var seat string
+				if err := r.Scan(&s.id, &s.firstTS, &s.model, &s.startSource, &s.transcriptPath, &s.endReason, &s.lastTS, &seat); err != nil {
 					return err
 				}
 				d.sessions[s.id] = s
+				if seat != "" {
+					d.seats[seat] = true
+				}
 				if s.firstTS > 0 && (d.earliest == 0 || s.firstTS < d.earliest) {
 					d.earliest = s.firstTS
 				}

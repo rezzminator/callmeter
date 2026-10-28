@@ -16,7 +16,7 @@ import (
 
 // clearedEnv are the variables a jail empties: none belongs to a test unless
 // it sets one with t.Setenv.
-var clearedEnv = []string{"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN", "PFM_COST_LEDGER_DIR", "PFM_HOME", "PLUGIN_LOG_DIR", "CALLMETER_RETENTION_DAYS"}
+var clearedEnv = []string{"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT", "CALLMETER_BIN", "CALLMETER_COST_LEDGER_DIR", "PLUGIN_LOG_DIR", "CALLMETER_RETENTION_DAYS"}
 
 // Run jails the process, runs the package's tests and removes the jail. It
 // returns a non-zero code, running no test, when the jail cannot be built:
