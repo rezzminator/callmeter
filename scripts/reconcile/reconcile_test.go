@@ -185,6 +185,40 @@ func TestMatchingFixtureIsClean(t *testing.T) {
 	}
 }
 
+// TestProjectsDefaultToEverySeatTheSnapshotRecords: without --projects the
+// disk is searched under the projects dir of each seat_dir the sessions record,
+// so a session on disk the store never recorded is found there; a snapshot
+// naming no seat does not search that dir.
+func TestProjectsDefaultToEverySeatTheSnapshotRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seat bool
+		want string
+	}{
+		{"seat recorded", true, "unrecorded disk sessions 1,"},
+		{"no seat", false, "unrecorded disk sessions 0,"},
+	} {
+		f := newFixture(t, nil, nil)
+		writeLines(t, filepath.Join(f.projects, "-tmp-demo-proj", "55555555-aaaa-4bbb-8ccc-000000000005.jsonl"), []string{promptLine(t, 30), assistantLine(t, 31, "msg_U1", 5, "end_turn", map[string]any{"type": "text", "text": fxSecret})})
+		if tc.seat {
+			store, err := callmeter.OpenDB(context.Background(), f.db)
+			if err != nil {
+				t.Fatalf("open fixture store: %v", err)
+			}
+			_, updateErr := store.DB().Exec(`UPDATE sessions SET seat_dir=?`, f.dir)
+			if closeErr := store.Close(); updateErr != nil || closeErr != nil {
+				t.Fatalf("set seat_dir: %v; close store: %v", updateErr, closeErr)
+			}
+		}
+		var out, errOut bytes.Buffer
+		code := run([]string{"--db", f.db, "--since", "2020-01-01T00:00:00Z", "--until", "2030-01-01T01:00:00Z",
+			"--allowlist", f.allow, "--scratch", filepath.Join(f.dir, "scratch")}, &out, &errOut)
+		if code == 2 || !strings.Contains(out.String(), tc.want) {
+			t.Errorf("%s: exit %d, want a run reporting %q:\n%s%s", tc.name, code, tc.want, out.String(), errOut.String())
+		}
+	}
+}
+
 // TestLedgerRequestIsNoMismatch: a request row ingested from the cost ledger (a
 // call no transcript records) is not compared against the transcripts.
 func TestLedgerRequestIsNoMismatch(t *testing.T) {

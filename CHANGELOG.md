@@ -7,6 +7,8 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 ### Changed
 
 - Installs as `callmeter@professor` from the professor marketplace; this repository's own marketplace file is gone, and the release check no longer reads it.
+- The cost ledger is read only from `CALLMETER_COST_LEDGER_DIR`. callmeter no longer reads `PFM_COST_LEDGER_DIR` or `PFM_HOME`, and no longer looks at a default `~/.local/state/pfm/cost-ledger`: with the variable unset, no ledger is read, and the `cost` report notes `side calls are not counted: no cost ledger is set; CALLMETER_COST_LEDGER_DIR names its directory`. A tool that writes a ledger sets the variable in Claude Code's environment.
+- `scripts/reconcile` (development only) searches `~/.claude/projects` and the `projects` directory of every seat the snapshot records, where it searched a fixed list of seat directories, when `--projects` is not given.
 
 ## [0.4.5] — 2026-10-27
 

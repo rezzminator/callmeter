@@ -102,6 +102,7 @@ func TestCostWithoutALedgerSaysSideCallsAreNotCounted(t *testing.T) {
 		want   string
 	}{
 		{"not looked for", nil, "side calls are not counted: no cost ledger was read"},
+		{"not set", &callmeter.LedgerSummary{}, "side calls are not counted: no cost ledger is set; CALLMETER_COST_LEDGER_DIR names its directory"},
 		{"directory absent", &callmeter.LedgerSummary{Dir: "/ledger"}, "side calls are not counted: no cost ledger at /ledger"},
 	} {
 		table, err := Cost(context.Background(), store, Filter{Ledger: tc.ledger}, chatOf)

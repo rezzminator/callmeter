@@ -68,6 +68,11 @@ func reconcile(ctx context.Context, cfg config) (*report, error) {
 	if cfg.until < cfg.since {
 		return nil, fmt.Errorf("the window ends (%s) before it starts (%s)", msString(cfg.until), msString(cfg.since))
 	}
+	if len(cfg.projects) == 0 {
+		if cfg.projects, err = defaultProjects(st.seats); err != nil {
+			return nil, err
+		}
+	}
 	index, err := diskIndex(cfg.projects)
 	if err != nil {
 		return nil, err

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
+	"github.com/rezzminator/callmeter/internal/paths"
 )
 
 // CostViews are the views of the cost topic, the first the default.
@@ -54,8 +55,7 @@ func Cost(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) 
 // exitGraceMS is how long after the exit a cost-state was written at a ledger-
 // priced call still belongs to that launch: a call's ledger row trails its
 // transcript line by up to a quarter second, and a reload starts the next
-// launch's first call seconds later. The same two seconds as pfm's
-// costledger.exitGrace, which callmeter does not import.
+// launch's first call seconds later.
 const exitGraceMS = 2000
 
 // costExit is the SQL for the exit a session's latest cost-state was written
@@ -306,8 +306,10 @@ func ledgerNotes(l *callmeter.LedgerSummary) []string {
 	switch {
 	case l != nil && l.Err != "":
 		return []string{"side calls are not counted: the cost ledger could not be read: " + l.Err}
-	case l == nil || (!l.Present && l.Dir == ""):
+	case l == nil:
 		return []string{"side calls are not counted: no cost ledger was read"}
+	case !l.Present && l.Dir == "":
+		return []string{"side calls are not counted: no cost ledger is set; " + paths.EnvCostLedgerDir + " names its directory"}
 	case !l.Present:
 		return []string{"side calls are not counted: no cost ledger at " + l.Dir}
 	case l.SchemaIncomplete:

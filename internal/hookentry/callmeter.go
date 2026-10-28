@@ -502,9 +502,9 @@ func (run *callmeterRun) ingestLedger() {
 	if run.gaveUp || run.store == nil || run.payload.SessionID == "" || (!run.deadline.IsZero() && run.spent()) {
 		return
 	}
-	dir, err := paths.CostLedger(run.getenv)
-	if err != nil {
-		return // no home to look under: there is no default ledger to read
+	dir := paths.CostLedger(run.getenv)
+	if dir == "" {
+		return // no ledger is set
 	}
 	ctx := run.ctx
 	if !run.deadline.IsZero() {

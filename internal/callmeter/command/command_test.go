@@ -1223,8 +1223,8 @@ func TestCallmeterCLIReportCostIngestsTheLedgerInEveryView(t *testing.T) {
 }
 
 // TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted: no ledger
-// directory is the default path of nothing, never an error and never a
-// smaller number passed off as complete.
+// directory set is nothing to read, never an error and never a smaller number
+// passed off as complete.
 func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
@@ -1232,8 +1232,8 @@ func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testi
 	if code != 0 || stderr != "" {
 		t.Fatalf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger at ") || !strings.Contains(stdout, ".local/state/pfm/cost-ledger") {
-		t.Errorf("report cost lacks the side-calls-not-counted note naming the default ledger path:\n%s", stdout)
+	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger is set; CALLMETER_COST_LEDGER_DIR names its directory") {
+		t.Errorf("report cost lacks the side-calls-not-counted note naming the ledger variable:\n%s", stdout)
 	}
 }
 
