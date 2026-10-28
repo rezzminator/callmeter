@@ -21,9 +21,9 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 - cmdparse: the Bash command parser filling `command_parts` · `internal/callmeter/cmdparse/` · design `docs/design.md` § Parsing a command
 - callclass: the call classifier behind `callmeter classify`, labelling a tool call `edit`, `test`, `git`, `housekeeping`, `search`, `read`, `capture`, `wait`, `spawn` or `other` from cmdparse's parts, plus the optional `--rules` file naming a project's wrappers, test programs and tool classes · `internal/callmeter/callclass/` · design `docs/design.md` § Classifying a call
 - reports: `callmeter report {name}`, read by the report skill · `internal/callmeter/report/`, `plugins/callmeter/skills/report/SKILL.md` · design `docs/design.md` § Reports
-- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs and clears `PFM_COST_LEDGER_DIR` and `PFM_HOME` · `internal/testjail/testjail.go`
-- cost ledger: pfm's per-call price files `{session_id}.jsonl` in `$PFM_COST_LEDGER_DIR`, else `{PFM_HOME or HOME}/.local/state/pfm/cost-ledger`, read at report time as optional data · `internal/callmeter/ledger.go`; `requests.api_request_id` links a row to transcripts
-- price table: a copy of pfm's, moved together with it · `internal/callmeter/pricing.go`
+- `testjail`: every test package's `TestMain` points `HOME`, `TMPDIR` and `CALLMETER_HOME` into temp dirs and clears `CALLMETER_COST_LEDGER_DIR` · `internal/testjail/testjail.go`
+- cost ledger: per-call price files `{session_id}.jsonl` in `$CALLMETER_COST_LEDGER_DIR`, which another tool writes; unset means none; read as optional data by the settling hooks and `callmeter report` · `internal/callmeter/ledger.go`; `requests.api_request_id` links a row to transcripts
+- price table: Anthropic's and OpenAI's published per-token rates, embedded; prices a request the cost ledger did not, and a price change is a new release · `internal/callmeter/pricing.go`
 - e2e: real `claude -p` runs reading the store they wrote · `e2e/`
 - sanitizer: the only writer of captured fixtures · `scripts/sanitize-capture.py`
 - leak gate: the identifying-content scan over a private, untracked terms file · `scripts/leak-check.sh`
@@ -51,20 +51,19 @@ Every hook of every live session on the host runs the binary cache: a bad binary
 
 ## Dev install
 
-- On a Professor alpha host whose `claude.plugins` names callmeter bare or is unset, `pfm install` owns this install: it builds the binary into the binary cache, keeping the replaced one as `callmeter.prev`, then refreshes the marketplace copy; the steps below are for a host without it.
 - Marketplace copy: `~/.local/share/callmeter-dev`, the `callmeter-dev` directory marketplace.
 - Plugin cache: `~/.claude/plugins/cache/callmeter-dev/callmeter/{version}`
 - Binary cache: `~/.local/state/callmeter/bin/{version}/callmeter`
 - Deploy order: the new version's binary into the binary cache first, then the marketplace copy; a plugin version without its cached binary falls through to the download, which an unreleased version's `SHA256SUMS` rejects, and its hooks drop events.
 - A binary fix deploys to every live hook by atomically replacing the cached binary: build beside it, then `mv -f` onto it.
 - A `hooks.json` change also needs the marketplace copy and the plugin cache refreshed, then `/reload-plugins`.
-- Refresh the marketplace with `claude plugin marketplace update callmeter-dev` exactly as written: a `CLAUDE_CONFIG_DIR` override pointing at `~/.claude` makes `claude` write `.claude.json` and `backups/` into the shared store, and `pfm`'s store-guard hook denies it.
+- Refresh the marketplace with `claude plugin marketplace update callmeter-dev` exactly as written: a `CLAUDE_CONFIG_DIR` override pointing at `~/.claude` makes `claude` write `.claude.json` and `backups/` into the shared store.
 
 # Rules
 
 ## Sacred ground
 
-- **Standalone:** NEVER require pfm, Professor or any other tool: the plugin, binary, tests and gates run for anyone with Claude Code and nothing else installed; other tools read the store, callmeter never calls them, and data it takes from one is optional.
+- **Standalone:** NEVER require any other tool: the plugin, binary, tests and gates run for anyone with Claude Code and nothing else installed; other tools read the store, callmeter never calls them, and data it takes from one is optional.
 - **Privacy:** NEVER store prompt, message or file content; the store keeps only its `{name}_bytes` count.
 - **Publication:** NEVER push, tag or release without the user's explicit ask in the current turn.
 - **Nothing identifying** ships in a tracked file: no machine-absolute path (`/Users/…`, `/home/…`), no private term; the leak gate is the backstop.
