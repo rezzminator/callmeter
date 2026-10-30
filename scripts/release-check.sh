@@ -4,7 +4,6 @@
 # Passes only when every place that carries callmeter's version says the same
 # one:
 #   - plugins/callmeter/.claude-plugin/plugin.json  "version"   (the reference)
-#   - .claude-plugin/marketplace.json               the plugin entry's "version"
 #   - README.md                                     the badge/version-{X}- badge (`--` for a dash)
 #   - CHANGELOG.md                                  a `## [{X}]` heading
 # --release also requires the CHANGELOG heading to carry a date,
@@ -38,12 +37,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 plugin_json="plugins/callmeter/.claude-plugin/plugin.json"
-marketplace=".claude-plugin/marketplace.json"
 readme="README.md"
 changelog="CHANGELOG.md"
 sums="plugins/callmeter/libexec/SHA256SUMS"
 
-for f in "$plugin_json" "$marketplace" "$readme" "$changelog" "$sums"; do
+for f in "$plugin_json" "$readme" "$changelog" "$sums"; do
   if [[ ! -r "$root/$f" ]]; then
     echo "release-check: cannot read $f" >&2
     exit 2
@@ -65,9 +63,6 @@ disagree() {
   echo "release-check: $1 says '$2', $plugin_json says '$version'" >&2
   bad=1
 }
-
-market_version="$(json_version "$marketplace")"
-[[ "$market_version" == "$version" ]] || disagree "$marketplace" "${market_version:-nothing}"
 
 # shields.io writes a literal dash as `--`, so a prerelease badge reads
 # `version-0.4.5--dev.1-blue`; the single dash ends the version.

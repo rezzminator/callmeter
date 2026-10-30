@@ -217,8 +217,13 @@ func seedFile(path, content string) error {
 	return os.Rename(tmp, path)
 }
 
-func (r *rig) cachePath() string  { return filepath.Join(r.home, "bin", version, "callmeter") }
-func (r *rig) missedPath() string { return filepath.Join(r.home, "missed.log") }
+func (r *rig) cachePath() string { return filepath.Join(r.home, "bin", version, "callmeter") }
+
+// missedPath is missed.log in the plugin log directory of the rig's HOME
+// (no PLUGIN_LOG_DIR): never under CALLMETER_HOME.
+func (r *rig) missedPath() string {
+	return filepath.Join(filepath.Dir(r.home), "userhome", ".local", "state", "callmeter", "logs", "missed.log")
+}
 
 func (r *rig) run(stdin string, extraEnv []string, args ...string) result {
 	return r.runShell("sh", stdin, extraEnv, args...)
@@ -1437,4 +1442,36 @@ func contains(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// missed.log lives in the plugin log directory: $PLUGIN_LOG_DIR/callmeter,
+// else $HOME/.local/state/callmeter/logs, directory 0700 and file 0600, and
+// never under CALLMETER_HOME.
+func TestMissedLogLivesInThePluginLogDirectory(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("PLUGIN_LOG_DIR=%v", shared), func(t *testing.T) {
+			r := newRig(t, rigOpts{status: http.StatusNotFound})
+			path, env := r.missedPath(), []string(nil)
+			if shared {
+				logs := filepath.Join(t.TempDir(), "plugin-logs")
+				path, env = filepath.Join(logs, "callmeter", "missed.log"), []string{"PLUGIN_LOG_DIR=" + logs}
+			}
+			res := r.run(`{"hook_event_name":"PostToolUse"}`, env, "hook")
+			if res.code != 0 || res.stdout != "" || res.stderr != "" {
+				t.Fatalf("exit %d stdout %q stderr %q, want 0 and both empty", res.code, res.stdout, res.stderr)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || !strings.Contains(string(data), "\tPostToolUse\tdownload failed (pid ") {
+				t.Fatalf("missed.log at %s = %q (%v), want the line", path, data, err)
+			}
+			for target, want := range map[string]os.FileMode{filepath.Dir(path): 0o700, path: 0o600} {
+				if info, err := os.Stat(target); err != nil || info.Mode().Perm() != want {
+					t.Errorf("%s: stat %v, want mode %o", target, err, want)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(r.home, "missed.log")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("missed.log under CALLMETER_HOME exists (stat %v), want none", err)
+			}
+		})
+	}
 }

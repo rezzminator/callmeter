@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+
+	"github.com/rezzminator/callmeter/internal/pluginlog"
 )
 
 // EnvHome names the variable that overrides the state home.
@@ -54,11 +56,31 @@ func Store(home string) string { return filepath.Join(home, "callmeter.db") }
 // Config is the optional settings file under home (internal/config).
 func Config(home string) string { return filepath.Join(home, "config.json") }
 
-// Log is the JSON-lines log file under home.
-func Log(home string) string { return filepath.Join(home, "callmeter.log") }
+// EnvPluginLogDir names the variable every plugin's logs go under, as
+// {dir}/callmeter.
+const EnvPluginLogDir = "PLUGIN_LOG_DIR"
 
-// Missed is the log the wrapper appends to when it could not run the binary.
-func Missed(home string) string { return filepath.Join(home, "missed.log") }
+// LogDir is the plugin log directory callmeter.log, missed.log and the level
+// files live in: $PLUGIN_LOG_DIR/callmeter, else
+// $HOME/.local/state/callmeter/logs; "" (logging off) when neither is set.
+// CALLMETER_HOME places the store, never the logs.
+func LogDir(getenv Getenv) string {
+	return pluginlog.Dir(getenv(EnvPluginLogDir), getenv("HOME"), "callmeter")
+}
+
+// Log is the JSON-lines log file in the plugin log directory dir; "" when dir is.
+func Log(dir string) string { return inDir(dir, "callmeter.log") }
+
+// Missed is the log the wrapper appends to when it could not run the binary,
+// in the plugin log directory dir; "" when dir is.
+func Missed(dir string) string { return inDir(dir, "missed.log") }
+
+func inDir(dir, name string) string {
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, name)
+}
 
 // BinCache is the cached binary of one version under home.
 func BinCache(home, version string) string {
@@ -96,24 +118,13 @@ func userHome(getenv Getenv) (string, error) {
 	return user, nil
 }
 
-// EnvCostLedgerDir names the variable that overrides the cost ledger's
-// directory, the one another tool writes and callmeter only reads.
-const EnvCostLedgerDir = "PFM_COST_LEDGER_DIR"
+// EnvCostLedgerDir names the variable that names the cost ledger's directory,
+// the one another tool writes and callmeter only reads.
+const EnvCostLedgerDir = "CALLMETER_COST_LEDGER_DIR"
 
-// CostLedger is the directory of the optional cost ledger: $PFM_COST_LEDGER_DIR
-// when set, else .local/state/pfm/cost-ledger under $PFM_HOME when set, else
-// under $HOME. It is where the ledger's writer puts it by default; callmeter
-// reads it as data and never requires it to exist.
-func CostLedger(getenv Getenv) (string, error) {
-	if dir := getenv(EnvCostLedgerDir); dir != "" {
-		return dir, nil
-	}
-	user := getenv("PFM_HOME")
-	if user == "" {
-		var err error
-		if user, err = userHome(getenv); err != nil {
-			return "", err
-		}
-	}
-	return filepath.Join(user, ".local", "state", "pfm", "cost-ledger"), nil
+// CostLedger is the directory of the optional cost ledger: $CALLMETER_COST_LEDGER_DIR,
+// "" when it is unset, and then no ledger is read. callmeter reads it as data
+// and never requires it to exist.
+func CostLedger(getenv Getenv) string {
+	return getenv(EnvCostLedgerDir)
 }

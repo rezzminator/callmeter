@@ -81,13 +81,37 @@ func TestFilesUnderHome(t *testing.T) {
 	home := "/x/cm"
 	for name, tt := range map[string]struct{ got, want string }{
 		"store":    {Store(home), "/x/cm/callmeter.db"},
-		"log":      {Log(home), "/x/cm/callmeter.log"},
-		"missed":   {Missed(home), "/x/cm/missed.log"},
 		"config":   {Config(home), "/x/cm/config.json"},
 		"bincache": {BinCache(home, "0.1.0"), "/x/cm/bin/0.1.0/callmeter"},
 	} {
 		if tt.got != tt.want {
 			t.Errorf("%s = %q, want %q", name, tt.got, tt.want)
+		}
+	}
+}
+
+// TestLogsLiveInThePluginLogDirectory: callmeter.log and missed.log sit in
+// $PLUGIN_LOG_DIR/callmeter, else $HOME/.local/state/callmeter/logs, never
+// under CALLMETER_HOME; with neither set there is no log file.
+func TestLogsLiveInThePluginLogDirectory(t *testing.T) {
+	for name, tt := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"shared":  {map[string]string{"PLUGIN_LOG_DIR": "/l", "HOME": "/h", "CALLMETER_HOME": "/x/cm"}, "/l/callmeter"},
+		"home":    {map[string]string{"HOME": "/h", "CALLMETER_HOME": "/x/cm"}, "/h/.local/state/callmeter/logs"},
+		"neither": {map[string]string{"CALLMETER_HOME": "/x/cm"}, ""},
+	} {
+		dir := LogDir(func(key string) string { return tt.env[key] })
+		if dir != tt.want {
+			t.Errorf("%s: LogDir = %q, want %q", name, dir, tt.want)
+		}
+		wantLog, wantMissed := "", ""
+		if tt.want != "" {
+			wantLog, wantMissed = tt.want+"/callmeter.log", tt.want+"/missed.log"
+		}
+		if Log(dir) != wantLog || Missed(dir) != wantMissed {
+			t.Errorf("%s: Log, Missed = %q, %q, want %q, %q", name, Log(dir), Missed(dir), wantLog, wantMissed)
 		}
 	}
 }
@@ -156,16 +180,14 @@ func TestCostLedger(t *testing.T) {
 		values map[string]string
 		want   string
 	}{
-		{"named", map[string]string{"PFM_COST_LEDGER_DIR": "/ledger", "HOME": "/h"}, "/ledger"},
-		{"default under HOME", map[string]string{"HOME": "/h"}, "/h/.local/state/pfm/cost-ledger"},
-		{"default under PFM_HOME", map[string]string{"HOME": "/h", "PFM_HOME": "/p"}, "/p/.local/state/pfm/cost-ledger"},
+		{"named", map[string]string{"CALLMETER_COST_LEDGER_DIR": "/ledger", "HOME": "/h"}, "/ledger"},
+		// No default: callmeter reads a ledger only where its own variable
+		// names one, never at a path another tool happens to write.
+		{"unset", map[string]string{"HOME": "/h", "PFM_HOME": "/p", "PFM_COST_LEDGER_DIR": "/elsewhere"}, ""},
+		{"no HOME", nil, ""},
 	} {
-		got, err := CostLedger(env(tc.values))
-		if err != nil || got != tc.want {
-			t.Errorf("%s: CostLedger = %q, %v; want %q", tc.name, got, err, tc.want)
+		if got := CostLedger(env(tc.values)); got != tc.want {
+			t.Errorf("%s: CostLedger = %q; want %q", tc.name, got, tc.want)
 		}
-	}
-	if got, err := CostLedger(env(nil)); err == nil || got != "" {
-		t.Errorf("CostLedger without HOME = %q, %v; want an error: no ledger directory can be named", got, err)
 	}
 }

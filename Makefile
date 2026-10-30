@@ -15,7 +15,6 @@ check:
 	[ -z "$$unformatted" ] || { printf 'gofmt: not formatted:\n%s\n' "$$unformatted"; exit 1; }
 	go vet ./...
 	go test ./...
-	claude plugin validate --strict .
 	claude plugin validate --strict plugins/callmeter
 
 # LEAK_TERMS names the terms file (CI writes the secret to one); unset, scripts/leak-terms.txt.

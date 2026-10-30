@@ -235,8 +235,12 @@ func refuseRealState(t *testing.T, home string) {
 type liveRun struct {
 	root    string
 	home    string
+	logs    string // PLUGIN_LOG_DIR: callmeter.log and missed.log sit in {logs}/callmeter
 	project string
 }
+
+// logDir is the run's callmeter plugin log directory.
+func (r *liveRun) logDir() string { return filepath.Join(r.logs, "callmeter") }
 
 func newLiveRun(t *testing.T, name string) *liveRun {
 	t.Helper()
@@ -244,7 +248,7 @@ func newLiveRun(t *testing.T, name string) *liveRun {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatalf("create run directory %s: %v", root, err)
 	}
-	r := &liveRun{root: root, home: filepath.Join(root, "home"), project: filepath.Join(root, "project")}
+	r := &liveRun{root: root, home: filepath.Join(root, "home"), logs: filepath.Join(root, "logs"), project: filepath.Join(root, "project")}
 	if err := os.Mkdir(r.home, 0o700); err != nil {
 		t.Fatalf("create CALLMETER_HOME %s: %v", r.home, err)
 	}
@@ -285,9 +289,10 @@ func logTail(path string, n int) string {
 	return fmt.Sprintf("--- last %d lines of %s ---\n%s", n, path, lastLines(data, n))
 }
 
-// logTails is the tail of callmeter.log and of missed.log of the run's home.
+// logTails is the tail of callmeter.log and of missed.log of the run's plugin
+// log directory.
 func (r *liveRun) logTails() string {
-	return logTail(paths.Log(r.home), logTailLines) + "\n" + logTail(paths.Missed(r.home), logTailLines)
+	return logTail(paths.Log(r.logDir()), logTailLines) + "\n" + logTail(paths.Missed(r.logDir()), logTailLines)
 }
 
 // gitEnv makes git deterministic and independent of the host's configuration.
@@ -392,7 +397,7 @@ func (r *liveRun) claude(t *testing.T, label, plugin, prompt, resume string, env
 	// dispatched, timed out or was killed shows only there.
 	debugPath := filepath.Join(r.root, label+".debug.txt")
 	args = append(args, "--debug-file", debugPath, "--output-format", "stream-json", "--verbose", prompt)
-	full := childEnv(append([]string{"CALLMETER_HOME=" + r.home, "CLAUDE_CODE_SUBAGENT_MODEL=haiku"}, append(gitEnv, env...)...)...)
+	full := childEnv(append([]string{"CALLMETER_HOME=" + r.home, "PLUGIN_LOG_DIR=" + r.logs, "CLAUDE_CODE_SUBAGENT_MODEL=haiku"}, append(gitEnv, env...)...)...)
 	res := execute(t, label, sessionTimeout, args, r.project, full, false)
 	streamPath := filepath.Join(r.root, label+".stream.jsonl")
 	if err := os.WriteFile(streamPath, res.Stdout, 0o600); err != nil {
@@ -418,7 +423,7 @@ func (r *liveRun) callmeter(t *testing.T, bin string, args ...string) runner.Run
 func (r *liveRun) callmeterEnv(t *testing.T, bin string, env []string, args ...string) runner.RunResult {
 	t.Helper()
 	return execute(t, "callmeter "+strings.Join(args, " "), time.Minute, append([]string{bin}, args...), r.project,
-		childEnv(append([]string{"CALLMETER_HOME=" + r.home}, env...)...), false)
+		childEnv(append([]string{"CALLMETER_HOME=" + r.home, "PLUGIN_LOG_DIR=" + r.logs}, env...)...), false)
 }
 
 // sessionEndHookLine matches the line Claude Code writes when it runs this
@@ -1001,11 +1006,12 @@ func assertSilentStream(t *testing.T, label string, stream []byte) {
 	}
 }
 
-// storeBytes is every byte callmeter keeps for a home: the store, its WAL and the log.
-func storeBytes(t *testing.T, home string) map[string][]byte {
+// storeBytes is every byte callmeter keeps for a home and its plugin log
+// directory logs: the store, its WAL and the log.
+func storeBytes(t *testing.T, home, logs string) map[string][]byte {
 	t.Helper()
 	out := map[string][]byte{}
-	for _, path := range []string{paths.Store(home), paths.Store(home) + "-wal", paths.Log(home)} {
+	for _, path := range []string{paths.Store(home), paths.Store(home) + "-wal", paths.Log(logs)} {
 		data, err := os.ReadFile(path)
 		if os.IsNotExist(err) {
 			continue
@@ -1306,7 +1312,7 @@ func TestLiveSessionFillsEveryTable(t *testing.T) {
 		if !bytes.Contains(readAll(t, main.path), []byte(sentinel)) {
 			t.Fatalf("the sentinel is not in the session's own transcript %s: the prompt did not carry it", main.path)
 		}
-		files := storeBytes(t, r.home)
+		files := storeBytes(t, r.home, r.logDir())
 		copied := map[string]bool{}
 		for _, use := range allUses(main, subs) {
 			if strings.Contains(use.Command, sentinel) {
@@ -1484,8 +1490,8 @@ func TestLiveDownloadPath(t *testing.T) {
 	}
 	// A hook a headless exit cut short leaves a "terminated by" line; any
 	// other line is a binary that did not run.
-	if _, err := os.Stat(paths.Missed(r.home)); err == nil {
-		for _, line := range unexpectedMissed(readAll(t, paths.Missed(r.home))) {
+	if _, err := os.Stat(paths.Missed(r.logDir())); err == nil {
+		for _, line := range unexpectedMissed(readAll(t, paths.Missed(r.logDir()))) {
 			t.Errorf("missed.log line whose reason does not start with %q: %q", "terminated by ", line)
 		}
 	} else if !os.IsNotExist(err) {
@@ -1555,10 +1561,10 @@ func TestSessionEndRanReadsTheDebugLog(t *testing.T) {
 }
 
 func TestLiveRunLogTailsNameBothLogs(t *testing.T) {
-	r := &liveRun{home: t.TempDir()}
-	writeFile(t, paths.Log(r.home), "hook said hello\n")
+	r := &liveRun{home: t.TempDir(), logs: t.TempDir()}
+	writeFile(t, paths.Log(r.logDir()), "hook said hello\n")
 	got := r.logTails()
-	if !strings.Contains(got, paths.Log(r.home)+" ---\nhook said hello") || !strings.Contains(got, paths.Missed(r.home)+": absent") {
+	if !strings.Contains(got, paths.Log(r.logDir())+" ---\nhook said hello") || !strings.Contains(got, paths.Missed(r.logDir())+": absent") {
 		t.Errorf("log tails of a run with callmeter.log and no missed.log: %q", got)
 	}
 }

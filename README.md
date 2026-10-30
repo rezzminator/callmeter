@@ -7,7 +7,7 @@
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 [![CI](https://github.com/rezzminator/callmeter/actions/workflows/release.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/release.yml)
-[![Version](https://img.shields.io/badge/version-0.4.5-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -116,7 +116,7 @@ Point the plugin's wrapper at your build with `CALLMETER_BIN=/path/to/callmeter`
 | `coverage` | transcripts on disk that callmeter never recorded |
 | `events` | lifecycle events by kind and value |
 | `compactions` | every context compaction: trigger, tokens before and after, tokens freed, seconds spent |
-| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when pfm's cost ledger is present |
+| `cost` | per chat the sum of its requests' prices, Claude Code's own total, the named difference and the spend before the ledger began (`PRE-LEDGER USD`); `--view agent` per agent, `--view call` per call, each price marked `ledger` (Claude Code's own) or `table` (callmeter's price list); spend no transcript records (web search helpers, summaries) is counted when a cost ledger is set (`CALLMETER_COST_LEDGER_DIR`) |
 | `hooks` | Stop-hook overhead: runs, total, average and longest time per hook |
 | `turns` | the wall time of every turn, with its messages, background agents and effort |
 | `resumes` | the cost of resuming a session cold: idle time, context size, whether the prompt cache expired, the estimated cache write |
@@ -158,7 +158,7 @@ A question no report answers (which sub-agent peaked highest, what a whole agent
 ## 📒 What it records
 
 - `calls`: one row per tool call: tool, sanitized input, chat or sub-agent, prompt, effort, permission mode, duration, failure, bytes produced and bytes delivered to the model, the file touched and its size, lines added and removed, commits, test runners.
-- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from pfm's cost ledger when it is present.
+- `requests`: one row per model request: model, stop reason, the token split (input, cache read, cache write at 5 m and 1 h, output, and the thinking part of the output when the transcript gives it) and the context size, its price in USD millionths with where it came from (`ledger` or `table`), and the calls a transcript does not record, read from the cost ledger when one is set.
 - `agents`: one row per sub-agent: type, parent call, first start, last stop, total tokens, tool uses, model.
 - `agent_turns`: one row per sub-agent turn, so an agent woken again by `SendMessage` shows every turn.
 - `turns`: one row per `Stop` and `SubagentStop`: effort, permission mode, background tasks, the size of the last message. A `Stop` rebuilt from the transcript after its hook was lost has these unknown.
@@ -204,9 +204,11 @@ Every hook but `SessionStart`, `SessionEnd` and `StopFailure` is async: nothing 
 
 | Variable | Effect |
 | --- | --- |
-| `CALLMETER_HOME` | where the store, logs and binary cache live; default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
+| `CALLMETER_HOME` | where the store, settings and binary cache live (never the logs); default `${XDG_STATE_HOME:-$HOME/.local/state}/callmeter` (`XDG_STATE_HOME` counts only when absolute) |
+| `PLUGIN_LOG_DIR` | the shared plugin log root: callmeter's logs go to `$PLUGIN_LOG_DIR/callmeter`; default `~/.local/state/callmeter/logs` |
 | `CALLMETER_BIN` | an executable the wrapper runs instead of resolving one (development) |
 | `CALLMETER_RELEASE_BASE` | where the wrapper downloads binaries from; default `https://github.com/rezzminator/callmeter/releases/download` |
+| `CALLMETER_COST_LEDGER_DIR` | an absolute directory of cost-ledger files (`{session_id}.jsonl`, one line per model call with Claude Code's own price) that another tool writes; callmeter reads it as optional data, so calls no transcript records are counted and requests carry Claude Code's price. Unset (the default): no ledger is read |
 | `CALLMETER_RETENTION_DAYS` | the environment form of the `retention_days` setting below; takes precedence over `config.json` |
 | `CALLMETER_E2E` | `1` enables the end-to-end tests (development) |
 
@@ -224,16 +226,16 @@ The variable beats `config.json`, which beats the default; unset or blank counts
 
 A `config.json` that cannot be read, is empty, is not one JSON object, names a key this version does not know or holds a value out of range stops the report with a line naming the file, before the store is touched: a misspelled key never silently keeps or drops rows. Only `callmeter report` reads it; the hooks never do, and never prune.
 
-Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `callmeter.log` (JSON lines), `missed.log`, `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
+Under `CALLMETER_HOME`: `callmeter.db` (the store), `config.json` (the optional settings), `archive.db` (rows a configured retention moved, or an earlier version's 30-day prune) and `bin/{version}/callmeter` (the cached binary).
 
-Plugin errors, warnings and info also append to `errors.jsonl`, `warnings.jsonl` and `info.jsonl` under `$PLUGIN_LOG_DIR/callmeter` when set, otherwise `$CALLMETER_HOME/logs` (the resolved state home). Each level file past 20 MB moves aside to `.1`, with a `log-capped` warning; rows are bounded to 4096 bytes. A failed write is one additional stderr notice per failing streak and never changes the hook result. The existing `callmeter.log` stays unchanged.
+Logs live in the plugin log directory, `$PLUGIN_LOG_DIR/callmeter` when that variable is set, else `~/.local/state/callmeter/logs`; with neither `PLUGIN_LOG_DIR` nor `HOME` there is none, and logging is off. In it: `callmeter.log` (one JSON line per failed hook step), `missed.log` (the hooks that could not be recorded, counted by the next run) and the level files `errors.jsonl`, `warnings.jsonl` and `info.jsonl`, written through the shared plugin log library. A level file past 20 MB moves aside to `.1` (five generations kept), with a `log-capped` warning; rows are bounded to 4096 bytes. Only an error reaches the screen: a failed hook step's error row is one stderr line, a warning or info row never is, and a failing log write is one stderr notice per failing streak; none of it changes the hook result.
 
 ## ❓ FAQ
 
 <details>
 <summary>Why not store it in the plugin's data directory?</summary>
 
-Claude Code gives each plugin a data directory per seat: `{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`. If you run several config dirs (several accounts, or a fleet controller such as Professor), each would get its own store, and calls that belong together would be split. The `callmeter` CLI and other tools also need to find the store without any plugin environment. So the store lives at `CALLMETER_HOME`, one per machine, and each row records the seat it came from.
+Claude Code gives each plugin a data directory per seat: `{CLAUDE_CONFIG_DIR}/plugins/data/callmeter-{marketplace}`. If you run several config dirs (several accounts, or a fleet controller), each would get its own store, and calls that belong together would be split. The `callmeter` CLI and other tools also need to find the store without any plugin environment. So the store lives at `CALLMETER_HOME`, one per machine, and each row records the seat it came from.
 
 </details>
 
@@ -247,14 +249,7 @@ No. The wrapper is POSIX sh, and binaries are released for macOS and Linux on am
 <details>
 <summary>What happens when a hook cannot run?</summary>
 
-The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `{CALLMETER_HOME}/missed.log`; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. Each missed reason is `{reason} (pid N)`, naming the wrapper's or binary's own pid; the tab-separated layout stays the same. Distinct writers' same-second lines remain distinct faults, while replaying identical bytes adds none. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
-
-</details>
-
-<details>
-<summary>I use Professor, which has its own recorder. Will calls be counted twice?</summary>
-
-Professor's built-in recorder writes its own store, so the two never mix rows, but both hooks run on every call. Run one recorder per chat: either the plugin or Professor's built-in hook, not both.
+The hook still exits 0 and the call goes on untouched. If the wrapper could not find or download the binary, it appends one line to `missed.log` in the plugin log directory; the next run turns it into a `binary` fault, and `/callmeter:report faults` shows it. If the hook binary is stopped by SIGTERM, SIGINT or SIGHUP before it recorded the event, it appends its own line there, which becomes a `terminated` fault beside the `binary` ones. Each missed reason is `{reason} (pid N)`, naming the wrapper's or binary's own pid; the tab-separated layout stays the same. Distinct writers' same-second lines remain distinct faults, while replaying identical bytes adds none. A failure inside the binary is a fault of its own stage. Gaps are counted, never hidden.
 
 </details>
 
@@ -275,7 +270,7 @@ internal/callmeter/       the store, with cmdparse/, callclass/, report/, comman
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
 internal/releasecheck/    tests of scripts/release-check.sh
-internal/…                clock, sqlitedb, runner, testjail, paths, config, applog
+internal/…                clock, sqlitedb, runner, testjail, paths, config, faultlog, pluginlog (vendored)
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/
@@ -289,14 +284,13 @@ go test ./internal/<pkg>/ -run <Test> -count=1   # affected
 go test ./...                                     # full
 go vet ./... && gofmt -l .                        # lint; gofmt prints nothing
 scripts/leak-check.sh
-claude plugin validate --strict .
 claude plugin validate --strict plugins/callmeter
 scripts/release-check.sh
 make release-check                                # every check of a release pull request
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the marketplace entry, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
 
 ## 🎓 Built with Professor
 

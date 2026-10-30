@@ -23,7 +23,7 @@ jobs:
           go-version-file: go.mod
       - name: install Claude Code
         run: npm install -g @anthropic-ai/claude-code
-      - name: gofmt, vet, test, validate the marketplace and the plugin
+      - name: gofmt, vet, test, validate the plugin
         run: make check
       - name: leak gate
         # A fork's pull request gets no secrets; a maintainer runs the gate before merging.

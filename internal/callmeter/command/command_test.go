@@ -32,6 +32,7 @@ type lab struct {
 	userHome  string
 	seat      string // the user's own Claude Code dir, $HOME/.claude
 	storePath string
+	logs      string // the plugin log directory: missed.log and the level files
 }
 
 func newLab(t *testing.T) lab {
@@ -50,6 +51,7 @@ func newLab(t *testing.T) lab {
 		userHome:  userHome,
 		seat:      filepath.Join(userHome, ".claude"),
 		storePath: paths.Store(state),
+		logs:      filepath.Join(userHome, ".local", "state", "callmeter", "logs"),
 	}
 }
 
@@ -569,7 +571,7 @@ func TestCallmeterCLIReportJSONWithoutStoreIsAbsentAndCreatesNothing(t *testing.
 func TestCallmeterCLIReportWithoutStoreCountsMissedLines(t *testing.T) {
 	const session = "0b5e1c2a-7d4f-4e8b-9a61-3f2c8d9e0a17"
 	for name, tc := range map[string]struct {
-		files map[string]string // file name under CALLMETER_HOME → content
+		files map[string]string // file name in the plugin log directory → content
 		note  string
 	}{
 		"missed.log only": {
@@ -594,7 +596,7 @@ func TestCallmeterCLIReportWithoutStoreCountsMissedLines(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			fixture := newLab(t)
-			home := filepath.Dir(fixture.storePath)
+			home := fixture.logs
 			if err := os.MkdirAll(home, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -625,7 +627,7 @@ func TestCallmeterCLIReportWithoutStoreCountsMissedLines(t *testing.T) {
 				t.Fatal(err)
 			}
 			if len(entries) != len(tc.files) {
-				t.Errorf("CALLMETER_HOME holds %d entries after the report, want the %d staged", len(entries), len(tc.files))
+				t.Errorf("the plugin log directory holds %d entries after the report, want the %d staged", len(entries), len(tc.files))
 			}
 			for file, content := range tc.files {
 				if data, err := os.ReadFile(filepath.Join(home, file)); err != nil || string(data) != content {
@@ -734,9 +736,12 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
-	missed := paths.Missed(filepath.Dir(fixture.storePath))
+	missed := paths.Missed(fixture.logs)
 	now := time.Now().Unix()
 	line := fmt.Sprintf("%d\tStop\tno binary\n%d\tunknown\tdownload failed\n", now, now)
+	if err := os.MkdirAll(fixture.logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	for index, topic := range allTopics {
 		if index > 0 {
 			// the second run finds nothing to ingest: only the first run's two faults exist
@@ -763,7 +768,10 @@ func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 func TestCallmeterCLIReportMissedLogFailureIsAStderrLineAndExit1(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	missed := paths.Missed(filepath.Dir(fixture.storePath))
+	missed := paths.Missed(fixture.logs)
+	if err := os.MkdirAll(fixture.logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	// A leftover claim that is a dangling link: listed for ingest, unreadable.
 	if err := os.Symlink(filepath.Join(filepath.Dir(missed), "nowhere"), missed+".ingest-1"); err != nil {
 		t.Fatal(err)
@@ -771,6 +779,25 @@ func TestCallmeterCLIReportMissedLogFailureIsAStderrLineAndExit1(t *testing.T) {
 	code, stdout, stderr := fixture.run("report", "files")
 	if code != 1 || stdout != "" || !strings.Contains(stderr, "callmeter: ingest missed.log: ") {
 		t.Fatalf("report with an unreadable missed.log = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+}
+
+// TestCallmeterCLIReportWithLoggingOffNeedsNoMissedLog: with neither
+// PLUGIN_LOG_DIR nor HOME, logging is off and no missed.log can exist; the
+// report runs on the store, or says there is none, and exits 0 either way.
+func TestCallmeterCLIReportWithLoggingOffNeedsNoMissedLog(t *testing.T) {
+	for _, seeded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("store %v", seeded), func(t *testing.T) {
+			fixture := newLab(t)
+			if seeded {
+				fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+			}
+			fixture.getenv = mapEnv(map[string]string{paths.EnvHome: filepath.Dir(fixture.storePath)})
+			code, stdout, stderr := fixture.run("report", "files")
+			if code != 0 || strings.Contains(stderr, "missed") {
+				t.Fatalf("report files with logging off = %d, want 0 and no missed.log failure\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+			}
+		})
 	}
 }
 
@@ -1223,8 +1250,8 @@ func TestCallmeterCLIReportCostIngestsTheLedgerInEveryView(t *testing.T) {
 }
 
 // TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted: no ledger
-// directory is the default path of nothing, never an error and never a
-// smaller number passed off as complete.
+// directory set is nothing to read, never an error and never a smaller number
+// passed off as complete.
 func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testing.T) {
 	fixture := newLab(t)
 	fixture.seedEverything(t)
@@ -1232,8 +1259,8 @@ func TestCallmeterCLIReportCostWithoutALedgerSaysSideCallsAreNotCounted(t *testi
 	if code != 0 || stderr != "" {
 		t.Fatalf("report cost = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
 	}
-	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger at ") || !strings.Contains(stdout, ".local/state/pfm/cost-ledger") {
-		t.Errorf("report cost lacks the side-calls-not-counted note naming the default ledger path:\n%s", stdout)
+	if !strings.Contains(stdout, "note: side calls are not counted: no cost ledger is set; CALLMETER_COST_LEDGER_DIR names its directory") {
+		t.Errorf("report cost lacks the side-calls-not-counted note naming the ledger variable:\n%s", stdout)
 	}
 }
 
