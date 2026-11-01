@@ -1,5 +1,5 @@
 // Package faultlog is the one door a failed hook step reports through: one JSON
-// line appended to callmeter.log, one level row through the vendored plugin log
+// line appended to callmeter.log, one level row through the plugin log
 // (internal/pluginlog), and, for an error row only, one line on stderr. Both
 // files sit in the plugin log directory (paths.LogDir).
 package faultlog

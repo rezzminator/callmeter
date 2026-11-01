@@ -7,7 +7,7 @@
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
 [![CI](https://github.com/rezzminator/callmeter/actions/workflows/release.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/release.yml)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -54,7 +54,7 @@ A long-running agent rarely runs out of ideas. It runs out of context: one `go t
 ## 🚀 Quick start
 
 ```sh
-claude plugin marketplace add rezzminator/professor
+claude plugin marketplace add rezzminator/callmeter
 claude plugin install callmeter@professor
 ```
 
@@ -270,7 +270,7 @@ internal/callmeter/       the store, with cmdparse/, callclass/, report/, comman
 internal/hookentry/       the hook entry and its captured payload fixtures
 internal/wrappertest/     tests of the sh wrapper
 internal/releasecheck/    tests of scripts/release-check.sh
-internal/…                clock, sqlitedb, runner, testjail, paths, config, faultlog, pluginlog (vendored)
+internal/…                clock, sqlitedb, runner, testjail, paths, config, faultlog, pluginlog
 e2e/                      real Claude Code runs (CALLMETER_E2E=1)
 plugins/callmeter/        only what installs: manifest, hooks, wrapper, skills
 scripts/                  build-release.sh, release-check.sh, leak-check.sh, sanitize-capture.py, reconcile/

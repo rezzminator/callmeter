@@ -4,6 +4,14 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-01
+
+### Changed
+
+- This repository is again a marketplace of its own, named `professor`, listing only callmeter: `claude plugin marketplace add rezzminator/callmeter`, then `claude plugin install callmeter@professor`. The plugin id stays `callmeter@professor`, so an install out of Professor's marketplace keeps working unchanged, and the store, its settings and the binary cache stay where they are.
+- `internal/pluginlog` is callmeter's own logging module, no longer a vendored copy kept in step with other plugins; the level files, their rotation and the held rows behave as before.
+- Dependencies updated: `modernc.org/sqlite` 1.61.1 with the `modernc.org/libc` 1.79.0 it requires, and `golang.org/x/sys` 0.49.0.
+
 ## [0.5.0] — 2026-10-30
 
 ### Changed
