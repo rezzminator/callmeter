@@ -1,9 +1,8 @@
-// Package pluginlog is the shared plugin-log library: level files under one directory per plugin, rows bounded and
+// Package pluginlog is the plugin-log library: level files under one directory per plugin, rows bounded and
 // keyed in one order, rotation past a cap, and rows held in memory across a failed write. It imports the standard
 // library only.
 //
-// This file is a vendored copy of the plugin-log canonical source, kept byte-identical in every plugin by a sync
-// check: change the canonical source, then re-vendor every copy.
+// This is callmeter's own logging module; edit it here.
 package pluginlog
 
 import (
