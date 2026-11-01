@@ -47,7 +47,7 @@ claude plugin validate --strict plugins/callmeter
 
 ## CI and the leak gate
 
-CI (`.github/workflows/release.yml`) runs on every pull request to `main`: gofmt, vet, the tests, the plugin validate and the leak gate (`scripts/leak-check.sh`), and on a release pull request the release checks; `make release-check` runs the same checks locally. The leak gate reads its private term list from a repository secret, and GitHub gives no secrets to pull requests from forks, so CI skips that one step on a fork's pull request: a maintainer runs it before merging.
+CI (`.github/workflows/ci.yml`) runs on every pull request to `main`: `make check` (gofmt, vet, the tests, the plugin validate and, last, the leak gate `scripts/leak-check.sh`) on Linux and macOS, and the release checks; `make release-check` runs the same checks locally. The leak gate reads its private term list from a repository secret, and GitHub gives no secrets to pull requests from forks, so a fork's `check` runs every other check and then fails at the leak gate: a maintainer runs it before merging.
 
 To run it yourself, put your own username and host name in `scripts/leak-terms.txt` (gitignored), one lowercase regex per line, then run `scripts/leak-check.sh`.
 

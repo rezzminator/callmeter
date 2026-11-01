@@ -788,13 +788,20 @@ func TestSettleRequestLeavesAnotherOwnersRow(t *testing.T) {
 // hooks of other chats write. Without an index on calls(request_id) each
 // recount scans calls, the sweep holds the write lock past the writers' wait,
 // and they drop their events busy.
+//
+// The writers wait BusyTimeout, the wait the hooks had when the unindexed
+// sweep cost them their events; a recorded async hook now waits longer still.
+// The hold is CPU-bound, so host load stretches both sides alike: indexed it is
+// about 0.4 s on an idle host, a twelfth of the wait, and unindexed about 40 s,
+// eight waits, so the scan fails at any load and the index passes on a host
+// slowed twelvefold.
 func TestSettleSweepLeavesTheStoreToConcurrentHooks(t *testing.T) {
 	const (
 		requests      = 800
 		callsPerReq   = 1
-		storedCalls   = 30000 // calls rows of the session, most of them no request's
+		storedCalls   = 60000 // calls rows of the session, most of them no request's
 		writers       = 8
-		writerWait    = time.Second
+		writerWait    = BusyTimeout
 		session       = "sess-sweep"
 		since         = int64(1000)
 		sweepSettleTS = int64(2000)

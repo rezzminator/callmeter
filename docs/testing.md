@@ -62,7 +62,7 @@ Fixed headings, fixed order. The behaviour under test is [design.md](design.md);
 
 ## Gates and floors
 
-- CI (`.github/workflows/release.yml`, pull requests to `main`): gofmt, vet, tests, the plugin validate and the leak gate, plus `make release`; `make release-check` runs them all locally.
+- CI (`.github/workflows/ci.yml`, pull requests to `main`): gofmt, vet, tests, the plugin validate and the leak gate on Linux and macOS, plus `make release`; `make release-check` runs them all locally.
 - No coverage floor in 0.1.0.
 - Allowed skips, each named: the e2e gate without `CALLMETER_E2E=1`, and corpus cases carrying `known_defect`. Any other skip fails review.
 
