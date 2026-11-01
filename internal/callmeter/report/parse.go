@@ -21,7 +21,7 @@ const statusOK = cmdparse.StatusOK
 type ParseSummary struct {
 	Parsed          int // calls whose parts were cached
 	SkippedRelative int // calls left unparsed for a relative or missing cwd
-	SkippedNoInput  int // calls left unparsed for an input without a command
+	SkippedNoInput  int // calls left unparsed for an input without a readable command
 }
 
 // EnsureParsed parses every Bash call that has no command_parts rows from
@@ -31,7 +31,7 @@ type ParseSummary struct {
 // its message. home is where
 // a leading `~` expands (runtime.Paths.Home: the commands ran as this user). A
 // call whose cwd is not absolute stays unparsed (cmdparse refuses it) and is
-// counted, as is one whose stored input carries no command.
+// counted, as is one whose stored input is not JSON or carries no command.
 func EnsureParsed(
 	ctx context.Context,
 	store *callmeter.Store,
@@ -67,14 +67,12 @@ func EnsureParsed(
 			var fields struct {
 				Command json.RawMessage `json:"command"`
 			}
-			if input != "" {
-				if err := json.Unmarshal([]byte(input), &fields); err != nil {
-					return fmt.Errorf("decode input of call %s: %w", p.call.ID, err)
-				}
-			}
+			// An input that is not JSON reads as one without a command: that
+			// call stays unparsed and counted, never the run.
+			badInput := input != "" && json.Unmarshal([]byte(input), &fields) != nil
 			var command *string
 			switch {
-			case len(fields.Command) == 0 || json.Unmarshal(fields.Command, &command) != nil || command == nil:
+			case badInput || len(fields.Command) == 0 || json.Unmarshal(fields.Command, &command) != nil || command == nil:
 				summary.SkippedNoInput++
 			case !filepath.IsAbs(p.call.Cwd):
 				summary.SkippedRelative++
@@ -156,28 +154,34 @@ func toStoreParts(parts []cmdparse.Part) []callmeter.CommandPart {
 	return out
 }
 
+// storedExists is each Existence's stored character: 0 missing, 1 present,
+// ? not known (the parse-time stat failed).
+var storedExists = map[cmdparse.Existence]string{
+	cmdparse.ExistsNo: "0", cmdparse.ExistsYes: "1", cmdparse.ExistsUnknown: "?",
+}
+
 // EncodeFileRef is the stored form of a file reference:
-// {action}\t{range}\t{exists 0|1}\t{path}. The path stays last, so a tab in a
-// path survives.
+// {action}\t{range}\t{exists 0|1|?}\t{path}. The path stays last, so a tab in
+// a path survives.
 func EncodeFileRef(ref cmdparse.FileRef) string {
-	exists := "0"
-	if ref.Exists {
-		exists = "1"
-	}
-	return ref.Action + "\t" + ref.Range + "\t" + exists + "\t" + ref.Path
+	return ref.Action + "\t" + ref.Range + "\t" + storedExists[ref.Exists] + "\t" + ref.Path
 }
 
 // DecodeFileRef reads EncodeFileRef's form back; any other shape is an error
 // naming the stored value.
 func DecodeFileRef(s string) (cmdparse.FileRef, error) {
 	fields := strings.SplitN(s, "\t", 4)
-	if len(fields) != 4 || (fields[2] != "0" && fields[2] != "1") {
-		return cmdparse.FileRef{}, fmt.Errorf(
-			"callmeter report: stored file reference %q is not action\\trange\\texists\\tpath",
-			s,
-		)
+	if len(fields) == 4 {
+		for exists, stored := range storedExists {
+			if fields[2] == stored {
+				return cmdparse.FileRef{Action: fields[0], Range: fields[1], Exists: exists, Path: fields[3]}, nil
+			}
+		}
 	}
-	return cmdparse.FileRef{Action: fields[0], Range: fields[1], Exists: fields[2] == "1", Path: fields[3]}, nil
+	return cmdparse.FileRef{}, fmt.Errorf(
+		"callmeter report: stored file reference %q is not action\\trange\\texists\\tpath",
+		s,
+	)
 }
 
 // storedPart is one command_parts row with its call's facts.
@@ -190,10 +194,15 @@ type storedPart struct {
 }
 
 // loadParts reads the parts of every call the filter keeps, in call then seq
-// order, keyed by call id.
-func loadParts(ctx context.Context, store *callmeter.Store, f Filter) (map[string][]storedPart, error) {
+// order, keyed by call id. A stored value that does not decode costs only
+// itself: args that do not decode leave the part's args unknown (its shape is
+// the program alone), a files list or a file reference that does not decode
+// drops those files; every other part and call is kept, and the notes count
+// each kind.
+func loadParts(ctx context.Context, store *callmeter.Store, f Filter) (map[string][]storedPart, []string, error) {
 	where, args := f.where()
 	out := map[string][]storedPart{}
+	var badArgs, badFiles, badRefs int64
 	err := query(ctx, store, "command parts",
 		`SELECT p.tool_use_id, COALESCE(p.program, ''), COALESCE(p.args, '[]'), COALESCE(p.files, '[]'), p.conditional
 		FROM command_parts p JOIN calls c ON c.tool_use_id = p.tool_use_id
@@ -205,16 +214,19 @@ func loadParts(ctx context.Context, store *callmeter.Store, f Filter) (map[strin
 				return err
 			}
 			if err := json.Unmarshal([]byte(argsJSON), &sp.args); err != nil {
-				return fmt.Errorf("decode args of call %s: %w", sp.callID, err)
+				sp.args = nil
+				badArgs++
 			}
 			var files []string
 			if err := json.Unmarshal([]byte(filesJSON), &files); err != nil {
-				return fmt.Errorf("decode files of call %s: %w", sp.callID, err)
+				files = nil
+				badFiles++
 			}
 			for _, encoded := range files {
 				ref, err := DecodeFileRef(encoded)
 				if err != nil {
-					return fmt.Errorf("call %s: %w", sp.callID, err)
+					badRefs++
+					continue
 				}
 				sp.files = append(sp.files, ref)
 			}
@@ -222,7 +234,20 @@ func loadParts(ctx context.Context, store *callmeter.Store, f Filter) (map[strin
 			return nil
 		})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	var notes []string
+	if badArgs > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d stored command parts have args that do not decode: args unknown, each shaped by its program alone", badArgs))
+	}
+	if badFiles > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d stored command parts have a files list that does not decode: their files are not counted", badFiles))
+	}
+	if badRefs > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"%d stored file references do not decode: those files are not counted", badRefs))
+	}
+	return out, notes, nil
 }

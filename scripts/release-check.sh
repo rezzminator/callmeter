@@ -41,7 +41,10 @@ readme="README.md"
 changelog="CHANGELOG.md"
 sums="plugins/callmeter/libexec/SHA256SUMS"
 
-for f in "$plugin_json" "$readme" "$changelog" "$sums"; do
+# SHA256SUMS is read only by --release, which compares it.
+needed=("$plugin_json" "$readme" "$changelog")
+[[ -z "$release" ]] || needed+=("$sums")
+for f in "${needed[@]}"; do
   if [[ ! -r "$root/$f" ]]; then
     echo "release-check: cannot read $f" >&2
     exit 2

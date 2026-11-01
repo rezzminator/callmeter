@@ -732,7 +732,8 @@ func (t *Tx) ResolvePendingFrom(ctx context.Context, pending []PendingRequest, f
 // A request older than since (the session's first recorded run) is written
 // only over a row a batch already stored: the transcript lines before callmeter
 // first saw the session (enabled mid-session, or a resumed history) are not
-// back-filled. Only a row r's session and agent own is written (ownedBy): a
+// back-filled; a request whose time is unknown (r.TS nil) cannot be judged
+// by that rule and is written with no ts. Only a row r's session and agent own is written (ownedBy): a
 // forked session's transcript opens with a copy of its parent's history under
 // the same message ids, and the copy's usage (Claude Code wrote one all zero)
 // never overwrites the parent's.
@@ -762,7 +763,7 @@ func (t *Tx) settleRequest(ctx context.Context, r Request, toolUseIDs []string, 
 			columns[i] = columns[i].withMode(FillEmpty)
 		}
 	}
-	if r.TS != nil && *r.TS >= since {
+	if r.TS == nil || *r.TS >= since {
 		written, err := t.upsertWhere(ctx, "requests", "request_id", r.RequestID, columns, mode,
 			ownedBy("requests."), r.SessionID, r.AgentID)
 		if err != nil {
@@ -1160,11 +1161,12 @@ func (s *Store) KnownMarks(ctx context.Context, sessionID string) (map[string]bo
 // Since is the marks a sweep with first-run time since writes: the compactions,
 // Stop-hook summaries and turn durations older than since are dropped (the
 // requests sweep's rule: what predates callmeter's first sight of the session
-// is not back-filled), and so is each whose entry id is known (KnownMarks).
+// is not back-filled; a mark whose time is unknown, TS 0, cannot be judged and
+// stays), and so is each whose entry id is known (KnownMarks).
 // The cost-state stays: it is cumulative, so the last one read is the one to
 // write whenever it is read.
 func (m TranscriptMarks) Since(since int64, known map[string]bool) TranscriptMarks {
-	keep := func(ts int64, id string) bool { return ts >= since && !known[id] }
+	keep := func(ts int64, id string) bool { return (ts == 0 || ts >= since) && !known[id] }
 	out := TranscriptMarks{Cost: m.Cost}
 	for _, c := range m.Compactions {
 		if keep(c.TS, c.EntryID) {
@@ -1187,6 +1189,15 @@ func (m TranscriptMarks) Since(since int64, known map[string]bool) TranscriptMar
 // Empty reports whether m holds nothing to write.
 func (m TranscriptMarks) Empty() bool {
 	return len(m.Compactions) == 0 && len(m.StopHooks) == 0 && len(m.TurnDurations) == 0 && m.Cost == nil
+}
+
+// markTS is a mark's ts column: NULL for TS 0, a time the transcript did not
+// give.
+func markTS(ts int64) any {
+	if ts == 0 {
+		return nil
+	}
+	return ts
 }
 
 // PutMarks writes the marks a transcript pass read (Since having filtered
@@ -1214,7 +1225,7 @@ func (t *Tx) PutMarks(ctx context.Context, sessionID, agentID, seatDir string, n
 			return fail("compactions", err)
 		}
 		for _, c := range m.Compactions {
-			_, err := stmt.ExecContext(ctx, c.EntryID, sessionID, nullable(agentID), c.TS, nullable(c.Trigger),
+			_, err := stmt.ExecContext(ctx, c.EntryID, sessionID, nullable(agentID), markTS(c.TS), nullable(c.Trigger),
 				c.PreTokens, c.PostTokens, c.CumulativeDroppedTokens, c.DurationMS, nullable(seatDir))
 			if err != nil {
 				return errors.Join(fail("compactions", err), stmt.Close())
@@ -1238,12 +1249,12 @@ func (t *Tx) PutMarks(ctx context.Context, sessionID, agentID, seatDir string, n
 		}
 		writeAll := func() error {
 			for _, h := range m.StopHooks {
-				if _, err := hooks.ExecContext(ctx, h.EntryID, sessionID, nullable(agentID), nullable(h.PromptID), h.TS,
+				if _, err := hooks.ExecContext(ctx, h.EntryID, sessionID, nullable(agentID), nullable(h.PromptID), markTS(h.TS),
 					h.HookCount, h.HookErrors, nullable(seatDir)); err != nil {
 					return err
 				}
 				for i, run := range h.Hooks {
-					if _, err := runs.ExecContext(ctx, h.EntryID, i+1, h.TS, run.Name, run.CommandBytes, run.DurationMS); err != nil {
+					if _, err := runs.ExecContext(ctx, h.EntryID, i+1, markTS(h.TS), run.Name, run.CommandBytes, run.DurationMS); err != nil {
 						return err
 					}
 				}
@@ -1262,7 +1273,7 @@ func (t *Tx) PutMarks(ctx context.Context, sessionID, agentID, seatDir string, n
 			return fail("turn durations", err)
 		}
 		for _, d := range m.TurnDurations {
-			_, err := stmt.ExecContext(ctx, d.EntryID, sessionID, nullable(agentID), nullable(d.PromptID), d.TS,
+			_, err := stmt.ExecContext(ctx, d.EntryID, sessionID, nullable(agentID), nullable(d.PromptID), markTS(d.TS),
 				d.DurationMS, d.MessageCount, d.BackgroundAgents, nullable(seatDir))
 			if err != nil {
 				return errors.Join(fail("turn durations", err), stmt.Close())

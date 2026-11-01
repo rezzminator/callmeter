@@ -30,7 +30,7 @@ printf '%s' "$FRESH_SUMS" > "$2/SHA256SUMS"
 
 // tree writes a temp tree whose version places all say `version`, with the
 // CHANGELOG heading carrying a date, and returns its root. committed is the
-// plugin's SHA256SUMS.
+// plugin's SHA256SUMS; "" leaves the file out.
 func tree(t *testing.T, committed, changelogHeading string) string {
 	t.Helper()
 	root := t.TempDir()
@@ -45,6 +45,9 @@ func tree(t *testing.T, committed, changelogHeading string) string {
 		"README.md":                            "[![Version](https://img.shields.io/badge/version-" + version + "-blue)](./CHANGELOG.md)\n",
 		"CHANGELOG.md":                         "# Changelog\n\n" + changelogHeading + "\n",
 		"plugins/callmeter/libexec/SHA256SUMS": committed,
+	}
+	if committed == "" {
+		delete(files, "plugins/callmeter/libexec/SHA256SUMS")
 	}
 	for rel, body := range files {
 		p := filepath.Join(root, rel)
@@ -103,6 +106,8 @@ func TestReleaseCheckComparesSumsOnlyForARelease(t *testing.T) {
 		{"release check fails on stale sums", staleSums, dated, []string{"--release"}, 1, "SHA256SUMS is stale"},
 		{"release check passes on fresh sums", freshSums, dated, []string{"--release"}, 0, "ok: " + version + " (release)"},
 		{"plain check still fails on a missing changelog heading", staleSums, "## [0.0.1]", nil, 1, "has no '## [" + version + "]' heading"},
+		{"plain check passes with no sums on disk", "", undated, nil, 0, "ok: " + version},
+		{"release check refuses missing sums", "", dated, []string{"--release"}, 2, "release-check: cannot read plugins/callmeter/libexec/SHA256SUMS"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

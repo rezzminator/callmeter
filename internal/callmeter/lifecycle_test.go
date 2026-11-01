@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -792,6 +793,71 @@ func TestRecoverTurnEndStop(t *testing.T) {
 			t.Errorf("RecoverTurnEnd of a SessionEnd = %v, want an error naming it", err)
 		}
 	})
+}
+
+// TestRecoverAgentStopTotals: a rebuilt SubagentStop writes the agent's
+// transcript totals over the stored ones at its latest stop, only fills them
+// when an earlier stop than the one stored is rebuilt, and leaves them as
+// stored when they could not be read (nil).
+func TestRecoverAgentStopTotals(t *testing.T) {
+	ctx := context.Background()
+	read := &AgentTotals{TotalTokens: 500, ToolUses: 3, Model: "claude-sonnet-5-5"}
+	storedTotals := Agent{AgentID: "a1", TotalTokens: Ptr(int64(100)), ToolUses: Ptr(int64(1)), Model: Ptr("claude-opus-5-5")}
+	laterStop := Agent{AgentID: "a1", Stopped: Ptr(int64(3000))}
+	for _, tc := range []struct {
+		name   string
+		stored []Agent
+		totals *AgentTotals
+		want   map[string]any // total_tokens, tool_uses, model, stopped
+	}{
+		{"latest stop", nil, read,
+			map[string]any{"total_tokens": int64(500), "tool_uses": int64(3), "model": "claude-sonnet-5-5", "stopped": int64(2000)}},
+		{"latest stop over stored totals", []Agent{storedTotals}, read,
+			map[string]any{"total_tokens": int64(500), "tool_uses": int64(3), "model": "claude-opus-5-5", "stopped": int64(2000)}},
+		{"earlier stop, no totals stored", []Agent{laterStop}, read,
+			map[string]any{"total_tokens": int64(500), "tool_uses": int64(3), "model": "claude-sonnet-5-5", "stopped": int64(3000)}},
+		{"earlier stop over stored totals", []Agent{laterStop, storedTotals}, read,
+			map[string]any{"total_tokens": int64(100), "tool_uses": int64(1), "model": "claude-opus-5-5", "stopped": int64(3000)}},
+		{"totals unread", []Agent{storedTotals}, nil,
+			map[string]any{"total_tokens": int64(100), "tool_uses": int64(1), "model": "claude-opus-5-5", "stopped": int64(2000)}},
+		{"totals unread, none stored", nil, nil,
+			map[string]any{"total_tokens": nil, "tool_uses": nil, "model": nil, "stopped": int64(2000)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openTestStore(t)
+			if err := store.Batch(ctx, func(tx *Tx) error {
+				if _, err := tx.InsertEvent(ctx, subagentEdge("e1", EventSubagentStart, 1000)); err != nil {
+					return err
+				}
+				if err := tx.RebuildAgentTurns(ctx, "a1"); err != nil {
+					return err
+				}
+				for _, a := range tc.stored {
+					if err := tx.UpsertAgent(ctx, a, Overwrite); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var inserted bool
+			if err := store.Batch(ctx, func(tx *Tx) (err error) {
+				inserted, err = tx.RecoverAgentStop(ctx, AgentStop{AgentID: "a1", Seq: 1, TS: 2000, Totals: tc.totals})
+				return err
+			}); err != nil {
+				t.Fatalf("RecoverAgentStop: %v", err)
+			}
+			if !inserted || agentTurnRows(t, store, "a1") != "1(1000,2000)" {
+				t.Errorf("rebuilt stop inserted %v, turns %s; want true, 1(1000,2000)", inserted, agentTurnRows(t, store, "a1"))
+			}
+			agent := row(t, store, "agents", "agent_id = ?", "a1")
+			got := map[string]any{"total_tokens": agent["total_tokens"], "tool_uses": agent["tool_uses"], "model": agent["model"], "stopped": agent["stopped"]}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("agent a1 = %v\nwant %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // putRows inserts events and turns in one transaction.

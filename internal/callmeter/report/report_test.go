@@ -99,12 +99,12 @@ func TestPruneExpiredPrunesOldRowsBeforeReport(t *testing.T) {
 			FilePath: callmeter.Ptr("/src/" + id + ".go"), BytesDelivered: callmeter.Ptr(int64(10)),
 		})
 	}
-	removed, err := PruneExpired(ctx, store, testNow)
+	removed, notes, err := PruneExpired(ctx, store, testNow)
 	if err != nil {
 		t.Fatalf("PruneExpired: %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("PruneExpired removed %d rows, want 1", removed)
+	if removed != 1 || notes != nil {
+		t.Errorf("PruneExpired = %d rows, notes %q; want 1, none", removed, notes)
 	}
 	table, err := Files(ctx, store, Filter{}, nil)
 	if err != nil {
@@ -112,6 +112,21 @@ func TestPruneExpiredPrunesOldRowsBeforeReport(t *testing.T) {
 	}
 	if len(table.Rows) != 1 || table.Rows[0][0] != "/src/new.go" {
 		t.Errorf("rows after prune = %v, want only /src/new.go", table.Rows)
+	}
+}
+
+// TestPruneExpiredOverAnIncompleteSchemaSaysItSkipped: a store whose open
+// could not complete its schema is not pruned, and the report's note says so
+// and why, never a silent "nothing expired".
+func TestPruneExpiredOverAnIncompleteSchemaSaysItSkipped(t *testing.T) {
+	store := incompleteStore(t)
+	store.SetRetention(30 * 24 * time.Hour)
+	removed, notes, err := PruneExpired(context.Background(), store, testNow)
+	// SchemaError's own text is pinned by TestOpenLeavesAStoreItCannotCompleteWorking.
+	want := []string{"schema incomplete: prune skipped, rows past retention kept until a later report completes it: " +
+		store.SchemaError().Error()}
+	if err != nil || removed != 0 || !slices.Equal(notes, want) {
+		t.Errorf("PruneExpired = %d, %q, %v; want 0, %q, nil", removed, notes, err, want)
 	}
 }
 
@@ -135,9 +150,9 @@ func TestPruneExpiredWithoutARetentionKeepsEveryRow(t *testing.T) {
 			FilePath: callmeter.Ptr("/src/" + id + ".go"), BytesDelivered: callmeter.Ptr(int64(10)),
 		})
 	}
-	removed, err := PruneExpired(ctx, store, testNow)
-	if err != nil || removed != 0 {
-		t.Fatalf("PruneExpired with no retention = %d, %v; want 0, nil", removed, err)
+	removed, notes, err := PruneExpired(ctx, store, testNow)
+	if err != nil || removed != 0 || notes != nil {
+		t.Fatalf("PruneExpired with no retention = %d, %q, %v; want 0, no note, nil", removed, notes, err)
 	}
 	table, err := Files(ctx, store, Filter{}, nil)
 	if err != nil {

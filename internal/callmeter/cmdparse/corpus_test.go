@@ -55,6 +55,8 @@ type corpusFile struct {
 	Action string `json:"action"`
 	Range  string `json:"range,omitempty"`
 	Exists bool   `json:"exists"`
+	// ExistsUnknown is a path whose parse-time stat failed; Exists is then false.
+	ExistsUnknown bool `json:"exists_unknown,omitempty"`
 }
 
 func loadCorpus(t *testing.T) []corpusCase {
@@ -126,7 +128,10 @@ func asCorpus(parts []Part, root string) []corpusPart {
 		for _, f := range p.Files {
 			cp.Files = append(
 				cp.Files,
-				corpusFile{Path: back(f.Path), Action: f.Action, Range: f.Range, Exists: f.Exists},
+				corpusFile{
+					Path: back(f.Path), Action: f.Action, Range: f.Range,
+					Exists: f.Exists == ExistsYes, ExistsUnknown: f.Exists == ExistsUnknown,
+				},
 			)
 		}
 		out = append(out, cp)

@@ -395,14 +395,21 @@ type Store struct {
 	db       *sql.DB
 	path     string
 	complete bool // every table, column and index of schema is present
+	// schemaErr is why an open could not complete the schema (completeSchema);
+	// nil when complete.
+	schemaErr error
 	// retention is how long the store keeps rows; 0 keeps them forever (SetRetention).
 	retention time.Duration
 }
 
 // SchemaComplete reports whether every table, column and index of schema is
 // present; false only when an open could not add them (a busy store), and a
-// later open tries again.
+// later open tries again (SchemaError says why).
 func (s *Store) SchemaComplete() bool { return s.complete }
+
+// SchemaError is why the open could not complete the store's schema, nil when
+// it is complete: what a report names when Prune leaves the store alone.
+func (s *Store) SchemaError() error { return s.schemaErr }
 
 // ViewVersions is the version marker (viewVersion) of the store's view name
 // and of the one this callmeter ships: a stored version above the shipped one
@@ -473,26 +480,27 @@ func openAndPrepare(ctx context.Context, path string, wait time.Duration) (*Stor
 	if err != nil {
 		return nil, fmt.Errorf("open callmeter store: %w", err)
 	}
-	complete, err := prepare(ctx, db, path)
+	incomplete, err := prepare(ctx, db, path)
 	if err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	return &Store{db: db, path: path, complete: complete}, nil
+	return &Store{db: db, path: path, complete: incomplete == nil, schemaErr: incomplete}, nil
 }
 
-// prepare brings the store to SchemaVersion and reports whether its schema is
-// complete: a fresh store is, a current-version store is when completeSchema
-// found or added what it lacked.
-func prepare(ctx context.Context, db *sql.DB, path string) (bool, error) {
+// prepare brings the store to SchemaVersion and returns, as incomplete, why its
+// schema is not complete: nil for a fresh store, and for a current-version
+// store whose missing parts completeSchema found or added. err is a store it
+// cannot open.
+func prepare(ctx context.Context, db *sql.DB, path string) (incomplete, err error) {
 	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
-		return false, fmt.Errorf("callmeter store %s: disable foreign keys: %w", path, err)
+		return nil, fmt.Errorf("callmeter store %s: disable foreign keys: %w", path, err)
 	}
 	var version int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
-		return false, fmt.Errorf("callmeter store %s: read schema version: %w", path, err)
+		return nil, fmt.Errorf("callmeter store %s: read schema version: %w", path, err)
 	}
 	if version > SchemaVersion {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"callmeter store %s has schema version %d, newer than this callmeter's version %d: %w",
 			path,
 			version,
@@ -503,9 +511,9 @@ func prepare(ctx context.Context, db *sql.DB, path string) (bool, error) {
 	if version == SchemaVersion {
 		// current: an open writes nothing but, once, what a store created
 		// before it lacks (best effort), so concurrent hooks never collide here
-		return completeSchema(ctx, db), nil
+		return completeSchema(ctx, db, path), nil
 	}
-	return true, createSchema(ctx, db, path)
+	return nil, createSchema(ctx, db, path)
 }
 
 // completeSchema adds to a version-1 store whatever of schema it lacks, and
@@ -519,46 +527,51 @@ func prepare(ctx context.Context, db *sql.DB, path string) (bool, error) {
 // at BEGIN IMMEDIATE, works out again what is missing (a concurrent open may
 // have added it), adds each missing column by ALTER TABLE and drops each such
 // view, then runs schema, which creates the missing tables, indexes and views
-// since every statement of it is IF NOT EXISTS, and commits. It reports true
+// since every statement of it is IF NOT EXISTS, and commits. It returns nil
 // when the store is complete. Any failure
-// (busy included) rolls back and reports false, and the open goes on without:
-// an open must never lose a hook's record over it, and a later open tries
-// again.
-func completeSchema(ctx context.Context, db *sql.DB) bool {
+// (busy included) rolls back and is returned, and the open goes on without
+// (Store.SchemaError keeps it): an open must never lose a hook's record over
+// it, and a later open tries again.
+func completeSchema(ctx context.Context, db *sql.DB, path string) error {
+	fail := func(step string, err error) error {
+		return fmt.Errorf("callmeter store %s: complete the schema: %s: %w", path, step, err)
+	}
 	alters, schemaMissing, err := missingFromSchema(ctx, db)
 	if err != nil {
-		return false
+		return fail("compare with the shipped schema", err)
 	}
 	if len(alters) == 0 && !schemaMissing {
-		return true
+		return nil
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return false
+		return fail("take a connection", err)
 	}
 	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return false
+		return fail("begin", err)
 	}
-	rollback := func() bool {
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
-		return false
+	rollback := func(step string, err error) error {
+		if _, rollbackErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rollbackErr != nil {
+			err = errors.Join(err, fmt.Errorf("roll back: %w", rollbackErr))
+		}
+		return fail(step, err)
 	}
 	if alters, _, err = missingFromSchema(ctx, conn); err != nil {
-		return rollback()
+		return rollback("compare with the shipped schema", err)
 	}
 	for _, alter := range alters {
 		if _, err := conn.ExecContext(ctx, alter); err != nil {
-			return rollback()
+			return rollback(alter, err)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, schema); err != nil {
-		return rollback()
+		return rollback("run the schema", err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return rollback()
+		return rollback("commit", err)
 	}
-	return true
+	return nil
 }
 
 // queryer is what *sql.DB and *sql.Conn share for a read.
@@ -1035,7 +1048,7 @@ var pruneAfterArchive func() error
 // Committed chunks survive a failure; the next prune resumes from those copies.
 //
 // A store whose schema is incomplete (SchemaComplete: an open could not add
-// what it lacked) is left alone and returns 0, nil: the prune's statements name
+// what it lacked, SchemaError naming why) is left alone and returns 0, nil: the prune's statements name
 // columns and tables it lacks. A later open that completes the store prunes it.
 //
 // A store with no row to archive is left alone and archive.db is never

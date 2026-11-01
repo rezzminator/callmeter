@@ -235,22 +235,33 @@ func TestFilesCountsOnlyReadModes(t *testing.T) {
 
 // A file the parse found missing (a scratch file since deleted) is a read
 // like any other; its SIZE says gone, never a 0
-// or the "-" of a size never seen.
+// or the "-" of a size never seen. One whose stat failed (stored exists ?)
+// is not known gone: its SIZE stays the "-" of a size never seen, and a later
+// failed stat of a file known gone leaves it gone.
 func TestFilesMarksAMissingFileGone(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	dir := workDir(t, "a.go")
 	seed(t, store, bash("b1", "s", "A", ms(time.Hour), dir, "cat a.go gone.go", 100))
+	seed(t, store, bash("b2", "s", "A", ms(2*time.Hour), dir, "cat denied.go", 100))
+	unstated := bash("b3", "s", "A", ms(30*time.Minute), dir, "cat gone.go", 0)
+	unstated.BytesDelivered = nil
+	seed(t, store, unstated)
 	if _, err := EnsureParsed(ctx, store, "", nil); err != nil {
 		t.Fatalf("EnsureParsed: %v", err)
+	}
+	for id, name := range map[string]string{"b2": "denied.go", "b3": "gone.go"} {
+		exec(t, store, `UPDATE command_parts SET files = json_array('read-whole' || char(9) || char(9) || '?' || char(9) || ?)
+		WHERE tool_use_id = ?`, filepath.Join(dir, name), id)
 	}
 	table, err := Files(ctx, store, Filter{}, nil)
 	if err != nil {
 		t.Fatalf("Files: %v", err)
 	}
 	want := [][]string{
+		{filepath.Join(dir, "denied.go"), "0", "100", "1", "1", "0", "1", "-", "1", "0", "0", "0"},
+		{filepath.Join(dir, "gone.go"), "0", UnknownSize, "2", "2", "0", "1", "gone", "2", "0", "1", "0"},
 		{filepath.Join(dir, "a.go"), "0", UnknownSize, "1", "1", "0", "1", "-", "1", "0", "0", "0"},
-		{filepath.Join(dir, "gone.go"), "0", UnknownSize, "1", "1", "0", "1", "gone", "1", "0", "0", "0"},
 	}
 	if !reflect.DeepEqual(table.Rows, want) {
 		t.Errorf("rows = %v\nwant   %v (header %v)", table.Rows, want, table.Header)

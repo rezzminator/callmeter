@@ -2,6 +2,7 @@ package report
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -110,30 +111,54 @@ func TestCoverageSinceFloorsTheModifiedTime(t *testing.T) {
 // TestCoverageUnreadableProjectsDirIsANameNeverZero: a seat whose projects
 // directory cannot be read is a note naming it, and the other seats still list.
 func TestCoverageUnreadableProjectsDirIsANameNeverZero(t *testing.T) {
-	lab := newCoverageLab(t)
-	broken := filepath.Join(t.TempDir(), "seat-broken")
-	if err := os.MkdirAll(broken, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(broken, "projects"), []byte("a file, not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedSession(t, lab.store, callmeter.Session{SessionID: "s-broken", TS: ms(time.Hour), SeatDir: callmeter.Ptr(broken)})
-	table, err := Coverage(context.Background(), lab.store, lab.filter(), chatOf)
-	if err != nil {
-		t.Fatalf("Coverage: %v", err)
-	}
-	if len(table.Rows) != 2 {
-		t.Errorf("rows = %v, want the readable seats' two transcripts", rowsOf(table))
-	}
-	named := 0
-	for _, note := range table.Notes {
-		if strings.HasPrefix(note, "cannot read "+filepath.Join(broken, "projects")+": ") {
-			named++
-		}
-	}
-	if named != 1 {
-		t.Errorf("notes = %q, want one note naming %s", table.Notes, filepath.Join(broken, "projects"))
+	for _, tc := range []struct {
+		name  string
+		spoil func(projects string) error
+		cause string // the open error a loop gives, named whole
+	}{
+		{
+			name:  "a file, not a directory",
+			spoil: func(p string) error { return os.WriteFile(p, []byte("a file, not a directory"), 0o600) },
+		},
+		{
+			// EvalSymlinks fails on a loop where a missing dir does not: the
+			// seat is still walked under its own path and named.
+			name:  "a symlink loop",
+			spoil: func(p string) error { return os.Symlink(p, p) },
+			cause: "too many levels of symbolic links",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lab := newCoverageLab(t)
+			broken := filepath.Join(t.TempDir(), "seat-broken")
+			if err := os.MkdirAll(broken, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			projects := filepath.Join(broken, "projects")
+			if err := tc.spoil(projects); err != nil {
+				t.Fatal(err)
+			}
+			seedSession(t, lab.store, callmeter.Session{SessionID: "s-broken", TS: ms(time.Hour), SeatDir: callmeter.Ptr(broken)})
+			table, err := Coverage(context.Background(), lab.store, lab.filter(), chatOf)
+			if err != nil {
+				t.Fatalf("Coverage: %v", err)
+			}
+			if len(table.Rows) != 2 {
+				t.Errorf("rows = %v, want the readable seats' two transcripts", rowsOf(table))
+			}
+			named := 0
+			for _, note := range table.Notes {
+				if strings.HasPrefix(note, "cannot read "+projects+": ") {
+					named++
+				}
+			}
+			if named != 1 {
+				t.Errorf("notes = %q, want one note naming %s", table.Notes, projects)
+			}
+			if tc.cause != "" {
+				hasNote(t, table, "cannot read "+projects+": open "+projects+": "+tc.cause)
+			}
+		})
 	}
 }
 
@@ -299,10 +324,10 @@ func TestCoverageUnreadableTranscriptIsAClassAndANote(t *testing.T) {
 	seat := t.TempDir()
 	transcriptLines(t, seat, "-w-p", "s-locked.jsonl", time.Hour, `{"type":"user","timestamp":"2026-09-23T10:00:00.000Z"}`)
 	path := filepath.Join(seat, "projects", "-w-p", "s-locked.jsonl")
-	if err := os.Chmod(path, 0o000); err != nil {
-		t.Fatal(err)
+	openTranscript = func(name string) (*os.File, error) {
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
 	}
-	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	t.Cleanup(func() { openTranscript = os.Open })
 	table, err := Coverage(context.Background(), openStore(t), Filter{Since: testNow.Add(-24 * time.Hour), OwnSeat: seat}, chatOf)
 	if err != nil {
 		t.Fatalf("Coverage: %v", err)

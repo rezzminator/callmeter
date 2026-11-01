@@ -48,6 +48,12 @@ func TestOutcomeColumnsLines(t *testing.T) {
 			"Edit", `{"file_path":"x"}`, `{"structuredPatch":[{"lines":["-a","\\ No newline at end of file","+b",""]}]}`, 1, 1,
 		},
 		"an update with no hunks changed nothing": {"Edit", `{"file_path":"x"}`, `{"structuredPatch":[]}`, 0, 0},
+		"Write create without a structuredPatch counts the content": {
+			"Write", `{"file_path":"x","content":"one\ntwo\n"}`, `{"type":"create"}`, 2, 0,
+		},
+		"Write create with a null structuredPatch counts the content": {
+			"Write", `{"file_path":"x","content":"one\n"}`, `{"type":"create","structuredPatch":null}`, 1, 0,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -76,7 +82,7 @@ func TestOutcomeColumnsMalformedResponse(t *testing.T) {
 		"patch a string":         {"Edit", `{}`, `{"structuredPatch":"nope"}`, "structuredPatch"},
 		"patch an object":        {"Edit", `{}`, `{"structuredPatch":{"lines":["+a"]}}`, "structuredPatch"},
 		"hunk lines not a list":  {"Edit", `{}`, `{"structuredPatch":[{"lines":"+a"}]}`, "structuredPatch"},
-		"patch absent":           {"Write", `{"content":"a"}`, `{"type":"create"}`, "structuredPatch"},
+		"patch absent":           {"Write", `{"content":"a"}`, `{"type":"update"}`, "structuredPatch"},
 		"patch null":             {"MultiEdit", `{}`, `{"structuredPatch":null}`, "structuredPatch"},
 		"response not an object": {"Edit", `{}`, `"done"`, "Edit response"},
 		"create without content": {"Write", `{"file_path":"x"}`, `{"type":"create","structuredPatch":[]}`, "content"},

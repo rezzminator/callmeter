@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,45 +33,96 @@ import (
 // callmeterPayload is the part of a hook's stdin callmeter reads, across the
 // events it is registered on (docs/design.md § What the harness gives a hook).
 type callmeterPayload struct {
-	HookEventName       string          `json:"hook_event_name"`
-	SessionID           string          `json:"session_id"`
-	TranscriptPath      string          `json:"transcript_path"`
-	Cwd                 string          `json:"cwd"`
-	AgentID             string          `json:"agent_id"`
-	AgentType           string          `json:"agent_type"`
-	AgentTranscriptPath string          `json:"agent_transcript_path"`
-	ToolName            string          `json:"tool_name"`
-	ToolUseID           string          `json:"tool_use_id"`
-	ToolInput           json.RawMessage `json:"tool_input"`
-	ToolResponse        json.RawMessage `json:"tool_response"`
-	DurationMS          *float64        `json:"duration_ms"`
-	Error               *string         `json:"error"`
-	ToolCalls           []struct {
-		ToolUseID    string          `json:"tool_use_id"`
-		ToolName     string          `json:"tool_name"`
-		ToolInput    json.RawMessage `json:"tool_input"`
-		ToolResponse json.RawMessage `json:"tool_response"`
-	} `json:"tool_calls"`
-	PromptID       string          `json:"prompt_id"`
-	PermissionMode string          `json:"permission_mode"`
-	Effort         json.RawMessage `json:"effort"` // {"level": …}
-	IsInterrupt    *bool           `json:"is_interrupt"`
-	Source         string          `json:"source"`
-	Model          string          `json:"model"`
-	Reason         string          `json:"reason"`
-	Trigger        string          `json:"trigger"`
-	LoadReason     string          `json:"load_reason"`
-	MemoryType     string          `json:"memory_type"`
-	FilePath       string          `json:"file_path"`
-	CommandName    string          `json:"command_name"`
-	TaskID         string          `json:"task_id"`
-	StopHookActive *bool           `json:"stop_hook_active"`
+	HookEventName       string              `json:"hook_event_name"`
+	SessionID           string              `json:"session_id"`
+	TranscriptPath      string              `json:"transcript_path"`
+	Cwd                 string              `json:"cwd"`
+	AgentID             string              `json:"agent_id"`
+	AgentType           string              `json:"agent_type"`
+	AgentTranscriptPath string              `json:"agent_transcript_path"`
+	ToolName            string              `json:"tool_name"`
+	ToolUseID           string              `json:"tool_use_id"`
+	ToolInput           json.RawMessage     `json:"tool_input"`
+	ToolResponse        json.RawMessage     `json:"tool_response"`
+	DurationMS          *float64            `json:"duration_ms"`
+	Error               *string             `json:"error"`
+	ToolCalls           []callmeterToolCall `json:"tool_calls"`
+	PromptID            string              `json:"prompt_id"`
+	PermissionMode      string              `json:"permission_mode"`
+	Effort              json.RawMessage     `json:"effort"` // {"level": …}
+	IsInterrupt         *bool               `json:"is_interrupt"`
+	Source              string              `json:"source"`
+	Model               string              `json:"model"`
+	Reason              string              `json:"reason"`
+	Trigger             string              `json:"trigger"`
+	LoadReason          string              `json:"load_reason"`
+	MemoryType          string              `json:"memory_type"`
+	FilePath            string              `json:"file_path"`
+	CommandName         string              `json:"command_name"`
+	TaskID              string              `json:"task_id"`
+	StopHookActive      *bool               `json:"stop_hook_active"`
 	// Free text and the lists that carry it: only measured or sanitized,
 	// never stored as they are.
 	Prompt               json.RawMessage `json:"prompt"`
 	LastAssistantMessage json.RawMessage `json:"last_assistant_message"`
 	BackgroundTasks      json.RawMessage `json:"background_tasks"`
 	SessionCrons         json.RawMessage `json:"session_crons"`
+}
+
+// callmeterToolCall is one PostToolBatch tool_calls entry. It decodes field by
+// field (decodeKnown): a mistyped field stays unset and is named in mistyped,
+// an entry that is no JSON object decodes empty with mistyped "(entry)", so one
+// bad entry never costs the batch its other entries.
+type callmeterToolCall struct {
+	ToolUseID    string          `json:"tool_use_id"`
+	ToolName     string          `json:"tool_name"`
+	ToolInput    json.RawMessage `json:"tool_input"`
+	ToolResponse json.RawMessage `json:"tool_response"`
+	mistyped     []string
+}
+
+func (c *callmeterToolCall) UnmarshalJSON(raw []byte) error {
+	type plain callmeterToolCall // its own fields, without this method
+	mistyped, err := decodeKnown(raw, (*plain)(c))
+	if err != nil {
+		*c = callmeterToolCall{mistyped: []string{"(entry)"}}
+		return nil
+	}
+	c.mistyped = mistyped
+	return nil
+}
+
+// decodeKnown decodes the JSON object raw into target, a pointer to a struct.
+// A field holding a value of the wrong type stays unset (nil, "") and its key is
+// named in mistyped, sorted; every other field decodes. raw that is not one
+// JSON object is err, target then unchanged. encoding/json alone keeps going
+// past a mistyped field but leaves a pointer field set to its zero value and
+// names only the first such field.
+func decodeKnown(raw []byte, target any) (mistyped []string, err error) {
+	err = json.Unmarshal(raw, target)
+	if !errors.As(err, new(*json.UnmarshalTypeError)) {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	value := reflect.ValueOf(target).Elem()
+	value.SetZero()
+	for _, key := range slices.Sorted(maps.Keys(fields)) {
+		one, err := json.Marshal(map[string]json.RawMessage{key: fields[key]})
+		if err != nil {
+			return nil, fmt.Errorf("re-encode field %q: %w", key, err)
+		}
+		if json.Unmarshal(one, reflect.New(value.Type()).Interface()) != nil {
+			mistyped = append(mistyped, key)
+			continue
+		}
+		if err := json.Unmarshal(one, target); err != nil {
+			return nil, fmt.Errorf("decode field %q: %w", key, err)
+		}
+	}
+	return mistyped, nil
 }
 
 // callIDs names each lost call separately; a payload without calls still
@@ -156,12 +209,24 @@ var closeStore = func(s *callmeter.Store) error { return s.Close() }
 // {class}` (giveUp).
 func Callmeter(input io.Reader, stderr io.Writer, getenv paths.Getenv) int {
 	sink := faultlog.ResolveSink(getenv)
+	missed := paths.Missed(sink.Levels)
 	home, err := paths.Home(getenv)
 	if err != nil {
 		faultlog.Failure(stderr, sink, callmeter.StageStore, "", "", fmt.Errorf("resolve callmeter home: %w", err))
+		// No store to write to: the missed.log line counts the lost event at the next run that has one.
+		var payload struct {
+			HookEventName string `json:"hook_event_name"`
+			SessionID     string `json:"session_id"`
+		}
+		if raw, readErr := io.ReadAll(input); readErr == nil {
+			_ = json.Unmarshal(raw, &payload) // undecodable: the line names event unknown
+		}
+		if err := AppendMissed(missed, payload.HookEventName, payload.SessionID, callmeter.StoreUnavailableReason+callmeter.StoreClassNoHome, clock.Real.Now()); err != nil {
+			faultlog.FailureAt(stderr, sink, callmeter.StageTerminated, payload.SessionID, "", err,
+				pluginlog.Row{Event: "append-missed", Where: "internal/hookentry/callmeter.go#Callmeter"})
+		}
 		return 0
 	}
-	missed := paths.Missed(sink.Levels)
 	state := &terminationState{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -429,12 +494,17 @@ func runCallmeter(
 	run.raw = raw
 	digest := sha256.Sum256(raw)
 	run.eventID = hex.EncodeToString(digest[:])
-	var payloadErr error
+	var payloadErr, mistypedErr error
 	if readErr != nil {
 		payloadErr = fmt.Errorf("read hook payload: %w", readErr)
-	} else if err := json.Unmarshal(raw, &run.payload); err != nil {
+	} else if mistyped, err := decodeKnown(raw, &run.payload); err != nil {
 		payloadErr = fmt.Errorf("decode hook payload (%d bytes): %w", len(raw), err)
 	} else {
+		if len(mistyped) > 0 {
+			// The event is recorded all the same, those fields unknown.
+			mistypedErr = fmt.Errorf("%s payload fields of the wrong type, recorded as unknown: %s",
+				faultEventName(run.payload.HookEventName), strings.Join(mistyped, ", "))
+		}
 		run.state.setPayload(run.payload.HookEventName, run.payload.SessionID)
 	}
 	store, err := callmeter.OpenDBWaiting(ctx, files.store, storeWait(run.payload.HookEventName))
@@ -472,6 +542,9 @@ func runCallmeter(
 	if payloadErr != nil {
 		run.fault(callmeter.StagePayload, run.payload.ToolUseID, payloadErr)
 		return 0
+	}
+	if mistypedErr != nil {
+		run.fault(callmeter.StagePayload, run.payload.ToolUseID, mistypedErr)
 	}
 	run.effort = effortOf(run.payload.Effort, run.payload.HookEventName, getenv, func() (string, error) {
 		if run.payload.HookEventName == callmeter.EventSessionStart {
@@ -524,9 +597,15 @@ func (run *callmeterRun) ingestLedger() {
 		faultlog.Failure(run.stderr, run.sink, callmeter.StageParse, run.payload.SessionID, "", fmt.Errorf("cost ledger: %w", err))
 	case err != nil:
 		run.faultOnce(callmeter.StageParse, "", fmt.Errorf("cost ledger: %w", err))
-	case sum.Faults > 0:
-		run.fault(callmeter.StageParse, "", fmt.Errorf(
-			"cost ledger: %d lines of the session's file skipped: not a JSON object, or missing a field the ledger contract requires", sum.Faults))
+	default:
+		if sum.Faults > 0 {
+			run.fault(callmeter.StageParse, "", fmt.Errorf(
+				"cost ledger: %d lines of the session's file skipped: not a JSON object, or missing a field the ledger contract requires", sum.Faults))
+		}
+		if sum.Partial > 0 {
+			run.fault(callmeter.StageParse, "", fmt.Errorf(
+				"cost ledger: %d lines of the session's file kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse", sum.Partial))
+		}
 	}
 }
 
@@ -730,12 +809,8 @@ func (run *callmeterRun) tier1(call *callmeter.Call) {
 
 func (run *callmeterRun) recordCall(failed bool) {
 	p := run.payload
-	if p.ToolUseID == "" || p.ToolName == "" {
-		run.fault(
-			callmeter.StagePayload,
-			p.ToolUseID,
-			fmt.Errorf("%s payload lacks tool_use_id or tool_name", p.HookEventName),
-		)
+	if p.ToolUseID == "" {
+		run.fault(callmeter.StagePayload, "", fmt.Errorf("%s payload lacks tool_use_id", p.HookEventName))
 		return
 	}
 	call := run.base(p.ToolUseID)
@@ -743,15 +818,21 @@ func (run *callmeterRun) recordCall(failed bool) {
 	prompt := call.PromptID
 	call.PromptID = nil
 	call.TS = callmeter.Ptr(run.now)
-	call.Tool = callmeter.Ptr(p.ToolName)
+	call.Tool = presentString(p.ToolName)
 	call.DurationMS = wholeNumber(p.DurationMS)
 	if call.DurationMS != nil && *call.DurationMS >= 0 {
 		call.TS = callmeter.Ptr(run.now - *call.DurationMS)
 	}
 	call.Failed = callmeter.Ptr(failed)
 	call.IsInterrupt = p.IsInterrupt
-	run.inputColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
-	run.fileColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
+	if p.ToolName == "" {
+		// The row lands with its tool unknown; the columns read by tool stay NULL.
+		run.fault(callmeter.StagePayload, p.ToolUseID,
+			fmt.Errorf("%s payload lacks tool_name: the call is recorded with its tool, input, file and result columns unknown", p.HookEventName))
+	} else {
+		run.inputColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
+		run.fileColumns(&call, p.ToolUseID, p.ToolName, p.ToolInput)
+	}
 	var agent *callmeter.Agent
 	if failed {
 		if p.Error != nil {
@@ -765,7 +846,7 @@ func (run *callmeterRun) recordCall(failed bool) {
 		if p.Error != nil {
 			call.BytesReal = callmeter.Ptr(int64(len(*p.Error)))
 		}
-	} else if len(p.ToolResponse) > 0 {
+	} else if len(p.ToolResponse) > 0 && p.ToolName != "" {
 		agent = run.responseColumns(&call)
 	}
 	run.write(p.ToolUseID, func(tx *callmeter.Tx) error {
@@ -795,9 +876,13 @@ func (run *callmeterRun) recordCall(failed bool) {
 // has them, and a PostToolUse landing in either order overwrites them.
 func (run *callmeterRun) recordStartCwd() {
 	p := run.payload
-	if p.ToolUseID == "" || p.Cwd == "" {
-		run.fault(callmeter.StagePayload, p.ToolUseID, fmt.Errorf("PreToolUse payload lacks tool_use_id or cwd"))
+	if p.ToolUseID == "" {
+		run.fault(callmeter.StagePayload, "", fmt.Errorf("PreToolUse payload lacks tool_use_id"))
 		return
+	}
+	if p.Cwd == "" && p.ToolName == "Bash" {
+		// Only a Bash command's paths are read against its cwd; the row lands without it.
+		run.fault(callmeter.StagePayload, p.ToolUseID, fmt.Errorf("PreToolUse payload lacks cwd: the command's relative paths stay unresolved"))
 	}
 	// One of Claude Code's own internal agents fires PreToolUse and nothing
 	// after it that is metered (recordBatch, recordAgent): a start row would
@@ -808,7 +893,7 @@ func (run *callmeterRun) recordStartCwd() {
 		return
 	}
 	call := run.base(p.ToolUseID)
-	call.Cwd = callmeter.Ptr(p.Cwd)
+	call.Cwd = presentString(p.Cwd)
 	call.PromptID = presentString(p.PromptID)
 	// The issuing prompt wins; PostToolUse's effort and mode still win.
 	start := callmeter.Call{ToolUseID: p.ToolUseID, TS: callmeter.Ptr(run.now), Tool: presentString(p.ToolName)}
@@ -862,12 +947,13 @@ func (run *callmeterRun) testRunner(call *callmeter.Call, toolUseID, toolName st
 // failure is a fault and leaves it NULL too.
 func (run *callmeterRun) fileColumns(call *callmeter.Call, toolUseID, toolName string, toolInput json.RawMessage) {
 	p := run.payload
+	// A field FileColumnsFromInput could not read leaves only itself NULL: the
+	// path it did read is still stat'd.
 	if err := callmeter.FileColumnsFromInput(call, toolName, toolInput, p.Cwd); err != nil {
 		run.fault(callmeter.StagePayload, toolUseID, err)
-		return
 	}
 	if call.FilePath == nil {
-		return // not a file tool
+		return // not a file tool, or no path read
 	}
 	path := *call.FilePath
 	info, err := os.Stat(path)
@@ -900,10 +986,14 @@ func (run *callmeterRun) responseColumns(call *callmeter.Call) *callmeter.Agent 
 		call.BytesReal = size
 		return nil
 	}
+	// A field of the wrong type leaves only itself unknown: the size, file and
+	// outcome columns are read from the response all the same.
 	var response callmeterResponse
-	if err := json.Unmarshal(trimmed, &response); err != nil {
+	if mistyped, err := decodeKnown(trimmed, &response); err != nil {
 		run.fault(callmeter.StagePayload, p.ToolUseID, fmt.Errorf("decode %s tool_response: %w", p.ToolName, err))
-		return nil
+	} else if len(mistyped) > 0 {
+		run.fault(callmeter.StagePayload, p.ToolUseID, fmt.Errorf("%s tool_response fields of the wrong type, recorded as unknown: %s",
+			p.ToolName, strings.Join(mistyped, ", ")))
 	}
 	// The size is callmeter.RealBytes's, the one path a transcript's
 	// toolUseResult is measured by too.
@@ -969,9 +1059,14 @@ func (run *callmeterRun) recordBatch() {
 	// overwritten (callmeter.FillEmpty).
 	fills := make([]callmeter.Call, 0, len(p.ToolCalls))
 	for _, toolCall := range p.ToolCalls {
+		if len(toolCall.mistyped) > 0 {
+			run.fault(callmeter.StagePayload, toolCall.ToolUseID, fmt.Errorf("PostToolBatch call fields of the wrong type, recorded as unknown: %s",
+				strings.Join(toolCall.mistyped, ", ")))
+		}
 		if toolCall.ToolUseID == "" {
+			// Only this entry is lost: the batch's other calls and its request still land.
 			run.fault(callmeter.StagePayload, "", errors.New("PostToolBatch call carries no tool_use_id"))
-			return
+			continue
 		}
 		call := run.base(toolCall.ToolUseID)
 		call.PromptID = presentString(p.PromptID)
@@ -1006,10 +1101,14 @@ func (run *callmeterRun) recordBatch() {
 		}
 		fills = append(fills, fill)
 	}
+	if len(ids) == 0 {
+		return // every entry faulted above
+	}
+	// A read that skipped bad lines still holds every other request
+	// (callmeter.LinesSkipped); a failed read holds none.
 	found, err := callmeter.FindRequests(transcript, ids)
 	if err != nil {
 		run.fault(callmeter.StageTranscript, ids[0], err)
-		found = nil
 	}
 	requests := map[string]*callmeter.Request{}
 	var order []string
@@ -1111,9 +1210,14 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 	meta := callmeter.Agent{AgentID: p.AgentID}
 	readMeta := func() {
 		if p.TranscriptPath != "" {
-			if agentType, parent, err := callmeter.SubagentMeta(p.TranscriptPath, p.AgentID); err == nil {
+			agentType, parent, err := callmeter.SubagentMeta(p.TranscriptPath, p.AgentID)
+			switch {
+			case err == nil:
 				meta.ParentToolUseID = presentString(parent)
 				meta.AgentType = presentString(agentType)
+			case !errors.Is(err, fs.ErrNotExist):
+				// The agent row lands; its parent call and meta type stay unknown.
+				run.faultOnce(callmeter.StageTranscript, "", fmt.Errorf("agent %s: %w", p.AgentID, err))
 			}
 		}
 	}
@@ -1172,9 +1276,12 @@ func (run *callmeterRun) recordAgent(stopped bool) {
 	// stored, so a late-landing earlier stop never rolls them back; the model
 	// only fills, so the Agent result's resolved model stays.
 	var totals, model *callmeter.Agent
-	if sum, err := run.settledAgentTotals(transcript); err != nil {
+	// Totals read past a bad line are kept beside its fault (callmeter.LinesSkipped).
+	sum, err := run.settledAgentTotals(transcript)
+	if err != nil {
 		run.fault(callmeter.StageTranscript, "", fmt.Errorf("agent %s totals: %w", p.AgentID, err))
-	} else {
+	}
+	if err == nil || callmeter.LinesSkipped(err) {
 		totals = &callmeter.Agent{
 			AgentID:     p.AgentID,
 			TotalTokens: callmeter.Ptr(sum.TotalTokens),
@@ -1234,7 +1341,7 @@ func (run *callmeterRun) settledAgentTotals(transcript string) (callmeter.AgentT
 	deadline := clock.Real.Now().Add(agentSettle)
 	for {
 		sum, err := callmeter.ReadAgentTotals(transcript, run.payload.PromptID)
-		if err != nil || sum.Final || !clock.Real.Now().Before(deadline) {
+		if (err != nil && !callmeter.LinesSkipped(err)) || sum.Final || !clock.Real.Now().Before(deadline) {
 			return sum, err
 		}
 		if err := clock.Real.Sleep(run.ctx, 25*time.Millisecond); err != nil {
@@ -1267,7 +1374,9 @@ func (run *callmeterRun) resolvePending(agentID, transcript string) {
 	found, err := callmeter.FindRequests(transcript, ids)
 	if err != nil {
 		run.fault(callmeter.StageTranscript, ids[0], err)
-		return
+		if !callmeter.LinesSkipped(err) {
+			return
+		}
 	}
 	run.write(ids[0], func(tx *callmeter.Tx) error {
 		return tx.ResolvePendingFrom(run.ctx, pending, found, callmeter.SourceHook)
@@ -1322,12 +1431,7 @@ func (run *callmeterRun) sweepSession(allAgents bool) {
 		if err != nil {
 			run.fault(callmeter.StageStore, "", err) // unknown: every agent on disk is read
 		}
-		ids, err := callmeter.SubagentTranscripts(p.TranscriptPath)
-		if err != nil {
-			run.fault(callmeter.StageTranscript, "", err)
-			return
-		}
-		for _, agentID := range ids {
+		for _, agentID := range callmeter.SubagentTranscripts(p.TranscriptPath) {
 			if settled[agentID] {
 				again = append(again, agentID)
 			} else {
@@ -1375,7 +1479,9 @@ func (run *callmeterRun) sweepRequests(agentID, transcript string, settle bool) 
 	read, err := run.transcriptRequests(transcript, settle)
 	if err != nil {
 		run.fault(callmeter.StageTranscript, "", fmt.Errorf("requests of %s: %w", transcript, err))
-		return
+		if !callmeter.LinesSkipped(err) {
+			return
+		}
 	}
 	requests := read.Requests
 	if len(requests) == 0 && read.Marks.Empty() {
@@ -1443,7 +1549,7 @@ func (run *callmeterRun) transcriptRequests(transcript string, settle bool) (cal
 	deadline := clock.Real.Now().Add(agentSettle)
 	for {
 		read, err := callmeter.ReadTranscript(transcript, run.payload.PromptID)
-		if err != nil || !settle || read.Final || len(read.Requests) == 0 || !clock.Real.Now().Before(deadline) {
+		if (err != nil && !callmeter.LinesSkipped(err)) || !settle || read.Final || len(read.Requests) == 0 || !clock.Real.Now().Before(deadline) {
 			return read, err
 		}
 		if err := clock.Real.Sleep(run.ctx, 25*time.Millisecond); err != nil {
@@ -1535,12 +1641,16 @@ func (run *callmeterRun) resolveUnfinished() {
 		}
 		if err != nil {
 			run.fault(callmeter.StageTranscript, ids[0], err)
-			continue
+			if !callmeter.LinesSkipped(err) {
+				continue
+			}
 		}
 		if !run.deadline.IsZero() {
 			var waitErr error
 			found, waitErr = run.awaitResults(transcript, ids, found, size, began)
-			if waitErr != nil {
+			// A re-read meeting the first read's bad lines again is the fault
+			// already recorded above.
+			if waitErr != nil && (err == nil || waitErr.Error() != err.Error()) {
 				run.fault(callmeter.StageTranscript, ids[0], waitErr)
 			}
 			for _, id := range ids {

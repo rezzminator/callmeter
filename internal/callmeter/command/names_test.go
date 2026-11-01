@@ -142,6 +142,27 @@ func TestTranscriptNamesUnreadableTranscriptReturnsItsError(t *testing.T) {
 	if name != "" || err == nil || !strings.Contains(err.Error(), "read transcript "+unreadable) {
 		t.Fatalf("nameOf = %q, %v; want blank and the read error naming %s", name, err, unreadable)
 	}
+	// A readable copy under a later project names the chat all the same.
+	writeTranscript(t, fixture.seat, "-work2", "sess-bad", `{"type":"custom-title","customTitle":"later copy"}`)
+	if name, err := fixture.names.nameOf("sess-bad"); name != "later copy" || err != nil {
+		t.Errorf("nameOf with a later readable copy = %q, %v; want its title and no error", name, err)
+	}
+}
+
+// TestTranscriptNamesUnreadableSeatsStillSearchTheOwnSeat: the store's seats
+// that cannot be read leave the report's own seat to search.
+func TestTranscriptNamesUnreadableSeatsStillSearchTheOwnSeat(t *testing.T) {
+	fixture := newNamesLab(t)
+	writeTranscript(t, fixture.seat, "-work", "sess-own", `{"type":"custom-title","customTitle":"own seat"}`)
+	if _, err := fixture.db.Exec(`DROP TABLE calls`); err != nil {
+		t.Fatal(err)
+	}
+	if name, err := fixture.names.nameOf("sess-own"); name != "own seat" || err != nil {
+		t.Errorf("nameOf with the stored seats unreadable = %q, %v; want the own seat's title and no error", name, err)
+	}
+	if name, err := fixture.names.nameOf("sess-nowhere"); name != "" || err == nil || !strings.Contains(err.Error(), "read the seats of session sess-nowhere") {
+		t.Errorf("nameOf found nowhere with the stored seats unreadable = %q, %v; want blank and the seats error", name, err)
+	}
 }
 
 func TestTranscriptNamesTellsStderrOncePerSession(t *testing.T) {
@@ -191,13 +212,22 @@ func TestTranscriptNamesTellsStderrOncePerSession(t *testing.T) {
 	}
 }
 
-func TestTranscriptNamesMalformedTitleEntryReturnsItsError(t *testing.T) {
+// TestTranscriptNamesMalformedTitleEntryCostsOnlyItsLine: a title line that
+// does not decode (a writer mid-append) is skipped and the titles that decode
+// name the chat; with none decoded the name is unknown, an error naming the
+// transcript, never the id start.
+func TestTranscriptNamesMalformedTitleEntryCostsOnlyItsLine(t *testing.T) {
 	fixture := newNamesLab(t)
-	path := writeTranscript(t, fixture.seat, "-work", "sess-torn",
+	writeTranscript(t, fixture.seat, "-work", "sess-torn",
 		`{"type":"custom-title","customTitle":"fine"}`, `{"type":"ai-title","aiTitle":"torn`)
-	_, err := fixture.names.nameOf("sess-torn")
-	if err == nil || !strings.Contains(err.Error(), "decode a title entry in transcript "+path) {
-		t.Fatalf("nameOf over a torn title entry = %v, want the decode error naming %s", err, path)
+	if name, err := fixture.names.nameOf("sess-torn"); name != "fine" || err != nil {
+		t.Errorf("nameOf beside a torn title entry = %q, %v; want the title that decoded and no error", name, err)
+	}
+	path := writeTranscript(t, fixture.seat, "-work", "sess-alltorn", `{"type":"ai-title","aiTitle":"torn`)
+	name, err := fixture.names.nameOf("sess-alltorn")
+	want := "decode 1 title entries in transcript " + path + ", none of them read: invalid character '\\n' in string"
+	if name != "" || err == nil || err.Error() != want {
+		t.Errorf("nameOf over only a torn title entry = %q, %v; want blank and %q", name, err, want)
 	}
 }
 
@@ -303,5 +333,10 @@ func TestTranscriptNamesStoredPathThatCannotBeReadIsAnError(t *testing.T) {
 	name, err := fixture.names.nameOf("sess-dir")
 	if name != "" || err == nil || !strings.Contains(err.Error(), "transcript "+dir+" is not a regular file") {
 		t.Fatalf("nameOf = %q, %v; want blank and the error naming %s", name, err, dir)
+	}
+	// A copy the seat search finds names the chat all the same.
+	writeTranscript(t, fixture.seat, "-work", "sess-dir", `{"type":"custom-title","customTitle":"searched copy"}`)
+	if name, err := fixture.names.nameOf("sess-dir"); name != "searched copy" || err != nil {
+		t.Errorf("nameOf with a searchable copy = %q, %v; want its title and no error", name, err)
 	}
 }

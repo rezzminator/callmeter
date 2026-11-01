@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -342,23 +343,81 @@ func TestEnsureParsedReparsesAfterTheStartCwdLands(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parts, err := loadParts(ctx, store, Filter{})
+	parts, _, err := loadParts(ctx, store, Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	files := parts["b1"][0].files
-	if len(files) != 1 || files[0].Path != filepath.Join(start, "a.txt") || !files[0].Exists || got.Parsed != 1 {
+	if len(files) != 1 || files[0].Path != filepath.Join(start, "a.txt") || files[0].Exists != cmdparse.ExistsYes || got.Parsed != 1 {
 		t.Fatalf("parts resolve against the old cwd; parsed %d calls, want one start-cwd re-parse", got.Parsed)
 	}
 }
 
-func TestEnsureParsedRejectsMalformedStoredJSON(t *testing.T) {
+// An input that is not JSON costs its own call only: it stays unparsed and
+// counted, the next call parses, and the report names it.
+func TestEnsureParsedSkipsMalformedStoredJSON(t *testing.T) {
+	ctx := context.Background()
 	store := openStore(t)
-	c := bash("b1", "s", "", ms(time.Hour), workDir(t), "", 10)
+	dir := workDir(t, "a.txt")
+	c := bash("b1", "s", "", ms(time.Hour), dir, "", 10)
 	c.Input = callmeter.Ptr("{")
 	seed(t, store, c)
-	if _, err := EnsureParsed(context.Background(), store, "", nil); err == nil || !strings.Contains(err.Error(), "decode input of call b1:") {
-		t.Fatalf("EnsureParsed error = %v, want a stored JSON decode error", err)
+	seed(t, store, bash("b2", "s", "", ms(time.Hour), dir, "cat a.txt", 10))
+	got, err := EnsureParsed(ctx, store, "", nil)
+	if err != nil {
+		t.Fatalf("EnsureParsed: %v", err)
+	}
+	if got != (ParseSummary{Parsed: 1, SkippedNoInput: 1}) {
+		t.Fatalf("summary = %+v, want b2 parsed and b1 skipped for its input", got)
+	}
+	table, err := Commands(ctx, store, Filter{}, nil)
+	if err != nil {
+		t.Fatalf("Commands: %v", err)
+	}
+	hasNote(t, table, "1 Bash calls skipped by the parser (relative or missing cwd, stored input not JSON, or no command)")
+}
+
+// A stored args list, files list or file reference that does not decode
+// costs only itself: every parts report runs, keeps every other part and
+// file, and counts each kind in a note.
+func TestPartsReportsKeepEverythingThatDecodes(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	dir := workDir(t, "a.txt", "b.txt", "c.txt")
+	seed(t, store, bash("b1", "s", "", ms(3*time.Hour), dir, "git status && cat a.txt", 100))
+	seed(t, store, bash("b2", "s", "", ms(2*time.Hour), dir, "head -n 5 b.txt", 50))
+	seed(t, store, bash("b3", "s", "", ms(time.Hour), dir, "wc -l c.txt", 10))
+	if _, err := EnsureParsed(ctx, store, "", nil); err != nil {
+		t.Fatalf("EnsureParsed: %v", err)
+	}
+	exec(t, store, `UPDATE command_parts SET args = '{' WHERE tool_use_id = 'b1' AND seq = 0`)
+	exec(t, store, `UPDATE command_parts SET files = '["not a ref", ' || substr(files, 2) WHERE tool_use_id = 'b2'`)
+	exec(t, store, `UPDATE command_parts SET files = 'nope' WHERE tool_use_id = 'b3'`)
+	notes := []string{
+		"1 stored command parts have args that do not decode: args unknown, each shaped by its program alone",
+		"1 stored command parts have a files list that does not decode: their files are not counted",
+		"1 stored file references do not decode: those files are not counted",
+	}
+	for name, report := range map[string]func(context.Context, *callmeter.Store, Filter, NameOf) (*Table, error){
+		"commands": Commands, "files": Files, "writes": Writes, "context": Context, "sequences": Sequences,
+	} {
+		table, err := report(ctx, store, Filter{}, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, want := range notes {
+			hasNote(t, table, want)
+		}
+		switch name {
+		case "commands":
+			wantRows(t, table, "git ; cat a.txt|1|100|100|100|0|0|0", "head|1|50|50|50|0|0|0", "wc|1|10|10|10|0|0|0")
+		case "files":
+			if got := bashBytesOf(t, table); !reflect.DeepEqual(got, map[string]string{
+				filepath.Join(dir, "a.txt"): "100", filepath.Join(dir, "b.txt"): "50",
+			}) {
+				t.Errorf("files BASH BYTES = %v, want a.txt and b.txt kept, c.txt not counted", got)
+			}
+		}
 	}
 }
 
@@ -447,13 +506,19 @@ func TestEnsureParsedMarksAPartWithNoProgram(t *testing.T) {
 }
 
 func TestFileRefRoundTrip(t *testing.T) {
-	for _, ref := range []cmdparse.FileRef{
-		{Path: "/w/a b.txt", Action: cmdparse.ActionReadRange, Range: "1,20", Exists: true},
-		{Path: "/w/gone\tscratch.txt", Action: cmdparse.ActionWrite},
+	for _, tc := range []struct {
+		ref    cmdparse.FileRef
+		stored string
+	}{
+		{cmdparse.FileRef{Path: "/w/a b.txt", Action: cmdparse.ActionReadRange, Range: "1,20", Exists: cmdparse.ExistsYes}, "read-range\t1,20\t1\t/w/a b.txt"},
+		{cmdparse.FileRef{Path: "/w/gone\tscratch.txt", Action: cmdparse.ActionWrite}, "write\t\t0\t/w/gone\tscratch.txt"},
+		// A stat that failed for another cause is stored unknown, never present.
+		{cmdparse.FileRef{Path: "/w/denied.txt", Action: cmdparse.ActionReadWhole, Exists: cmdparse.ExistsUnknown}, "read-whole\t\t?\t/w/denied.txt"},
 	} {
-		got, err := DecodeFileRef(EncodeFileRef(ref))
-		if err != nil || got != ref {
-			t.Errorf("round trip = %+v, %v; want %+v", got, err, ref)
+		stored := EncodeFileRef(tc.ref)
+		got, err := DecodeFileRef(stored)
+		if stored != tc.stored || err != nil || got != tc.ref {
+			t.Errorf("EncodeFileRef = %q, want %q; round trip = %+v, %v; want %+v", stored, tc.stored, got, err, tc.ref)
 		}
 	}
 	// The three-field form predates exists; a stored value of any other shape

@@ -26,30 +26,44 @@ import (
 // row with source 'ledger'; a call a transcript records keeps its own row,
 // priced by the ledger. docs/design.md § The cost ledger.
 
-// ledgerFields are the keys of a ledger line callmeter reads; a line's other
-// keys are ignored and never stored.
+// ledgerFields are the keys of a ledger line callmeter reads (parseLedgerLine
+// names each); a line's other keys are ignored and never stored. Every one but
+// RequestID is nil when the line did not carry it in a form callmeter reads.
 type ledgerFields struct {
-	RequestID     *string `json:"request_id"`
-	TS            *string `json:"ts"`
-	AgentID       *string `json:"agent_id"`
-	QuerySource   *string `json:"query_source"`
-	Model         *string `json:"model"`
-	Input         *int64  `json:"input_tokens"`
-	Output        *int64  `json:"output_tokens"`
-	CacheRead     *int64  `json:"cache_read_tokens"`
-	CacheCreation *int64  `json:"cache_creation_tokens"`
-	Cost          *int64  `json:"cost_usd_micros"`
-	Join          string  `json:"join"`
+	RequestID     *string
+	TS            *string
+	AgentID       *string
+	QuerySource   *string
+	Model         *string
+	Input         *int64
+	Output        *int64
+	CacheRead     *int64
+	CacheCreation *int64
+	Cost          *int64
+	Join          *string
 }
 
-// ledgerRow is one valid ledger line: the file's session and the line's fields.
+// ledgerRow is one ledger line naming a request id: the file's session and the
+// line's fields; at is zero when the line's ts is unknown.
 type ledgerRow struct {
 	ledgerFields
 	id      string
 	session string
 	at      time.Time
 	rank    int
+	partial bool // a field of the line was unknown (parseLedgerLine)
 }
+
+// keeps reports whether r takes the place of prior, an earlier line of the same
+// request id: a better join does, and at the same join a later line does unless
+// it is partial and prior is not, so no unknown field takes a known one back.
+func (r ledgerRow) keeps(prior ledgerRow) bool {
+	return r.rank > prior.rank || r.rank == prior.rank && (!r.partial || prior.partial)
+}
+
+// inWindow reports whether r is inside a retention window starting at cutoff:
+// at or after it, or of an unknown ts, which no window can judge.
+func (r ledgerRow) inWindow(cutoff time.Time) bool { return r.at.IsZero() || !r.at.Before(cutoff) }
 
 // UnknownLedgerAgent is the agent_id a ledger row carries when its log half
 // arrived and its agent could not be learned.
@@ -62,8 +76,8 @@ const UnknownLedgerAgent = "?"
 // per token stays near 1e14 micros, and no price reaches the range where
 // PriceMicros's float64 to int64 conversion is implementation-defined. A sum
 // over many lines is not bounded by them (about 9,000 lines at the price bound
-// fill an int64). A line past either is a bad line, counted in Faults and
-// stored nowhere.
+// fill an int64). A value past either is unknown: the line is kept with that
+// field NULL and counted in Partial.
 const (
 	maxLedgerTokens = 1_000_000_000_000
 	maxLedgerMicros = 1_000_000_000_000_000
@@ -94,11 +108,13 @@ type LedgerSummary struct {
 	SchemaIncomplete bool
 	Files            int // ledger files read
 	Rows             int // distinct calls read; inside the retention window when one is set
-	Faults           int // lines skipped: not a JSON object, or missing a field the contract requires
+	Faults           int // lines skipped: not a JSON object, or naming no request_id
+	Partial          int // lines kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse
+	FilesSkipped     int // ledger files that could not be read whole (stat, open or read failed, or no regular file): their unread calls are not counted
 	Held             int // calls a transcript of their session records
 	HeldUnrecorded   int // held calls the store has no request for yet: not counted until a hook or recovery writes it
 	Side             int // calls no transcript records: ingested as source 'ledger' requests
-	Unreadable       int // sessions whose transcripts could not be read: their unknown calls count as side calls
+	Unreadable       int // sessions whose transcripts could not be read whole (none named, a file unread, a requestId line not JSON): their unknown calls count as side calls
 }
 
 // IngestLedger brings the cost ledger in dir into the store, idempotently:
@@ -273,14 +289,22 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 	if r.Model != nil {
 		model = *r.Model
 	}
-	var cost, source any
+	// A field the line did not carry readably is NULL, and so is what needs it.
+	counted := r.Input != nil && r.Output != nil && r.CacheRead != nil && r.CacheCreation != nil
+	var cost, source, contextTokens, ts any
 	switch {
 	case r.Cost != nil:
 		cost, source = *r.Cost, SourceLedger
-	default:
+	case counted:
 		if micros, ok := PriceMicros(model, *r.Input, *r.Output, *r.CacheRead, *r.CacheCreation, nil, nil); ok {
 			cost, source = micros, CostSourceTable
 		}
+	}
+	if r.Input != nil && r.CacheRead != nil && r.CacheCreation != nil {
+		contextTokens = *r.Input + *r.CacheRead + *r.CacheCreation
+	}
+	if !r.at.IsZero() {
+		ts = r.at.UnixMilli()
 	}
 	_, err := t.tx.ExecContext(ctx,
 		`INSERT INTO requests (request_id, session_id, agent_id, ts, model, input_tokens, cache_read_tokens,
@@ -301,8 +325,8 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 			OR requests.cache_creation_tokens IS NOT excluded.cache_creation_tokens
 			OR requests.output_tokens IS NOT excluded.output_tokens OR requests.query_source IS NOT excluded.query_source
 			OR requests.cost_usd_micros IS NOT excluded.cost_usd_micros OR requests.cost_source IS NOT excluded.cost_source)`,
-		r.id, r.session, agent, r.at.UnixMilli(), nullablePtr(r.Model), *r.Input, *r.CacheRead, *r.CacheCreation,
-		*r.Input+*r.CacheRead+*r.CacheCreation, *r.Output, SourceLedger, nullablePtr(r.QuerySource), cost, source)
+		r.id, r.session, agent, ts, nullablePtr(r.Model), r.Input, r.CacheRead, r.CacheCreation,
+		contextTokens, r.Output, SourceLedger, nullablePtr(r.QuerySource), cost, source)
 	if err != nil {
 		return fmt.Errorf("callmeter store %s: write ledger request %q: %w", t.path, r.id, err)
 	}
@@ -310,10 +334,13 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 }
 
 // readLedger reads every ledger file of dir touched at or after cutoff and
-// returns its distinct calls at or after cutoff (all of them when cutoff is the
-// zero time), the best join of each request
-// id (a later line among equals), in a stable order. A line that is not a JSON
-// object, or lacks a field the contract requires, is counted in sum.Faults.
+// returns its distinct calls in the window (inWindow; all of them when cutoff
+// is the zero time), the best join of each request id (a later line among
+// equals), in a stable order. A line that is not a JSON object, or names no
+// request id, is counted in sum.Faults; one kept with a field unknown in
+// sum.Partial. A file that cannot be read whole is counted in
+// sum.FilesSkipped, keeping the lines read before the failure; the other
+// files are still read.
 func readLedger(dir string, cutoff time.Time, sum *LedgerSummary) ([]ledgerRow, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -328,20 +355,20 @@ func readLedger(dir string, cutoff time.Time, sum *LedgerSummary) ([]ledgerRow, 
 		path := filepath.Join(dir, name)
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil, fmt.Errorf("callmeter ledger: stat %s: %w", path, err)
+			sum.FilesSkipped++
+			continue
 		}
 		if info.ModTime().Before(cutoff) {
 			continue
 		}
 		sum.Files++
-		session := strings.TrimSuffix(name, ".jsonl")
-		if err := readLedgerFile(path, session, best, sum); err != nil {
-			return nil, err
+		if err := readLedgerFile(path, strings.TrimSuffix(name, ".jsonl"), best, sum); err != nil {
+			sum.FilesSkipped++ // the lines read before the failure stand
 		}
 	}
 	rows := make([]ledgerRow, 0, len(best))
 	for _, r := range best {
-		if !r.at.Before(cutoff) {
+		if r.inWindow(cutoff) {
 			rows = append(rows, r)
 		}
 	}
@@ -364,10 +391,14 @@ func readLedgerFile(path, session string, best map[string]ledgerRow, sum *Ledger
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(bytes.TrimSpace(line)) > 0 {
-			row, ok := parseLedgerLine(line, session)
-			if !ok {
+			row, partial, ok := parseLedgerLine(line, session)
+			switch {
+			case !ok:
 				sum.Faults++
-			} else if prior, seen := best[row.id]; !seen || row.rank >= prior.rank {
+			case partial:
+				sum.Partial++
+			}
+			if prior, seen := best[row.id]; ok && (!seen || row.keeps(prior)) {
 				best[row.id] = row
 			}
 		}
@@ -380,30 +411,68 @@ func readLedgerFile(path, session string, best map[string]ledgerRow, sum *Ledger
 	}
 }
 
-// parseLedgerLine reads one ledger line; ok is false for a line that is not a
-// JSON object holding the fields the contract requires.
-func parseLedgerLine(line []byte, session string) (ledgerRow, bool) {
+// parseLedgerLine reads one ledger line; ok is false only for a line that is
+// not a JSON object or names no request_id, the one field a row is keyed by.
+// Every other field is read on its own: one absent where the contract requires
+// it (ts and the four counts), of another JSON type, or past its bound (a
+// count above maxLedgerTokens, a price above maxLedgerMicros), and a ts that is
+// no RFC 3339 time, is kept unknown (nil; at zero) and partial says so, the
+// rest of the line standing.
+func parseLedgerLine(line []byte, session string) (row ledgerRow, partial, ok bool) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(line), &raw); err != nil || raw == nil {
+		return ledgerRow{}, false, false
+	}
 	var f ledgerFields
-	if err := json.Unmarshal(bytes.TrimSpace(line), &f); err != nil {
-		return ledgerRow{}, false
+	if f.RequestID = ledgerField[string](raw, "request_id", true, &partial); f.RequestID == nil || *f.RequestID == "" {
+		return ledgerRow{}, false, false
 	}
-	if f.RequestID == nil || *f.RequestID == "" || f.TS == nil || f.Input == nil || f.Output == nil ||
-		f.CacheRead == nil || f.CacheCreation == nil {
-		return ledgerRow{}, false
+	bounded := func(key string, bound int64) *int64 {
+		value := ledgerField[int64](raw, key, true, &partial)
+		if value != nil && (*value < 0 || *value > bound) {
+			partial = true
+			return nil
+		}
+		return value
 	}
-	for _, count := range []int64{*f.Input, *f.Output, *f.CacheRead, *f.CacheCreation} {
-		if count < 0 || count > maxLedgerTokens {
-			return ledgerRow{}, false
+	f.TS = ledgerField[string](raw, "ts", true, &partial)
+	f.AgentID = ledgerField[string](raw, "agent_id", false, &partial)
+	f.QuerySource = ledgerField[string](raw, "query_source", false, &partial)
+	f.Model = ledgerField[string](raw, "model", false, &partial)
+	f.Input = bounded("input_tokens", maxLedgerTokens)
+	f.Output = bounded("output_tokens", maxLedgerTokens)
+	f.CacheRead = bounded("cache_read_tokens", maxLedgerTokens)
+	f.CacheCreation = bounded("cache_creation_tokens", maxLedgerTokens)
+	f.Join = ledgerField[string](raw, "join", false, &partial)
+	if f.Cost = ledgerField[int64](raw, "cost_usd_micros", false, &partial); f.Cost != nil && (*f.Cost < 0 || *f.Cost > maxLedgerMicros) {
+		f.Cost, partial = nil, true
+	}
+	var at time.Time
+	if f.TS != nil {
+		parsed, err := time.Parse(time.RFC3339Nano, *f.TS)
+		if err != nil {
+			partial = true
+		} else {
+			at = parsed
 		}
 	}
-	if f.Cost != nil && (*f.Cost < 0 || *f.Cost > maxLedgerMicros) {
-		return ledgerRow{}, false
+	join := ""
+	if f.Join != nil {
+		join = *f.Join
 	}
-	at, err := time.Parse(time.RFC3339Nano, *f.TS)
-	if err != nil {
-		return ledgerRow{}, false
+	return ledgerRow{ledgerFields: f, id: *f.RequestID, session: session, at: at, rank: joinRank(join), partial: partial}, partial, true
+}
+
+// ledgerField is key of a ledger line's fields decoded as a T (decodeField):
+// nil when absent, null or of another JSON type. bad is set for a value there
+// that is not a T, and, when required, for an absent or null one.
+func ledgerField[T any](raw map[string]json.RawMessage, key string, required bool, bad *bool) *T {
+	var mistyped []error
+	out := decodeField[*T](raw, key, &mistyped)
+	if len(mistyped) > 0 || (out == nil && required) {
+		*bad = true
 	}
-	return ledgerRow{ledgerFields: f, id: *f.RequestID, session: session, at: at, rank: joinRank(f.Join)}, true
+	return out
 }
 
 // storedAPIRequest is a stored request holding a requestId.
@@ -451,7 +520,8 @@ func (h transcriptHold) twin(requestID string) bool { return h.stored[h.held[req
 
 // scanUnknownSessions reads the transcripts of every session that holds a
 // ledger call the store has no request for, and notes the sessions whose
-// transcripts could not be read.
+// transcripts could not be read whole: no main transcript named, a file
+// unread, or a line naming a requestId that is not JSON. What was read still holds its calls.
 func (s *Store) scanUnknownSessions(ctx context.Context, rows []ledgerRow, known map[string]storedAPIRequest, sum *LedgerSummary) (transcriptHold, error) {
 	hold := transcriptHold{held: map[string]string{}, stored: map[string]bool{}}
 	sessions := map[string]bool{}
@@ -472,14 +542,15 @@ func (s *Store) scanUnknownSessions(ctx context.Context, rows []ledgerRow, known
 		if err != nil {
 			return hold, err
 		}
-		readable := len(paths.files) > 0
+		readable := paths.main != ""
 		for _, path := range paths.files {
-			found, err := scanRequestIDs(path)
+			found, whole, err := scanRequestIDs(path)
 			switch {
 			case err == nil:
 				for apiID, messageID := range found {
 					hold.held[apiID] = messageID
 				}
+				readable = readable && whole
 			case errors.Is(err, fs.ErrNotExist) && path != paths.main:
 				// A sub-agent that wrote no transcript holds no request.
 			default:
@@ -540,17 +611,12 @@ func (s *Store) sessionTranscripts(ctx context.Context, session string) (transcr
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return out, fmt.Errorf("callmeter store %s: read the transcript of session %q: %w", s.path, session, err)
 	}
-	if main.String == "" {
-		return out, nil
-	}
-	out.main = main.String
-	add(main.String)
-	agentIDs, err := SubagentTranscripts(main.String)
-	if err != nil {
-		return out, err
-	}
-	for _, id := range agentIDs {
-		add(SubagentTranscriptPath(main.String, id))
+	if main.String != "" {
+		out.main = main.String
+		add(main.String)
+		for _, id := range SubagentTranscripts(main.String) {
+			add(SubagentTranscriptPath(main.String, id))
+		}
 	}
 	rows, err := s.db.QueryContext(ctx,
 		"SELECT transcript_path FROM agents WHERE session_id = ? AND transcript_path IS NOT NULL AND transcript_path != ''", session)
@@ -572,37 +638,40 @@ func (s *Store) sessionTranscripts(ctx context.Context, session string) (transcr
 
 // scanRequestIDs reads a transcript for the requestId of each assistant message
 // it records, mapped to the message's id. Nothing else of a line is kept.
-func scanRequestIDs(path string) (map[string]string, error) {
+// whole is false when a line naming a requestId is not JSON (a torn or
+// malformed line): its call, if any, is not among found. A final line with no
+// newline is a writer mid-append (readLines), never a torn one.
+func scanRequestIDs(path string) (found map[string]string, whole bool, err error) {
 	file, err := openRegular(path)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer file.Close()
-	found := map[string]string{}
-	reader := bufio.NewReaderSize(file, 1<<20)
+	found = map[string]string{}
 	marker := []byte(`"requestId"`)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if bytes.Contains(line, marker) {
-			var entry struct {
-				Type      string `json:"type"`
-				RequestID string `json:"requestId"`
-				Message   struct {
-					ID string `json:"id"`
-				} `json:"message"`
-			}
-			// A line that is not an entry is another reader's fault to name.
-			if json.Unmarshal(line, &entry) == nil && entry.Type == "assistant" && entry.RequestID != "" && entry.Message.ID != "" {
-				found[entry.RequestID] = entry.Message.ID
-			}
+	bad, err := readLines(file, path, 0, false, func(line []byte) error {
+		if !bytes.Contains(line, marker) {
+			return nil
 		}
-		if errors.Is(err, io.EOF) {
-			return found, nil
+		var entry struct {
+			Type      string `json:"type"`
+			RequestID string `json:"requestId"`
+			Message   struct {
+				ID string `json:"id"`
+			} `json:"message"`
 		}
-		if err != nil {
-			return nil, fmt.Errorf("callmeter ledger: read transcript: %w", err)
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return err
 		}
+		if entry.Type == "assistant" && entry.RequestID != "" && entry.Message.ID != "" {
+			found[entry.RequestID] = entry.Message.ID
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("callmeter ledger: %w", err)
 	}
+	return found, bad == nil, nil
 }
 
 // PriceUnpriced prices from the table every settled request that has no price

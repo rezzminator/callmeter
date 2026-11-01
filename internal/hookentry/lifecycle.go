@@ -195,7 +195,9 @@ func (run *callmeterRun) recoverTurnEnd() {
 	}
 	if err != nil {
 		run.fault(callmeter.StageTranscript, "", err)
-		return
+		if !callmeter.LinesSkipped(err) {
+			return
+		}
 	}
 	if end.Event == "" {
 		return

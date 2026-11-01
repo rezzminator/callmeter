@@ -178,11 +178,84 @@ func (f fixture) run(t *testing.T, since string) (int, string) {
 }
 
 func TestMatchingFixtureIsClean(t *testing.T) {
-	f := newFixture(t, nil, nil)
-	code, out := f.run(t, "2030-01-01T00:00:00Z")
-	if code != 0 || !strings.Contains(out, "sessions compared 1, transcripts read 2,") || !strings.Contains(out, "mismatches 0 unexplained 0 expected; by class: none") {
-		t.Fatalf("exit %d, want 0 and a clean summary:\n%s", code, out)
+	for _, c := range []struct {
+		name  string
+		setup func(t *testing.T, f *fixture)
+		lines func(f fixture) []string // whole output lines that must print
+	}{
+		{name: "the fixture as written"},
+		// A projects dir is a literal path: glob syntax in its name is neither a
+		// bad pattern nor a pattern matching some other name.
+		{name: "projects dir whose name is a bad glob pattern", setup: func(t *testing.T, f *fixture) { moveProjects(t, f, "pro[j") }},
+		{name: "projects dir whose name is a glob class", setup: func(t *testing.T, f *fixture) { moveProjects(t, f, "pro[j]") }},
+		{
+			// A scratch root that cannot be looked at is listed, never taken
+			// for an empty one.
+			name: "scratch root that cannot be stat'd",
+			setup: func(t *testing.T, f *fixture) {
+				if err := os.Symlink(filepath.Join(f.dir, "scratch"), filepath.Join(f.dir, "scratch")); err != nil {
+					t.Fatalf("loop the scratch root: %v", err)
+				}
+			},
+			lines: func(f fixture) []string {
+				root := filepath.Join(f.dir, "scratch")
+				return []string{"reconcile: scratch stores under " + root + ": 0 read, unreadable: " + root + " (stat " + root + ": too many levels of symbolic links)"}
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFixture(t, nil, nil)
+			if c.setup != nil {
+				c.setup(t, &f)
+			}
+			code, out := f.run(t, "2030-01-01T00:00:00Z")
+			if code != 0 || !strings.Contains(out, "sessions compared 1, transcripts read 2,") || !strings.Contains(out, "mismatches 0 unexplained 0 expected; by class: none") {
+				t.Fatalf("exit %d, want 0 and a clean summary:\n%s", code, out)
+			}
+			if c.lines != nil {
+				assertLines(t, out, c.lines(f))
+			}
+		})
 	}
+}
+
+// moveProjects moves the fixture's projects dir to dir/name, the session's
+// stored transcript path with it.
+func moveProjects(t *testing.T, f *fixture, name string) {
+	t.Helper()
+	moved := filepath.Join(f.dir, name)
+	if err := os.Rename(f.projects, moved); err != nil {
+		t.Fatalf("move projects dir: %v", err)
+	}
+	f.main = filepath.Join(moved, strings.TrimPrefix(f.main, f.projects))
+	f.projects = moved
+	setTranscriptPath(t, *f, fxSession, f.main)
+}
+
+// assertLines fails unless each line prints as a whole output line.
+func assertLines(t *testing.T, out string, lines []string) {
+	t.Helper()
+	got := strings.Split(out, "\n")
+	for _, l := range lines {
+		if !slices.Contains(got, l) {
+			t.Errorf("no output line\n%s\nin:\n%s", l, out)
+		}
+	}
+}
+
+// resolved is a fixture path with its symlinks resolved, as readFile names it.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return real
+}
+
+// metaPath is the fixture sub-agent's .meta.json.
+func (f fixture) metaPath() string {
+	return filepath.Join(f.projects, "-tmp-demo-proj", fxSession, "subagents", "agent-"+fxAgent+".meta.json")
 }
 
 // TestProjectsDefaultToEverySeatTheSnapshotRecords: without --projects the
@@ -235,6 +308,8 @@ func TestSeededMismatchIsCaught(t *testing.T) {
 		name, class string
 		extraMain   []string
 		sql         []string
+		setup       func(t *testing.T, f *fixture)
+		lines       func(t *testing.T, f fixture) []string // whole output lines that must print
 	}{
 		// calls
 		{name: "call row missing", class: "call-missing", sql: []string{`DELETE FROM calls WHERE tool_use_id='toolu_B1'`}},
@@ -268,16 +343,173 @@ func TestSeededMismatchIsCaught(t *testing.T) {
 		{name: "session without a model", class: "session-no-model", sql: []string{`UPDATE sessions SET model=NULL`}},
 		// the window edge: a call whose result is in, still without a request row
 		{name: "returned call without a request row", class: "call-no-request", sql: []string{`UPDATE calls SET request_id=NULL WHERE tool_use_id='toolu_A1'`}},
+		// a tool use whose message carries no id is still a tool use
+		{name: "tool use of a message without an id", class: "call-missing", extraMain: []string{assistantLine(t, 22, "", 5, "tool_use", toolUse("toolu_N1", "Bash"))},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{"MISMATCH call-missing session=" + fxSession + " ids=toolu_N1 tool=Bash agent=- ts=2030-01-01T00:00:22Z at=2030-01-01T00:00:22Z"}
+			}},
+		// A tool result whose line has no timestamp, or one that does not
+		// parse, still landed: kept with its time unknown.
+		{name: "tool result on a line without a timestamp", class: "call-no-size", extraMain: untimedResult(t, nil), sql: []string{untimedCall},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{"MISMATCH call-no-size session=" + fxSession + " ids=toolu_T1 tool=Bash at=2030-01-01T00:00:22Z"}
+			}},
+		// Unreadable input: the one item is skipped and printed as an
+		// unreadable mismatch, the rest of the run read and compared.
+		{name: "tool result on a line whose timestamp does not parse", class: "unreadable", extraMain: untimedResult(t, "yesterday"), sql: []string{untimedCall},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " parse timestamp in " + resolved(t, f.main) + ` line 8: parsing time "yesterday" as "2006-01-02T15:04:05.999999999Z07:00": cannot parse "yesterday" as "2006"`,
+					"MISMATCH call-no-size session=" + fxSession + " ids=toolu_T1 tool=Bash at=2030-01-01T00:00:22Z",
+				}
+			}},
+		{name: "transcript line that is not JSON", class: "unreadable",
+			extraMain: []string{`{"type":`, jsonLine(t, map[string]any{"type": "system", "subtype": "compact_boundary", "timestamp": fxTS(22), "sessionId": fxSession, "entrypoint": "cli"})},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " parse transcript " + resolved(t, f.main) + " line 7: unexpected end of JSON input",
+					"MISMATCH event-compact session=" + fxSession + " PostCompact transcript_boundaries=1 (main 1, sub-agents 0) store=0",
+				}
+			}},
+		{name: "content blocks that do not parse", class: "unreadable",
+			extraMain: []string{jsonLine(t, map[string]any{"type": "user", "timestamp": fxTS(22), "sessionId": fxSession, "entrypoint": "cli", "promptId": fxPrompt2, "message": map[string]any{"role": "user", "content": []any{1}}})},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " parse content blocks in " + resolved(t, f.main) + " line 7: json: cannot unmarshal number into .0 of type main.block",
+					"MISMATCH event-prompt-missing session=" + fxSession + " ids=" + fxPrompt2 + " transcript_prompts=2",
+				}
+			}},
+		{name: "TaskStop whose input does not parse", class: "unreadable",
+			extraMain: []string{assistantLine(t, 22, "msg_S1", 5, "tool_use", map[string]any{"type": "tool_use", "id": "toolu_S1", "name": "TaskStop", "input": "oops"})},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " transcript " + resolved(t, f.main) + " line 7: TaskStop toolu_S1 input: json: cannot unmarshal string into Go value of type main.taskStopInput",
+					"MISMATCH call-missing session=" + fxSession + " ids=toolu_S1 tool=TaskStop agent=- ts=2030-01-01T00:00:22Z at=2030-01-01T00:00:22Z",
+				}
+			}},
+		{name: "sub-agent meta that does not parse", class: "unreadable", sql: []string{`UPDATE calls SET agent_id=NULL WHERE tool_use_id='toolu_B1'`},
+			setup: func(t *testing.T, f *fixture) {
+				if err := os.WriteFile(f.metaPath(), []byte("{"), 0o600); err != nil {
+					t.Fatalf("write meta: %v", err)
+				}
+			},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " parse sub-agent meta " + f.metaPath() + ": unexpected end of JSON input",
+					"MISMATCH call-agent session=" + fxSession + " ids=toolu_B1 transcript_agent=" + fxAgent + " store_agent=- at=2030-01-01T00:00:06Z",
+				}
+			}},
+		{name: "sub-agent meta that cannot be read", class: "unreadable", sql: []string{`UPDATE calls SET agent_id=NULL WHERE tool_use_id='toolu_B1'`},
+			setup: func(t *testing.T, f *fixture) {
+				if err := os.Remove(f.metaPath()); err != nil {
+					t.Fatalf("remove meta: %v", err)
+				}
+				if err := os.Mkdir(f.metaPath(), 0o700); err != nil {
+					t.Fatalf("meta as a directory: %v", err)
+				}
+			},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " read sub-agent meta " + f.metaPath() + ": read " + f.metaPath() + ": is a directory",
+					"MISMATCH call-agent session=" + fxSession + " ids=toolu_B1 transcript_agent=" + fxAgent + " store_agent=- at=2030-01-01T00:00:06Z",
+				}
+			}},
+		{name: "main transcript that cannot be read", class: "unreadable",
+			setup: func(t *testing.T, f *fixture) {
+				if err := os.Remove(f.main); err != nil {
+					t.Fatalf("remove main transcript: %v", err)
+				}
+				if err := os.Mkdir(f.main, 0o700); err != nil {
+					t.Fatalf("main transcript as a directory: %v", err)
+				}
+			},
+			lines: func(t *testing.T, f fixture) []string {
+				real := resolved(t, f.main)
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " read transcript " + real + ": read " + real + ": is a directory",
+					// the sub-agent's transcript is still read: toolu_B1 matches
+					"reconcile: sessions compared 1, transcripts read 2, unrecorded disk sessions 0, mismatches 4 unexplained 0 expected; by class: call-extra=2 request-extra=1 unreadable=1",
+				}
+			}},
+		{name: "stored transcript path that cannot be stat'd", class: "unreadable",
+			setup: func(t *testing.T, f *fixture) { setTranscriptPath(t, *f, fxSession, filepath.Join(f.main, "x")) },
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=" + fxSession + " stat transcript of session " + fxSession + ": stat " + filepath.Join(f.main, "x") + ": not a directory",
+					// the index's path is compared instead
+					"reconcile: sessions compared 1, transcripts read 2, unrecorded disk sessions 0, mismatches 1 unexplained 0 expected; by class: unreadable=1",
+				}
+			}},
+		{name: "disk transcript that cannot be stat'd", class: "unreadable",
+			setup: func(t *testing.T, f *fixture) {
+				loop := filepath.Join(f.projects, "-tmp-demo-proj", fxSession2+".jsonl")
+				if err := os.Symlink(loop, loop); err != nil {
+					t.Fatalf("loop a disk transcript: %v", err)
+				}
+			},
+			lines: func(t *testing.T, f fixture) []string {
+				loop := filepath.Join(f.projects, "-tmp-demo-proj", fxSession2+".jsonl")
+				return []string{
+					"MISMATCH unreadable session=" + fxSession2 + " stat transcript " + loop + ": stat " + loop + ": too many levels of symbolic links",
+					"reconcile: sessions compared 1, transcripts read 2, unrecorded disk sessions 0, mismatches 1 unexplained 0 expected; by class: unreadable=1",
+				}
+			}},
+		{name: "projects dir that cannot be resolved", class: "unreadable",
+			setup: func(t *testing.T, f *fixture) {
+				loop := filepath.Join(f.dir, "loop")
+				if err := os.Symlink(loop, loop); err != nil {
+					t.Fatalf("loop a projects dir: %v", err)
+				}
+				f.projects += "," + loop
+			},
+			lines: func(t *testing.T, f fixture) []string {
+				loop := filepath.Join(f.dir, "loop")
+				return []string{
+					"MISMATCH unreadable session=- resolve projects dir " + loop + ": EvalSymlinks: too many links",
+					"reconcile: sessions compared 1, transcripts read 2, unrecorded disk sessions 0, mismatches 1 unexplained 0 expected; by class: unreadable=1",
+				}
+			}},
+		{name: "snapshot row that does not scan", class: "unreadable", sql: []string{`UPDATE calls SET ts='never' WHERE tool_use_id='toolu_A2'`},
+			lines: func(t *testing.T, f fixture) []string {
+				return []string{
+					"MISMATCH unreadable session=- snapshot " + f.db + `: 1 calls rows skipped, the first: sql: Scan error on column index 5, name "COALESCE(ts,0)": converting driver.Value type string ("never") to a int64: invalid syntax`,
+					// the other calls rows are read: only toolu_A2 is missing
+					"reconcile: sessions compared 1, transcripts read 2, unrecorded disk sessions 0, mismatches 2 unexplained 0 expected; by class: call-missing=1 unreadable=1",
+				}
+			}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := newFixture(t, c.extraMain, c.sql)
+			if c.setup != nil {
+				c.setup(t, &f)
+			}
 			code, out := f.run(t, "2030-01-01T00:00:00Z")
 			if code != 1 || !strings.Contains(out, "MISMATCH "+c.class+" ") {
 				t.Fatalf("exit %d, want 1 and a %s mismatch:\n%s", code, c.class, out)
 			}
+			if c.lines != nil {
+				assertLines(t, out, c.lines(t, f))
+			}
 		})
 	}
+}
+
+// untimedCall is the store's row for untimedResult's call: settled but for
+// its size.
+var untimedCall = fmt.Sprintf(`INSERT INTO calls(tool_use_id, session_id, request_id, ts, tool, cwd, failed) VALUES('toolu_T1', '%s', 'msg_T1', %d, 'Bash', '/work/demo', 0)`, fxSession, fxMS(22))
+
+// untimedResult is a Bash call at 22 s and its tool_result on a line whose
+// timestamp is ts (nil: none).
+func untimedResult(t *testing.T, ts any) []string {
+	l := map[string]any{
+		"type": "user", "sessionId": fxSession, "entrypoint": "cli",
+		"message": map[string]any{"role": "user", "content": []map[string]any{{"type": "tool_result", "tool_use_id": "toolu_T1", "is_error": false, "content": fxSecret}}},
+	}
+	if ts != nil {
+		l["timestamp"] = ts
+	}
+	return []string{assistantLine(t, 22, "msg_T1", 5, "tool_use", toolUse("toolu_T1", "Bash")), jsonLine(t, l)}
 }
 
 const (

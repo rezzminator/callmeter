@@ -235,7 +235,9 @@ func refusalsOf(ctx context.Context, store *callmeter.Store, f Filter) ([]refusa
 		if turn.transcript != "" {
 			kind, err = callmeter.TranscriptAPIError(turn.transcript)
 		}
-		if err != nil {
+		// A read past a bad line that still names the last good message's error
+		// checked the session; one that names none could not tell.
+		if err != nil && (kind == "" || !callmeter.LinesSkipped(err)) {
 			if unchecked == nil {
 				unchecked = &uncheckedRefusals{first: err}
 			}

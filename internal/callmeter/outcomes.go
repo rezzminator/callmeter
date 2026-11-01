@@ -27,7 +27,8 @@ type outcomeResponse struct {
 // OutcomeColumns sets, from a successful call's own input and response, what
 // the call did: lines_added and lines_removed for Write, Edit and MultiEdit
 // (the `+` and `-` lines of every structuredPatch hunk; a Write that created a
-// file has no hunks, so its input content's lines are the added ones), and
+// file has no hunks, or no structuredPatch at all, so its input content's
+// lines are the added ones), and
 // commit_sha and commit_branch for a Bash `git … commit` whose stdout carries
 // git's `[branch sha] subject` line. The amend of a commit counts: it made a
 // new one. Any other tool is left untouched.
@@ -51,15 +52,19 @@ func lineColumns(c *Call, tool string, input, response json.RawMessage) error {
 	if err := json.Unmarshal(response, &fields); err != nil {
 		return fmt.Errorf("decode %s response (%d bytes): %w", tool, len(response), err)
 	}
-	patch := bytes.TrimSpace(fields.StructuredPatch)
-	if len(patch) == 0 || bytes.Equal(patch, []byte("null")) {
-		return fmt.Errorf("%s response has no structuredPatch", tool)
-	}
 	var hunks []struct {
 		Lines []string `json:"lines"`
 	}
-	if err := json.Unmarshal(patch, &hunks); err != nil {
-		return fmt.Errorf("%s response: structuredPatch is not a list of hunks with lines: %w", tool, err)
+	patch := bytes.TrimSpace(fields.StructuredPatch)
+	switch {
+	case len(patch) == 0 || bytes.Equal(patch, []byte("null")):
+		if tool != toolWrite || fields.Type != "create" { // a created file's lines are its input content's
+			return fmt.Errorf("%s response has no structuredPatch", tool)
+		}
+	default:
+		if err := json.Unmarshal(patch, &hunks); err != nil {
+			return fmt.Errorf("%s response: structuredPatch is not a list of hunks with lines: %w", tool, err)
+		}
 	}
 	var added, removed int64
 	for _, hunk := range hunks {

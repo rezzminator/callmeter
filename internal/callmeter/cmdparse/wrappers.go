@@ -121,5 +121,5 @@ func (p *callParser) programFile(program arg) []FileRef {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil
 	}
-	return []FileRef{{Path: path, Action: ActionExec, Exists: true}}
+	return []FileRef{{Path: path, Action: ActionExec, Exists: ExistsYes}}
 }

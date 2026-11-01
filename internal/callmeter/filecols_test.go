@@ -93,8 +93,20 @@ func TestFileColumns(t *testing.T) {
 			"<NULL> <NULL> <NULL> <NULL> <NULL>", "decode Write input",
 		},
 		{
-			"undecodable result", "Read", `{"file_path":"/tmp/demo-proj/a.md"}`, "", `{"file":{"startLine":"x"}}`,
-			"/tmp/demo-proj/a.md 1 <NULL> <NULL> <NULL>", "decode Read result",
+			"a mistyped offset leaves only the start unknown", "Read",
+			`{"file_path":"/tmp/demo-proj/a.md","offset":"7","limit":3}`, "", "",
+			"/tmp/demo-proj/a.md <NULL> 3 <NULL> <NULL>",
+			"decode Read input (58 bytes): offset: json: cannot unmarshal string into Go value of type float64",
+		},
+		{
+			"a mistyped result field keeps the others", "Read", `{"file_path":"/tmp/demo-proj/a.md"}`, "",
+			`{"file":{"startLine":"x","numLines":2,"totalLines":9}}`, "/tmp/demo-proj/a.md 1 2 9 <NULL>",
+			"decode Read result (54 bytes): startLine: json: cannot unmarshal string into Go value of type float64",
+		},
+		{
+			"a mistyped write type keeps the prior size", "Write", `{"file_path":"/tmp/demo-proj/out.md","content":"x"}`, "",
+			`{"type":7,"originalFile":"abcd"}`, "/tmp/demo-proj/out.md <NULL> <NULL> <NULL> 4",
+			"decode Write result (32 bytes): type: json: cannot unmarshal number into Go value of type string",
 		},
 	}
 	for _, tc := range cases {

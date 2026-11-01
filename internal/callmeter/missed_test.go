@@ -309,6 +309,31 @@ func TestIngestMissedLeavesAClaimAnotherRunHolds(t *testing.T) {
 	}
 }
 
+// TestIngestMissedSkipsAClaimItCannotRead: a claim that cannot be opened (a
+// dangling link) stays for a later run and is named in the error, and every
+// other file is ingested all the same.
+func TestIngestMissedSkipsAClaimItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	path := missedPath(store)
+	broken := path + ingestInfix + "999998"
+	if err := os.Symlink(filepath.Join(filepath.Dir(path), "gone"), broken); err != nil {
+		t.Fatal(err)
+	}
+	writeMissed(t, path, "1790000002\tStop\tmine\n")
+	n, err := store.IngestMissed(ctx, path)
+	wantErr := "callmeter store " + store.path + ": open " + broken + ": open " + broken + ": no such file or directory"
+	if n != 1 || err == nil || err.Error() != wantErr {
+		t.Fatalf("IngestMissed = %d, %v; want 1, %s", n, err, wantErr)
+	}
+	if got, want := binaryFaults(t, store), "1790000002000|Stop: mine"; got != want {
+		t.Errorf("binary faults = %s, want %s", got, want)
+	}
+	if left := ingestLeftovers(t, path); len(left) != 1 || left[0] != broken {
+		t.Errorf("claims left = %v, want only the unreadable %s", left, broken)
+	}
+}
+
 // TestStoreFailureClass: each store failure a hook can meet reads as its fixed
 // label; a real store refusing a newer schema, a file that is no database and
 // a trigger's abort among them, and an error joined to another keeps its class.

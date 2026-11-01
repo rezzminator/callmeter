@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 
 	"github.com/rezzminator/callmeter/internal/callmeter"
 	"github.com/rezzminator/callmeter/internal/paths"
@@ -66,6 +67,10 @@ func Redact(args []string, stdout, stderr io.Writer, getenv paths.Getenv) int {
 			what = "rows deleted (parsed again by the next report)"
 		}
 		fmt.Fprintf(stdout, "%-15s %d %s\n", c.Column, c.Rows, what)
+		if len(c.Unreadable) > 0 {
+			fmt.Fprintf(stdout, "%-15s %d rows could not be read and keep their stored text: %s\n",
+				c.Column, len(c.Unreadable), strings.Join(c.Unreadable, ", "))
+		}
 	}
 	return 0
 }

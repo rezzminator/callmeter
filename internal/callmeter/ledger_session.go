@@ -40,7 +40,8 @@ type LedgerSessionSummary struct {
 	Bytes   int64 // bytes read this run
 	Offset  int64 // the offset kept after this run
 	Lines   int   // complete lines read
-	Faults  int   // lines skipped: not a JSON object, or missing a field the contract requires
+	Faults  int   // lines skipped: not a JSON object, naming no request_id, or longer than the cap
+	Partial int   // lines kept with a field unknown (parseLedgerLine)
 	Held    int   // calls a stored transcript request holds: priced from the ledger
 	Side    int   // calls no stored transcript request holds: ingested as source 'ledger' requests
 	More    bool  // bytes remain beyond this run's cap
@@ -177,17 +178,22 @@ func (s *Store) ingestLedgerSession(ctx context.Context, dir, session string, no
 			continue
 		}
 		sum.Lines++
-		row, ok := parseLedgerLine(line, session)
-		if !ok {
+		row, partial, ok := parseLedgerLine(line, session)
+		switch {
+		case !ok:
 			sum.Faults++
-		} else if prior, seen := best[row.id]; !seen || row.rank >= prior.rank {
+			continue
+		case partial:
+			sum.Partial++
+		}
+		if prior, seen := best[row.id]; !seen || row.keeps(prior) {
 			best[row.id] = row
 		}
 	}
 	cutoff := s.retentionFloor(now)
 	rows := make([]ledgerRow, 0, len(best))
 	for _, r := range best {
-		if !r.at.Before(cutoff) {
+		if r.inWindow(cutoff) {
 			rows = append(rows, r)
 		}
 	}

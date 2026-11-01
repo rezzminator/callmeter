@@ -295,8 +295,8 @@ func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS 
 type AgentStop struct {
 	AgentID string
 	Seq     int64
-	TS      int64 // the turn-end entry's own timestamp, Unix ms UTC
-	Totals  AgentTotals
+	TS      int64        // the turn-end entry's own timestamp, Unix ms UTC
+	Totals  *AgentTotals // nil: the agent's transcript totals could not be read
 	SeatDir *string
 }
 
@@ -318,7 +318,9 @@ func fromNull(n sql.NullString) *string {
 // turns rebuilt from its events, so the turn closes at it; the agent's stopped
 // kept at the latest, its session, type and prompt filled, and, as the hook
 // does at the agent's latest stop, its total_tokens and tool_uses from the
-// transcript, its model filled. It writes nothing unless turn stop.Seq is still
+// transcript, its model filled; a stop earlier than the one stored only fills
+// totals none stored, and totals that could not be read (nil) leave the stored
+// ones. It writes nothing unless turn stop.Seq is still
 // the agent's latest and has no stop: a stop stored since (the hook's, or an
 // earlier recovery's) wins. The id follows from the agent and the turn's start,
 // so a repeated recovery is a no-op by event_id too. The SubagentStop hook,
@@ -374,11 +376,15 @@ func (t *Tx) RecoverAgentStop(ctx context.Context, stop AgentStop) (bool, error)
 			return false, fmt.Errorf("recover the SubagentStop of agent %q: %w", stop.AgentID, err)
 		}
 	}
+	if stop.Totals == nil {
+		return inserted, nil
+	}
+	mode := Overwrite
 	if !latest {
-		return inserted, nil // an earlier stop than the one stored keeps the stored totals
+		mode = FillEmpty // an earlier stop than the one stored keeps the stored totals
 	}
 	totals := Agent{AgentID: stop.AgentID, TotalTokens: Ptr(stop.Totals.TotalTokens), ToolUses: Ptr(stop.Totals.ToolUses)}
-	if err := t.UpsertAgent(ctx, totals, Overwrite); err != nil {
+	if err := t.UpsertAgent(ctx, totals, mode); err != nil {
 		return false, fmt.Errorf("recover the totals of agent %q: %w", stop.AgentID, err)
 	}
 	if err := t.UpsertAgent(ctx, Agent{AgentID: stop.AgentID, Model: presentString(stop.Totals.Model)}, FillEmpty); err != nil {

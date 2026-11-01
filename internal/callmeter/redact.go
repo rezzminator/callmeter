@@ -9,10 +9,12 @@ import (
 	"strings"
 )
 
-// RedactCount is how many rows of one column a Redact pass changed.
+// RedactCount is how many rows of one column a Redact pass changed, and the
+// keys of the rows it could not read, which keep their stored text.
 type RedactCount struct {
-	Column string
-	Rows   int64
+	Column     string
+	Rows       int64
+	Unreadable []string
 }
 
 // Redact rewrites the rows already stored the way they are written now, in one
@@ -21,8 +23,10 @@ type RedactCount struct {
 // sized), every calls.error through SanitizeError, every events.detail through
 // SanitizeDetail for its event, every faults.error through sanitizeFault, every stop_hook_runs.name
 // StopHookName could not store through redactHookName. A call whose input changed loses its command_parts rows,
-// which the next report parses again from the redacted input. A row that
-// cannot be rewritten fails the whole pass and changes nothing. Redact is an
+// which the next report parses again from the redacted input. A row whose
+// value cannot be read is left exactly as stored, its command_parts too, and
+// named in Unreadable; the pass goes on. A failed write fails the whole pass
+// and changes nothing. Redact is an
 // explicit command, never a migration; a second pass changes nothing. It
 // returns the rows changed per column: calls.input, calls.error,
 // events.detail, faults.error, stop_hook_runs.name, then the command_parts
@@ -56,7 +60,7 @@ func (s *Store) Redact(ctx context.Context) (counts []RedactCount, err error) {
 
 // redactRows is Redact's work inside its transaction.
 func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
-	inputs, err := rewriteColumn(ctx, conn, "calls.input",
+	inputs, unreadableInputs, err := rewriteColumn(ctx, conn, "calls.input",
 		`SELECT tool_use_id, COALESCE(tool, ''), input FROM calls WHERE input IS NOT NULL`,
 		`UPDATE calls SET input = ? WHERE tool_use_id = ?`,
 		func(tool, input string) (string, error) { return SanitizeInput(tool, json.RawMessage(input)) })
@@ -75,14 +79,14 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 		}
 		parts += n
 	}
-	errorRows, err := rewriteColumn(ctx, conn, "calls.error",
+	errorRows, unreadableErrors, err := rewriteColumn(ctx, conn, "calls.error",
 		`SELECT tool_use_id, '', error FROM calls WHERE error IS NOT NULL`,
 		`UPDATE calls SET error = ? WHERE tool_use_id = ?`,
 		func(_, text string) (string, error) { return SanitizeError(text), nil })
 	if err != nil {
 		return nil, err
 	}
-	details, err := rewriteColumn(ctx, conn, "events.detail",
+	details, unreadableDetails, err := rewriteColumn(ctx, conn, "events.detail",
 		`SELECT event_id, COALESCE(event, '') || char(9) || COALESCE(tool_name, ''), detail FROM events WHERE detail IS NOT NULL`,
 		`UPDATE events SET detail = ? WHERE event_id = ?`,
 		func(eventTool, detail string) (string, error) {
@@ -97,14 +101,14 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 	if err != nil {
 		return nil, err
 	}
-	faults, err := rewriteColumn(ctx, conn, "faults.error",
+	faults, unreadableFaults, err := rewriteColumn(ctx, conn, "faults.error",
 		`SELECT fault_id, COALESCE(stage, ''), error FROM faults WHERE error IS NOT NULL`,
 		`UPDATE faults SET error = ? WHERE fault_id = ?`,
 		func(stage, text string) (string, error) { return sanitizeFault(stage, text), nil })
 	if err != nil {
 		return nil, err
 	}
-	hookNames, err := rewriteColumn(ctx, conn, "stop_hook_runs.name",
+	hookNames, unreadableHookNames, err := rewriteColumn(ctx, conn, "stop_hook_runs.name",
 		`SELECT rowid, entry_id || char(0) || seq, name FROM stop_hook_runs WHERE name IS NOT NULL`,
 		`UPDATE stop_hook_runs SET name = ? WHERE rowid = ?`,
 		func(row, name string) (string, error) { return redactHookName(row, name), nil })
@@ -112,11 +116,11 @@ func redactRows(ctx context.Context, conn *sql.Conn) ([]RedactCount, error) {
 		return nil, err
 	}
 	return []RedactCount{
-		{Column: "calls.input", Rows: int64(len(inputs))},
-		{Column: "calls.error", Rows: int64(len(errorRows))},
-		{Column: "events.detail", Rows: int64(len(details))},
-		{Column: "faults.error", Rows: int64(len(faults))},
-		{Column: "stop_hook_runs.name", Rows: int64(len(hookNames))},
+		{Column: "calls.input", Rows: int64(len(inputs)), Unreadable: unreadableInputs},
+		{Column: "calls.error", Rows: int64(len(errorRows)), Unreadable: unreadableErrors},
+		{Column: "events.detail", Rows: int64(len(details)), Unreadable: unreadableDetails},
+		{Column: "faults.error", Rows: int64(len(faults)), Unreadable: unreadableFaults},
+		{Column: "stop_hook_runs.name", Rows: int64(len(hookNames)), Unreadable: unreadableHookNames},
 		{Column: "command_parts", Rows: parts},
 	}, nil
 }
@@ -136,13 +140,15 @@ func redactHookName(row, name string) string {
 
 // rewriteColumn reads every (key, aux, value) row selectRows yields, then
 // writes each value rewrite changes back through update (value, key). It
-// returns the keys of the rows it changed.
+// returns the keys of the rows it changed and of the rows rewrite could not
+// read, which it leaves as stored: a row that cannot be redacted keeps its
+// text, never loses it, and never stops the rows after it.
 func rewriteColumn(
 	ctx context.Context,
 	conn *sql.Conn,
 	column, selectRows, update string,
 	rewrite func(aux, value string) (string, error),
-) ([]any, error) {
+) (changed []any, unreadable []string, err error) {
 	type row struct {
 		key        any
 		aux, value string
@@ -150,33 +156,33 @@ func rewriteColumn(
 	var rows []row
 	result, err := conn.QueryContext(ctx, selectRows)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", column, err)
+		return nil, nil, fmt.Errorf("read %s: %w", column, err)
 	}
 	for result.Next() {
 		var r row
 		if err := result.Scan(&r.key, &r.aux, &r.value); err != nil {
-			return nil, errors.Join(fmt.Errorf("scan %s: %w", column, err), result.Close())
+			return nil, nil, errors.Join(fmt.Errorf("scan %s: %w", column, err), result.Close())
 		}
 		rows = append(rows, r)
 	}
 	if err := errors.Join(result.Err(), result.Close()); err != nil {
-		return nil, fmt.Errorf("read %s: %w", column, err)
+		return nil, nil, fmt.Errorf("read %s: %w", column, err)
 	}
-	var changed []any
 	for _, r := range rows {
 		value, err := rewrite(r.aux, r.value)
 		if err != nil {
-			return nil, fmt.Errorf("%s of row %v: %w", column, r.key, err)
+			unreadable = append(unreadable, fmt.Sprint(r.key))
+			continue
 		}
 		if value == r.value {
 			continue
 		}
 		if _, err := conn.ExecContext(ctx, update, value, r.key); err != nil {
-			return nil, fmt.Errorf("write %s of row %v: %w", column, r.key, err)
+			return nil, nil, fmt.Errorf("write %s of row %v: %w", column, r.key, err)
 		}
 		changed = append(changed, r.key)
 	}
-	return changed, nil
+	return changed, unreadable, nil
 }
 
 // UnredactedCalls counts the calls Redact would rewrite: a stored input that

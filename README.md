@@ -32,7 +32,7 @@ FILE                                READ BYTES  BASH BYTES  READS  CERTAIN  COND
 note: 1 calls denied by permission
 note: 2 calls refused by Claude Code
 note: 2 snippets unparsed: script-body
-note: 1 Bash calls skipped by the parser (relative or missing cwd, or no command)
+note: 1 Bash calls skipped by the parser (relative or missing cwd, stored input not JSON, or no command)
 note: 2 Bash calls read several files or also ran one: their bytes are credited to no file in BASH BYTES
 ```
 
