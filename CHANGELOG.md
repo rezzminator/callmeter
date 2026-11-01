@@ -4,6 +4,19 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-11-01
+
+### Fixed
+
+- A transcript line that cannot be read skips only itself: the rest of the session is still recorded. The last line of a live transcript caught mid-append is read as a writer still appending, not as an unreadable session.
+- A transcript entry whose timestamp cannot be read (a compaction, a Stop-hook summary, a turn duration) is kept with `ts` NULL, and one with no `uuid` is keyed `line#` and 16 hex digits of its line's SHA-256.
+- A cost-ledger line with a field that cannot be read is kept with that field unknown and counted in a `cost ledger: {n} lines of the session's file kept with a field unknown: …` fault; a later partial line never replaces a complete one.
+- A file a Bash call names whose existence cannot be checked is stored as unknown (`?` in `command_parts.files`), where it read as missing, and a newer reference whose check failed no longer clears a file known to be gone. A Bash call whose stored input is not JSON is counted among the calls the parser skipped.
+- `callmeter redact` leaves a row it cannot read byte-for-byte unchanged, counts it as unreadable and lists its ids.
+- `callmeter classify` answers an input line that is not a JSON object or has no id in its place, with an empty id and class and the status `unreadable input line {n}: {cause}`, and says so on stderr.
+- Quiet-session recovery reports unreadable metadata as skipped in its light pass too, reads a session with no stored transcript path from its seat's transcript, and leaves an agent's `total_tokens` and `tool_uses` as stored when its transcript totals cannot be read.
+- Reports no longer say a session was both checked and not checkable, and a store that cannot be opened is named by its kind of failure, never by a raw error text.
+
 ## [0.5.1] — 2026-11-01
 
 ### Changed
