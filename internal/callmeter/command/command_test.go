@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -730,6 +731,68 @@ func TestCallmeterCLIFiltersNarrowEveryTopicOrSayTheyCannot(t *testing.T) {
 	}
 }
 
+// TestCallmeterCLIReportOlderRulesFailureKeepsTheTable: the older-rules hint
+// failing to read the store costs only that hint: the topic's table renders,
+// the failure is a stderr line, exit 0.
+func TestCallmeterCLIReportOlderRulesFailureKeepsTheTable(t *testing.T) {
+	saved := olderRulesNotes
+	t.Cleanup(func() { olderRulesNotes = saved })
+	olderRulesNotes = func(context.Context, *callmeter.Store) ([]string, error) {
+		return []string{"a note never shown"}, errors.New("test: calls unreadable")
+	}
+	fixture := newLab(t)
+	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+	code, stdout, stderr := fixture.run("report", "files", "--json")
+	want := "callmeter: count calls under older privacy rules: test: calls unreadable\n"
+	if code != 0 || stderr != want {
+		t.Fatalf("report files = %d, want 0 and stderr %q\nstdout:\n%s\nstderr:\n%s", code, want, stdout, stderr)
+	}
+	got := decodeReport(t, stdout)
+	if !slices.ContainsFunc(got.Rows, func(row []string) bool { return slices.Contains(row, "/work/one.md") }) {
+		t.Errorf("rows = %q, want the seeded file", got.Rows)
+	}
+	if slices.Contains(got.Notes, "a note never shown") {
+		t.Errorf("notes = %q, want no note from the failed read", got.Notes)
+	}
+}
+
+// TestCallmeterCLIReportWithoutStoreNamesAnUnreadableMissedLog: with no store
+// and a missed.log that cannot be read, the no-store answer still prints,
+// its note saying the lost events could not be counted, never "nothing
+// recorded yet"; exit 0.
+func TestCallmeterCLIReportWithoutStoreNamesAnUnreadableMissedLog(t *testing.T) {
+	fixture := newLab(t)
+	missed := paths.Missed(fixture.logs)
+	// A directory where missed.log should be: there, and unreadable.
+	if err := os.MkdirAll(missed, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := fixture.run("report", "files")
+	want := "callmeter: no store at " + fixture.storePath + "\nnote: missed.log could not be read: events it holds are not counted\n"
+	if code != 0 || stdout != want || !strings.HasPrefix(stderr, "callmeter: count missed.log: ") {
+		t.Errorf("report files = %d\nstdout:\n%s\nwant:\n%s\nstderr:\n%s", code, stdout, want, stderr)
+	}
+
+	// One claim that cannot be read costs its own lines alone: the readable
+	// claim's are still counted.
+	if err := os.Remove(missed); err != nil {
+		t.Fatal(err)
+	}
+	// A claim that is a link to a directory: listed as a claim, its read fails.
+	if err := os.Symlink(t.TempDir(), missed+".ingest-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(missed+".ingest-2", []byte("1790000001\tStop\tbinary missing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr = fixture.run("report", "files")
+	want = "callmeter: no store at " + fixture.storePath + "\nnote: 1 events unrecorded: binary unavailable: 1\n" +
+		"note: missed.log could not be read: events it holds are not counted\n"
+	if code != 0 || stdout != want || !strings.HasPrefix(stderr, "callmeter: count missed.log: ") {
+		t.Errorf("report files beside one unreadable claim = %d\nstdout:\n%s\nwant:\n%s\nstderr:\n%s", code, stdout, want, stderr)
+	}
+}
+
 // TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic: a missed.log present
 // when a report runs is turned into faults first, so the note counts it on all
 // 21 topics, and the file is consumed.
@@ -765,20 +828,113 @@ func TestCallmeterCLIReportIngestsMissedLogBeforeEveryTopic(t *testing.T) {
 	}
 }
 
-func TestCallmeterCLIReportMissedLogFailureIsAStderrLineAndExit1(t *testing.T) {
-	fixture := newLab(t)
-	fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
-	missed := paths.Missed(fixture.logs)
-	if err := os.MkdirAll(fixture.logs, 0o700); err != nil {
-		t.Fatal(err)
+// TestCallmeterCLIReportUpkeepFailureIsANote: a step a report runs before its
+// topic (missed.log ingest, prune, quiet-session recovery, command parsing,
+// pricing) that fails is a stderr line and one note saying what the numbers may
+// lack; the topic still runs on the store as it stands, exit 0.
+func TestCallmeterCLIReportUpkeepFailureIsANote(t *testing.T) {
+	exec := func(t *testing.T, fixture lab, statements ...string) {
+		t.Helper()
+		store, err := callmeter.OpenDB(context.Background(), fixture.storePath)
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		defer func() {
+			if err := store.Close(); err != nil {
+				t.Errorf("close store: %v", err)
+			}
+		}()
+		for _, statement := range statements {
+			if _, err := store.DB().Exec(statement); err != nil {
+				t.Fatalf("seed %s: %v", statement, err)
+			}
+		}
 	}
-	// A leftover claim that is a dangling link: listed for ingest, unreadable.
-	if err := os.Symlink(filepath.Join(filepath.Dir(missed), "nowhere"), missed+".ingest-1"); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, stderr := fixture.run("report", "files")
-	if code != 1 || stdout != "" || !strings.Contains(stderr, "callmeter: ingest missed.log: ") {
-		t.Fatalf("report with an unreadable missed.log = %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	now := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	for _, c := range []struct {
+		name, stderr, note string
+		setup              func(*testing.T, lab)
+	}{
+		{
+			name: "missed.log ingest", stderr: "callmeter: ingest missed.log: ",
+			note: "missed.log not ingested: unrecorded event counts may be low",
+			setup: func(t *testing.T, fixture lab) {
+				missed := paths.Missed(fixture.logs)
+				if err := os.MkdirAll(fixture.logs, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				// A leftover claim that is a dangling link: listed for ingest, unreadable.
+				if err := os.Symlink(filepath.Join(filepath.Dir(missed), "nowhere"), missed+".ingest-1"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "prune", stderr: "callmeter: ",
+			note: "prune failed: rows past retention kept",
+			setup: func(t *testing.T, fixture lab) {
+				fixture.seedReadAt(t, "toolu_old", "sess-1", "/work/old.md", fixture.seat, time.Now().Add(-365*24*time.Hour))
+				fixture.writeConfig(t, `{"retention_days": 30}`)
+				// The archive the aged row moves to cannot be opened.
+				if err := os.Mkdir(filepath.Join(filepath.Dir(fixture.storePath), callmeter.ArchiveFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "recovery", stderr: "callmeter: recover quiet sessions: ",
+			note: "quiet sessions not recovered: calls and requests they left open stay as their hooks wrote them",
+			setup: func(t *testing.T, fixture lab) {
+				main := writeTranscript(t, fixture.seat, "-work", "sess-1", `{"type":"user"}`)
+				meta := filepath.Join(strings.TrimSuffix(main, ".jsonl"), "subagents", "agent-aunlinked.meta.json")
+				if err := os.MkdirAll(filepath.Dir(meta), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(meta, []byte(`{"agentType":"Explore","toolUseId":"toolu_parent"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// Recovery's fill of the agent's parent from its meta is refused.
+				exec(t, fixture,
+					"INSERT INTO sessions (session_id, transcript_path) VALUES ('sess-1', '"+main+"')",
+					"INSERT INTO agents (agent_id, session_id) VALUES ('aunlinked', 'sess-1')",
+					"CREATE TRIGGER refuse_agents BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'test agents refused'); END")
+			},
+		},
+		{
+			name: "command parsing", stderr: "callmeter: parse commands: ",
+			note: "commands not parsed: command, file and write counts may be low",
+			setup: func(t *testing.T, fixture lab) {
+				exec(t, fixture,
+					`INSERT INTO calls (tool_use_id, session_id, ts, tool, input, cwd, failed) VALUES ('toolu_bash', 'sess-1', `+now+`, 'Bash', '{"command":"ls"}', '/work', 0)`,
+					"CREATE TRIGGER refuse_parts BEFORE INSERT ON command_parts BEGIN SELECT RAISE(ABORT, 'test parts refused'); END")
+			},
+		},
+		{
+			name: "pricing", stderr: "callmeter: price requests: ",
+			note: "prices not refreshed: requests priced since the last report show no cost",
+			setup: func(t *testing.T, fixture lab) {
+				exec(t, fixture,
+					"INSERT INTO requests (request_id, session_id, ts, model, input_tokens, output_tokens, pending) VALUES ('msg_1', 'sess-1', "+now+", 'claude-opus-4-1', 10, 5, 0)",
+					"CREATE TRIGGER refuse_price BEFORE UPDATE ON requests BEGIN SELECT RAISE(ABORT, 'test price refused'); END")
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fixture := newLab(t)
+			fixture.seedRead(t, "toolu_1", "sess-1", "/work/one.md", fixture.seat)
+			c.setup(t, fixture)
+			code, stdout, stderr := fixture.run("report", "files", "--json")
+			if code != 0 || !strings.HasPrefix(stderr, c.stderr) {
+				t.Fatalf("report files = %d, want 0 and stderr opening %q\nstdout:\n%s\nstderr:\n%s", code, c.stderr, stdout, stderr)
+			}
+			got := decodeReport(t, stdout)
+			if !slices.ContainsFunc(got.Rows, func(row []string) bool { return slices.Contains(row, "/work/one.md") }) {
+				t.Errorf("rows = %q, want the seeded file: the topic ran", got.Rows)
+			}
+			if !slices.Contains(got.Notes, c.note) {
+				t.Errorf("notes = %q, want %q", got.Notes, c.note)
+			}
+		})
 	}
 }
 
@@ -1063,6 +1219,22 @@ func TestCallmeterCLIReportNotesCallsStoredUnderOlderPrivacyRules(t *testing.T) 
 			}
 		}
 	}
+
+	// Inputs redact cannot read keep their stored text, each named by its id.
+	fixture.seedStoredCall(t, "toolu_torn1", "Bash", `{"command":"cat <<EOF TORNONE`, "")
+	fixture.seedStoredCall(t, "toolu_torn2", "Bash", `{"command":"cat <<EOF TORNTWO`, "")
+	out.Reset()
+	errs.Reset()
+	code = Redact([]string{"redact"}, &out, &errs, fixture.getenv)
+	lines := strings.Split(out.String(), "\n")
+	for _, want := range []string{
+		"calls.input     0 rows rewritten",
+		"calls.input     2 rows could not be read and keep their stored text: toolu_torn1, toolu_torn2",
+	} {
+		if code != 0 || !slices.Contains(lines, want) {
+			t.Errorf("second redact = %d, want 0 and the line %q\nstdout:\n%s\nstderr:\n%s", code, want, out.String(), errs.String())
+		}
+	}
 }
 
 // TestCallmeterCLIReportNoOlderRulesNoteOverConformingCalls: calls stored as
@@ -1296,9 +1468,11 @@ func TestCallmeterCLIClassifyLabelsCallsInOrder(t *testing.T) {
 	t.Parallel()
 	in := strings.Join([]string{
 		`{"id":"a","tool":"Bash","command":"go test ./... > /tmp/red.log 2>&1","cwd":"/tmp"}`,
+		`{nope`,
 		``,
 		`{"id":"b","tool":"Bash","command":"python3 - <<'EOF'\np = 'x.go'\nopen(p, 'w').write('y')\nEOF","cwd":"/tmp"}`,
 		`{"id":"c","tool":"Edit"}`,
+		`{"tool":"Read"}`,
 		`{"id":"d","tool":"Bash","command":"git commit -m x"}`,
 	}, "\n")
 	var stdout, stderr bytes.Buffer
@@ -1306,9 +1480,12 @@ func TestCallmeterCLIClassifyLabelsCallsInOrder(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
+	// An unreadable line costs only itself: it keeps its place, its status naming it.
 	want := `{"id":"a","class":"test","classes":["test","capture"],"status":"ok"}
+{"id":"","class":"","classes":null,"status":"unreadable input line 2: not a JSON object"}
 {"id":"b","class":"edit","classes":["edit"],"status":"ok"}
 {"id":"c","class":"edit","classes":["edit"],"status":"ok"}
+{"id":"","class":"","classes":null,"status":"unreadable input line 6: no id"}
 {"id":"d","class":"git","classes":["git"],"status":"ok"}
 `
 	if stdout.String() != want {
@@ -1319,8 +1496,6 @@ func TestCallmeterCLIClassifyLabelsCallsInOrder(t *testing.T) {
 func TestCallmeterCLIClassifyRefusesBadInput(t *testing.T) {
 	t.Parallel()
 	for name, in := range map[string]string{
-		"not json":      "{nope",
-		"missing id":    `{"tool":"Read"}`,
 		"duplicate ids": `{"id":"a","tool":"Read"}` + "\n" + `{"id":"a","tool":"Edit"}`,
 	} {
 		var stdout, stderr bytes.Buffer
@@ -1474,7 +1649,7 @@ func TestCallmeterCLIPluginLogLevels(t *testing.T) {
 		code                             int
 	}{
 		{"usage", []string{"report", "not-a-topic"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/command.go#reportAction", 2},
-		{"input", []string{"classify"}, "not json", "errors.jsonl", "payload-unparsable", "error", "internal/callmeter/command/classify.go#Classify", 1},
+		{"input", []string{"classify"}, "not json", "warnings.jsonl", "payload-unparsable", "warning", "internal/callmeter/command/classify.go#Classify", 0},
 		{"redact", []string{"redact", "extra"}, "", "info.jsonl", "usage-refused", "info", "internal/callmeter/command/redact.go#Redact", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

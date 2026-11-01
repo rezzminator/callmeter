@@ -520,6 +520,106 @@ func TestCallmeterGarbagePayload(t *testing.T) {
 	}
 }
 
+// TestCallmeterPayloadGapsKeepTheRest: a payload field of the wrong type or
+// missing costs only that field (or that batch entry): the row lands with it
+// unknown, every sibling column and entry is kept, and the gap is one payload
+// fault naming it.
+func TestCallmeterPayloadGapsKeepTheRest(t *testing.T) {
+	bash := map[string]any{"command": "echo hi"}
+	batch := func(t *testing.T, lab *callmeterLab) string {
+		lab.write(lab.transcript(cmSessionA), nil) // on disk, the request not yet in it
+		payload := decoded(t, batchPayload(t, lab.transcript(cmSessionA), "toolu_b1", "toolu_b2", "toolu_b3"))
+		calls := payload["tool_calls"].([]any)
+		delete(calls[1].(map[string]any), "tool_use_id")
+		calls[2].(map[string]any)["tool_name"] = 42
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(encoded)
+	}
+	for _, c := range []struct {
+		name    string
+		payload func(*testing.T, *callmeterLab) string
+		calls   map[string]map[string]any // tool_use_id → expected columns
+		faults  string
+	}{
+		{
+			name: "mistyped fields",
+			payload: func(t *testing.T, _ *callmeterLab) string {
+				return toolPayload(t, "PostToolUse", "toolu_mistyped", "Bash", bash, map[string]any{"duration_ms": "slow", "is_interrupt": "no"})
+			},
+			calls:  map[string]map[string]any{"toolu_mistyped": {"tool": "Bash", "duration_ms": "<nil>", "is_interrupt": "<nil>", "failed": 0, "test_runner": "<nil>"}},
+			faults: `[payload toolu_mistyped "PostToolUse" payload fields of the wrong type, recorded as unknown: duration_ms, is_interrupt]`,
+		},
+		{
+			name: "no tool_name",
+			payload: func(t *testing.T, _ *callmeterLab) string {
+				return toolPayload(t, "PostToolUse", "toolu_noname", "Bash", bash, map[string]any{"tool_name": dropKey, "duration_ms": 7})
+			},
+			calls:  map[string]map[string]any{"toolu_noname": {"tool": "<nil>", "duration_ms": 7, "input": "<nil>", "bytes_real": "<nil>", "failed": 0}},
+			faults: "[payload toolu_noname PostToolUse payload lacks tool_name: the call is recorded with its tool, input, file and result columns unknown]",
+		},
+		{
+			name: "PreToolUse of a Read with no cwd",
+			payload: func(t *testing.T, _ *callmeterLab) string {
+				return toolPayload(t, "PreToolUse", "toolu_readstart", "Read", map[string]any{"file_path": "/work/a.md"}, map[string]any{"cwd": dropKey})
+			},
+			calls: map[string]map[string]any{"toolu_readstart": {"tool": "Read", "cwd": "<nil>", "session_id": cmSessionA}},
+		},
+		{
+			name: "PreToolUse of a Bash with no cwd",
+			payload: func(t *testing.T, _ *callmeterLab) string {
+				return toolPayload(t, "PreToolUse", "toolu_bashstart", "Bash", bash, map[string]any{"cwd": dropKey})
+			},
+			calls:  map[string]map[string]any{"toolu_bashstart": {"tool": "Bash", "cwd": "<nil>", "input": `{"command":"echo hi"}`}},
+			faults: "[payload toolu_bashstart PreToolUse payload lacks cwd: the command's relative paths stay unresolved]",
+		},
+		{
+			name: "mistyped tool_response field",
+			payload: func(t *testing.T, _ *callmeterLab) string {
+				return toolPayload(t, "PostToolUse", "toolu_badpath", "Bash", bash, map[string]any{
+					"tool_response": map[string]any{"stdout": "hello", "stderr": "", "interrupted": false, "persistedOutputPath": 42},
+				})
+			},
+			calls:  map[string]map[string]any{"toolu_badpath": {"tool": "Bash", "bytes_real": 5, "persisted_path": "<nil>"}},
+			faults: "[payload toolu_badpath Bash tool_response fields of the wrong type, recorded as unknown: persistedOutputPath]",
+		},
+		{
+			// The offset alone is unknown: the path it names is still stat'd.
+			name: "mistyped Read offset",
+			payload: func(t *testing.T, lab *callmeterLab) string {
+				lab.write(filepath.Join(lab.root, "a.md"), []byte("hello\n"))
+				return toolPayload(t, "PostToolUse", "toolu_badoffset", "Read", map[string]any{"file_path": "a.md", "offset": "ten"},
+					map[string]any{"cwd": lab.root})
+			},
+			calls:  map[string]map[string]any{"toolu_badoffset": {"tool": "Read", "file_bytes": 6}},
+			faults: "[payload toolu_badoffset decode Read input (35 bytes): offset: json: cannot unmarshal string into Go value of type float64]",
+		},
+		{
+			name:    "batch entries without an id or with a mistyped name",
+			payload: batch,
+			calls: map[string]map[string]any{
+				"toolu_b1": {"bytes_delivered": 2, "request_id": "pending:toolu_b1"},
+				"toolu_b3": {"bytes_delivered": 2, "request_id": "pending:toolu_b1", "tool": "<nil>"},
+			},
+			faults: "[payload  PostToolBatch call carries no tool_use_id] " +
+				"[payload toolu_b3 PostToolBatch call fields of the wrong type, recorded as unknown: tool_name]",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lab := newCallmeterLab(t)
+			lab.feed(c.payload(t, lab))
+			for id, want := range c.calls {
+				expect(t, id, lab.call(id), want)
+			}
+			if got := lab.faultsText(); got != c.faults {
+				t.Errorf("faults = %s\nwant     %s", got, c.faults)
+			}
+		})
+	}
+}
+
 func TestCallmeterUnreadableTranscript(t *testing.T) {
 	lab := newCallmeterLab(t)
 	// Malformed and holding the batch lead: the line the lookup must read. A
@@ -677,6 +777,28 @@ func TestCallmeterEntryHomeUnresolvableIsSaidOnStderr(t *testing.T) {
 	if !strings.Contains(stderr.String(), "resolve callmeter home") || !strings.Contains(stderr.String(), paths.EnvHome) {
 		t.Errorf("stderr = %q, want the home error said", stderr.String())
 	}
+	t.Run("with a plugin log directory the loss is a missed.log line", func(t *testing.T) {
+		logs := t.TempDir()
+		env := mapEnv(map[string]string{"PLUGIN_LOG_DIR": logs})
+		payload := lab.payloads("probe5.jsonl")[1]
+		stderr.Reset()
+		if code := Callmeter(strings.NewReader(payload), &stderr, env); code != 0 {
+			t.Fatalf("exit code = %d, want 0 with no home", code)
+		}
+		missed := paths.Missed(paths.LogDir(env))
+		data, err := os.ReadFile(missed)
+		if err != nil {
+			t.Fatalf("read %s: %v; stderr %q", missed, err, stderr.String())
+		}
+		fields := strings.Split(strings.TrimSuffix(string(data), "\n"), "\t")
+		want := []string{
+			fields[0], payloadField(t, payload, "hook_event_name").(string),
+			fmt.Sprintf("store unavailable: no home (pid %d)", os.Getpid()), payloadField(t, payload, "session_id").(string),
+		}
+		if !slices.Equal(fields, want) {
+			t.Errorf("%s = %q, want %q", missed, fields, want)
+		}
+	})
 }
 
 // TestCallmeterEntryStoreUnopenableIsSaid: CALLMETER_HOME and PLUGIN_LOG_DIR
@@ -936,6 +1058,22 @@ func TestCallmeterSubagentStopFillsTotals(t *testing.T) {
 			"total_tokens": before["total_tokens"], "tool_uses": before["tool_uses"],
 		})
 	})
+	t.Run("a bad line among good messages", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		scripted := lab.payloads("scripted.jsonl")
+		agentTranscript, _ := payloadField(t, scripted[8], "agent_transcript_path").(string)
+		first := sweepEntry("msg_agent_a", "01", `"tool_use"`, 5, `{"type":"text","text":"invented"}`)
+		lab.write(agentTranscript, []byte(first+`{"type":"assistant","message":{"id":"msg_agent_a",`+"\n"+
+			sweepEntry("msg_agent_b", "02", `"end_turn"`, 7, `{"type":"text","text":"invented"}`)))
+		lab.feed(scripted[5], scripted[8])
+		// Each message is 3 input + 40 cache read + 5 cache creation + its output.
+		expect(t, "agent", agentRow(lab), map[string]any{"total_tokens": (48 + 5) + (48 + 7), "tool_uses": 0})
+		want := fmt.Sprintf("agent %s totals: 1 undecodable transcript line(s) skipped, the first: transcript %s at byte %d: "+
+			"malformed entry: unexpected end of JSON input", cmSubagent, agentTranscript, len(first))
+		if n := lab.count("SELECT count(*) FROM faults WHERE stage = ? AND error = ?", callmeter.StageTranscript, want); n != 1 {
+			t.Errorf("faults %q = %d, want 1: %s", want, n, lab.faultsText())
+		}
+	})
 	t.Run("unreadable agent transcript", func(t *testing.T) {
 		lab := newCallmeterLab(t)
 		scripted := lab.payloads("scripted.jsonl")
@@ -963,6 +1101,7 @@ func TestCallmeterSubagentMetaFillsParentAndType(t *testing.T) {
 		writeFail  bool
 		wantType   any
 		wantParent any
+		wantFault  string // the one transcript fault, %[1]s the meta path; "" is none
 	}{
 		{name: "start fills parent", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, wantParent: "toolu_meta", wantType: "general-purpose"},
 		{name: "stop fills both", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, stopped: true, wantParent: "toolu_meta", wantType: "Explore"},
@@ -970,10 +1109,10 @@ func TestCallmeterSubagentMetaFillsParentAndType(t *testing.T) {
 		{name: "stop keeps hook parent", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, result: true, stopped: true, wantType: "general-purpose"},
 		{name: "start no meta", wantType: "general-purpose"},
 		{name: "stop no meta", stopped: true},
-		{name: "start directory", directory: true, wantType: "general-purpose"},
-		{name: "stop directory", directory: true, stopped: true},
-		{name: "start bad JSON", meta: `{`, wantType: "general-purpose"},
-		{name: "stop bad JSON", meta: `{`, stopped: true},
+		{name: "start directory", directory: true, wantType: "general-purpose", wantFault: "agent " + cmSubagent + ": read sub-agent meta: read %[1]s: is a directory"},
+		{name: "stop directory", directory: true, stopped: true, wantFault: "agent " + cmSubagent + ": read sub-agent meta: read %[1]s: is a directory"},
+		{name: "start bad JSON", meta: `{`, wantType: "general-purpose", wantFault: "agent " + cmSubagent + ": sub-agent meta %[1]s: unexpected end of JSON input"},
+		{name: "stop bad JSON", meta: `{`, stopped: true, wantFault: "agent " + cmSubagent + ": sub-agent meta %[1]s: unexpected end of JSON input"},
 		{name: "start empty meta", meta: `{}`, wantType: "general-purpose"},
 		{name: "stop empty meta", meta: `{}`, stopped: true},
 		{name: "start no transcript path", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, noPath: true, wantType: "general-purpose"},
@@ -1037,6 +1176,13 @@ func TestCallmeterSubagentMetaFillsParentAndType(t *testing.T) {
 			expect(t, "agent", lab.row("SELECT * FROM agents WHERE agent_id = ?", cmSubagent), map[string]any{
 				"parent_tool_use_id": wantParent, "agent_type": test.wantType,
 			})
+			if test.wantFault != "" {
+				// The row lands, its parent and meta type unknown, and the unread meta is a fault.
+				if got, want := lab.faultsText(), "["+callmeter.StageTranscript+"  "+fmt.Sprintf(test.wantFault, meta)+"]"; got != want {
+					t.Errorf("faults = %s, want %s", got, want)
+				}
+				return
+			}
 			if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
 				t.Errorf("faults = %d, want 0", n)
 			}
@@ -1511,6 +1657,99 @@ func TestCallmeterBatchResolvesEarlierPending(t *testing.T) {
 		t.Errorf("pending requests after the next batch = %d, want 0", n)
 	}
 	expect(t, "early call", lab.call("toolu_early"), map[string]any{"request_id": "msg_early"})
+}
+
+// TestCallmeterBadTranscriptLineCostsItselfAlone: one line that does not
+// decode, between two good requests, costs that line alone: the batch that
+// reads the requests by their calls and the Stop that sweeps the turn's
+// replies each store both good requests and record the bad line as one fault.
+func TestCallmeterBadTranscriptLineCostsItselfAlone(t *testing.T) {
+	const parseErr = "malformed entry: unexpected end of JSON input"
+	skipped := func(path string, at int) string {
+		return fmt.Sprintf("1 undecodable transcript line(s) skipped, the first: transcript %s at byte %d: %s", path, at, parseErr)
+	}
+	t.Run("batch", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		transcript := lab.transcript(cmSessionA)
+		entry := func(msg, id string) string {
+			return `{"type":"assistant","timestamp":"2026-09-23T01:00:00.000Z","message":{"id":"` + msg +
+				`","content":[{"type":"tool_use","id":"` + id + `"}],"usage":{"input_tokens":5,` +
+				`"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1}}}` + "\n"
+		}
+		first := entry("msg_good_a", "toolu_good_a")
+		lab.write(transcript, []byte(first+`{"type":"assistant","message":{"id":"msg_good_a",`+"\n"+entry("msg_good_b", "toolu_good_b")))
+		encoded, err := json.Marshal(map[string]any{
+			"session_id": cmSessionA, "hook_event_name": "PostToolBatch", "transcript_path": transcript,
+			"tool_calls": []map[string]any{{"tool_use_id": "toolu_good_a", "tool_response": "ok"}, {"tool_use_id": "toolu_good_b", "tool_response": "ok"}},
+		})
+		if err != nil {
+			t.Fatalf("encode batch: %v", err)
+		}
+		lab.feed(string(encoded))
+		for call, request := range map[string]string{"toolu_good_a": "msg_good_a", "toolu_good_b": "msg_good_b"} {
+			expect(t, call, lab.call(call), map[string]any{"request_id": request})
+			expect(t, request, lab.row("SELECT pending, calls, context_tokens FROM requests WHERE request_id = ?", request),
+				map[string]any{"pending": 0, "calls": 1, "context_tokens": 5})
+		}
+		if n := lab.count("SELECT count(*) FROM requests"); n != 2 {
+			t.Errorf("requests = %d, want 2", n)
+		}
+		want := fmt.Sprintf("[%s toolu_good_a %s]", callmeter.StageTranscript, skipped(transcript, len(first)))
+		if got := lab.faultsText(); got != want {
+			t.Errorf("faults = %s\nwant %s", got, want)
+		}
+	})
+	t.Run("stop sweep", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		transcript := lab.transcript(cmSessionA)
+		first := sweepEntry("msg_reply_a", "01", `"end_turn"`, 5, `{"type":"text","text":"invented"}`)
+		lab.write(transcript, []byte(first+`{"type":"assistant","message":{"id":"msg_reply_a",`+"\n"+
+			sweepEntry("msg_reply_b", "02", `"end_turn"`, 7, `{"type":"text","text":"invented"}`)))
+		lab.feedAt(1790125199000, hookPayload(t, "UserPromptSubmit", map[string]any{"transcript_path": transcript, "prompt": "invented"}))
+		lab.feedAt(1790125300000, hookPayload(t, eventStop, map[string]any{"transcript_path": transcript, "prompt_id": "prompt-1"}))
+		for request, output := range map[string]int{"msg_reply_a": 5, "msg_reply_b": 7} {
+			expect(t, request, lab.row("SELECT pending, output_tokens, session_id FROM requests WHERE request_id = ?", request),
+				map[string]any{"pending": 0, "output_tokens": output, "session_id": cmSessionA})
+		}
+		if n := lab.count("SELECT count(*) FROM requests"); n != 2 {
+			t.Errorf("requests = %d, want 2", n)
+		}
+		want := fmt.Sprintf("[%s  requests of %s: %s]", callmeter.StageTranscript, transcript, skipped(transcript, len(first)))
+		if got := lab.faultsText(); got != want {
+			t.Errorf("faults = %s\nwant %s", got, want)
+		}
+	})
+	// At SessionEnd the call left in flight is settled from its result, the
+	// turn's end is rebuilt and the replies are swept, each read past the bad
+	// line and each naming it once.
+	t.Run("session end", func(t *testing.T) {
+		lab := newCallmeterLab(t)
+		transcript := lab.transcript(cmSessionA)
+		first := sweepEntry("msg_open", "01", `"tool_use"`, 5, `{"type":"tool_use","id":"toolu_open","name":"Bash","input":{}}`)
+		lab.write(transcript, []byte(first+
+			`{"type":"assistant","message":{"id":"msg_open","content":[{"type":"tool_use","id":"toolu_open"`+"\n"+
+			`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_open","content":"ok"}]}}`+"\n"+
+			sweepEntry("msg_close", "02", `"end_turn"`, 7, `{"type":"text","text":"invented"}`)))
+		lab.feedAt(1790125199000, hookPayload(t, "UserPromptSubmit", map[string]any{"transcript_path": transcript, "prompt": "invented"}))
+		lab.feedAt(1790125200500, toolPayload(t, "PreToolUse", "toolu_open", "Bash", map[string]any{"command": "echo hi"},
+			map[string]any{"transcript_path": transcript}))
+		lab.feedAt(1790125300000, hookPayload(t, callmeter.EventSessionEnd, map[string]any{"transcript_path": transcript, "reason": "other"}))
+		expect(t, "settled call", lab.call("toolu_open"), map[string]any{"bytes_delivered": 2, "failed": 0, "request_id": "msg_open"})
+		for request, output := range map[string]int{"msg_open": 5, "msg_close": 7} {
+			expect(t, request, lab.row("SELECT pending, output_tokens FROM requests WHERE request_id = ?", request),
+				map[string]any{"pending": 0, "output_tokens": output})
+		}
+		if n := lab.count("SELECT count(*) FROM events WHERE event = ? AND detail = ?", eventStop, callmeter.RecoveredDetail); n != 1 {
+			t.Errorf("rebuilt Stop events = %d, want 1", n)
+		}
+		at := len(first)
+		want := fmt.Sprintf("[%[1]s toolu_open 1 undecodable transcript line(s) skipped, the first: transcript %[2]s at byte %[3]d: "+
+			"decode transcript line: unexpected end of JSON input] [%[1]s  requests of %[2]s: %[4]s] [%[1]s  %[4]s]",
+			callmeter.StageTranscript, transcript, at, skipped(transcript, at))
+		if got := lab.faultsText(); got != want {
+			t.Errorf("faults = %s\nwant %s", got, want)
+		}
+	})
 }
 
 // TestCallmeterSessionEdgeResolvesAnAbandonedAgentsPending: a sub-agent whose
@@ -2788,6 +3027,32 @@ func TestCallmeterSessionEndReadsASettledAgentLast(t *testing.T) {
 // TestCallmeterSessionEndBudgetSpentIsNotAWarning: SessionEnd leaving transcript
 // reads to report-time recovery when its 1.2 s budget runs out is an expected,
 // documented outcome (docs/testing.md, reconcile): its faults row stands for the
+// TestCallmeterSessionEndSweepsTheAgentsOfABracketedDirectory: a main
+// transcript under a directory whose name holds a `[` has its sub-agents
+// listed as written and swept at SessionEnd, with no fault.
+func TestCallmeterSessionEndSweepsTheAgentsOfABracketedDirectory(t *testing.T) {
+	lab := newCallmeterLab(t)
+	main := filepath.Join(lab.home, ".claude", "projects", "pro[j", cmSessionA+".jsonl")
+	const running = "arunning00000001"
+	path := callmeter.SubagentTranscriptPath(main, running)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create subagents dir: %v", err)
+	}
+	lab.write(main, []byte(sweepEntry("msg_mainreply01", "01", `"end_turn"`, 5, `{"type":"text","text":"ok"}`)))
+	lab.write(path, []byte(sweepEntry("msg_"+running, "01", `"end_turn"`, 5, `{"type":"text","text":"done"}`)))
+	const before = 1790125140000 // 2026-09-23T00:59:00Z, before the transcripts' entries
+	lab.feedAt(before, hookPayload(t, callmeter.EventSubagentStart, map[string]any{
+		"agent_id": running, "agent_type": "gitter", "transcript_path": main, "agent_transcript_path": path,
+	}))
+	lab.feedAt(before+1000, hookPayload(t, callmeter.EventSessionEnd, map[string]any{"reason": "other", "transcript_path": main}))
+	if n := lab.count("SELECT count(*) FROM requests WHERE request_id = ? AND agent_id = ?", "msg_"+running, running); n != 1 {
+		t.Errorf("request of the stored agent swept %d times, want 1; faults %s", n, lab.faultsText())
+	}
+	if n := lab.count("SELECT count(*) FROM faults"); n != 0 {
+		t.Errorf("faults = %d, want 0: %s", n, lab.faultsText())
+	}
+}
+
 // reports, and its plugin log row is info, never a transcript-unreadable warning.
 func TestCallmeterSessionEndBudgetSpentIsNotAWarning(t *testing.T) {
 	saved := sessionEndBudget
@@ -2877,6 +3142,45 @@ func TestCallmeterSessionEndWaitsForAnInFlightCallsResult(t *testing.T) {
 		expect(t, "call", lab.call(id), map[string]any{"failed": 1, "bytes_delivered": len("Exit code 137"), "error": "Exit code 137"})
 		if n := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = ?", id); n != 0 {
 			t.Errorf("faults naming the call = %d, want 0: its result was found", n)
+		}
+	})
+	// A bad line naming the call costs that line alone: the re-reads past it
+	// settle the call, and the line is one fault, never one per read.
+	t.Run("a bad line before the result is one fault", func(t *testing.T) {
+		lab, main := setup(t)
+		info, err := os.Stat(main)
+		if err != nil {
+			t.Fatalf("stat transcript: %v", err)
+		}
+		torn, err := os.OpenFile(main, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatalf("open transcript: %v", err)
+		}
+		_, err = torn.WriteString(`{"type":"assistant","message":{"id":"msg_inflight001","content":[{"type":"tool_use","id":"` + id + `"` + "\n")
+		if err := errors.Join(err, torn.Close()); err != nil {
+			t.Fatalf("append the bad line: %v", err)
+		}
+		appended := make(chan error, 1)
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			file, err := os.OpenFile(main, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				appended <- err
+				return
+			}
+			_, err = file.WriteString(toolResultLine(id, "Exit code 137"))
+			appended <- errors.Join(err, file.Close())
+		}()
+		lab.feed(end(t, main))
+		if err := <-appended; err != nil {
+			t.Fatalf("append the tool_result: %v", err)
+		}
+		expect(t, "call", lab.call(id), map[string]any{"failed": 1, "bytes_delivered": len("Exit code 137"), "error": "Exit code 137"})
+		want := fmt.Sprintf("1 undecodable transcript line(s) skipped, the first: transcript %s at byte %d: "+
+			"decode transcript line: unexpected end of JSON input", main, info.Size())
+		if all, named := lab.count("SELECT count(*) FROM faults WHERE tool_use_id = ?", id),
+			lab.count("SELECT count(*) FROM faults WHERE tool_use_id = ? AND error = ?", id, want); all != 1 || named != 1 {
+			t.Errorf("faults naming the call = %d, %d of them %q; want that one alone (faults %s)", all, named, want, lab.faultsText())
 		}
 	})
 	t.Run("result never lands", func(t *testing.T) {
@@ -3311,15 +3615,16 @@ func TestCallmeterNoRealOutputToolsStoreNullBytesReal(t *testing.T) {
 	for _, c := range []struct {
 		name     string
 		response any
+		faults   int // payload faults: the mistyped field, then what the response lacks
 	}{
-		{"malformed object", map[string]any{"agentId": 42}},
-		{"malformed non-object", 42},
+		{"malformed object", map[string]any{"agentId": 42}, 2},
+		{"malformed block list", []any{42}, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			lab := newCallmeterLab(t)
 			lab.feed(toolPayload(t, "PostToolUse", "toolu_malformed_edit", "Edit", capturedLine(t, "PostToolUse", "Edit")["tool_input"], map[string]any{"tool_response": c.response}))
-			if lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'payload' AND tool_use_id = ?", "toolu_malformed_edit") != 1 {
-				t.Fatal("malformed response must have one payload fault")
+			if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = 'payload' AND tool_use_id = ?", "toolu_malformed_edit"); n != c.faults {
+				t.Fatalf("malformed response payload faults = %d, want %d: %s", n, c.faults, lab.faultsText())
 			}
 		})
 	}
@@ -3484,6 +3789,18 @@ func TestCallmeterSettlingHooksIngestTheSessionsLedger(t *testing.T) {
 	size, _ := os.Stat(file)
 	if got := lab.count("SELECT ledger_offset FROM sessions WHERE session_id = '" + cmSessionA + "'"); int64(got) != size.Size() {
 		t.Errorf("ledger_offset = %d, want the file's %d bytes", got, size.Size())
+	}
+
+	// A line with a field of another type is kept, that field unknown, and
+	// said as one fault.
+	partial := strings.Replace(ledgerLine(5, 5555), `"input_tokens":3`, `"input_tokens":"three"`, 1)
+	lab.write(file, []byte(ledgerLine(1, 1111)+"\n"+ledgerLine(2, 2222)+"\n"+ledgerLine(3, 3333)+"\n"+ledgerLine(4, 4444)+"\n"+partial+"\n"))
+	lab.feedAt(at+3500, hookPayload(t, eventStop, map[string]any{"transcript_path": main, "prompt_id": "prompt-2b"}))
+	expect(t, "partial side call", lab.row("SELECT input_tokens, cost_usd_micros FROM requests WHERE request_id = 'req_hook0005'"),
+		map[string]any{"input_tokens": "<nil>", "cost_usd_micros": 5555})
+	const partialFault = "cost ledger: 1 lines of the session's file kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse"
+	if n := lab.count("SELECT COUNT(*) FROM faults WHERE stage = ? AND error = ?", callmeter.StageParse, partialFault); n != 1 {
+		t.Errorf("faults %q = %d, want 1: %s", partialFault, n, lab.faultsText())
 	}
 
 	// A ledger directory that is a file is a fault, not a failed hook; the

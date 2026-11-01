@@ -30,7 +30,7 @@ type fileStat struct {
 	cond      int64            // reads made only by parts inside a branch
 	agents    map[string]int64 // reads per agent
 	size      *int64           // last size on disk seen by a Read
-	gone      bool             // the latest look found no file: a Bash reference with Exists false
+	gone      bool             // the latest look found no file: a Bash reference with Exists ExistsNo
 	sizeTS    int64            // ts of the latest look: a Read's size or a Bash reference's existence
 	whole     int64
 	ranged    int64
@@ -107,7 +107,7 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	if err != nil {
 		return nil, err
 	}
-	parts, err := loadParts(ctx, store, f)
+	parts, partNotes, err := loadParts(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
@@ -169,9 +169,11 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 					}
 					seen[ref.Path] = true
 					s := stat(ref.Path)
-					if ts >= s.sizeTS {
-						// One call's references share one parse-time stat.
-						s.gone, s.sizeTS = !ref.Exists, ts
+					if ts >= s.sizeTS && ref.Exists != cmdparse.ExistsUnknown {
+						// One call's references share one parse-time stat; a
+						// failed stat (ExistsUnknown) never changes what the
+						// latest look that saw the file knew.
+						s.gone, s.sizeTS = ref.Exists == cmdparse.ExistsNo, ts
 					}
 					switch {
 					case delivered == nil:
@@ -264,7 +266,7 @@ func Files(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf)
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = notes
+	t.Notes = append(notes, partNotes...)
 	if readUnknown > 0 {
 		t.Notes = append(t.Notes, unknownSizeNote(readUnknown, "Read calls", "READ BYTES"))
 	}
@@ -324,7 +326,7 @@ func Writes(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 	if err != nil {
 		return nil, err
 	}
-	parts, err := loadParts(ctx, store, f)
+	parts, partNotes, err := loadParts(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +371,7 @@ func Writes(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = notes
+	t.Notes = append(notes, partNotes...)
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
 }

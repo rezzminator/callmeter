@@ -18,7 +18,8 @@ const ClassifyUsage = `usage: callmeter classify [--rules FILE] < calls.jsonl
   in  {"id": "...", "tool": "Bash", "command": "...", "cwd": "/abs/dir"}   (command and cwd for Bash only)
   out {"id": "...", "class": "edit", "classes": ["edit", "test"], "status": "ok"}
   classes: edit test git housekeeping search read capture wait spawn other; class is the first held, in that order
-  status: ok, or the cause the command could not be fully parsed (the call is then labelled from its parsed parts)
+  status: ok, or the cause the command could not be fully parsed (the call is then labelled from its parsed parts),
+    or "unreadable input line N: ..." for an input line that is not a JSON object or has no id (id and class empty)
   --rules FILE: a JSON rules file adding to the built-in defaults; a bad file stops the run with its path and cause
     {"tools": {"<tool name>": "<class>"},
      "wrappers": [{"program": "<name>", "after": ["<word>", ...]}],   the words after those words are a command of their own
@@ -40,6 +41,12 @@ type classifyOut struct {
 	Class   string   `json:"class"`
 	Classes []string `json:"classes"`
 	Status  string   `json:"status"`
+}
+
+// unreadableStatus is the status of the output line standing for input line n,
+// skipped for cause; its id, class and classes are empty.
+func unreadableStatus(n int, cause string) string {
+	return fmt.Sprintf("unreadable input line %d: %s", n, cause)
 }
 
 // classifyArgs reads `classify [--rules FILE | --rules=FILE]`: the rules path
@@ -70,9 +77,11 @@ func classifyArgs(args []string) (string, bool) {
 
 // Classify is `callmeter classify`: callclass.Classify over the calls on
 // stdin, the whole input one batch. It touches no store. args starts with
-// "classify", then at most one --rules FILE. It returns the process exit code:
-// 0 done, 1 an unreadable input line, an unusable rules file or a classify
-// error, 2 usage.
+// "classify", then at most one --rules FILE. An input line that is not a JSON
+// object or has no id is skipped, said on stderr, and keeps its place in the
+// output as a line whose status names it (unreadableStatus). It returns the
+// process exit code: 0 done, 1 an unusable rules file or a classify error, 2
+// usage.
 func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv paths.Getenv) int {
 	rulesPath, ok := classifyArgs(args)
 	if !ok {
@@ -91,6 +100,7 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 	}
 	var ins []classifyIn
 	var calls []callclass.Call
+	unreadable := map[int]string{} // index in ins → its status
 	sc := bufio.NewScanner(stdin)
 	sc.Buffer(make([]byte, 0, 1<<20), 1<<26)
 	for n := 1; sc.Scan(); n++ {
@@ -98,15 +108,21 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 			continue
 		}
 		var in classifyIn
+		cause := ""
 		if err := json.Unmarshal(sc.Bytes(), &in); err != nil {
+			cause = "not a JSON object"
 			fmt.Fprintf(stderr, "callmeter classify: input line %d: %v\n", n, err)
-			pluginLog(stderr, getenv, "error", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", err.Error())
-			return 1
-		}
-		if in.ID == "" {
+			pluginLog(stderr, getenv, "warning", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", err.Error())
+		} else if in.ID == "" {
+			cause = "no id"
 			fmt.Fprintf(stderr, "callmeter classify: input line %d: no id\n", n)
-			pluginLog(stderr, getenv, "error", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", "input line has no id")
-			return 1
+			pluginLog(stderr, getenv, "warning", "payload-unparsable", "internal/callmeter/command/classify.go#Classify", "input line has no id")
+		}
+		if cause != "" {
+			// Only this line is skipped; it keeps its place in the output.
+			unreadable[len(ins)] = unreadableStatus(n, cause)
+			ins = append(ins, classifyIn{})
+			continue
 		}
 		ins = append(ins, in)
 		calls = append(calls, callclass.Call{ID: in.ID, Tool: in.Tool, Command: in.Command, Cwd: in.Cwd})
@@ -123,7 +139,15 @@ func Classify(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv p
 		return 1
 	}
 	enc := json.NewEncoder(stdout)
-	for _, in := range ins {
+	for i, in := range ins {
+		if status, skipped := unreadable[i]; skipped {
+			if err := enc.Encode(classifyOut{Status: status}); err != nil {
+				fmt.Fprintf(stderr, "callmeter classify: write output: %v\n", err)
+				pluginLog(stderr, getenv, "error", "classify-failed", "internal/callmeter/command/classify.go#Classify", err.Error())
+				return 1
+			}
+			continue
+		}
 		r := res[in.ID]
 		out := classifyOut{ID: in.ID, Class: string(r.Class), Status: r.Status}
 		for _, c := range r.Classes {

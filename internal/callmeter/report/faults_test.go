@@ -275,9 +275,12 @@ func TestFaultsListsRefusals(t *testing.T) {
 		"s-done":  transcript("s-done", refusalPrompt, refusalLine("rate_limit"), refusalPrompt, refusalAnswer),
 		"s-gone":  filepath.Join(dir, "absent.jsonl"),
 		"s-built": transcript("s-built", refusalPrompt, refusalLine("rate_limit"), refusalTail),
+		// A torn line after the refusal costs that line alone: the refusal stands,
+		// and the session counts as checked.
+		"s-torn": transcript("s-torn", refusalPrompt, refusalLine("rate_limit"), `{"type":"user","message":`, refusalTail),
 	}
-	for i, id := range []string{"s-hook", "s-lost", "s-odd", "s-open", "s-done", "s-gone", "s-built"} {
-		at := ms(time.Duration(7-i) * time.Hour)
+	for i, id := range []string{"s-torn", "s-hook", "s-lost", "s-odd", "s-open", "s-done", "s-gone", "s-built"} {
+		at := ms(time.Duration(8-i) * time.Hour)
 		batch(t, store, func(ctx context.Context, tx *callmeter.Tx) error {
 			return tx.TouchSession(ctx, callmeter.Session{SessionID: id, TS: at, TranscriptPath: p(sessions[id])})
 		})
@@ -307,6 +310,7 @@ func TestFaultsListsRefusals(t *testing.T) {
 		"unknown|1|chat-s-odd|transcript, no StopFailure",
 		"rate_limit|1|chat-s-lost|transcript, no StopFailure",
 		"oauth_org_not_allowed|1|chat-s-hook|StopFailure",
+		"rate_limit|1|chat-s-torn|transcript, no StopFailure",
 	}
 	if strings.Join(refusals, "\n") != strings.Join(want, "\n") {
 		t.Errorf("refusal rows =\n%s\nwant\n%s\n(rows %v)", strings.Join(refusals, "\n"), strings.Join(want, "\n"), table.Rows)

@@ -216,6 +216,7 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 	}
 	ledgerRead := f.Ledger != nil && f.Ledger.Present
 	var sessions []*string
+	var undecoded int
 	for _, c := range ordered {
 		session := c.session
 		sessions = append(sessions, &session)
@@ -230,7 +231,11 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 		if !c.side.Valid && c.micros.Valid && ledgerRead {
 			side = "0.00"
 		}
-		t.Rows = append(t.Rows, []string{"", usd(c.micros, 2), cc, diff, c.preLedger(), side, tenths(c.api), tenths(c.retry), tenths(c.tool), tenths(c.wall), modelCosts(c.models)})
+		models := modelCosts(c.models)
+		if models == undecodedModels {
+			undecoded++
+		}
+		t.Rows = append(t.Rows, []string{"", usd(c.micros, 2), cc, diff, c.preLedger(), side, tenths(c.api), tenths(c.retry), tenths(c.tool), tenths(c.wall), models})
 	}
 	nameChats(n, t, sessions)
 	if t.Notes, err = gainedNotes(ctx, store, f, n, "session_costs table"); err != nil {
@@ -248,6 +253,9 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 		return nil, err
 	}
 	t.Notes = append(t.Notes, gaps...)
+	if undecoded > 0 {
+		t.Notes = append(t.Notes, fmt.Sprintf("%d chats show MODELS %s: their stored per-model costs do not decode", undecoded, undecodedModels))
+	}
 	t.Notes = append(t.Notes, ledgerNotes(f.Ledger)...)
 	if ccCount > 0 {
 		t.Notes = append(t.Notes, fmt.Sprintf("%.2f USD in total over %d sessions (Claude Code's own accounting)", ccTotal, ccCount))
@@ -320,6 +328,16 @@ func ledgerNotes(l *callmeter.LedgerSummary) []string {
 		notes = append(notes, plural(int64(l.Faults),
 			"1 ledger line was skipped: not a JSON object, or missing a field the ledger contract requires",
 			"%d ledger lines were skipped: not a JSON object, or missing a field the ledger contract requires"))
+	}
+	if l.Partial > 0 {
+		notes = append(notes, plural(int64(l.Partial),
+			"1 ledger line was kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse",
+			"%d ledger lines were kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse"))
+	}
+	if l.FilesSkipped > 0 {
+		notes = append(notes, plural(int64(l.FilesSkipped),
+			"1 ledger file could not be read whole: its unread calls are not counted",
+			"%d ledger files could not be read whole: their unread calls are not counted"))
 	}
 	if l.HeldUnrecorded > 0 {
 		notes = append(notes, plural(int64(l.HeldUnrecorded),
@@ -454,14 +472,22 @@ func costCalls(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 	return t, nil
 }
 
+// undecodedModels is the MODELS cell of a chat whose stored per-model costs
+// do not decode: unknown, never the "-" of a chat that has none.
+const undecodedModels = "?"
+
 // modelCosts is the stored {model: usd} JSON as `model=usd` pairs, the most
-// expensive first, two decimals; "-" when there is none or it is not that JSON.
+// expensive first, two decimals; "-" when there is none, undecodedModels when
+// it is not that JSON.
 func modelCosts(raw *string) string {
 	if raw == nil {
 		return "-"
 	}
 	var costs map[string]float64
-	if err := json.Unmarshal([]byte(*raw), &costs); err != nil || len(costs) == 0 {
+	if err := json.Unmarshal([]byte(*raw), &costs); err != nil {
+		return undecodedModels
+	}
+	if len(costs) == 0 {
 		return "-"
 	}
 	models := make([]string, 0, len(costs))

@@ -31,9 +31,9 @@ func TestDeliveredBytes(t *testing.T) {
 		{name: "empty array", raw: `[]`, want: 0},
 		{name: "null", raw: `null`, want: 0},
 		{name: "empty raw message", raw: ``, want: 0},
-		{name: "object is unmeasurable", raw: `{"foo":"bar"}`, wantErr: true},
-		{name: "number is unmeasurable", raw: `42`, wantErr: true},
-		{name: "boolean is unmeasurable", raw: `true`, wantErr: true},
+		{name: "object is its JSON text", raw: `{"foo":"bar"}`, want: int64(len(`{"foo":"bar"}`))},
+		{name: "number is its JSON text", raw: `42`, want: 2},
+		{name: "boolean is its JSON text", raw: `true`, want: 4},
 		{name: "malformed string errors", raw: `"unterminated`, wantErr: true},
 		{name: "malformed array errors", raw: `[{"text":`, wantErr: true},
 	}
@@ -169,8 +169,8 @@ func TestRealBytes(t *testing.T) {
 		{name: "content string", raw: `{"content":"abcd","prompt":"long prompt"}`, want: 4},
 		{name: "null content falls back", raw: `{"content":null}`, want: int64(len(`{"content":null}`))},
 		{name: "fallback is the response length", raw: `{"agentId":"a1","status":"completed"}`, want: int64(len(`{"agentId":"a1","status":"completed"}`))},
-		{name: "unmeasurable content", raw: `{"content":{"x":1}}`, wantErr: true},
-		{name: "number", raw: `42`, wantErr: true},
+		{name: "object content is its JSON text", raw: `{"content":{"x":1}}`, want: int64(len(`{"x":1}`))},
+		{name: "number", raw: `42`, want: 2},
 		{name: "malformed object", raw: `{"stdout":5}`, wantErr: true},
 	}
 	for _, response := range noRealOutputResponses(t) {
@@ -209,8 +209,9 @@ func TestRealBytes(t *testing.T) {
 
 // TestFindResultsReal: a successful call's Real is RealBytes of the line's
 // toolUseResult; a line with none, a null one, a failed call and a line holding
-// several tool_results have none, and a toolUseResult RealBytes cannot measure
-// is an error naming the tool_use_id.
+// several tool_results have none. A line that does not decode costs that line
+// alone, and a toolUseResult RealBytes cannot measure only that call's Real:
+// every other result is kept, beside an error naming the line or the call.
 func TestFindResultsReal(t *testing.T) {
 	line := func(useResult string, ids ...string) string {
 		var blocks []string
@@ -280,10 +281,34 @@ func TestFindResultsReal(t *testing.T) {
 		}
 	})
 	t.Run("an unmeasurable toolUseResult", func(t *testing.T) {
-		path := write(t, line(`{"content":{"x":1}}`, "toolu_a"))
-		_, err := FindResults(path, []string{"toolu_a"})
-		if err == nil || !strings.Contains(err.Error(), "toolu_a") {
-			t.Fatalf("FindResults error = %v, want one naming toolu_a", err)
+		path := write(t, line(`{"stdout":5}`, "toolu_a"), line(`{"stdout":"ok"}`, "toolu_b"))
+		found, err := FindResults(path, []string{"toolu_a", "toolu_b"})
+		want := "1 undecodable transcript line(s) skipped, the first: transcript " + path +
+			" at byte 0: tool_result toolu_a: toolUseResult: decode tool_response: json: cannot unmarshal number into Go struct field realResponse.stdout of type string"
+		if err == nil || err.Error() != want {
+			t.Fatalf("FindResults error = %v, want %s", err, want)
+		}
+		if got, ok := found["toolu_a"]; !ok || got.Real != nil || got.Bytes != 7 {
+			t.Errorf("toolu_a = %+v (found %t), want its delivered 7 bytes kept, Real unknown", got, ok)
+		}
+		if got := found["toolu_b"]; got.Real == nil || *got.Real != 2 {
+			t.Errorf("toolu_b = %+v, want Real 2: the other line is kept", got)
+		}
+	})
+	t.Run("a malformed line", func(t *testing.T) {
+		bad := `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_a"` + "\n"
+		path := write(t, bad, line(`{"stdout":"ok"}`, "toolu_b"))
+		found, err := FindResults(path, []string{"toolu_a", "toolu_b"})
+		want := "1 undecodable transcript line(s) skipped, the first: transcript " + path +
+			" at byte 0: decode transcript line: unexpected end of JSON input"
+		if err == nil || err.Error() != want {
+			t.Fatalf("FindResults error = %v, want %s", err, want)
+		}
+		if got := found["toolu_b"]; got.Real == nil || *got.Real != 2 || got.Bytes != 7 {
+			t.Errorf("toolu_b = %+v, want Real 2, Bytes 7: the line after the bad one is kept", got)
+		}
+		if _, ok := found["toolu_a"]; ok {
+			t.Errorf("toolu_a found on the malformed line")
 		}
 	})
 }

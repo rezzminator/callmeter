@@ -349,16 +349,89 @@ func TestRecoverQuietNamesAnUnreadableTranscriptAndGoesOn(t *testing.T) {
 	if err := os.Chtimes(q.sub, mtime, mtime); err != nil {
 		t.Fatal(err)
 	}
+	// sess-0, recovered first, fails at the store: that costs sess-0 alone.
+	gone := filepath.Join(t.TempDir(), "sess-0.jsonl")
+	if _, err := q.store.DB().Exec(`INSERT INTO sessions(session_id, transcript_path, last_ts) VALUES('sess-0', ?, 1)`, gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.store.DB().Exec(`CREATE TRIGGER sess0_fails BEFORE UPDATE ON sessions WHEN old.session_id = 'sess-0'
+		BEGIN SELECT RAISE(ABORT, 'invented store failure'); END`); err != nil {
+		t.Fatal(err)
+	}
 	summary, err := q.store.RecoverQuiet(context.Background(), q.now, QuietAfter)
 	if err != nil {
 		t.Fatalf("RecoverQuiet: %v", err)
 	}
-	if len(summary.Skipped) == 0 || !strings.Contains(summary.Skipped[0].Error(), "session sess-1") ||
-		!strings.Contains(summary.Skipped[0].Error(), q.sub) {
+	if len(summary.Skipped) < 2 {
+		t.Fatalf("RecoverQuiet skipped %v, want sess-0's failure and sess-1's unreadable line", summary.Skipped)
+	}
+	if want := "session sess-0: " + gone + ": callmeter store " + q.store.path +
+		`: mark session "sess-0" ended with no SessionEnd: constraint failed: invented store failure (1811)`; summary.Skipped[0].Error() != want {
+		t.Errorf("RecoverQuiet skipped first %v, want %s", summary.Skipped[0], want)
+	}
+	if !strings.Contains(summary.Skipped[1].Error(), "session sess-1") || !strings.Contains(summary.Skipped[1].Error(), q.sub) {
 		t.Fatalf("RecoverQuiet skipped %v, want an error naming session sess-1 and %s", summary.Skipped, q.sub)
 	}
 	if main := row(t, q.store, "calls", "tool_use_id = 'toolu_main'"); main["bytes_delivered"] != int64(len(failedResult)) {
 		t.Errorf("main call bytes_delivered = %v, want %d: the readable transcript still settles", main["bytes_delivered"], len(failedResult))
+	}
+
+	// A `[` in the transcript's directory is read as written: its sub-agents
+	// are listed and read. A sub-agent transcript that cannot be statted costs
+	// that file alone and leaves the session not read in full, so nothing is
+	// marked.
+	for _, c := range []struct {
+		name    string
+		break_  func(t *testing.T, q quietStore) (path, skipped string)
+		subSize any
+	}{
+		{"a [ in the transcript's directory", func(t *testing.T, q quietStore) (string, string) {
+			projects := filepath.Dir(filepath.Dir(q.main))
+			weird := filepath.Join(projects, "-tmp-we[ird")
+			if err := os.Rename(filepath.Dir(q.main), weird); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := q.store.DB().Exec("UPDATE sessions SET transcript_path = ?", filepath.Join(weird, "sess-1.jsonl")); err != nil {
+				t.Fatal(err)
+			}
+			return "", ""
+		}, int64(len(secretResult))},
+		{"a sub-agent transcript that cannot be statted", func(t *testing.T, q quietStore) (string, string) {
+			loop := filepath.Join(filepath.Dir(q.sub), "agent-loop.jsonl")
+			if err := os.Symlink(loop, loop); err != nil {
+				t.Fatal(err)
+			}
+			return loop, "stat transcript: stat " + loop + ": too many levels of symbolic links"
+		}, int64(len(secretResult))},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+			path, skipped := c.break_(t, q)
+			summary, err := q.store.RecoverQuiet(context.Background(), q.now, QuietAfter)
+			if err != nil {
+				t.Fatalf("RecoverQuiet: %v", err)
+			}
+			var want []string
+			if path != "" {
+				want = []string{"session sess-1: " + path + ": " + skipped}
+			}
+			var got []string
+			for _, entry := range summary.Skipped {
+				got = append(got, entry.Error())
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("RecoverQuiet skipped %q, want %q", got, want)
+			}
+			if main := row(t, q.store, "calls", "tool_use_id = 'toolu_main'"); main["bytes_delivered"] != int64(len(failedResult)) {
+				t.Errorf("main call bytes_delivered = %v, want %d: the main transcript is still read", main["bytes_delivered"], len(failedResult))
+			}
+			if sub := row(t, q.store, "calls", "tool_use_id = 'toolu_sub'"); sub["bytes_delivered"] != c.subSize {
+				t.Errorf("sub-agent call bytes_delivered = %v, want %v", sub["bytes_delivered"], c.subSize)
+			}
+			if n := count(t, q.store, "faults"); n != 0 {
+				t.Errorf("faults = %d, want 0: a session not read in full is never marked", n)
+			}
+		})
 	}
 }
 
@@ -376,7 +449,34 @@ func TestRecoverQuietSettlesAPendingRequestFromItsTranscript(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	summary := q.recover(t)
+	// A malformed line naming the call costs that line alone: the request is
+	// still resolved from the good ones, the line named as skipped.
+	raw, err := os.ReadFile(q.main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := `{"type":"assistant","message":{"id":"msg_main","content":[{"type":"tool_use","id":"` + q.toolMain + `"` + "\n"
+	q.writeTranscript(t, q.main, strings.TrimSuffix(bad+string(raw), "\n"))
+	mtime := q.now.Add(-2 * time.Hour)
+	if err := os.Chtimes(q.main, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+	if err != nil {
+		t.Fatalf("RecoverQuiet: %v", err)
+	}
+	lineErr := "session sess-1: " + q.main + ": 1 undecodable transcript line(s) skipped, the first: transcript " + q.main + " at byte 0: "
+	var skipped []string
+	for _, entry := range summary.Skipped {
+		skipped = append(skipped, entry.Error())
+	}
+	if want := []string{
+		lineErr + "malformed entry: unexpected end of JSON input",        // FindRequests
+		lineErr + "decode transcript line: unexpected end of JSON input", // FindResults
+		lineErr + "malformed entry: unexpected end of JSON input",        // ReadTranscript
+	}; !reflect.DeepEqual(skipped, want) {
+		t.Errorf("RecoverQuiet skipped %q, want %q: each read names the bad line", skipped, want)
+	}
 	if summary.Requests != 2 {
 		t.Errorf("RecoverQuiet = %+v, want 2 requests: the pending one resolved and the sub-agent's written", summary)
 	}
@@ -553,6 +653,60 @@ func TestRecoverQuietRebuildsAnUnrecordedCall(t *testing.T) {
 		}
 		if n := count(t, q.store, "faults"); n != 0 {
 			t.Errorf("faults = %d, want 0", n)
+		}
+	})
+	t.Run("a sub-agent transcript read past a bad line: rebuilt, never marked", func(t *testing.T) {
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), toolUseLine("msg_lost", "toolu_lost", 9, start.Add(6*time.Second)))
+		q.writeTranscript(t, q.sub, `{"type":"assistant","message":`)
+		for _, file := range []string{q.main, q.sub} {
+			if err := os.Chtimes(file, start, start); err != nil {
+				t.Fatal(err)
+			}
+		}
+		summary, err := q.store.RecoverQuiet(context.Background(), q.now, QuietAfter)
+		if err != nil {
+			t.Fatalf("RecoverQuiet: %v", err)
+		}
+		want := "session sess-1: " + q.sub + ": 1 undecodable transcript line(s) skipped, the first: transcript " + q.sub +
+			" at byte 0: malformed entry: unexpected end of JSON input"
+		if len(summary.Skipped) != 1 || summary.Skipped[0].Error() != want {
+			t.Errorf("RecoverQuiet skipped %v, want [%s]", summary.Skipped, want)
+		}
+		if summary.Rebuilt != 1 {
+			t.Errorf("RecoverQuiet = %+v, want the main chat's lost call rebuilt", summary)
+		}
+		if call := row(t, q.store, "calls", "tool_use_id = 'toolu_lost'"); call == nil || call["request_id"] != "msg_lost" {
+			t.Errorf("rebuilt call = %v, want it on request msg_lost", call)
+		}
+		if n := count(t, q.store, "faults"); n != 0 {
+			t.Errorf("faults = %d, want 0: a session not read in full is never marked", n)
+		}
+	})
+	t.Run("a lost call whose message time is no RFC 3339: rebuilt, its time unknown", func(t *testing.T) {
+		q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
+		start := q.now.Add(-2 * time.Hour)
+		q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start),
+			strings.Replace(toolUseLine("msg_lost", "toolu_lost", 9, start.Add(6*time.Second)), stamp(start.Add(6*time.Second)), "invented", 1))
+		if err := os.Chtimes(q.main, start, start); err != nil {
+			t.Fatal(err)
+		}
+		summary, err := q.store.RecoverQuiet(context.Background(), q.now, QuietAfter)
+		if err != nil {
+			t.Fatalf("RecoverQuiet: %v", err)
+		}
+		at := len(promptLine("prompt-1", secretPrompt, start)) + 1
+		want := fmt.Sprintf(`session sess-1: %[1]s: 1 undecodable transcript line(s) skipped, the first: transcript %[1]s at byte %[2]d: `+
+			`assistant message "msg_lost": timestamp of 8 bytes is not RFC 3339`, q.main, at)
+		if len(summary.Skipped) != 1 || summary.Skipped[0].Error() != want {
+			t.Errorf("RecoverQuiet skipped %v, want [%s]", summary.Skipped, want)
+		}
+		if call := row(t, q.store, "calls", "tool_use_id = 'toolu_lost'"); call == nil || call["request_id"] != "msg_lost" || call["ts"] != nil {
+			t.Errorf("rebuilt call = %v, want it on msg_lost with ts NULL", call)
+		}
+		if request := row(t, q.store, "requests", "request_id = 'msg_lost'"); request == nil || request["ts"] != nil || request["output_tokens"] != int64(9) {
+			t.Errorf("request msg_lost = %v, want it written with ts NULL and output 9", request)
 		}
 	})
 	t.Run("no result: one call marker", func(t *testing.T) {
@@ -740,16 +894,18 @@ func TestRecoverQuietFillsAgentMetaWithoutWaiting(t *testing.T) {
 		wantParent any
 		wantType   any
 		wantCount  int
+		skipped    string // the Skipped entry each pass names, after "session sess-1: {sub-agent transcript}: "
 	}{
 		{name: "live session", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
 		{name: "meta absent"},
-		{name: "meta directory", directory: true},
-		{name: "meta bad JSON", meta: `{`},
+		{name: "meta directory", directory: true, skipped: "read sub-agent meta: read {meta}: is a directory"},
+		{name: "meta bad JSON", meta: `{`, skipped: "sub-agent meta {meta}: unexpected end of JSON input"},
 		{name: "meta empty", meta: `{}`},
 		{name: "parent kept type filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, parent: "toolu_kept", wantParent: "toolu_kept", wantType: "Explore", wantCount: 1},
 		{name: "type kept parent filled", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, agentType: "general-purpose", wantParent: "toolu_meta", wantType: "general-purpose", wantCount: 1},
-		{name: "transcript NULL", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("NULL")},
-		{name: "transcript empty", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("")},
+		// No stored path: the transcript is found under the seat, as recovery finds it.
+		{name: "transcript NULL", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr("NULL"), wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
+		{name: "transcript empty", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, transcript: Ptr(""), wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
 		{name: "moved transcript", meta: `{"agentType":"Explore","toolUseId":"toolu_meta"}`, moved: true, wantParent: "toolu_meta", wantType: "Explore", wantCount: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -790,7 +946,22 @@ func TestRecoverQuietFillsAgentMetaWithoutWaiting(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			first := q.recover(t)
+			pass := func() RecoverSummary {
+				t.Helper()
+				if test.skipped == "" {
+					return q.recover(t)
+				}
+				summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+				if err != nil {
+					t.Fatalf("RecoverQuiet: %v", err)
+				}
+				want := "session sess-1: " + q.sub + ": " + strings.ReplaceAll(test.skipped, "{meta}", meta)
+				if len(summary.Skipped) != 1 || summary.Skipped[0].Error() != want {
+					t.Errorf("RecoverQuiet skipped %v, want [%s]", summary.Skipped, want)
+				}
+				return summary
+			}
+			first := pass()
 			if first.Parents != test.wantCount || first.Sessions != 0 {
 				t.Errorf("RecoverQuiet Parents = %d, Sessions = %d; want %d, 0", first.Parents, first.Sessions, test.wantCount)
 			}
@@ -807,7 +978,7 @@ func TestRecoverQuietFillsAgentMetaWithoutWaiting(t *testing.T) {
 					t.Errorf("transcript-less agent parent = %v, type = %v; want NULL, NULL", unread["parent_tool_use_id"], unread["agent_type"])
 				}
 			}
-			if again := q.recover(t); again.Parents != 0 || again.Sessions != 0 {
+			if again := pass(); again.Parents != 0 || again.Sessions != 0 {
 				t.Errorf("second RecoverQuiet Parents = %d, Sessions = %d; want 0, 0", again.Parents, again.Sessions)
 			}
 		})
@@ -871,7 +1042,7 @@ func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
 	start := time.Now().Add(-2 * time.Hour).Truncate(time.Millisecond)
 	notice := start.Add(20 * time.Second)
 	for _, test := range []struct {
-		name, kind, agent, status                                 string
+		name, kind, agent, status, badLine                        string
 		offset                                                    time.Duration
 		woken, several, ended, live, noID, noStatus, noTranscript bool
 	}{
@@ -887,6 +1058,11 @@ func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
 		{name: "without task-id", noID: true},
 		{name: "without status", noStatus: true},
 		{name: "transcript turn end exists", ended: true, offset: -18 * time.Second},
+		// An assistant line with no message id, or whose content is no block
+		// list, costs that line (or its tool uses) alone: the stop still
+		// settles at the turn end, its totals kept.
+		{name: "an id-less message beside the turn end", ended: true, offset: -18 * time.Second, badLine: "id-less"},
+		{name: "a message whose content is no block list", ended: true, offset: -18 * time.Second, badLine: "text content"},
 		{name: "notice usage differs"},
 		{name: "privacy"},
 		{name: "live session", live: true},
@@ -939,6 +1115,14 @@ func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
 				wantEnd = start.Add(3 * time.Second).UnixMilli()
 				subLines = append(subLines, endTurnLine("msg_sub", 77, start.Add(3*time.Second)))
 			}
+			badAt := len(strings.Join(subLines, "\n")) + 1
+			switch test.badLine {
+			case "id-less":
+				subLines = append(subLines, strings.Replace(textLine("msg_sub", secretMessage, 5, start.Add(4*time.Second)), `"id":"msg_sub",`, "", 1))
+			case "text content":
+				subLines = append(subLines, strings.Replace(textLine("msg_more", secretMessage, 5, start.Add(4*time.Second)),
+					`[{"type":"text","text":`+fmt.Sprintf("%q", secretMessage)+`}]`, fmt.Sprintf("%q", secretMessage), 1))
+			}
 			ctx := context.Background()
 			q := newUnfilledStore(t, 2*time.Hour, start.Add(-time.Minute), mainLines, subLines, func(tx *Tx) error {
 				if _, err := tx.tx.ExecContext(ctx, `INSERT INTO agents(agent_id, session_id, started) VALUES('a1', 'sess-1', ?)`, start.UnixMilli()); err != nil {
@@ -969,10 +1153,27 @@ func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			summary := q.recover(t)
+			summary, err := q.store.RecoverQuiet(ctx, q.now, QuietAfter)
+			if err != nil {
+				t.Fatalf("RecoverQuiet: %v", err)
+			}
 			unfilled := test.offset < -20*time.Second || test.agent == "a2" || test.noID || test.noStatus || test.noTranscript
-			if len(summary.Skipped) != 0 {
-				t.Fatalf("RecoverQuiet skipped %v, want nothing skipped", summary.Skipped)
+			var skipped, wantSkipped []string
+			for _, entry := range summary.Skipped {
+				skipped = append(skipped, entry.Error())
+			}
+			bad := fmt.Sprintf("session sess-1: %[1]s: 1 undecodable transcript line(s) skipped, the first: transcript %[1]s at byte %[2]d: ", q.sub, badAt)
+			switch test.badLine {
+			case "id-less":
+				wantSkipped = []string{bad + "assistant message carries no id"}
+			case "text content":
+				wantSkipped = []string{
+					bad + `assistant message "msg_more": content is not a block list: json: cannot unmarshal string into Go value of type []callmeter.toolUseBlock`,
+					bad + `message "msg_more": content is not a block list: json: cannot unmarshal string into Go value of type []callmeter.contentBlock`,
+				}
+			}
+			if !reflect.DeepEqual(skipped, wantSkipped) {
+				t.Fatalf("RecoverQuiet skipped %q, want %q", skipped, wantSkipped)
 			}
 			if test.live || unfilled {
 				wantFaults := 0
@@ -1014,7 +1215,7 @@ func TestRecoverQuietEndsAnAgentTurnAtItsNotice(t *testing.T) {
 				t.Fatal("earlier turn changed")
 			}
 			totals, err := ReadAgentTotals(q.sub, "")
-			if err != nil {
+			if err != nil && !(test.badLine != "" && LinesSkipped(err)) {
 				t.Fatal(err)
 			}
 			agentRow := row(t, q.store, "agents", "agent_id = 'a1'")
@@ -1897,9 +2098,10 @@ func TestRecoverQuietSizesAHookCallFromItsToolUseResult(t *testing.T) {
 			marks := row(t, q.store, "faults", "tool_use_id = ? AND stage = ? AND error LIKE ?", q.toolMain, StageTranscript, "call "+q.toolMain+": %")
 			switch {
 			case c.noTS:
-				if main["bytes_real"] != nil || main["ts"] != nil || main["bytes_delivered"] != int64(len(secretResult)) {
-					t.Errorf("ts-less batch call = bytes_real %v ts %v bytes_delivered %v, want NULL, NULL, %d: its batch size alone",
-						main["bytes_real"], main["ts"], main["bytes_delivered"], len(secretResult))
+				// Its real size is looked up all the same; its ts stays unknown.
+				if main["bytes_real"] != int64(len(stdout)) || main["ts"] != nil || main["bytes_delivered"] != int64(len(secretResult)) {
+					t.Errorf("ts-less batch call = bytes_real %v ts %v bytes_delivered %v, want %d, NULL, %d",
+						main["bytes_real"], main["ts"], main["bytes_delivered"], len(stdout), len(secretResult))
 				}
 			case c.result:
 				if main["bytes_real"] != int64(len(stdout)) || main["bytes_delivered"] != int64(len(secretResult)) || main["failed"] != int64(0) {
@@ -2078,8 +2280,8 @@ func TestRecoverQuietReadsTheNewestTranscriptPath(t *testing.T) {
 }
 
 func TestRecoverQuietFindsAMovedTranscript(t *testing.T) {
-	for _, viaSeat := range []bool{false, true} {
-		t.Run(fmt.Sprintf("seat=%v", viaSeat), func(t *testing.T) {
+	for _, stored := range []string{"moved", "gone", "none"} {
+		t.Run("stored path "+stored, func(t *testing.T) {
 			q := newQuietStore(t, 2*time.Hour, 2*time.Hour)
 			start := time.UnixMilli(q.firstTS).Add(time.Minute)
 			q.writeTranscript(t, q.main, promptLine("prompt-1", secretPrompt, start), endTurnLine("msg_end", 9, start.Add(time.Second)))
@@ -2090,9 +2292,12 @@ func TestRecoverQuietFindsAMovedTranscript(t *testing.T) {
 			if err := os.Rename(filepath.Dir(q.main), filepath.Join(projects, "-tmp-moved-proj")); err != nil {
 				t.Fatal(err)
 			}
-			if viaSeat {
-				dead := filepath.Join(t.TempDir(), "gone", "sess-1.jsonl")
-				if _, err := q.store.DB().Exec("UPDATE sessions SET transcript_path = ?, seat_dir = ?", dead, filepath.Dir(projects)); err != nil {
+			if stored != "moved" {
+				var path any // none: the session never named its transcript, only its seat
+				if stored == "gone" {
+					path = filepath.Join(t.TempDir(), "gone", "sess-1.jsonl")
+				}
+				if _, err := q.store.DB().Exec("UPDATE sessions SET transcript_path = ?, seat_dir = ?", path, filepath.Dir(projects)); err != nil {
 					t.Fatal(err)
 				}
 			}

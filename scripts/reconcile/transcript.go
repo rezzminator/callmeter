@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rezzminator/callmeter/internal/callmeter"
 )
 
 // tokens is one usage split.
@@ -107,6 +109,22 @@ type world struct {
 	subagents    map[string][]*transcript // by session
 	read         map[string]bool          // resolved paths read
 	from         map[string]int64         // by session: its first store row
+	unread       []mismatch               // each item skipped as unreadable
+}
+
+// classUnreadable is the mismatch an input item this check could not read
+// prints as: the item is skipped, never the read around it, and the run says
+// so, so a check that could not look never reads as one that found nothing.
+const classUnreadable = "unreadable"
+
+// unreadable is the mismatch for one skipped item; session "" when the item
+// belongs to none.
+func unreadable(session, detail string) mismatch {
+	return mismatch{class: classUnreadable, session: session, detail: detail}
+}
+
+func (w *world) skip(session, detail string) {
+	w.unread = append(w.unread, unreadable(session, detail))
 }
 
 func newWorld(since, until int64) *world {
@@ -153,25 +171,29 @@ func defaultProjects(seats map[string]bool) ([]string, error) {
 }
 
 // diskIndex maps a session id to its main transcript, over every projects dir,
-// symlinks resolved so a dir shared by several seats is listed once.
-func diskIndex(projects []string) (map[string]string, error) {
+// symlinks resolved so a dir shared by several seats is listed once. A dir that
+// cannot be read is skipped and returned as an unreadable mismatch.
+func diskIndex(projects []string) (map[string]string, []mismatch) {
 	index := map[string]string{}
 	seen := map[string]bool{}
+	var unread []mismatch
 	for _, p := range projects {
 		real, err := filepath.EvalSymlinks(p)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("resolve projects dir %s: %w", p, err)
+			unread = append(unread, unreadable("", fmt.Sprintf("resolve projects dir %s: %v", p, err)))
+			continue
 		}
 		if seen[real] {
 			continue
 		}
 		seen[real] = true
-		files, err := filepath.Glob(filepath.Join(real, "*", "*.jsonl"))
+		files, err := filepath.Glob(filepath.Join(callmeter.GlobLiteral.Replace(real), "*", "*.jsonl"))
 		if err != nil {
-			return nil, fmt.Errorf("list transcripts under %s: %w", real, err)
+			unread = append(unread, unreadable("", fmt.Sprintf("list transcripts under %s: %v", real, err)))
+			continue
 		}
 		for _, f := range files {
 			id := strings.TrimSuffix(filepath.Base(f), ".jsonl")
@@ -180,47 +202,51 @@ func diskIndex(projects []string) (map[string]string, error) {
 			}
 		}
 	}
-	return index, nil
+	return index, unread
 }
 
 // readSession reads a session's main transcript and every sub-agent transcript
-// beside it, each resolved file once.
-func (w *world) readSession(session, path string) error {
+// beside it, each resolved file once. A file or meta that cannot be read is
+// skipped as unreadable, its siblings read.
+func (w *world) readSession(session, path string) {
 	main, err := w.readFile(path, session, "")
 	if err != nil {
-		return err
+		w.skip(session, err.Error())
+	} else if main == nil {
+		return
+	} else {
+		w.mains[session] = main
 	}
-	if main == nil {
-		return nil
-	}
-	w.mains[session] = main
 	dir := filepath.Join(filepath.Dir(path), session, "subagents")
-	files, err := filepath.Glob(filepath.Join(dir, "agent-*.jsonl"))
+	files, err := filepath.Glob(filepath.Join(callmeter.GlobLiteral.Replace(dir), "agent-*.jsonl"))
 	if err != nil {
-		return fmt.Errorf("list sub-agent transcripts in %s: %w", dir, err)
+		w.skip(session, fmt.Sprintf("list sub-agent transcripts in %s: %v", dir, err))
+		return
 	}
 	sort.Strings(files)
 	for _, f := range files {
 		agent := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(f), "agent-"), ".jsonl")
 		t, err := w.readFile(f, session, agent)
 		if err != nil {
-			return err
+			w.skip(session, err.Error())
+			continue
 		}
 		if t == nil {
 			continue
 		}
+		// A meta that cannot be read leaves the agent's type and parent unknown.
 		metaPath := strings.TrimSuffix(f, ".jsonl") + ".meta.json"
 		if raw, err := os.ReadFile(metaPath); err == nil {
 			if err := json.Unmarshal(raw, &t.meta); err != nil {
-				return fmt.Errorf("parse sub-agent meta %s: %w", metaPath, err)
+				t.meta = agentMeta{}
+				w.skip(session, fmt.Sprintf("parse sub-agent meta %s: %v", metaPath, err))
 			}
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("read sub-agent meta %s: %w", metaPath, err)
+			w.skip(session, fmt.Sprintf("read sub-agent meta %s: %v", metaPath, err))
 		}
 		w.agents[agent] = t
 		w.subagents[session] = append(w.subagents[session], t)
 	}
-	return nil
 }
 
 type line struct {
@@ -275,6 +301,9 @@ type block struct {
 }
 
 // readFile parses one transcript; nil when this resolved path was read before.
+// A line, a timestamp or a content-block array that does not parse is skipped
+// as unreadable, the rest of the file read; a file that cannot be opened or
+// read through is an error.
 func (w *world) readFile(path, session, agent string) (*transcript, error) {
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -311,7 +340,8 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 		}
 		var l line
 		if err := json.Unmarshal(raw, &l); err != nil {
-			return nil, fmt.Errorf("parse transcript %s line %d: %w", real, n, err)
+			w.skip(session, fmt.Sprintf("parse transcript %s line %d: %v", real, n, err))
+			continue
 		}
 		// Claude Code records a hook it ran as an attachment line (hook_success,
 		// hook_non_blocking_error, ...), each naming its hookEvent: any such line
@@ -322,25 +352,33 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 		if l.Type == "user" && l.PromptID != "" {
 			t.prompt = l.PromptID
 		}
-		if l.Timestamp == "" {
-			continue
+		// A line with no timestamp, or one that does not parse, is dated
+		// unknown: only its tool_results count, everything dated skips it.
+		var ms int64
+		if l.Timestamp != "" {
+			ts, err := time.Parse(time.RFC3339Nano, l.Timestamp)
+			if err != nil {
+				w.skip(session, fmt.Sprintf("parse timestamp in %s line %d: %v", real, n, err))
+			} else {
+				ms = ts.UnixMilli()
+			}
 		}
-		ts, err := time.Parse(time.RFC3339Nano, l.Timestamp)
-		if err != nil {
-			return nil, fmt.Errorf("parse timestamp in %s line %d: %w", real, n, err)
-		}
-		ms := ts.UnixMilli()
 		var blocks []block
 		if l.Message != nil && len(l.Message.Content) > 0 && l.Message.Content[0] == '[' {
 			if err := json.Unmarshal(l.Message.Content, &blocks); err != nil {
-				return nil, fmt.Errorf("parse content blocks in %s line %d: %w", real, n, err)
+				w.skip(session, fmt.Sprintf("parse content blocks in %s line %d: %v", real, n, err))
+				blocks = nil
 			}
 		}
-		// A tool_result counts whenever it landed: the check on it skips one past the window's end.
+		// A tool_result counts whenever it landed, an unknown time (0) as landed
+		// by --until: the check on it skips one past the window's end.
 		for _, b := range blocks {
 			if b.Type == "tool_result" && b.ToolUseID != "" {
 				w.results[b.ToolUseID] = result{ts: ms, isError: b.IsError}
 			}
+		}
+		if ms == 0 {
+			continue
 		}
 		// A typed /reload-plugins counts whenever it landed: the check on it
 		// compares it with the session's first store row.
@@ -394,9 +432,7 @@ func (w *world) readFile(path, session, agent string) (*transcript, error) {
 		switch l.Type {
 		case "assistant":
 			t.afterAPIError = l.IsAPIError
-			if err := w.assistant(t, &l, blocks, ms); err != nil {
-				return nil, fmt.Errorf("transcript %s line %d: %w", real, n, err)
-			}
+			w.assistant(t, &l, blocks, ms, n)
 		case "user":
 			if t.agent == "" {
 				w.notice(&l, ms)
@@ -597,13 +633,41 @@ func isPrompt(content json.RawMessage, blocks []block) bool {
 // UserPromptSubmit: a manual /compact fires PreCompact with that promptId.
 var typedLocal = map[string]bool{"/compact": true, "/clear": true, "/model": true, "/effort": true, "/reload": true}
 
-func (w *world) assistant(t *transcript, l *line, blocks []block, ms int64) error {
+// taskStopInput is the part of a TaskStop's input this check reads.
+type taskStopInput struct {
+	TaskID string `json:"task_id"`
+}
+
+// assistant reads assistant line n. Every tool_use counts, its message id
+// "" when the line has none; only a message with an id that is not synthetic
+// counts as a model message.
+func (w *world) assistant(t *transcript, l *line, blocks []block, ms int64, n int) {
 	if l.IsAPIError {
 		t.apiErrors++
 	}
 	m := l.Message
-	if m == nil || m.ID == "" || m.Model == "<synthetic>" {
-		return nil
+	if m == nil {
+		return
+	}
+	for _, b := range blocks {
+		if b.Type != "tool_use" || b.ID == "" {
+			continue
+		}
+		t.toolUses[b.ID] = true
+		if b.Name == "TaskStop" {
+			var in taskStopInput
+			if err := json.Unmarshal(b.Input, &in); err != nil {
+				w.skip(t.session, fmt.Sprintf("transcript %s line %d: TaskStop %s input: %v", t.path, n, b.ID, err))
+			} else if in.TaskID != "" {
+				w.taskStops[in.TaskID] = append(w.taskStops[in.TaskID], ms)
+			}
+		}
+		if _, ok := w.uses[b.ID]; !ok {
+			w.uses[b.ID] = &use{id: b.ID, name: b.Name, session: t.session, agent: t.agent, msgID: m.ID, ts: ms}
+		}
+	}
+	if m.ID == "" || m.Model == "<synthetic>" {
+		return
 	}
 	t.assistants++
 	t.lastAssistant = max(t.lastAssistant, ms)
@@ -634,25 +698,8 @@ func (w *world) assistant(t *transcript, l *line, blocks []block, ms int64) erro
 		}
 	}
 	for _, b := range blocks {
-		if b.Type != "tool_use" || b.ID == "" {
-			continue
-		}
-		msg.toolIDs[b.ID] = true
-		t.toolUses[b.ID] = true
-		if b.Name == "TaskStop" {
-			var in struct {
-				TaskID string `json:"task_id"`
-			}
-			if err := json.Unmarshal(b.Input, &in); err != nil {
-				return fmt.Errorf("TaskStop %s input: %w", b.ID, err)
-			}
-			if in.TaskID != "" {
-				w.taskStops[in.TaskID] = append(w.taskStops[in.TaskID], ms)
-			}
-		}
-		if _, ok := w.uses[b.ID]; !ok {
-			w.uses[b.ID] = &use{id: b.ID, name: b.Name, session: t.session, agent: t.agent, msgID: m.ID, ts: ms}
+		if b.Type == "tool_use" && b.ID != "" {
+			msg.toolIDs[b.ID] = true
 		}
 	}
-	return nil
 }

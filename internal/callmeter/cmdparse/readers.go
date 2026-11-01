@@ -153,7 +153,7 @@ func (p *callParser) plain(args []arg, action string) []FileRef {
 
 // named attributes the file operands of a known reader or writer and a
 // redirect target: one that does not exist at parse time is still attributed,
-// with Exists false, so history keeps its deleted and scratch files. A glob
+// with Exists ExistsNo, so history keeps its deleted and scratch files. A glob
 // that matched nothing and `-` (stdin) are never a missing file.
 func (p *callParser) named(args []arg, action, rng string) []FileRef {
 	return p.refs(args, action, rng, true)
@@ -701,13 +701,16 @@ func (p *callParser) file(a arg) (string, bool) {
 
 // lookup resolves a value against the current directory (a relative value
 // attributes nothing when a `cd` left it unknown) and reports whether it names
-// a file: an existing regular file (exists true) or, when missingOK, a path
-// that does not exist (exists false). An existing non-regular file, or a
+// a file: an existing regular file (ExistsYes) or, when missingOK, a path
+// that does not exist (ExistsNo). An existing non-regular file, or a
 // path through a non-directory, names none. A stat failure other than "no
-// such file" is kept as a note on the part, never read as absence.
-func (p *callParser) lookup(val string, missingOK bool) (path string, exists, ok bool) {
+// such file" is kept as a note on the part, never read as absence: a value
+// that may be missing (a known reader's or writer's operand) still names its
+// path, ExistsUnknown; any other value names none, as it may not be a file at
+// all.
+func (p *callParser) lookup(val string, missingOK bool) (path string, exists Existence, ok bool) {
 	if val == "" || strings.ContainsAny(val, "\x00\n") {
-		return "", false, false
+		return "", ExistsNo, false
 	}
 	if placeholder(val) {
 		missingOK = false
@@ -715,7 +718,7 @@ func (p *callParser) lookup(val string, missingOK bool) (path string, exists, ok
 	path = val
 	if !filepath.IsAbs(path) {
 		if p.dir == "" {
-			return "", false, false
+			return "", ExistsNo, false
 		}
 		path = filepath.Join(p.dir, path)
 	}
@@ -728,18 +731,21 @@ func (p *callParser) lookup(val string, missingOK bool) (path string, exists, ok
 		if errors.As(ioErr, &bound) {
 			p.notes = append(p.notes, fmt.Sprintf("stat %s over %s, left unattributed", val, bound))
 		}
-		return "", false, false
+		return "", ExistsNo, false
 	}
 	switch {
 	case err == nil:
-		return path, true, info.Mode().IsRegular()
+		return path, ExistsYes, info.Mode().IsRegular()
 	case errors.Is(err, fs.ErrNotExist):
-		return path, false, missingOK
+		return path, ExistsNo, missingOK
 	case errors.Is(err, syscall.ENOTDIR), errors.Is(err, syscall.ENAMETOOLONG):
-		return "", false, false
+		return "", ExistsNo, false
 	default:
 		p.notes = append(p.notes, fmt.Sprintf("stat %s: %v", path, err))
-		return "", false, false
+		if missingOK {
+			return path, ExistsUnknown, true
+		}
+		return "", ExistsNo, false
 	}
 }
 
@@ -796,7 +802,7 @@ func strAt(args []*string, i int) string {
 }
 
 // pyFiles attributes one scanned snippet: open(), Path(...) and its
-// read/write methods (a path that does not exist yet included, Exists false),
+// read/write methods (a path that does not exist yet included, Exists ExistsNo),
 // subprocess argv through the readers table, then every other string constant
 // that is an existing file as unknown.
 func (p *callParser) pyFiles(res PyResult) []FileRef {

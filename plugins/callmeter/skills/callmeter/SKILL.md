@@ -185,7 +185,7 @@ printf '%s\n' '{"id":"1","tool":"Bash","command":"sed -i s/a/b/ f.txt && go test
 # {"id":"1","class":"edit","classes":["edit","test"],"status":"ok"}
 ```
 
-`class` is the first of `edit test git housekeeping search read capture wait spawn other` that the call holds; `classes` lists all it holds; `status` is `ok` or the cause the command could not be fully parsed. `edit` means the call authored file content; output redirected into a file the command did not author is `capture`. A project's own names come from `--rules FILE`, a JSON file with `tools` (tool name to class), `wrappers` (`program` and the `after` words before a command string) and `tests` (`program` and the `args` that make it a test); a bad file stops the run with its path and cause. Feed it calls from a transcript (`tool_use` blocks) or from the `calls` table (`tool`, `input`'s command, `cwd`).
+`class` is the first of `edit test git housekeeping search read capture wait spawn other` that the call holds; `classes` lists all it holds; `status` is `ok` or the cause the command could not be fully parsed, or `unreadable input line {n}: {cause}` for an input line that is not a JSON object or has no id (id and class empty). `edit` means the call authored file content; output redirected into a file the command did not author is `capture`. A project's own names come from `--rules FILE`, a JSON file with `tools` (tool name to class), `wrappers` (`program` and the `after` words before a command string) and `tests` (`program` and the `args` that make it a test); a bad file stops the run with its path and cause. Feed it calls from a transcript (`tool_use` blocks) or from the `calls` table (`tool`, `input`'s command, `cwd`).
 
 ## Python
 

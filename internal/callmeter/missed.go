@@ -63,7 +63,9 @@ const unparsedLimit = 200
 // a handle opened before the claim's rename lands there, and the first ingest
 // after the grace writes the lines past the bytes read in its own transaction
 // and removes the file after its commit. A failed commit leaves every file for
-// the next run. A path with no file is 0, nil; an empty path is an error.
+// the next run. A claim that cannot be opened, locked or read is left for a
+// later run and named in the error returned after every other file is
+// ingested. A path with no file is 0, nil; an empty path is an error.
 func (s *Store) IngestMissed(ctx context.Context, path string) (int, error) {
 	return s.IngestMissedHeld(ctx, path, nil)
 }
@@ -93,6 +95,9 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 	var faults []Fault // from files a dead run may already have ingested
 	var fresh []Fault  // from own: never ingested
 	var locks []*os.File
+	// lockErr names each file that could not be read: it stays for a later
+	// run, and every other file is ingested all the same.
+	var lockErr error
 	defer func() {
 		for _, held := range locks {
 			if closeErr := held.Close(); closeErr != nil {
@@ -103,7 +108,8 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 	for _, file := range claims {
 		held, data, info, err := lockClaim(file)
 		if err != nil {
-			return 0, fmt.Errorf("callmeter store %s: %w", s.path, err)
+			lockErr = errors.Join(lockErr, fmt.Errorf("callmeter store %s: %w", s.path, err))
+			continue
 		}
 		if held == nil {
 			continue
@@ -122,7 +128,8 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 		held, data, info, err := lockClaim(file)
 		if err != nil {
-			return 0, fmt.Errorf("callmeter store %s: %w", s.path, err)
+			lockErr = errors.Join(lockErr, fmt.Errorf("callmeter store %s: %w", s.path, err))
+			continue
 		}
 		if held == nil {
 			continue
@@ -137,7 +144,7 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 	}
 	if len(taken) == 0 {
-		return 0, nil
+		return 0, lockErr
 	}
 	release := func() {}
 	defer func() { release() }()
@@ -159,7 +166,7 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("callmeter store %s: ingest %d missed.log faults: %w", s.path, len(faults)+len(fresh), err)
+		return 0, errors.Join(lockErr, fmt.Errorf("callmeter store %s: ingest %d missed.log faults: %w", s.path, len(faults)+len(fresh), err))
 	}
 	var moveErr error
 	for _, claim := range taken {
@@ -173,7 +180,7 @@ func (s *Store) IngestMissedHeld(ctx context.Context, path string, hold func() (
 			moveErr = errors.Join(moveErr, fmt.Errorf("callmeter store %s: %w", s.path, err))
 		}
 	}
-	return n, moveErr
+	return n, errors.Join(lockErr, moveErr)
 }
 
 // takenClaim is a file one ingest holds: a claim and the bytes read from it,
@@ -338,7 +345,8 @@ var errNoMissedLog = errors.New("callmeter missed log: no plugin log directory (
 // faults (StageBinary or StageTerminated, an unparsed line StageBinary): what
 // a report says was lost when no store exists to ingest them into. An ingested
 // claim {path}.done-* is not counted: its lines went into a store. A file gone
-// between its listing and its read counts nothing.
+// between its listing and its read counts nothing; a file that cannot be read
+// is the error, returned beside every other file's counts.
 func CountMissed(path string) (map[string]int, error) {
 	if path == "" {
 		return nil, errNoMissedLog
@@ -348,19 +356,22 @@ func CountMissed(path string) (map[string]int, error) {
 		return nil, err
 	}
 	counts := map[string]int{}
+	var unread []error
 	for _, file := range append([]string{path}, claims...) {
 		data, err := os.ReadFile(file)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("callmeter missed log: read %s: %w", file, err)
+			// That file alone goes uncounted: the others' counts stand beside the error.
+			unread = append(unread, fmt.Errorf("callmeter missed log: read %s: %w", file, err))
+			continue
 		}
 		for _, fault := range parseMissed(data, 0) {
 			counts[fault.Stage]++
 		}
 	}
-	return counts, nil
+	return counts, errors.Join(unread...)
 }
 
 // ingestFiles lists {path}{infix}* in name order.
@@ -434,13 +445,14 @@ const TerminatedByStoreBusy = TerminatedReason + "store busy"
 // StoreUnavailableReason opens the reason of the binary's own line when its
 // store could take neither its event nor the fault saying so, for a cause
 // other than a busy store: `store unavailable: {class}`, the class one of the
-// StoreClass labels (StoreFailureClass), never the error's own text.
+// StoreClass labels (StoreFailureClass, or StoreClassNoHome when no store
+// directory resolves), never the error's own text.
 // parseMissedLine turns it into a StageTerminated fault, as a `terminated by`
 // line.
 const StoreUnavailableReason = "store unavailable: "
 
 // The StoreClass labels: why a store could not be written, as
-// StoreFailureClass reads an error.
+// StoreFailureClass reads an error, and StoreClassNoHome.
 const (
 	StoreClassNewerSchema = "newer schema" // its user_version is newer than SchemaVersion
 	StoreClassFull        = "full"         // SQLITE_FULL, ENOSPC
@@ -449,6 +461,7 @@ const (
 	StoreClassCorrupt     = "corrupt"      // SQLITE_CORRUPT, SQLITE_NOTADB
 	StoreClassOpen        = "open"         // SQLITE_CANTOPEN, any other file-system error
 	StoreClassOther       = "other"        // anything else, a constraint or a trigger's abort among them
+	StoreClassNoHome      = "no home"      // no store directory resolves (paths.Home), so no store was opened
 )
 
 // StoreFailureClass reads why a store could not be written as one of the

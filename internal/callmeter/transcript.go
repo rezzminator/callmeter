@@ -22,10 +22,13 @@ import (
 // transcript records it.
 type RequestUsage struct {
 	MessageID string
+	// NoUsage: no entry of the message carried usage, so its token counts are
+	// unknown, never 0 (ApplyUsage leaves them NULL).
+	NoUsage bool
 	// APIRequestID is the requestId of the transcript line, the API request id
 	// the cost ledger keys by; "" when the line carries none.
 	APIRequestID        string
-	TS                  int64 // the entry's timestamp, Unix ms UTC
+	TS                  int64 // the entry's timestamp, Unix ms UTC; 0 when it is not RFC 3339 (unknown)
 	Model               string
 	StopReason          string // "" when the entry carries none
 	InputTokens         int64
@@ -68,19 +71,24 @@ func SubagentTranscriptPath(transcriptPath, agentID string) string {
 	return filepath.Join(strings.TrimSuffix(transcriptPath, ".jsonl"), "subagents", "agent-"+agentID+".jsonl")
 }
 
+// GlobLiteral escapes a path so filepath.Glob reads it as written: a projects
+// directory may hold `[`, `*`, `?` or `\` (the escape is Unix-only, as
+// callmeter is).
+var GlobLiteral = strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`)
+
 // SubagentTranscripts lists the sub-agents whose transcript sits beside the
 // main one: the ids of `{mainTranscript without .jsonl}/subagents/agent-*.jsonl`,
-// in file-name order. No such directory is no sub-agent, not an error.
-func SubagentTranscripts(mainTranscript string) (agentIDs []string, err error) {
+// in file-name order, the directory matched as written (GlobLiteral). No such
+// directory is no sub-agent.
+func SubagentTranscripts(mainTranscript string) (agentIDs []string) {
 	dir := filepath.Join(strings.TrimSuffix(mainTranscript, ".jsonl"), "subagents")
-	files, err := filepath.Glob(filepath.Join(dir, "agent-*.jsonl"))
-	if err != nil {
-		return nil, fmt.Errorf("list sub-agent transcripts in %s: %w", dir, err)
-	}
+	// Glob's only error is a malformed pattern, and an escaped directory before
+	// a fixed name makes none.
+	files, _ := filepath.Glob(filepath.Join(GlobLiteral.Replace(dir), "agent-*.jsonl"))
 	for _, file := range files {
 		agentIDs = append(agentIDs, strings.TrimSuffix(strings.TrimPrefix(filepath.Base(file), "agent-"), ".jsonl"))
 	}
-	return agentIDs, nil
+	return agentIDs
 }
 
 // UntypedAgentMissingTranscript reports whether a payload names one of Claude
@@ -135,11 +143,19 @@ func presentString(value string) *string {
 // ApplyUsage copies a transcript request's usage into a requests row: its
 // time, model, stop reason, the token split and the iterations that are not
 // the message itself. A cache-creation split the usage did not carry stays
-// NULL.
+// NULL, and an unknown time (TS 0) and the token counts of a message no entry
+// gave usage (NoUsage) are left as the row holds them.
 func ApplyUsage(request *Request, usage RequestUsage) {
-	request.TS = Ptr(usage.TS)
+	if usage.TS != 0 {
+		request.TS = Ptr(usage.TS)
+	}
 	request.Model = presentString(usage.Model)
 	request.StopReason = presentString(usage.StopReason)
+	request.APIRequestID = presentString(usage.APIRequestID)
+	request.Iterations = usage.Iterations
+	if usage.NoUsage {
+		return
+	}
 	request.InputTokens = Ptr(usage.InputTokens)
 	request.CacheReadTokens = Ptr(usage.CacheReadTokens)
 	request.CacheCreationTokens = Ptr(usage.CacheCreationTokens)
@@ -148,8 +164,6 @@ func ApplyUsage(request *Request, usage RequestUsage) {
 	request.ContextTokens = Ptr(usage.ContextTokens)
 	request.OutputTokens = Ptr(usage.OutputTokens)
 	request.ThinkingTokens = usage.ThinkingTokens
-	request.APIRequestID = presentString(usage.APIRequestID)
-	request.Iterations = usage.Iterations
 }
 
 type transcriptEntry struct {
@@ -160,7 +174,6 @@ type transcriptEntry struct {
 }
 
 type assistantMessage struct {
-	timestamp  string          // its entry's, set by agentMessage
 	requestID  string          // its entry's requestId, set where an entry's message is decoded
 	ID         string          `json:"id"`
 	Model      string          `json:"model"`
@@ -233,6 +246,67 @@ type contentBlock struct {
 	ID   string `json:"id"`
 }
 
+// BadLines is the error a transcript read returns beside everything it kept:
+// Count lines, or parts of a line, that did not decode were each skipped
+// alone, First the first of them, naming the path and its byte offset. The
+// read's result is whole but for those (LinesSkipped).
+type BadLines struct {
+	Count int
+	First error
+}
+
+func (e *BadLines) Error() string {
+	return fmt.Sprintf("%d undecodable transcript line(s) skipped, the first: %v", e.Count, e.First)
+}
+
+func (e *BadLines) Unwrap() error { return e.First }
+
+// err is e as an error, nil when no line was skipped.
+func (e *BadLines) err() error {
+	if e == nil {
+		return nil
+	}
+	return e
+}
+
+// LinesSkipped reports whether err holds a *BadLines: the read went on past
+// its bad lines, and what it returned is kept.
+func LinesSkipped(err error) bool {
+	var bad *BadLines
+	return errors.As(err, &bad)
+}
+
+// readLines is the one line-decode door of a transcript read: it reads r,
+// which starts at byte offset of the transcript at path, line by line and hands
+// each line to decode. A line decode fails on (or on part of, keeping the rest)
+// costs that line alone: it is counted in the *BadLines returned, nil when
+// none. A final line with no newline that fails is a writer mid-append, never
+// a bad line. skipFirst drops the first, partial line of a read starting
+// inside the file. Only a failed read ends it early, as the error.
+func readLines(r io.Reader, path string, offset int64, skipFirst bool, decode func(raw []byte) error) (*BadLines, error) {
+	reader := bufio.NewReaderSize(r, 1<<16)
+	var bad *BadLines
+	for first := true; ; first = false {
+		raw, readErr := reader.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return bad, fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
+		}
+		partial := errors.Is(readErr, io.EOF)
+		if !first || !skipFirst {
+			if err := decode(raw); err != nil && !partial {
+				if bad == nil {
+					bad = &BadLines{First: fmt.Errorf("transcript %s at byte %d: %w", path, offset, err)}
+				}
+				bad.Count++
+			}
+		}
+		offset += int64(len(raw))
+		if partial {
+			return bad, nil
+		}
+	}
+}
+
 // requestTailWindow is the transcript tail FindRequests reads first; each miss
 // widens it fourfold until the whole file is read.
 const requestTailWindow = 1 << 20
@@ -247,10 +321,11 @@ const requestTailWindow = 1 << 20
 // transcript that grows to tens of MB, so the scan reads the last MB first and
 // widens only while an id is missing; a line is decoded only when it mentions
 // a wanted id or a found message. An id not yet on disk is absent from the
-// map; a file that cannot be read, or a malformed line holding a wanted id or
-// found message, is an error naming the path and the line's byte offset. A
-// final line with no newline that does not parse is a writer mid-append and is
-// skipped.
+// map; a file that cannot be read is an error naming the path. A malformed
+// line holding a wanted id or found message costs that line alone: the map
+// holds every other request, beside a *BadLines (readLines). A request whose
+// message no entry gave usage is kept with NoUsage, one whose time is not
+// RFC 3339 with TS 0, that timestamp counted as a bad line.
 func FindRequests(path string, toolUseIDs []string) (found map[string]RequestUsage, err error) {
 	found = map[string]RequestUsage{}
 	wanted := map[string]bool{}
@@ -279,7 +354,8 @@ func FindRequests(path string, toolUseIDs []string) (found map[string]RequestUsa
 		scan := &requestScan{
 			wanted: wanted, messages: map[string]*RequestUsage{}, owner: map[string]string{}, at: map[string]int64{},
 		}
-		if err := scan.read(file, path, start, size); err != nil {
+		bad, err := scan.read(file, path, start, size)
+		if err != nil {
 			return nil, err
 		}
 		if len(scan.owner) == len(wanted) || start == 0 {
@@ -289,7 +365,7 @@ func FindRequests(path string, toolUseIDs []string) (found map[string]RequestUsa
 				request.TS = scan.at[id]
 				found[id] = request
 			}
-			return found, nil
+			return found, bad.err()
 		}
 	}
 }
@@ -307,32 +383,13 @@ type requestScan struct {
 // read scans [start, end) of the transcript line by line to its end, since a
 // found message's final entry follows the entry naming the id; a start inside
 // the file drops the first, partial line.
-func (scan *requestScan) read(file *os.File, path string, start, end int64) error {
-	reader := bufio.NewReaderSize(io.NewSectionReader(file, start, end-start), 1<<16)
-	offset := start
-	if start > 0 {
-		skipped, err := reader.ReadBytes('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("read transcript %s at byte %d: %w", path, offset, err)
-		}
-		offset += int64(len(skipped))
-	}
-	for {
-		raw, readErr := reader.ReadBytes('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
-		}
-		partial := errors.Is(readErr, io.EOF)
-		if scan.mentioned(raw) {
-			if err := scan.entry(raw); err != nil && !partial {
-				return fmt.Errorf("transcript %s at byte %d: %w", path, offset, err)
-			}
-		}
-		offset += int64(len(raw))
-		if partial {
+func (scan *requestScan) read(file *os.File, path string, start, end int64) (*BadLines, error) {
+	return readLines(io.NewSectionReader(file, start, end-start), path, start, start > 0, func(raw []byte) error {
+		if !scan.mentioned(raw) {
 			return nil
 		}
-	}
+		return scan.entry(raw)
+	})
 }
 
 // mentioned is the cheap pre-check before a line is decoded: whether it holds
@@ -364,13 +421,14 @@ func (scan *requestScan) entry(raw []byte) error {
 		return fmt.Errorf("malformed assistant message: %w", err)
 	}
 	message.requestID = entry.RequestID
+	if request, known := scan.messages[message.ID]; known {
+		foldEntry(request, &message)
+	}
 	var blocks []contentBlock
 	if err := json.Unmarshal(message.Content, &blocks); err != nil {
 		return fmt.Errorf("assistant message %q: content is not a block list: %w", message.ID, err)
 	}
-	if request, known := scan.messages[message.ID]; known {
-		foldEntry(request, &message)
-	}
+	var timeErr error
 	for _, block := range blocks {
 		if block.Type != toolUse || !scan.wanted[block.ID] {
 			continue
@@ -378,34 +436,32 @@ func (scan *requestScan) entry(raw []byte) error {
 		if _, done := scan.owner[block.ID]; done {
 			continue
 		}
-		if message.Usage == nil {
-			return fmt.Errorf("assistant message %q holding %s has no usage", message.ID, block.ID)
-		}
-		at, err := entryTime(message.ID, entry.Timestamp)
-		if err != nil {
-			return err
-		}
 		if _, known := scan.messages[message.ID]; !known {
-			request := &RequestUsage{MessageID: message.ID}
+			request := &RequestUsage{MessageID: message.ID, NoUsage: true}
 			foldEntry(request, &message)
 			scan.messages[message.ID] = request
 		}
 		scan.owner[block.ID] = message.ID
-		scan.at[block.ID] = at.UnixMilli()
+		at, err := entryTime(message.ID, entry.Timestamp)
+		if err != nil {
+			timeErr = err // the request stays, its time unknown
+			continue
+		}
+		scan.at[block.ID] = at
 	}
-	return nil
+	return timeErr
 }
 
-// entryTime is the timestamp of the assistant entry carrying messageID. One
-// that does not parse is an error naming the message id and the timestamp's
-// size, never its value nor the parse error quoting it: the value may be any
-// text, and the error reaches faults.error.
-func entryTime(messageID, timestamp string) (time.Time, error) {
+// entryTime is the timestamp of the assistant entry carrying messageID, Unix
+// ms UTC. One that does not parse is 0, unknown, and an error naming the
+// message id and the timestamp's size, never its value nor the parse error
+// quoting it: the value may be any text, and the error reaches faults.error.
+func entryTime(messageID, timestamp string) (int64, error) {
 	at, err := time.Parse(time.RFC3339Nano, timestamp)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("assistant message %q: timestamp of %d bytes is not RFC 3339", messageID, len(timestamp))
+		return 0, fmt.Errorf("assistant message %q: timestamp of %d bytes is not RFC 3339", messageID, len(timestamp))
 	}
-	return at, nil
+	return at.UnixMilli(), nil
 }
 
 // foldEntry folds one entry of a message into its request: the model, stop
@@ -425,6 +481,7 @@ func foldEntry(request *RequestUsage, message *assistantMessage) {
 	if usage == nil {
 		return
 	}
+	request.NoUsage = false
 	request.InputTokens = usage.InputTokens
 	request.CacheReadTokens = usage.CacheReadInputTokens
 	request.CacheCreationTokens = usage.CacheCreationInputTokens
@@ -496,17 +553,19 @@ func SubagentMeta(mainTranscript, agentID string) (agentType, toolUseID string, 
 // with no tool call too, which no PostToolBatch ever reads. final reports
 // whether the last assistant entry ends the turn (a stop_reason other than
 // tool_use), so the transcript holds the turn's last message. A message with no
-// id, the synthetic message Claude Code writes itself (syntheticModel) and a
-// message no entry gives usage are not requests. A file that cannot be read or
-// a malformed line is an error naming the path and the line's byte offset; a
-// final line with no newline that does not parse is a writer mid-append and is
-// skipped. Only lines naming an assistant entry or a prompt are decoded.
+// id and the synthetic message Claude Code writes itself (syntheticModel) are
+// not requests; a message no entry gives usage is one, NoUsage. A file that
+// cannot be read is an error; a malformed line costs that line alone, as in
+// ReadTranscript. Only lines naming an assistant entry or a prompt are decoded.
 func ReadRequests(path string) (requests []TranscriptRequest, final bool, err error) {
 	return ReadTurnRequests(path, "")
 }
 
 // ReadTaskNotices reads only task-id and non-empty status tags of task
-// notifications; nothing of the body is kept. Times are in file order.
+// notifications; nothing of the body is kept. Times are in file order. A
+// notice line that does not decode, or a notice whose time is not RFC 3339
+// (the time is all a notice gives its reader), costs that line alone, beside
+// a *BadLines (readLines).
 func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -518,56 +577,64 @@ func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
 		}
 	}()
 	notices = map[string][]int64{}
-	reader := bufio.NewReaderSize(file, 1<<16)
-	for {
-		raw, readErr := reader.ReadBytes('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, fmt.Errorf("read task notices %s: %w", path, readErr)
+	bad, err := readLines(file, path, 0, false, func(raw []byte) error {
+		if !bytes.Contains(raw, []byte("task-notification")) {
+			return nil
 		}
-		if bytes.Contains(raw, []byte("task-notification")) {
-			var entry struct {
-				Type      string `json:"type"`
-				Timestamp string `json:"timestamp"`
-				Origin    struct {
+		var entry struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Origin    struct {
+				Kind string `json:"kind"`
+			} `json:"origin"`
+			Message struct {
+				Content json.RawMessage `json:"content"`
+			} `json:"message"`
+			Attachment struct {
+				Type   string `json:"type"`
+				Origin struct {
 					Kind string `json:"kind"`
 				} `json:"origin"`
-				Message struct {
-					Content json.RawMessage `json:"content"`
-				} `json:"message"`
-				Attachment struct {
-					Type   string `json:"type"`
-					Origin struct {
-						Kind string `json:"kind"`
-					} `json:"origin"`
-					Prompt json.RawMessage `json:"prompt"`
-				} `json:"attachment"`
-			}
-			if json.Unmarshal(raw, &entry) == nil {
-				// The body is a string, or a content-block array (a queued prompt
-				// carrying an image) read from its "text" blocks; any other shape
-				// is no notice, never a failed line.
-				var body string
-				switch {
-				case entry.Type == "user" && entry.Origin.Kind == "task-notification":
-					body, _ = ResultText(entry.Message.Content)
-				case entry.Type == "attachment" && entry.Attachment.Type == "queued_command" && entry.Attachment.Origin.Kind == "task-notification":
-					body, _ = ResultText(entry.Attachment.Prompt)
-				}
-				_, task, hasTask := strings.Cut(body, "<task-id>")
-				agentID, _, taskClosed := strings.Cut(task, "</task-id>")
-				_, status, hasStatus := strings.Cut(body, "<status>")
-				status, _, statusClosed := strings.Cut(status, "</status>")
-				at, timeErr := time.Parse(time.RFC3339Nano, entry.Timestamp)
-				if hasTask && taskClosed && agentID != "" && hasStatus && statusClosed && status != "" && timeErr == nil {
-					notices[agentID] = append(notices[agentID], at.UnixMilli())
-				}
-			}
+				Prompt json.RawMessage `json:"prompt"`
+			} `json:"attachment"`
 		}
-		if errors.Is(readErr, io.EOF) {
-			break
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return fmt.Errorf("malformed task notice entry: %w", err)
 		}
+		// The body is a string, or a content-block array (a queued prompt
+		// carrying an image) read from its "text" blocks; a body of any other
+		// shape is read as its raw text.
+		var content json.RawMessage
+		switch {
+		case entry.Type == "user" && entry.Origin.Kind == "task-notification":
+			content = entry.Message.Content
+		case entry.Type == "attachment" && entry.Attachment.Type == "queued_command" && entry.Attachment.Origin.Kind == "task-notification":
+			content = entry.Attachment.Prompt
+		default:
+			return nil
+		}
+		body, err := ResultText(content)
+		if err != nil {
+			body = string(content)
+		}
+		_, task, hasTask := strings.Cut(body, "<task-id>")
+		agentID, _, taskClosed := strings.Cut(task, "</task-id>")
+		_, status, hasStatus := strings.Cut(body, "<status>")
+		status, _, statusClosed := strings.Cut(status, "</status>")
+		if !hasTask || !taskClosed || agentID == "" || !hasStatus || !statusClosed || status == "" {
+			return nil
+		}
+		at, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+		if err != nil {
+			return fmt.Errorf("task notice: timestamp of %d bytes is not RFC 3339", len(entry.Timestamp))
+		}
+		notices[agentID] = append(notices[agentID], at.UnixMilli())
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read task notices: %w", err)
 	}
-	return notices, nil
+	return notices, bad.err()
 }
 
 // ReadTurnRequests is ReadRequests for the turn of promptID: final also needs
@@ -578,10 +645,7 @@ func ReadTaskNotices(path string) (notices map[string][]int64, err error) {
 // ReadRequests.
 func ReadTurnRequests(path, promptID string) (requests []TranscriptRequest, final bool, err error) {
 	read, err := ReadTranscript(path, promptID)
-	if err != nil {
-		return nil, false, err
-	}
-	return read.Requests, read.Final, nil
+	return read.Requests, read.Final, err
 }
 
 // TranscriptRead is what one pass over a transcript holds: its requests, the
@@ -595,10 +659,11 @@ type TranscriptRead struct {
 
 // ReadTranscript is ReadTurnRequests in one pass that also collects the
 // transcript's marks (TranscriptMarks): compactions, Stop-hook summaries, turn
-// durations and the last cost-state. A mark line follows the rules of the
-// others: a final line with no newline that does not parse is skipped, any
-// other malformed line is an error naming the path and its byte offset. Only
-// lines naming an assistant entry, a prompt or a mark are decoded.
+// durations and the last cost-state. A line that does not decode, or the part
+// of one (a content that is no block list, a timestamp that is not RFC 3339),
+// costs that line or part alone: read holds everything else, beside a
+// *BadLines (readLines). Only lines naming an assistant entry, a prompt or a
+// mark are decoded.
 func ReadTranscript(path, promptID string) (read TranscriptRead, err error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -609,44 +674,30 @@ func ReadTranscript(path, promptID string) (read TranscriptRead, err error) {
 			err = errors.Join(err, fmt.Errorf("close transcript %s: %w", path, closeErr))
 		}
 	}()
-	scan := transcriptRequests{index: map[string]int{}, used: map[string]bool{}, turn: promptID, seen: map[string]bool{}}
-	reader := bufio.NewReaderSize(file, 1<<16)
-	var offset int64
-	for {
-		raw, readErr := reader.ReadBytes('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return TranscriptRead{}, fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
-		}
-		partial := errors.Is(readErr, io.EOF)
+	scan := transcriptRequests{index: map[string]int{}, turn: promptID, seen: map[string]bool{}}
+	bad, err := readLines(file, path, 0, false, func(raw []byte) error {
 		if bytes.Contains(raw, []byte(`"assistant"`)) || bytes.Contains(raw, []byte(`"promptId"`)) ||
 			bytes.Contains(raw, []byte(`"compact_boundary"`)) || bytes.Contains(raw, []byte(`"stop_hook_summary"`)) ||
 			bytes.Contains(raw, []byte(`"turn_duration"`)) || bytes.Contains(raw, []byte(`"cost-state"`)) {
-			if err := scan.entry(raw); err != nil && !partial {
-				return TranscriptRead{}, fmt.Errorf("transcript %s at byte %d: %w", path, offset, err)
-			}
+			return scan.entry(raw)
 		}
-		offset += int64(len(raw))
-		if partial {
-			break
-		}
+		return nil
+	})
+	if err != nil {
+		return TranscriptRead{}, err
 	}
-	for _, request := range scan.requests {
-		if scan.used[request.MessageID] {
-			read.Requests = append(read.Requests, request)
-		}
-	}
+	read.Requests = scan.requests
 	read.Final = scan.final
 	read.Marks = scan.marks
-	return read, nil
+	return read, bad.err()
 }
 
 // transcriptRequests is one ReadRequests pass.
 type transcriptRequests struct {
 	requests []TranscriptRequest
-	index    map[string]int  // message id -> its position in requests
-	used     map[string]bool // message ids some entry gave usage
-	prompt   string          // the latest user entry's promptId
-	turn     string          // the promptId whose answer final waits for; "" for none
+	index    map[string]int // message id -> its position in requests
+	prompt   string         // the latest user entry's promptId
+	turn     string         // the promptId whose answer final waits for; "" for none
 	final    bool
 	marks    TranscriptMarks
 	seen     map[string]bool // entry ids of the marks kept, so a repeated line counts once
@@ -687,20 +738,19 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 	if message.ID == "" || message.Model == syntheticModel {
 		return nil
 	}
-	var blocks []toolUseBlock
-	if err := json.Unmarshal(message.Content, &blocks); err != nil {
-		return fmt.Errorf("assistant message %q: content is not a block list: %w", message.ID, err)
-	}
+	// What fails below costs only its part: the request stays, its time
+	// unknown (0) or without this entry's tool calls, and the line counts as bad.
+	var lost []error
+	at, timeErr := entryTime(message.ID, entry.Timestamp)
 	i, known := scan.index[message.ID]
 	if !known {
-		at, err := entryTime(message.ID, entry.Timestamp)
-		if err != nil {
-			return err
+		if timeErr != nil {
+			lost = append(lost, timeErr)
 		}
 		i = len(scan.requests)
 		scan.index[message.ID] = i
 		scan.requests = append(scan.requests, TranscriptRequest{
-			RequestUsage: RequestUsage{MessageID: message.ID, TS: at.UnixMilli()},
+			RequestUsage: RequestUsage{MessageID: message.ID, TS: at, NoUsage: true},
 			PromptID:     scan.prompt,
 			Cwd:          entry.Cwd,
 		})
@@ -708,14 +758,14 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 	request := &scan.requests[i]
 	foldEntry(&request.RequestUsage, &message)
 	if message.StopReason != nil && *message.StopReason != "" && *message.StopReason != toolUse {
-		at, err := entryTime(message.ID, entry.Timestamp)
-		if err != nil {
-			return err
+		if timeErr != nil && known {
+			lost = append(lost, timeErr)
 		}
-		request.EndTS = at.UnixMilli()
+		request.EndTS = at
 	}
-	if message.Usage != nil {
-		scan.used[message.ID] = true
+	var blocks []toolUseBlock
+	if err := json.Unmarshal(message.Content, &blocks); err != nil {
+		lost = append(lost, fmt.Errorf("assistant message %q: content is not a block list: %w", message.ID, err))
 	}
 	for _, block := range blocks {
 		if block.Type == toolUse && block.ID != "" && !slices.Contains(request.ToolUseIDs, block.ID) {
@@ -724,7 +774,7 @@ func (scan *transcriptRequests) entry(raw []byte) error {
 		}
 	}
 	scan.final = message.StopReason != nil && *message.StopReason != toolUse
-	return nil
+	return errors.Join(lost...)
 }
 
 // AgentTotals is what a sub-agent's own transcript says it spent.
@@ -736,84 +786,76 @@ type AgentTotals struct {
 	// set and not tool_use) and no user entry of the turn read for follows it
 	// (ReadTurnRequests), so the transcript holds the turn's last message.
 	Final bool
-	// LastTimestamp is the last assistant entry's timestamp as written (RFC
-	// 3339): the agent's stop when Final.
-	LastTimestamp string
 }
 
 // ReadAgentTotals sums the sub-agent transcript at path. One model message is
 // split across several entries sharing its id, each repeating its usage, so a
 // message's usage counts once (its last entry's, the final count). A file that
-// cannot be read, a malformed line or an assistant message with no id is an
-// error naming the path and line; a final line with no newline that does not
-// parse is a writer mid-append and is skipped. promptID is the turn whose
-// answer Final waits for, as in ReadTurnRequests; "" for none.
-func ReadAgentTotals(path, promptID string) (AgentTotals, error) {
-	var totals AgentTotals
+// cannot be read is an error naming the path; a malformed line or an assistant
+// message with no id costs that line alone, and a content that is no block list
+// only that entry's tool uses, beside a *BadLines (readLines); bad lines with
+// no message read at all are a failed read, never zero totals. promptID is the
+// turn whose answer Final waits for, as in ReadTurnRequests; "" for none.
+func ReadAgentTotals(path, promptID string) (totals AgentTotals, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return totals, fmt.Errorf("read agent transcript: %w", err)
 	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close agent transcript %s: %w", path, closeErr))
+		}
+	}()
 	usage := map[string]int64{}
 	var order []string
 	toolUses := map[string]bool{}
-	reader := bufio.NewReaderSize(file, 1<<16)
-	for line := 1; ; line++ {
-		raw, readErr := reader.ReadBytes('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return totals, errors.Join(
-				fmt.Errorf("read agent transcript %s line %d: %w", path, line, readErr),
-				file.Close(),
-			)
+	bad, err := readLines(file, path, 0, false, func(raw []byte) error {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			return nil
 		}
-		partial := errors.Is(readErr, io.EOF)
-		if strings.TrimSpace(string(raw)) != "" {
-			message, prompt, err := agentMessage(raw)
-			switch {
-			case err != nil && !partial:
-				return totals, errors.Join(fmt.Errorf("agent transcript %s line %d: %w", path, line, err), file.Close())
-			case err == nil && promptID != "" && prompt == promptID:
-				totals.Final = false // the turn's answer to this entry is still to come
-			case err == nil && message != nil:
-				if _, seen := usage[message.ID]; !seen {
-					order = append(order, message.ID)
-				}
-				if message.Usage != nil {
-					u := message.Usage
-					usage[message.ID] = u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens + u.OutputTokens
-				}
-				if message.Model != "" && message.Model != "<synthetic>" {
-					totals.Model = message.Model
-				}
-				totals.Final = message.StopReason != nil && *message.StopReason != toolUse
-				totals.LastTimestamp = message.timestamp
-				var blocks []contentBlock
-				if err := json.Unmarshal(message.Content, &blocks); err != nil {
-					return totals, errors.Join(
-						fmt.Errorf("agent transcript %s line %d: message %q content is not a block list: %w",
-							path, line, message.ID, err),
-						file.Close(),
-					)
-				}
-				for _, block := range blocks {
-					if block.Type == toolUse && block.ID != "" {
-						toolUses[block.ID] = true
-					}
+		message, prompt, err := agentMessage(raw)
+		switch {
+		case err != nil:
+			return err
+		case promptID != "" && prompt == promptID:
+			totals.Final = false // the turn's answer to this entry is still to come
+		case message != nil:
+			if _, seen := usage[message.ID]; !seen {
+				order = append(order, message.ID)
+			}
+			if message.Usage != nil {
+				u := message.Usage
+				usage[message.ID] = u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens + u.OutputTokens
+			}
+			if message.Model != "" && message.Model != syntheticModel {
+				totals.Model = message.Model
+			}
+			totals.Final = message.StopReason != nil && *message.StopReason != toolUse
+			var blocks []contentBlock
+			if err := json.Unmarshal(message.Content, &blocks); err != nil {
+				return fmt.Errorf("message %q: content is not a block list: %w", message.ID, err)
+			}
+			for _, block := range blocks {
+				if block.Type == toolUse && block.ID != "" {
+					toolUses[block.ID] = true
 				}
 			}
 		}
-		if partial {
-			break
-		}
-	}
-	if err := file.Close(); err != nil {
-		return totals, fmt.Errorf("close agent transcript %s: %w", path, err)
+		return nil
+	})
+	if err != nil {
+		return AgentTotals{}, fmt.Errorf("read agent transcript: %w", err)
 	}
 	for _, id := range order {
 		totals.TotalTokens += usage[id]
 	}
+	if bad != nil && len(order) == 0 {
+		// Bad lines and no message read: zero totals would read as an agent
+		// that used nothing, so this read failed rather than skipped.
+		return AgentTotals{}, fmt.Errorf("read agent transcript: no message read past %d bad line(s), the first: %w", bad.Count, bad.First)
+	}
 	totals.ToolUses = int64(len(toolUses))
-	return totals, nil
+	return totals, bad.err()
 }
 
 // agentMessage decodes one transcript line: its assistant message, or the
@@ -839,7 +881,6 @@ func agentMessage(raw []byte) (message *assistantMessage, prompt string, err err
 	if message.ID == "" {
 		return nil, "", errors.New("assistant message carries no id")
 	}
-	message.timestamp = entry.Timestamp
 	return message, "", nil
 }
 
@@ -870,9 +911,9 @@ type messageEntry struct {
 // Claude Code writes in place of an answer the API refused, the entry's error
 // kind, else UnknownAPIError; otherwise "". Bookkeeping entries after the
 // message do not count. The scan reads the tail first and widens fourfold
-// while it holds no message. A file that cannot be read or a malformed line is
-// an error naming the path and the line's byte offset; a final line with no
-// newline that does not parse is a writer mid-append and is skipped.
+// while it holds no message. A file that cannot be read is an error naming the
+// path; a malformed line costs that line alone, the last good message read
+// beside a *BadLines (lastMessage).
 func TranscriptAPIError(path string) (kind string, err error) {
 	end, err := TranscriptTurnEnd(path)
 	return end.ErrorType, err
@@ -915,19 +956,19 @@ func TranscriptTurnEnd(path string) (end TurnEnd, err error) {
 	size := info.Size()
 	for window := int64(requestTailWindow); ; window *= 4 {
 		start := max(0, size-window)
-		last, err := lastMessage(file, path, start, size)
+		last, bad, err := lastMessage(file, path, start, size)
 		if err != nil {
 			return TurnEnd{}, err
 		}
 		if last != nil || start == 0 {
 			end = turnEndOf(last)
 			if end.Event == "" {
-				return TurnEnd{}, nil
+				return TurnEnd{}, bad.err()
 			}
 			if at, parseErr := time.Parse(time.RFC3339, last.Timestamp); parseErr == nil {
 				end.TS = at.UnixMilli()
 			}
-			return end, nil
+			return end, bad.err()
 		}
 	}
 }
@@ -941,44 +982,50 @@ func turnEndOf(entry *messageEntry) TurnEnd {
 	if entry == nil || entry.Type != "assistant" {
 		return TurnEnd{}
 	}
-	var message struct {
-		Model      string `json:"model"`
-		StopReason string `json:"stop_reason"`
-	}
+	var message turnMessage
 	if json.Unmarshal(entry.Message, &message) != nil || message.Model == syntheticModel || !turnEndReasons[message.StopReason] {
 		return TurnEnd{}
 	}
 	return TurnEnd{Event: EventStop}
 }
 
+// turnMessage is the part of an assistant message a turn end reads.
+type turnMessage struct {
+	Model      string `json:"model"`
+	StopReason string `json:"stop_reason"`
+}
+
 // lastMessage is the last user or assistant entry in [start, end) of the
 // transcript, nil when there is none; a start inside the file drops the
-// first, partial line.
-func lastMessage(file *os.File, path string, start, end int64) (*messageEntry, error) {
-	reader := bufio.NewReaderSize(io.NewSectionReader(file, start, end-start), 1<<16)
-	offset := start
+// first, partial line. A line that does not decode, or an assistant entry
+// whose message is no object, costs that line alone (readLines): the last
+// good message stands, beside the *BadLines.
+func lastMessage(file *os.File, path string, start, end int64) (*messageEntry, *BadLines, error) {
 	var last *messageEntry
-	for first := true; ; first = false {
-		raw, readErr := reader.ReadBytes('\n')
-		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return nil, fmt.Errorf("read transcript %s at byte %d: %w", path, offset, readErr)
+	bad, err := readLines(io.NewSectionReader(file, start, end-start), path, start, start > 0, func(raw []byte) error {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			return nil
 		}
-		partial := errors.Is(readErr, io.EOF)
-		if !(first && start > 0) && len(bytes.TrimSpace(raw)) > 0 {
-			var entry messageEntry
-			if err := json.Unmarshal(raw, &entry); err != nil {
-				if !partial {
-					return nil, fmt.Errorf("transcript %s at byte %d: malformed entry: %w", path, offset, err)
-				}
-			} else if entry.Type == "user" || entry.Type == "assistant" {
-				last = &entry
+		var entry messageEntry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return fmt.Errorf("malformed entry: %w", err)
+		}
+		if entry.Type != "user" && entry.Type != "assistant" {
+			return nil
+		}
+		if entry.Type == "assistant" {
+			var message turnMessage
+			if err := json.Unmarshal(entry.Message, &message); err != nil {
+				return fmt.Errorf("malformed assistant message: %w", err)
 			}
 		}
-		offset += int64(len(raw))
-		if partial {
-			return last, nil
-		}
+		last = &entry
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
+	return last, bad, nil
 }
 
 // apiErrorOf is the error kind of entry when it is a `<synthetic>` API-error
@@ -1195,7 +1242,7 @@ func wholeNumber(n *float64) *int64 {
 }
 
 // markTime is the timestamp of a mark entry, Unix ms UTC. An unparsable one is
-// an error naming only its size, as entryTime does.
+// 0, unknown, and an error naming only its size, as entryTime does.
 func markTime(timestamp string) (int64, error) {
 	at, err := time.Parse(time.RFC3339Nano, timestamp)
 	if err != nil {
@@ -1205,12 +1252,18 @@ func markTime(timestamp string) (int64, error) {
 }
 
 // system reads one system entry when it is a mark: a compaction, a Stop-hook
-// summary or a turn duration. Any other subtype, and an entry with no uuid, is
-// no mark.
+// summary or a turn duration; any other subtype is no mark. An entry with no
+// uuid is keyed by its line (lineKey). A mark whose timestamp is not RFC 3339
+// is kept with TS 0, unknown, its error returned for the line's count; one
+// that does not decode is dropped alone, its error returned.
 func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp string) error {
-	if uuid == "" || scan.seen[uuid] {
+	if uuid == "" {
+		uuid = lineKey(raw)
+	}
+	if scan.seen[uuid] {
 		return nil
 	}
+	var timeErr error
 	switch subtype {
 	case "compact_boundary":
 		var entry struct {
@@ -1226,9 +1279,7 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 			return fmt.Errorf("malformed compact_boundary entry: %w", err)
 		}
 		at, err := markTime(timestamp)
-		if err != nil {
-			return err
-		}
+		timeErr = err
 		meta := entry.CompactMetadata
 		compaction := Compaction{
 			EntryID: uuid, TS: at, PreTokens: wholeNumber(meta.PreTokens), PostTokens: wholeNumber(meta.PostTokens),
@@ -1252,9 +1303,7 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 			return fmt.Errorf("malformed stop_hook_summary entry: %w", err)
 		}
 		at, err := markTime(timestamp)
-		if err != nil {
-			return err
-		}
+		timeErr = err
 		summary := StopHookSummary{
 			EntryID: uuid, TS: at, PromptID: scan.prompt,
 			HookCount: int64(len(entry.HookInfos)), HookErrors: int64(len(entry.HookErrors)),
@@ -1278,9 +1327,7 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 			return fmt.Errorf("malformed turn_duration entry: %w", err)
 		}
 		at, err := markTime(timestamp)
-		if err != nil {
-			return err
-		}
+		timeErr = err
 		scan.marks.TurnDurations = append(scan.marks.TurnDurations, TurnDuration{
 			EntryID: uuid, TS: at, PromptID: scan.prompt, DurationMS: wholeNumber(entry.DurationMS),
 			MessageCount: wholeNumber(entry.MessageCount), BackgroundAgents: wholeNumber(entry.BackgroundAgents),
@@ -1289,7 +1336,14 @@ func (scan *transcriptRequests) system(raw []byte, uuid, subtype, timestamp stri
 		return nil
 	}
 	scan.seen[uuid] = true
-	return nil
+	return timeErr
+}
+
+// lineKey is the entry id of a mark line that carries no uuid: "line#" and the
+// first 16 hex digits of the line's SHA-256, so a repeated line is one mark.
+func lineKey(raw []byte) string {
+	sum := sha256.Sum256(bytes.TrimSpace(raw))
+	return "line#" + hex.EncodeToString(sum[:])[:16]
 }
 
 // cost reads one cost-state entry; the last one read stands.

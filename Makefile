@@ -1,4 +1,4 @@
-# The checks GitHub runs on a pull request to main (.github/workflows/release.yml),
+# The checks GitHub runs on a pull request to main (.github/workflows/ci.yml),
 # runnable here first: `make release-check` runs them all.
 GO_VERSION := $(shell awk '/^go /{print $$2}' go.mod)
 # go.mod's toolchain exactly, as setup-go gives CI; build-release.sh refuses any other.
@@ -8,14 +8,16 @@ JSON_VERSION := grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n 1 
 
 .PHONY: release-check check leak release
 
-release-check: check leak release
+release-check: check release
 
+# The whole local gate, the leak scan last: a run with no terms still reports every other check.
 check:
 	unformatted=$$(sh -c '"$$(go env GOROOT)/bin/gofmt" -l .'); \
 	[ -z "$$unformatted" ] || { printf 'gofmt: not formatted:\n%s\n' "$$unformatted"; exit 1; }
 	go vet ./...
 	go test ./...
 	claude plugin validate --strict plugins/callmeter
+	$(MAKE) --no-print-directory leak
 
 # LEAK_TERMS names the terms file (CI writes the secret to one); unset, scripts/leak-terms.txt.
 leak:

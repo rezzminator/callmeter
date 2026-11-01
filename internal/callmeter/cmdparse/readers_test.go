@@ -237,7 +237,7 @@ func TestReaderUnresolvedOptionsStayUnknown(t *testing.T) {
 }
 
 // A known reader or writer naming a path that does not exist yet (a scratch
-// file, a heredoc's write target) attributes it with Exists false; the corpus
+// file, a heredoc's write target) attributes it with Exists ExistsNo; the corpus
 // lost every `cat > f <<EOF` write. An unknown program's words, a metadata
 // look and a glob that matched nothing stay unattributed.
 func TestMissingFiles(t *testing.T) {
@@ -310,9 +310,9 @@ func TestTildeAndPlaceholders(t *testing.T) {
 			home:    home,
 			command: `tail -n 5 ~/.zsh_history ~/gone.txt; F=~/.zsh_history; wc -l "$F"`,
 			want: []FileRef{
-				{Path: hist, Action: ActionReadRange, Range: "-5", Exists: true},
+				{Path: hist, Action: ActionReadRange, Range: "-5", Exists: ExistsYes},
 				{Path: filepath.Join(home, "gone.txt"), Action: ActionReadRange, Range: "-5"},
-				{Path: hist, Action: ActionReadWhole, Exists: true},
+				{Path: hist, Action: ActionReadWhole, Exists: ExistsYes},
 			},
 		},
 		{name: "no home: a tilde path attributes nothing", command: `cat ~/.zsh_history`},
@@ -328,7 +328,7 @@ func TestTildeAndPlaceholders(t *testing.T) {
 			name:    "Python expanduser string",
 			home:    home,
 			command: `python3 -c "import os; print(open(os.path.expanduser('~/.zsh_history')).read())"`,
-			want:    []FileRef{{Path: hist, Action: ActionUnknown, Exists: true}},
+			want:    []FileRef{{Path: hist, Action: ActionUnknown, Exists: ExistsYes}},
 		},
 	}
 	for _, tc := range cases {
@@ -481,26 +481,29 @@ func TestLookupOrdinaryStat(t *testing.T) {
 		return orig(path)
 	}
 	cases := []struct {
-		name, val  string
-		missingOK  bool
-		path       string
-		exists, ok bool
-		note       string
+		name, val string
+		missingOK bool
+		path      string
+		exists    Existence
+		ok        bool
+		note      string
 	}{
-		{"regular", "have.txt", false, filepath.Join(cwd, "have.txt"), true, true, ""},
-		{"directory", "dir", false, filepath.Join(cwd, "dir"), true, false, ""},
-		{"missing allowed", "gone.txt", true, filepath.Join(cwd, "gone.txt"), false, true, ""},
-		{"missing excluded", "gone.txt", false, filepath.Join(cwd, "gone.txt"), false, false, ""},
-		{"not a directory", "have.txt/child", true, "", false, false, ""},
-		{"name too long", strings.Repeat("x", 256), true, "", false, false, ""},
-		{"other error", "denied.txt", true, "", false, false, "stat " + filepath.Join(cwd, "denied.txt") + ": " + fs.ErrPermission.Error()},
+		{"regular", "have.txt", false, filepath.Join(cwd, "have.txt"), ExistsYes, true, ""},
+		{"directory", "dir", false, filepath.Join(cwd, "dir"), ExistsYes, false, ""},
+		{"missing allowed", "gone.txt", true, filepath.Join(cwd, "gone.txt"), ExistsNo, true, ""},
+		{"missing excluded", "gone.txt", false, filepath.Join(cwd, "gone.txt"), ExistsNo, false, ""},
+		{"not a directory", "have.txt/child", true, "", ExistsNo, false, ""},
+		{"name too long", strings.Repeat("x", 256), true, "", ExistsNo, false, ""},
+		{"other error on a named file", "denied.txt", true, filepath.Join(cwd, "denied.txt"), ExistsUnknown, true, "stat " + filepath.Join(cwd, "denied.txt") + ": " + fs.ErrPermission.Error()},
+		{"other error on any word", "denied.txt", false, "", ExistsNo, false, "stat " + filepath.Join(cwd, "denied.txt") + ": " + fs.ErrPermission.Error()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &callParser{dir: cwd, globLookups: maxGlobLookups}
 			path, exists, ok := p.lookup(tc.val, tc.missingOK)
 			if path != tc.path || exists != tc.exists || ok != tc.ok || strings.Join(p.notes, "; ") != tc.note {
-				t.Errorf("lookup = (%q, %v, %v), note = %q", path, exists, ok, strings.Join(p.notes, "; "))
+				t.Errorf("lookup = (%q, %v, %v), note = %q; want (%q, %v, %v), note = %q",
+					path, exists, ok, strings.Join(p.notes, "; "), tc.path, tc.exists, tc.ok, tc.note)
 			}
 			if p.globLookups != maxGlobLookups {
 				t.Errorf("stat changed lookup budget to %d", p.globLookups)

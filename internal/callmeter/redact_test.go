@@ -60,7 +60,8 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Redact: %v", err)
 	}
-	want := []RedactCount{{"calls.input", 2}, {"calls.error", 2}, {"events.detail", 4}, {"faults.error", 2}, {"stop_hook_runs.name", 0}, {"command_parts", 2}}
+	want := []RedactCount{{"calls.input", 2, nil}, {"calls.error", 2, nil}, {"events.detail", 4, nil}, {"faults.error", 2, nil},
+		{"stop_hook_runs.name", 0, nil}, {"command_parts", 2, nil}}
 	if !reflect.DeepEqual(counts, want) {
 		t.Fatalf("Redact = %v, want %v", counts, want)
 	}
@@ -136,8 +137,9 @@ func TestRedactRewritesStoredRows(t *testing.T) {
 	}
 }
 
-// A row Redact cannot rewrite fails the pass and leaves every row as it was.
-func TestRedactFailureChangesNothing(t *testing.T) {
+// A row Redact cannot read keeps its exact stored text, and its command_parts,
+// and is named; the rows around it are redacted in the same pass.
+func TestRedactKeepsARowItCannotRead(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenDB(ctx, filepath.Join(t.TempDir(), "callmeter.db"))
 	if err != nil {
@@ -148,18 +150,41 @@ func TestRedactFailureChangesNothing(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	}()
-	if _, err := store.DB().Exec(oldRows[0]); err != nil {
+	for _, stmt := range []string{
+		oldRows[0], oldRows[1],
+		`INSERT INTO calls (tool_use_id, tool, ts, input) VALUES ('toolu_torn', 'Bash', 6, '{"command":"cat <<EOF private-torn')`,
+		`INSERT INTO command_parts (tool_use_id, seq, lang, program, args, files, parse_status, parser) VALUES
+			('toolu_torn', 0, 'sh', 'cat', '[]', '[]', 'ok', 1)`,
+		`INSERT INTO events (event_id, event, ts, detail) VALUES ('bad', 'Notification', 9, 'not json private-note')`,
+	} {
+		if _, err := store.DB().Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	counts, err := store.Redact(ctx)
+	if err != nil {
+		t.Fatalf("Redact: %v", err)
+	}
+	want := []RedactCount{{"calls.input", 2, []string{"toolu_torn"}}, {"calls.error", 2, nil}, {"events.detail", 0, []string{"bad"}},
+		{"faults.error", 0, nil}, {"stop_hook_runs.name", 0, nil}, {"command_parts", 2, nil}}
+	if !reflect.DeepEqual(counts, want) {
+		t.Fatalf("Redact = %v, want %v", counts, want)
+	}
+	var redacted string
+	if err := store.DB().QueryRow(`SELECT input FROM calls WHERE tool_use_id = 'toolu_heredoc'`).Scan(&redacted); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().Exec(`INSERT INTO events (event_id, event, ts, detail) VALUES ('bad', 'Notification', 9, 'not json')`); err != nil {
+	if strings.Contains(redacted, "private-body-line") {
+		t.Fatalf("the readable call's input = %s, want its heredoc body cut", redacted)
+	}
+	var torn, detail string
+	var parts int
+	if err := store.DB().QueryRow(`SELECT input, (SELECT count(*) FROM command_parts WHERE tool_use_id = 'toolu_torn'),
+		(SELECT detail FROM events WHERE event_id = 'bad') FROM calls WHERE tool_use_id = 'toolu_torn'`).Scan(&torn, &parts, &detail); err != nil {
 		t.Fatal(err)
 	}
-	if counts, err := store.Redact(ctx); err == nil || !strings.Contains(err.Error(), "events.detail of row bad") {
-		t.Fatalf("Redact = (%v, %v), want the bad detail named", counts, err)
-	}
-	var n int
-	if err := store.DB().QueryRow(`SELECT count(*) FROM calls WHERE instr(input, 'private-body-line') > 0`).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("rows still holding the body = %d (%v), want 1: the pass must roll back", n, err)
+	if torn != `{"command":"cat <<EOF private-torn` || parts != 1 || detail != "not json private-note" {
+		t.Fatalf("unreadable rows = input %q, %d command_parts, detail %q; want them as stored", torn, parts, detail)
 	}
 }
 

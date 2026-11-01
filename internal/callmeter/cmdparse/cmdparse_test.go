@@ -38,7 +38,7 @@ func parseOne(t *testing.T, cwd, command string, py PythonRunner) []Part {
 }
 
 func ref(cwd, name, action, rng string) FileRef {
-	return FileRef{Path: filepath.Join(cwd, name), Action: action, Range: rng, Exists: true}
+	return FileRef{Path: filepath.Join(cwd, name), Action: action, Range: rng, Exists: ExistsYes}
 }
 
 // missing is a reference to a path that did not exist at parse time.

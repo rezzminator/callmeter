@@ -146,7 +146,7 @@ func TestParseBatchPythonCrashIsPythonError(t *testing.T) {
 }
 
 // A Python open() or Path(...) write of a file that does not exist yet is
-// attributed, Exists false, in the directory the part ran in; a bare string
+// attributed, Exists ExistsNo, in the directory the part ran in; a bare string
 // naming nothing on disk stays unattributed.
 func TestPythonWriteOfAMissingFile(t *testing.T) {
 	t.Parallel()

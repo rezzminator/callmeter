@@ -45,9 +45,12 @@ type titles struct{ custom, ai, summary string }
 // recorded for the session and the seat the report itself runs under. The
 // answer is the last customTitle, else the last aiTitle, else the
 // last summary, else the session id's first characters. A transcript that is
-// absent names nothing; one that exists but cannot be read returns its error,
-// so the table prints "?" and a count with a safe label in its note; the full
-// error, including the path, is written to stderr once per session.
+// absent names nothing. A source that cannot be read (the store's seats, a
+// transcript that exists but cannot be read) is passed over for the next one;
+// when no source names the chat and one of them failed, its error is returned,
+// so the table prints "?" and a count with a safe label in its note, never the
+// id prefix that means no title; the full error, including the path, is written
+// to stderr once per session.
 type transcriptNames struct {
 	ctx    context.Context
 	db     *sql.DB
@@ -78,25 +81,28 @@ func (names *transcriptNames) nameOf(sessionID string) (name string, err error) 
 	if !plainName(sessionID) {
 		return fallback, nil
 	}
+	var unread []error
 	stored, err := names.storedTitle(sessionID)
 	if err != nil {
-		return "", err
-	}
-	if stored != "" {
+		unread = append(unread, err)
+	} else if stored != "" {
 		return stored, nil
 	}
 	seats, err := names.seats(sessionID)
 	if err != nil {
-		return "", err
+		unread = append(unread, err)
 	}
 	for _, seat := range seats {
 		found, err := titlesOf(seat, sessionID)
 		if err != nil {
-			return "", err
+			unread = append(unread, err)
 		}
 		if title := found.best(); title != "" {
 			return title, nil
 		}
+	}
+	if len(unread) > 0 {
+		return "", errors.Join(unread...)
 	}
 	return fallback, nil
 }
@@ -144,8 +150,21 @@ func plainName(id string) bool {
 // seats are the Claude Code config dirs to look under, in order: the distinct
 // seat_dir values the store holds for the session, then the report's own
 // seat. A seat that cannot be resolved is an error only when no stored seat
-// exists to look under.
+// exists to look under. A store that cannot be read is an error returned
+// beside the report's own seat, still worth a look.
 func (names *transcriptNames) seats(sessionID string) ([]string, error) {
+	stored, err := names.storedSeats(sessionID)
+	if err != nil {
+		if own, ownErr := paths.SeatDir(names.getenv); ownErr == nil {
+			return []string{own}, err
+		}
+		return nil, err
+	}
+	return names.withOwnSeat(stored)
+}
+
+// storedSeats are the distinct seat_dir values the store holds for the session.
+func (names *transcriptNames) storedSeats(sessionID string) ([]string, error) {
 	rows, err := names.db.QueryContext(names.ctx, `
 		SELECT seat_dir FROM calls WHERE session_id = ?1 AND seat_dir IS NOT NULL AND seat_dir != ''
 		UNION SELECT seat_dir FROM requests WHERE session_id = ?1 AND seat_dir IS NOT NULL AND seat_dir != ''
@@ -168,6 +187,11 @@ func (names *transcriptNames) seats(sessionID string) ([]string, error) {
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("read the seats of session %s: %w", sessionID, err)
 	}
+	return seats, nil
+}
+
+// withOwnSeat is seats then the report's own seat when it is not among them.
+func (names *transcriptNames) withOwnSeat(seats []string) ([]string, error) {
 	own, err := paths.SeatDir(names.getenv)
 	if err != nil {
 		if len(seats) == 0 {
@@ -184,8 +208,10 @@ func (names *transcriptNames) seats(sessionID string) ([]string, error) {
 }
 
 // titlesOf reads the titles of session's transcript under seat: the first
-// {seat}/projects/{project}/{session}.jsonl in project-name order. A seat with
-// no projects directory or no such transcript holds none.
+// {seat}/projects/{project}/{session}.jsonl in project-name order that reads.
+// A seat with no projects directory or no such transcript holds none; a copy
+// that cannot be read is passed over for the next project, and its error is
+// returned when no later copy reads.
 func titlesOf(seat, session string) (titles, error) {
 	projects := filepath.Join(seat, "projects")
 	entries, err := os.ReadDir(projects)
@@ -195,6 +221,7 @@ func titlesOf(seat, session string) (titles, error) {
 	if err != nil {
 		return titles{}, fmt.Errorf("list transcripts under %s: %w", projects, err)
 	}
+	var unread []error
 	for _, entry := range entries {
 		if !entry.IsDir() && entry.Type()&fs.ModeSymlink == 0 {
 			continue
@@ -205,15 +232,18 @@ func titlesOf(seat, session string) (titles, error) {
 			continue
 		}
 		if err != nil {
-			return titles{}, err
+			unread = append(unread, err)
+			continue
 		}
 		return found, nil
 	}
-	return titles{}, nil
+	return titles{}, errors.Join(unread...)
 }
 
 // readTitles scans one transcript for its title entries. A transcript that is
-// not there returns an error wrapping fs.ErrNotExist.
+// not there returns an error wrapping fs.ErrNotExist. A title line that does
+// not decode (a writer mid-append) is skipped; when no title decodes and one
+// was skipped, the name is unknown, not absent, and that is an error.
 func readTitles(path string) (found titles, err error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -225,16 +255,24 @@ func readTitles(path string) (found titles, err error) {
 		}
 	}()
 	reader := bufio.NewReader(file)
+	var skipped int
+	var firstErr error
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if hasTitleMarker(line) {
 			var entry titleEntry
 			if err := json.Unmarshal(line, &entry); err != nil {
-				return titles{}, fmt.Errorf("decode a title entry in transcript %s: %w", path, err)
+				if skipped++; firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				found.add(entry)
 			}
-			found.add(entry)
 		}
 		if errors.Is(readErr, io.EOF) {
+			if skipped > 0 && found.best() == "" {
+				return titles{}, fmt.Errorf("decode %d title entries in transcript %s, none of them read: %w", skipped, path, firstErr)
+			}
 			return found, nil
 		}
 		if readErr != nil {

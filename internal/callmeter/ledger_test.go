@@ -64,6 +64,9 @@ func (e *ledgerEnv) writeLedger(session string, lines ...string) {
 	}
 }
 
+// absentField, as a replacement value of line, removes the field.
+type absentField struct{}
+
 // line is a sample row n with the given fields replaced.
 func (e *ledgerEnv) line(n int, replace map[string]any) string {
 	e.t.Helper()
@@ -73,6 +76,9 @@ func (e *ledgerEnv) line(n int, replace map[string]any) string {
 	}
 	for k, v := range replace {
 		fields[k] = v
+		if _, gone := v.(absentField); gone {
+			delete(fields, k)
+		}
 	}
 	out, err := json.Marshal(fields)
 	if err != nil {
@@ -271,7 +277,8 @@ func TestIngestLedgerMergesATranscriptLineThatArrivesLate(t *testing.T) {
 
 // TestIngestLedgerNamesEveryGap: a torn or foreign line is a counted fault and
 // never an error or a smaller number; a duplicate request id keeps the best
-// join; a half-joined row (no cost yet) is priced from the table until its
+// join, and at the same join a later partial line never replaces a whole one;
+// a half-joined row (no cost yet) is priced from the table until its
 // upgraded line lands; a log-only row keeps its unknown agent.
 func TestIngestLedgerNamesEveryGap(t *testing.T) {
 	e := newLedgerEnv(t)
@@ -280,6 +287,7 @@ func TestIngestLedgerNamesEveryGap(t *testing.T) {
 	logOnly := e.line(9, map[string]any{"agent_id": "?", "parent_agent_id": "", "join": "log"})
 	e.writeLedger(ledgerSession,
 		e.sample[0],
+		e.line(1, map[string]any{"cost_usd_micros": "149149"}), // row 1 again, partial at the same join: ignored
 		spanOnly, // row 7 span-only first ...
 		`{"request_id":"req_torn","ts":"2026-10-09T18:2`,                 // a torn line
 		`["not","an","object"]`,                                          // not an object
@@ -350,6 +358,97 @@ func TestIngestLedgerOnlyTakesTheRetentionWindow(t *testing.T) {
 	}
 	if r := row(t, e.store, "requests", "request_id = ?", sampleRequestID(1)); r != nil {
 		t.Errorf("row older than retention stored: %v", r)
+	}
+}
+
+// TestIngestLedgerReadsWhatItCanOfASessionsTranscripts: a session whose
+// transcripts cannot all be read is named unreadable, and what can be read
+// still holds its calls: the sub-agent transcripts the agents table names when
+// the session names no main transcript, and every whole line of a transcript
+// holding a torn one. A `[` in a transcript's directory is read as written.
+func TestIngestLedgerReadsWhatItCanOfASessionsTranscripts(t *testing.T) {
+	assistant := func(n int) string {
+		return fmt.Sprintf(`{"type":"assistant","requestId":%q,"message":{"id":"msg_invented_%d"}}`, sampleRequestID(n), n)
+	}
+	for _, tc := range []struct {
+		name     string
+		mainDir  string // the main transcript's directory under the project; "" names none
+		main     []string
+		agent    []string // the lines of the sub-agent transcript the agents table names
+		ledger   []int
+		stored   []int // requests a hook stored without their requestId
+		held     []int
+		sideRows []int
+		whole    bool // every transcript of the session was read
+		appended bool // the main transcript's last line has no newline yet
+	}{
+		{name: "no main transcript", agent: []string{assistant(4)}, ledger: []int{4}, stored: []int{4}, held: []int{4}},
+		// A `[` in the directory is read as written: the session reads whole.
+		{name: "a [ in the main transcript's directory", mainDir: "we[ird", main: []string{assistant(1)}, agent: []string{assistant(4)},
+			ledger: []int{1, 4}, stored: []int{1, 4}, held: []int{1, 4}, whole: true},
+		{name: "a torn line", mainDir: "proj", main: []string{assistant(1), assistant(3)[:40]},
+			ledger: []int{1, 3}, stored: []int{1}, held: []int{1}, sideRows: []int{3}},
+		// A last line the writer has not finished is no torn line: the session reads whole.
+		{name: "a last line mid-append", mainDir: "proj", main: []string{assistant(1), assistant(3)[:40]}, appended: true,
+			ledger: []int{1, 3}, stored: []int{1}, held: []int{1}, sideRows: []int{3}, whole: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newLedgerEnv(t)
+			mainPath := ""
+			if tc.mainDir != "" {
+				mainPath = filepath.Join(e.proj, tc.mainDir, ledgerSession+".jsonl")
+				if err := os.MkdirAll(filepath.Dir(mainPath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				text := strings.Join(tc.main, "\n")
+				if !tc.appended {
+					text += "\n"
+				}
+				if err := os.WriteFile(mainPath, []byte(text), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := e.store.DB().Exec(`INSERT INTO sessions (session_id, transcript_path) VALUES (?, ?)`, ledgerSession, nullable(mainPath)); err != nil {
+				t.Fatal(err)
+			}
+			if len(tc.agent) > 0 {
+				agentPath := filepath.Join(e.proj, "elsewhere", "agent-a0000000000000002.jsonl")
+				if err := os.MkdirAll(filepath.Dir(agentPath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(agentPath, []byte(strings.Join(tc.agent, "\n")+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := e.store.DB().Exec(`INSERT INTO agents (agent_id, session_id, transcript_path) VALUES ('a0000000000000002', ?, ?)`,
+					ledgerSession, agentPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, n := range tc.stored {
+				e.storeRequest(n, false)
+			}
+			lines := make([]string, 0, len(tc.ledger))
+			for _, n := range tc.ledger {
+				lines = append(lines, e.sample[n-1])
+			}
+			e.writeLedger(ledgerSession, lines...)
+			got := e.ingest()
+			unreadable := 1
+			if tc.whole {
+				unreadable = 0
+			}
+			if got.Held != len(tc.held) || got.Side != len(tc.sideRows) || got.Unreadable != unreadable {
+				t.Errorf("summary = %+v, want %d held, %d side, %d sessions unreadable", got, len(tc.held), len(tc.sideRows), unreadable)
+			}
+			for _, n := range tc.held {
+				if r := row(t, e.store, "requests", "request_id = ?", fmt.Sprintf("msg_invented_%d", n)); r["api_request_id"] != sampleRequestID(n) || r["cost_source"] != "ledger" {
+					t.Errorf("held request %d = requestId %v from %v, want %s priced by the ledger", n, r["api_request_id"], r["cost_source"], sampleRequestID(n))
+				}
+			}
+			if n, _ := e.sum("source = 'ledger'"); n != len(tc.sideRows) {
+				t.Errorf("side rows = %d, want %d", n, len(tc.sideRows))
+			}
+		})
 	}
 }
 
@@ -666,7 +765,9 @@ func TestIngestLedgerSessionLedgerIsOptionalData(t *testing.T) {
 
 // TestLedgerReadsRefuseAPathThatIsNoRegularFile: the report run's ledger read
 // and the transcript scan open a file out of a directory or a path the store
-// names; a pipe there is refused with an error before it can stall a run.
+// names; a pipe there is refused before it can stall a run. The transcript scan
+// returns the refusal; the report run skips that file, and one it cannot stat
+// (a dangling link), counts both and reads the rest.
 func TestLedgerReadsRefuseAPathThatIsNoRegularFile(t *testing.T) {
 	e := newLedgerEnv(t)
 	fifo := filepath.Join(e.dir, "pipe-session.jsonl")
@@ -680,30 +781,39 @@ func TestLedgerReadsRefuseAPathThatIsNoRegularFile(t *testing.T) {
 			f.Close()
 		}
 	})
-	runs := []struct {
-		name string
-		run  func() error
-	}{
-		{"the report run's ledger read", func() error {
-			_, err := e.store.IngestLedger(context.Background(), e.dir, e.now)
-			return err
-		}},
-		{"the transcript scan", func() error {
-			_, err := scanRequestIDs(fifo)
-			return err
-		}},
+	if err := os.Symlink(filepath.Join(e.dir, "gone"), filepath.Join(e.dir, "dangling-session.jsonl")); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range runs {
-		done := make(chan error, 1)
-		go func() { done <- tc.run() }()
-		select {
-		case err := <-done:
-			if err == nil || !strings.Contains(err.Error(), "is not a regular file") {
-				t.Errorf("%s: err = %v; want a refusal naming a path that is no regular file", tc.name, err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("%s: blocked on a pipe", tc.name)
+	e.writeLedger(ledgerSession, e.sample[6])
+	type result struct {
+		sum LedgerSummary
+		err error
+	}
+	report := make(chan result, 1)
+	go func() {
+		sum, err := e.store.IngestLedger(context.Background(), e.dir, e.now)
+		report <- result{sum, err}
+	}()
+	select {
+	case got := <-report:
+		if got.err != nil || got.sum.Files != 2 || got.sum.FilesSkipped != 2 || got.sum.Rows != 1 || got.sum.Side != 1 {
+			t.Errorf("the report run's ledger read = %+v, %v; want the pipe and the dangling link skipped, 1 side call from %s", got.sum, got.err, ledgerSession)
 		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the report run's ledger read blocked on a pipe")
+	}
+	scan := make(chan error, 1)
+	go func() {
+		_, _, err := scanRequestIDs(fifo)
+		scan <- err
+	}()
+	select {
+	case err := <-scan:
+		if want := "callmeter ledger: " + fifo + " is not a regular file"; err == nil || err.Error() != want {
+			t.Errorf("the transcript scan: err = %v; want %q", err, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the transcript scan blocked on a pipe")
 	}
 }
 
@@ -765,8 +875,8 @@ func TestIngestLedgerSessionRequestWrittenAfterItsLedgerLine(t *testing.T) {
 // sideRow parses sample row n as a ledger row of the test session.
 func (e *ledgerEnv) sideRow(n int) ledgerRow {
 	e.t.Helper()
-	r, ok := parseLedgerLine([]byte(e.sample[n-1]), ledgerSession)
-	if !ok {
+	r, partial, ok := parseLedgerLine([]byte(e.sample[n-1]), ledgerSession)
+	if !ok || partial {
 		e.t.Fatalf("sample row %d does not parse", n)
 	}
 	return r
@@ -998,45 +1108,88 @@ func TestIngestLedgerSessionPassesALineLongerThanItsCap(t *testing.T) {
 	}
 }
 
-// TestLedgerLinesPastTheBoundsAreFaults: a count above 1e12 or a price above 1e15
-// micros is no ledger line, so no sum of a row's counts can wrap and no price
-// leaves the range of an int64; a value at the bound parses. Both ingest paths
-// count the line in Faults and store nothing.
-func TestLedgerLinesPastTheBoundsAreFaults(t *testing.T) {
+// TestLedgerLineKeepsWhatItCanRead: a field a ledger line does not carry in a
+// form callmeter reads (absent, of another JSON type, past its bound: a count
+// above 1e12 or a price above 1e15 micros, so no sum of a row's counts wraps
+// and no price leaves the range of an int64) and a ts that does not parse is
+// NULL in the line's row, and so is what needs it (context_tokens; a price,
+// then the table's); the rest of the line is stored and the line counted as
+// partial, by both ingest paths. A value at the bound parses whole.
+func TestLedgerLineKeepsWhatItCanRead(t *testing.T) {
 	const bigCount, bigMicros = int64(9_000_000_000_000_000_000), int64(9_000_000_000_000_000_000)
+	whole := map[string]any{
+		"source": "ledger", "session_id": ledgerSession, "agent_id": "a0000000000000001", "query_source": "web_search_tool",
+		"model": "claude-opus-5-5", "input_tokens": int64(12409), "output_tokens": int64(716), "cache_read_tokens": int64(0),
+		"cache_creation_tokens": int64(0), "context_tokens": int64(12409), "cost_usd_micros": int64(73956), "cost_source": "ledger",
+		"api_request_id": sampleRequestID(7), "ts": time.Date(2026, 10, 9, 18, 27, 40, 395_000_000, time.UTC).UnixMilli(),
+	}
+	tablePrice := map[string]any{"cost_usd_micros": int64(63956), "cost_source": "table"}
 	for _, tc := range []struct {
-		field string
-		value int64
-		ok    bool
+		field   string
+		value   any
+		partial bool
+		want    map[string]any // the columns that differ from the whole line's row
 	}{
-		{"input_tokens", bigCount, false}, {"input_tokens", 1_000_000_000_001, false}, {"input_tokens", 1_000_000_000_000, true},
-		{"output_tokens", bigCount, false}, {"output_tokens", 1_000_000_000_001, false}, {"output_tokens", 1_000_000_000_000, true},
-		{"cache_read_tokens", bigCount, false}, {"cache_read_tokens", 1_000_000_000_001, false}, {"cache_read_tokens", 1_000_000_000_000, true},
-		{"cache_creation_tokens", bigCount, false}, {"cache_creation_tokens", 1_000_000_000_001, false}, {"cache_creation_tokens", 1_000_000_000_000, true},
-		{"cost_usd_micros", bigMicros, false}, {"cost_usd_micros", 1_000_000_000_000_001, false}, {"cost_usd_micros", 1_000_000_000_000_000, true},
+		{"input_tokens", bigCount, true, map[string]any{"input_tokens": nil, "context_tokens": nil}},
+		{"input_tokens", 1_000_000_000_001, true, map[string]any{"input_tokens": nil, "context_tokens": nil}},
+		{"input_tokens", 1_000_000_000_000, false, map[string]any{"input_tokens": int64(1_000_000_000_000), "context_tokens": int64(1_000_000_000_000)}},
+		{"input_tokens", "12409", true, map[string]any{"input_tokens": nil, "context_tokens": nil}},
+		{"input_tokens", absentField{}, true, map[string]any{"input_tokens": nil, "context_tokens": nil}},
+		{"output_tokens", bigCount, true, map[string]any{"output_tokens": nil}},
+		{"output_tokens", 1_000_000_000_001, true, map[string]any{"output_tokens": nil}},
+		{"output_tokens", 1_000_000_000_000, false, map[string]any{"output_tokens": int64(1_000_000_000_000)}},
+		{"cache_read_tokens", bigCount, true, map[string]any{"cache_read_tokens": nil, "context_tokens": nil}},
+		{"cache_read_tokens", 1_000_000_000_001, true, map[string]any{"cache_read_tokens": nil, "context_tokens": nil}},
+		{"cache_read_tokens", 1_000_000_000_000, false, map[string]any{"cache_read_tokens": int64(1_000_000_000_000), "context_tokens": int64(1_000_000_012_409)}},
+		{"cache_creation_tokens", bigCount, true, map[string]any{"cache_creation_tokens": nil, "context_tokens": nil}},
+		{"cache_creation_tokens", 1_000_000_000_001, true, map[string]any{"cache_creation_tokens": nil, "context_tokens": nil}},
+		{"cache_creation_tokens", 1_000_000_000_000, false, map[string]any{"cache_creation_tokens": int64(1_000_000_000_000), "context_tokens": int64(1_000_000_012_409)}},
+		{"cost_usd_micros", bigMicros, true, tablePrice},
+		{"cost_usd_micros", 1_000_000_000_000_001, true, tablePrice},
+		{"cost_usd_micros", 1_000_000_000_000_000, false, map[string]any{"cost_usd_micros": int64(1_000_000_000_000_000)}},
+		{"cost_usd_micros", "73956", true, tablePrice},
+		{"ts", "yesterday", true, map[string]any{"ts": nil}},
+		{"ts", absentField{}, true, map[string]any{"ts": nil}},
+		{"model", 5, true, map[string]any{"model": nil}},
 	} {
-		t.Run(fmt.Sprintf("%s=%d", tc.field, tc.value), func(t *testing.T) {
-			wantRows, wantFaults := 1, 0
-			if !tc.ok {
-				wantRows, wantFaults = 0, 1
+		t.Run(fmt.Sprintf("%s=%v", tc.field, tc.value), func(t *testing.T) {
+			want := map[string]any{}
+			for column, value := range whole {
+				want[column] = value
+			}
+			for column, value := range tc.want {
+				want[column] = value
+			}
+			check := func(run string, store *Store) {
+				t.Helper()
+				got := row(t, store, "requests", "request_id = ?", sampleRequestID(7))
+				for column, value := range want {
+					if got[column] != value {
+						t.Errorf("%s: %s = %v, want %v", run, column, got[column], value)
+					}
+				}
 			}
 			report := newLedgerEnv(t)
 			line := report.line(7, map[string]any{tc.field: tc.value})
-			if _, ok := parseLedgerLine([]byte(line), ledgerSession); ok != tc.ok {
-				t.Errorf("parseLedgerLine ok = %v, want %v", ok, tc.ok)
-			}
 			report.writeLedger(ledgerSession, line)
-			sum := report.ingest()
-			if n, _ := report.sum("source = 'ledger'"); sum.Faults != wantFaults || n != wantRows {
-				t.Errorf("report run: %d faults, %d rows; want %d, %d", sum.Faults, n, wantFaults, wantRows)
+			if _, partial, ok := parseLedgerLine([]byte(line), ledgerSession); !ok || partial != tc.partial {
+				t.Errorf("parseLedgerLine = partial %v, ok %v; want partial %v, ok", partial, ok, tc.partial)
 			}
+			wantPartial := 0
+			if tc.partial {
+				wantPartial = 1
+			}
+			if sum := report.ingest(); sum.Faults != 0 || sum.Rows != 1 || sum.Partial != wantPartial {
+				t.Errorf("report run = %+v; want no fault, 1 row, %d partial", sum, wantPartial)
+			}
+			check("report run", report.store)
 			hooks := newLedgerEnv(t)
 			hooks.holdAll()
 			hooks.writeLedger(ledgerSession, line)
-			got := hooks.ingestSession(LedgerReadCap)
-			if n, _ := hooks.sum("source = 'ledger'"); got.Faults != wantFaults || n != wantRows || got.Lines != 1 {
-				t.Errorf("hook run = %+v with %d side rows; want %d faults, %d rows from 1 line", got, n, wantFaults, wantRows)
+			if got := hooks.ingestSession(LedgerReadCap); got.Faults != 0 || got.Lines != 1 || got.Partial != wantPartial {
+				t.Errorf("hook run = %+v; want no fault from 1 line, %d partial", got, wantPartial)
 			}
+			check("hook run", hooks.store)
 		})
 	}
 }

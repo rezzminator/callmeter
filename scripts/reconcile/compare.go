@@ -73,10 +73,7 @@ func reconcile(ctx context.Context, cfg config) (*report, error) {
 			return nil, err
 		}
 	}
-	index, err := diskIndex(cfg.projects)
-	if err != nil {
-		return nil, err
-	}
+	index, unreadDirs := diskIndex(cfg.projects)
 	allow, err := loadAllowlist(cfg.allowlist)
 	if err != nil {
 		return nil, err
@@ -93,6 +90,11 @@ func reconcile(ctx context.Context, cfg config) (*report, error) {
 	if err != nil {
 		return nil, err
 	}
+	// What the run could not read outside any one pass: snapshot rows and
+	// projects dirs.
+	unread := append(slices.Clone(st.unread), unreadDirs...)
+	allow.apply(unread)
+	rep.mismatches = append(rep.mismatches, unread...)
 	// A kill of unknown event is judged by the sessions beside it, so only once
 	// every other mismatch has its verdict. The window limits which rows are
 	// judged, not which evidence is read: a neighbour this window did not
@@ -174,7 +176,8 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			if _, err := os.Stat(s.transcriptPath); err == nil {
 				path = s.transcriptPath
 			} else if !errors.Is(err, fs.ErrNotExist) {
-				return nil, nil, nil, fmt.Errorf("stat transcript of session %s: %w", s.id, err)
+				// Could not look: the disk index's path is read instead.
+				w.skip(s.id, fmt.Sprintf("stat transcript of session %s: %v", s.id, err))
 			}
 		}
 		if path == "" {
@@ -190,9 +193,7 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 			rep.add("session-no-transcript", s.id, 0, fmt.Sprintf("work_rows=%t %s", workFor[s.id], promptlessDetail(s, st)))
 			continue
 		}
-		if err := w.readSession(s.id, path); err != nil {
-			return nil, nil, nil, err
-		}
+		w.readSession(s.id, path)
 	}
 
 	// Sessions on disk active in the window that the store never compared.
@@ -209,14 +210,13 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 		}
 		info, err := os.Stat(index[id])
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("stat transcript %s: %w", index[id], err)
+			other.skip(id, fmt.Sprintf("stat transcript %s: %v", index[id], err))
+			continue
 		}
 		if info.ModTime().UnixMilli() < cfg.since {
 			continue
 		}
-		if err := other.readSession(id, index[id]); err != nil {
-			return nil, nil, nil, err
-		}
+		other.readSession(id, index[id])
 		t := other.mains[id]
 		if t == nil || t.assistants == 0 {
 			continue
@@ -234,6 +234,8 @@ func comparePass(st *storeData, index map[string]string, cfg config, allow allow
 		}
 	}
 	rep.transcriptsRead = len(w.read)
+	rep.mismatches = append(rep.mismatches, w.unread...)
+	rep.mismatches = append(rep.mismatches, other.unread...)
 
 	compareSessions(rep, st, w, compared, workFor)
 	compareCalls(rep, st, w)

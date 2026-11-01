@@ -97,6 +97,7 @@ type storeData struct {
 	parts        map[string][]sPart
 	faults       []sFault
 	maxParser    int64
+	unread       []mismatch // a table's rows skipped as unreadable, one per table
 	latest       int64
 	earliest     int64           // the earliest session's first row; 0: no session
 	seats        map[string]bool // every sessions.seat_dir the snapshot records
@@ -232,8 +233,23 @@ func loadStore(ctx context.Context, path string) (*storeData, error) {
 			}},
 	}
 	for _, s := range steps {
-		if err := queryEach(ctx, db, s.query, s.scan); err != nil {
+		// A row that does not scan is skipped, its table's other rows read.
+		skipped := 0
+		var first error
+		err := queryEach(ctx, db, s.query, func(r *sql.Rows) error {
+			if err := s.scan(r); err != nil {
+				if skipped == 0 {
+					first = err
+				}
+				skipped++
+			}
+			return nil
+		})
+		if err != nil {
 			return nil, fmt.Errorf("snapshot %s: read %s: %w", path, s.name, err)
+		}
+		if skipped > 0 {
+			d.unread = append(d.unread, unreadable("", fmt.Sprintf("snapshot %s: %d %s rows skipped, the first: %v", path, skipped, s.name, first)))
 		}
 	}
 	return d, nil
@@ -258,8 +274,8 @@ var scratchURI = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
 
 // loadScratch indexes the scratch stores under root: every callmeter.db but
 // the snapshot itself, opened read-only, mapping each session_id it records to
-// its path (the first in walk order). A store or directory that cannot be read
-// is listed, never skipped silently; an absent root holds none.
+// its path (the first in walk order). A store or directory that cannot be read,
+// the root included, is listed, never skipped silently; an absent root holds none.
 func loadScratch(ctx context.Context, root, snapshot string) (map[string]string, int, []string, error) {
 	sessions := map[string]string{}
 	if root == "" {
@@ -268,7 +284,7 @@ func loadScratch(ctx context.Context, root, snapshot string) (map[string]string,
 	if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
 		return sessions, 0, nil, nil
 	} else if err != nil {
-		return nil, 0, nil, fmt.Errorf("--scratch %s: %w", root, err)
+		return sessions, 0, []string{fmt.Sprintf("%s (%v)", root, err)}, nil
 	}
 	snap, err := filepath.Abs(snapshot)
 	if err != nil {

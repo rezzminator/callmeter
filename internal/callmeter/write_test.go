@@ -788,13 +788,20 @@ func TestSettleRequestLeavesAnotherOwnersRow(t *testing.T) {
 // hooks of other chats write. Without an index on calls(request_id) each
 // recount scans calls, the sweep holds the write lock past the writers' wait,
 // and they drop their events busy.
+//
+// The writers wait BusyTimeout, the wait the hooks had when the unindexed
+// sweep cost them their events; a recorded async hook now waits longer still.
+// The hold is CPU-bound, so host load stretches both sides alike: indexed it is
+// about 0.4 s on an idle host, a twelfth of the wait, and unindexed about 40 s,
+// eight waits, so the scan fails at any load and the index passes on a host
+// slowed twelvefold.
 func TestSettleSweepLeavesTheStoreToConcurrentHooks(t *testing.T) {
 	const (
 		requests      = 800
 		callsPerReq   = 1
-		storedCalls   = 30000 // calls rows of the session, most of them no request's
+		storedCalls   = 60000 // calls rows of the session, most of them no request's
 		writers       = 8
-		writerWait    = time.Second
+		writerWait    = BusyTimeout
 		session       = "sess-sweep"
 		since         = int64(1000)
 		sweepSettleTS = int64(2000)
@@ -1015,6 +1022,25 @@ func TestPutMarksWritesTheRowsOnce(t *testing.T) {
 	if got := row(t, store, "session_costs", "session_id = ?", "sess-demo"); got["cost_usd"] != 60.5 || got["wall_ms"] != int64(53062359) || got["ts"] != int64(7000) {
 		t.Errorf("session_costs after an earlier cost-state landed late = %v, want the later state kept, ts 7000", got)
 	}
+	// A mark whose time the transcript did not give (TS 0) is stored with no ts.
+	unknown := openTestStore(t)
+	putMarks(t, unknown, "", 5000, unknownTimeMarks(t))
+	for table, entry := range map[string]string{
+		"compactions": "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7", "stop_hooks": "8b7a2d0e-b849-4d10-a191-b1cd766d87f3",
+		"stop_hook_runs": "8b7a2d0e-b849-4d10-a191-b1cd766d87f3", "turn_durations": "463cc8cc-6d27-4c84-b49d-06fa061a443b",
+	} {
+		if got := row(t, unknown, table, "1 = 1"); got["entry_id"] != entry || got["ts"] != nil {
+			t.Errorf("%s row of a mark of unknown time: entry %v ts %v, want %s <nil>", table, got["entry_id"], got["ts"], entry)
+		}
+	}
+}
+
+// unknownTimeMarks is the marks fixture with each mark's time unknown (TS 0).
+func unknownTimeMarks(t *testing.T) TranscriptMarks {
+	t.Helper()
+	marks := readMarksFixture(t).Marks
+	marks.Compactions[0].TS, marks.StopHooks[0].TS, marks.TurnDurations[0].TS = 0, 0, 0
+	return marks
 }
 
 func TestPutMarksOfAnAgentKeepsItsIdAndNoCost(t *testing.T) {
@@ -1127,6 +1153,15 @@ func TestKnownMarksAndSince(t *testing.T) {
 	young := marks.Since(1791100000000, nil)
 	if len(young.Compactions) != 1 || len(young.StopHooks) != 0 || len(young.TurnDurations) != 0 || young.Cost == nil {
 		t.Errorf("Since(1791100000000) = %+v", young)
+	}
+	// A mark of unknown time (TS 0) cannot be judged by since: it stays, while
+	// a known entry id still drops it.
+	unknown := unknownTimeMarks(t)
+	if kept := unknown.Since(1791200000000, nil); !reflect.DeepEqual(kept, unknown) {
+		t.Errorf("Since(1791200000000) of marks of unknown time = %+v\nwant %+v", kept, unknown)
+	}
+	if left := unknown.Since(1791200000000, known); len(left.Compactions)+len(left.StopHooks)+len(left.TurnDurations) != 0 {
+		t.Errorf("Since of known marks of unknown time = %+v, want only the cost", left)
 	}
 }
 
@@ -1270,6 +1305,18 @@ func TestRequestIterationsFollowTheirRequest(t *testing.T) {
 		{"older than the session, never stored", func(tx *Tx) error {
 			return tx.SettleRequest(ctx, request("msg_1"), nil, 1788019350229+1)
 		}, nil},
+		{"time unknown, stored with no ts", func(tx *Tx) error {
+			r := request("msg_1")
+			r.TS = nil
+			return tx.SettleRequest(ctx, r, nil, 1788019350229+1)
+		}, func() map[string]any {
+			kept := map[string]any{}
+			for k, v := range want {
+				kept[k] = v
+			}
+			kept["ts"] = nil // the request's ts, unknown
+			return kept
+		}()},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

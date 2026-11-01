@@ -1,12 +1,10 @@
 package callmeter
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"slices"
 	"strings"
@@ -16,9 +14,9 @@ import (
 // received it: a string's UTF-8 bytes, or the summed text of a content-block
 // array's "text" blocks (a non-text block contributes nothing — the model
 // never read it as text). Absent, empty or null content is 0 bytes. Any other
-// JSON shape (an object, a number, a boolean, malformed JSON) cannot be
-// measured this way and is an error naming the shape, never a silent 0 or a
-// guess at the raw encoding's length.
+// JSON shape (an object, a number, a boolean) is the length of its JSON text,
+// as RealBytes measures an object it finds no size in; malformed JSON is an
+// error, never a silent 0.
 func DeliveredBytes(raw json.RawMessage) (int64, error) {
 	text, err := ResultText(raw)
 	return int64(len(text)), err
@@ -26,7 +24,8 @@ func DeliveredBytes(raw json.RawMessage) (int64, error) {
 
 // ResultText is a tool result's content as the model read it, under
 // DeliveredBytes's rules: a string as it is, a content-block array's "text"
-// blocks joined, absent, empty or null content "", any other shape an error.
+// blocks joined, absent, empty or null content "", any other JSON value its
+// JSON text, malformed JSON an error.
 // It is only measured and classified, never stored.
 func ResultText(raw json.RawMessage) (string, error) {
 	trimmed := bytes.TrimSpace(raw)
@@ -54,6 +53,8 @@ func ResultText(raw json.RawMessage) (string, error) {
 			}
 		}
 		return text.String(), nil
+	case json.Valid(trimmed):
+		return string(trimmed), nil
 	default:
 		return "", fmt.Errorf("unmeasurable tool result shape: %s", shapeName(trimmed))
 	}
@@ -221,35 +222,31 @@ func SettledCall(toolUseID string, r Result) Call {
 // FindResults reads a transcript for the tool_result of each wanted call; a
 // call with no result on disk is absent from the map. A line is decoded only
 // when it names a wanted tool_use or tool_result; tool names are collected
-// in the same pass. A decode failure names its line. A missing transcript
-// is an error
-// wrapping fs.ErrNotExist.
-func FindResults(path string, ids []string) (map[string]Result, error) {
+// in the same pass. A line, or a result of it, that does not decode costs
+// that line or result alone: the map holds every other, beside a *BadLines
+// (readLines). A missing transcript is an error wrapping fs.ErrNotExist.
+func FindResults(path string, ids []string) (found map[string]Result, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open transcript %s: %w", path, err)
 	}
-	found := map[string]Result{}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close transcript %s: %w", path, closeErr))
+		}
+	}()
+	found = map[string]Result{}
 	tools := map[string]string{}
-	reader := bufio.NewReader(file)
-	for n := 1; ; n++ {
-		line, readErr := reader.ReadBytes('\n')
+	bad, err := readLines(file, path, 0, false, func(line []byte) error {
 		if (bytes.Contains(line, []byte(`"tool_result"`)) || bytes.Contains(line, []byte(`"tool_use"`))) && namesAny(line, ids) {
-			if err := resultsOf(line, ids, tools, found); err != nil {
-				return nil, errors.Join(fmt.Errorf("transcript %s line %d: %w", path, n, err), file.Close())
-			}
+			return resultsOf(line, ids, tools, found)
 		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return nil, errors.Join(fmt.Errorf("read transcript %s: %w", path, readErr), file.Close())
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := file.Close(); err != nil {
-		return nil, fmt.Errorf("close transcript %s: %w", path, err)
-	}
-	return found, nil
+	return found, bad.err()
 }
 
 func namesAny(line []byte, ids []string) bool {
@@ -262,7 +259,9 @@ func namesAny(line []byte, ids []string) bool {
 }
 
 // resultsOf remembers wanted tool_use names and adds tool_result blocks to
-// found; a message whose content is a string holds no tool_result.
+// found; a message whose content is a string holds no tool_result. A result
+// whose content cannot be measured is left out alone, its error returned after
+// every other result of the line is added.
 func resultsOf(line []byte, ids []string, tools map[string]string, found map[string]Result) error {
 	var entry struct {
 		Message struct {
@@ -301,13 +300,15 @@ func resultsOf(line []byte, ids []string, tools map[string]string, found map[str
 	}
 	useResult := bytes.TrimSpace(entry.ToolUseResult)
 	hasUseResult := results == 1 && len(useResult) > 0 && !bytes.Equal(useResult, []byte("null"))
+	var lost []error
 	for _, block := range blocks {
 		if block.Type != "tool_result" || !slices.Contains(ids, block.ToolUseID) {
 			continue
 		}
 		text, err := ResultText(block.Content)
 		if err != nil {
-			return fmt.Errorf("tool_result %s: %w", block.ToolUseID, err)
+			lost = append(lost, fmt.Errorf("tool_result %s: %w", block.ToolUseID, err))
+			continue
 		}
 		outcome, refused := ResultOutcome(text)
 		failed := block.IsError || refused
@@ -317,12 +318,13 @@ func resultsOf(line []byte, ids []string, tools map[string]string, found map[str
 		result := Result{Bytes: int64(len(text)), Failed: failed, Outcome: outcome, Refused: refused}
 		if hasUseResult && !failed { // a failed call's whole output is its text
 			if result.Real, err = RealBytes(tools[block.ToolUseID], useResult); err != nil {
-				return fmt.Errorf("tool_result %s: toolUseResult: %w", block.ToolUseID, err)
+				// The delivered size and outcome stay; the real size is unknown.
+				lost = append(lost, fmt.Errorf("tool_result %s: toolUseResult: %w", block.ToolUseID, err))
 			}
 		}
 		found[block.ToolUseID] = result
 	}
-	return nil
+	return errors.Join(lost...)
 }
 
 // shapeName names the JSON shape at trimmed's first byte, for an error that

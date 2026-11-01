@@ -112,7 +112,7 @@ func Context(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	if err != nil {
 		return nil, err
 	}
-	parts, err := loadParts(ctx, store, f)
+	parts, partNotes, err := loadParts(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +164,7 @@ func Context(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = notes
+	t.Notes = append(notes, partNotes...)
 	t.Notes = append(t.Notes, n.notes()...)
 	return t, nil
 }

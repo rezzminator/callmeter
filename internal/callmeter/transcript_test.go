@@ -74,9 +74,14 @@ func TestReadTaskNoticesReadsOnlyIdAndStatus(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The broken line and the notice with no RFC 3339 time each cost that line
+	// alone, counted, the first named by its byte offset.
 	got, err := ReadTaskNotices(path)
-	if err != nil {
-		t.Fatal(err)
+	broken := len(strings.Join(lines[:7], "\n")) + 1
+	wantErr := fmt.Sprintf("2 undecodable transcript line(s) skipped, the first: transcript %s at byte %d: "+
+		"malformed task notice entry: invalid character 'b' looking for beginning of value", path, broken)
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("ReadTaskNotices error = %v, want %s", err, wantErr)
 	}
 	want := map[string][]int64{
 		"a1": {at.UnixMilli(), at.Add(time.Second).UnixMilli(), at.Add(-time.Second).UnixMilli()}, "a2": {at.Add(2 * time.Second).UnixMilli()},
@@ -141,14 +146,57 @@ func TestFindRequestsUnreadableIsAnError(t *testing.T) {
 	}
 }
 
-func TestFindRequestsMalformedLineNamesIt(t *testing.T) {
-	path := filepath.Join("testdata", "malformed.jsonl")
-	_, err := FindRequests(path, []string{"toolu_x"})
-	if err == nil {
-		t.Fatal("FindRequests on a malformed middle line succeeded")
+// TestABadTranscriptLineCostsThatLineAlone: a malformed line, and an assistant
+// entry whose content is no block list, each cost only themselves: every other
+// request is kept, beside an error counting them and naming the first by its
+// path and byte offset.
+func TestABadTranscriptLineCostsThatLineAlone(t *testing.T) {
+	malformed, err := os.ReadFile(filepath.Join("testdata", "malformed.jsonl"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "at byte 96") {
-		t.Fatalf("error %q does not name %s at byte 96, the malformed line holding toolu_x", err, path)
+	clean, err := os.ReadFile(filepath.Join("testdata", "transcript.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := strings.SplitAfter(string(malformed), "\n")[1] // the line holding toolu_x, cut mid-entry
+	text := `{"type":"assistant","timestamp":"2026-09-22T23:16:39.000Z","message":{"id":"msg_text","model":"claude-haiku-4-5-20251001",` +
+		`"content":"invented text","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n"
+	path := filepath.Join(t.TempDir(), "main.jsonl")
+	if err := os.WriteFile(path, []byte(text+bad+string(clean)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badAt := len(text)
+	malformedErr := fmt.Sprintf("transcript %s at byte %d: malformed entry: unexpected end of JSON input", path, badAt)
+
+	found, err := FindRequests(path, []string{"toolu_x", "toolu_demo_A", "toolu_demo_B"})
+	if want := "1 undecodable transcript line(s) skipped, the first: " + malformedErr; err == nil || err.Error() != want {
+		t.Fatalf("FindRequests error = %v, want %s", err, want)
+	}
+	for _, id := range []string{"toolu_demo_A", "toolu_demo_B"} {
+		if got := found[id]; got.MessageID != "msg_demo_1" || got.OutputTokens != 276 {
+			t.Errorf("FindRequests[%s] = %+v, want msg_demo_1 at output 276", id, got)
+		}
+	}
+	if _, ok := found["toolu_x"]; ok {
+		t.Errorf("FindRequests found toolu_x on the malformed line")
+	}
+
+	read, err := ReadTranscript(path, "")
+	wantErr := "2 undecodable transcript line(s) skipped, the first: transcript " + path +
+		` at byte 0: assistant message "msg_text": content is not a block list: json: cannot unmarshal string into Go value of type []callmeter.toolUseBlock`
+	if err == nil || err.Error() != wantErr {
+		t.Fatalf("ReadTranscript error = %v, want %s", err, wantErr)
+	}
+	var ids []string
+	for _, request := range read.Requests {
+		ids = append(ids, request.MessageID)
+	}
+	if want := []string{"msg_text", "msg_demo_1", "msg_demo_2"}; !reflect.DeepEqual(ids, want) {
+		t.Fatalf("ReadTranscript requests = %v, want %v", ids, want)
+	}
+	if got := read.Requests[0]; got.OutputTokens != 1 || got.TS != 1790118999000 || got.ToolUseIDs != nil {
+		t.Errorf("msg_text = %+v, want its usage and time kept, no tool call", got)
 	}
 }
 
@@ -409,8 +457,9 @@ func TestFindRequestsTakesTheMessagesFinalEntry(t *testing.T) {
 // TestReadRequestsReadsEveryRequestAtItsFinalUsage: ReadRequests returns each
 // message once, in order, at its last entry's usage and stop reason, a reply
 // with no tool call included, with the prompt it answered; the synthetic
-// message and a message with no usage are not requests; final follows the last
-// assistant entry.
+// message is no request, and a message no entry gives usage is one with its
+// token counts unknown (NoUsage), as FindRequests finds it; final follows the
+// last assistant entry.
 func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "main.jsonl")
 	reply := func(stop string, output int) string {
@@ -420,7 +469,8 @@ func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
 	}
 	transcript := `{"type":"user","promptId":"prompt-invented-1","message":{"role":"user","content":"invented"}}` + "\n" +
 		multiBlockMessage("msg_blocks", "toolu_first", "toolu_last") +
-		`{"type":"assistant","timestamp":"2026-09-23T01:00:08.000Z","message":{"id":"msg_nousage","model":"claude-opus-4-1","content":[]}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-09-23T01:00:08.000Z","message":{"id":"msg_nousage","model":"claude-opus-4-1",` +
+		`"content":[{"type":"tool_use","id":"toolu_nousage","name":"Bash","input":{}}]}}` + "\n" +
 		`{"type":"assistant","timestamp":"2026-09-23T01:00:08.500Z","message":{"id":"msg_synthetic","model":"<synthetic>",` +
 		`"stop_reason":"stop_sequence","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}` + "\n" +
 		reply(`null`, 4)
@@ -454,6 +504,11 @@ func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
 			ToolUses: []ToolUse{{ID: "toolu_first", Name: "Bash", Input: json.RawMessage(`{}`)}, {ID: "toolu_last", Name: "Bash", Input: json.RawMessage(`{}`)}},
 		},
 		{
+			RequestUsage: RequestUsage{MessageID: "msg_nousage", NoUsage: true, TS: 1790125208000, Model: "claude-opus-4-1"},
+			PromptID:     "prompt-invented-1", ToolUseIDs: []string{"toolu_nousage"},
+			ToolUses: []ToolUse{{ID: "toolu_nousage", Name: "Bash", Input: json.RawMessage(`{}`)}},
+		},
+		{
 			RequestUsage: RequestUsage{
 				MessageID: "msg_reply", TS: 1790125209000, Model: "claude-opus-4-1", StopReason: "end_turn",
 				InputTokens: 1, CacheReadTokens: 90, CacheCreationTokens: 2, ContextTokens: 93, OutputTokens: 212,
@@ -463,6 +518,13 @@ func TestReadRequestsReadsEveryRequestAtItsFinalUsage(t *testing.T) {
 	}
 	if !reflect.DeepEqual(requests, want) {
 		t.Fatalf("ReadRequests = %+v\nwant %+v", requests, want)
+	}
+	found, err := FindRequests(path, []string{"toolu_nousage"})
+	if err != nil {
+		t.Fatalf("FindRequests: %v", err)
+	}
+	if want := (RequestUsage{MessageID: "msg_nousage", NoUsage: true, TS: 1790125208000, Model: "claude-opus-4-1"}); !reflect.DeepEqual(found["toolu_nousage"], want) {
+		t.Errorf("FindRequests = %+v, want %+v", found, want)
 	}
 }
 
@@ -477,17 +539,22 @@ func TestTranscriptTimestampErrorStatesOnlyItsSize(t *testing.T) {
 	if err := os.WriteFile(path, []byte(entry), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, findErr := FindRequests(path, []string{"toolu_badtime"})
-	_, _, readErr := ReadRequests(path)
-	want := fmt.Sprintf(`assistant message "msg_badtime": timestamp of %d bytes is not RFC 3339`, len(private))
+	found, findErr := FindRequests(path, []string{"toolu_badtime"})
+	requests, _, readErr := ReadRequests(path)
+	want := fmt.Sprintf(`1 undecodable transcript line(s) skipped, the first: transcript %s at byte 0: `+
+		`assistant message "msg_badtime": timestamp of %d bytes is not RFC 3339`, path, len(private))
 	for name, err := range map[string]error{"FindRequests": findErr, "ReadRequests": readErr} {
-		if err == nil {
-			t.Errorf("%s on an unparsable timestamp succeeded", name)
-			continue
+		if err == nil || err.Error() != want {
+			t.Errorf("%s error = %v, want %s", name, err, want)
 		}
-		if !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), private) {
-			t.Errorf("%s error = %q, want it to hold %q and never the timestamp", name, err, want)
-		}
+	}
+	// The request is kept, its time unknown (0).
+	if got := found["toolu_badtime"]; got.MessageID != "msg_badtime" || got.TS != 0 || got.OutputTokens != 1 {
+		t.Errorf("FindRequests = %+v, want msg_badtime with TS 0 and output 1", found)
+	}
+	if len(requests) != 1 || requests[0].MessageID != "msg_badtime" || requests[0].TS != 0 ||
+		!reflect.DeepEqual(requests[0].ToolUseIDs, []string{"toolu_badtime"}) {
+		t.Errorf("ReadRequests = %+v, want msg_badtime with TS 0 and its call", requests)
 	}
 }
 
@@ -538,6 +605,27 @@ func TestTranscriptTurnEnd(t *testing.T) {
 				t.Errorf("TranscriptTurnEnd = %+v, want %+v", end, want)
 			}
 		})
+	}
+	// A line that does not decode, or an assistant entry whose message is no
+	// object, costs that line alone: the last good message's end stands,
+	// beside an error naming the line.
+	for _, c := range []struct{ name, line, err string }{
+		{"malformed line", `{bad`, "malformed entry: invalid character 'b' looking for beginning of object key string"},
+		{"message no object", `{"type":"assistant","timestamp":"2026-09-23T09:00:02.000Z","message":"invented"}`,
+			"malformed assistant message: json: cannot unmarshal string into Go value of type callmeter.turnMessage"},
+	} {
+		path := filepath.Join(t.TempDir(), "t.jsonl")
+		if err := os.WriteFile(path, []byte(prompt+"\n"+answer+"\n"+c.line+"\n"), 0o600); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
+		end, err := TranscriptTurnEnd(path)
+		want := fmt.Sprintf("1 undecodable transcript line(s) skipped, the first: transcript %s at byte %d: %s", path, len(prompt)+len(answer)+2, c.err)
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: TranscriptTurnEnd error = %v, want %s", c.name, err, want)
+		}
+		if wantEnd := (TurnEnd{Event: EventStop, TS: 1790154001000}); end != wantEnd {
+			t.Errorf("%s: TranscriptTurnEnd = %+v, want %+v", c.name, end, wantEnd)
+		}
 	}
 	if _, err := TranscriptTurnEnd(filepath.Join(t.TempDir(), "absent.jsonl")); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("TranscriptTurnEnd on a missing transcript = %v, want an error wrapping fs.ErrNotExist", err)
@@ -765,19 +853,27 @@ func TestReadTranscriptTurnDurationTakesThePrecedingPrompt(t *testing.T) {
 }
 
 func TestReadTranscriptMarkLineRules(t *testing.T) {
-	// An entry with no uuid is no mark.
-	read, err := readMarksVariant(t, `"uuid":"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7"`, `"nouuid":"x"`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(read.Marks.Compactions) != 0 {
-		t.Errorf("a compact_boundary with no uuid gave %+v", read.Marks.Compactions)
-	}
 	raw, err := os.ReadFile(marksFixture)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.SplitAfter(string(raw), "\n")
+	// An entry with no uuid is keyed by its line: "line#" and the first 16 hex
+	// digits of the line's SHA-256.
+	read, err := readMarksVariant(t, `"uuid":"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7"`, `"nouuid":"x"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var boundary string
+	for _, line := range lines {
+		if strings.Contains(line, "4c8d0498-fbb2-45a0-b6ac-7279953c4fd7") {
+			boundary = strings.Replace(strings.TrimSpace(line), `"uuid":"4c8d0498-fbb2-45a0-b6ac-7279953c4fd7"`, `"nouuid":"x"`, 1)
+		}
+	}
+	sum := sha256.Sum256([]byte(boundary))
+	if got := read.Marks.Compactions; len(got) != 1 || got[0].EntryID != "line#"+hex.EncodeToString(sum[:])[:16] || got[0].TS != 1791113158553 {
+		t.Errorf("a compact_boundary with no uuid gave %+v, want one keyed line#%s", got, hex.EncodeToString(sum[:])[:16])
+	}
 	var turn string
 	for _, line := range lines {
 		if strings.Contains(line, `"turn_duration"`) {
@@ -794,13 +890,61 @@ func TestReadTranscriptMarkLineRules(t *testing.T) {
 	if _, err := ReadTranscript(partial, ""); err != nil {
 		t.Errorf("a partial last mark line: %v, want it skipped", err)
 	}
-	// Any other malformed mark line is an error naming the path.
+	// Any other malformed mark line costs that line alone: every other mark
+	// and request is kept, beside an error naming the path.
 	malformed := filepath.Join(dir, "malformed.jsonl")
 	if err := os.WriteFile(malformed, []byte(cutTurn+"\n"+strings.Join(lines, "")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ReadTranscript(malformed, ""); err == nil || !strings.Contains(err.Error(), malformed) {
-		t.Errorf("a malformed mark line: %v, want an error naming %s", err, malformed)
+	read, err = ReadTranscript(malformed, "")
+	if want := "1 undecodable transcript line(s) skipped, the first: transcript " + malformed +
+		" at byte 0: malformed entry: invalid character '\\n' in string"; err == nil || err.Error() != want {
+		t.Errorf("a malformed mark line: %v, want %s", err, want)
+	}
+	if len(read.Requests) != 3 || len(read.Marks.TurnDurations) != 1 || len(read.Marks.Compactions) != 1 {
+		t.Errorf("a malformed mark line kept %d requests, %d turn durations, %d compactions; want 3, 1, 1",
+			len(read.Requests), len(read.Marks.TurnDurations), len(read.Marks.Compactions))
+	}
+	// A mark whose fields do not decode is dropped alone; one whose time is no
+	// RFC 3339 is kept with TS 0, unknown; each is counted.
+	for _, c := range []struct {
+		name, from, to, err string
+		kept                func(TranscriptMarks) bool
+	}{
+		{"compaction", `"preTokens":333677`, `"preTokens":"many"`,
+			"malformed compact_boundary entry: json: cannot unmarshal string into Go struct field .compactMetadata.preTokens of type float64",
+			func(m TranscriptMarks) bool {
+				return len(m.Compactions) == 0 && len(m.StopHooks) == 1 && len(m.TurnDurations) == 1
+			}},
+		{"stop-hook summary", `"hookErrors":[]`, `"hookErrors":5`,
+			"malformed stop_hook_summary entry: json: cannot unmarshal number into Go struct field .hookErrors of type []jsontext.Value",
+			func(m TranscriptMarks) bool {
+				return len(m.StopHooks) == 0 && len(m.Compactions) == 1 && len(m.TurnDurations) == 1
+			}},
+		{"turn duration", `"durationMs":81557`, `"durationMs":"long"`,
+			"malformed turn_duration entry: json: cannot unmarshal string into Go struct field .durationMs of type float64",
+			func(m TranscriptMarks) bool {
+				return len(m.TurnDurations) == 0 && len(m.StopHooks) == 1 && len(m.Compactions) == 1
+			}},
+		{"cost-state", `"totalCostUSD":59.30682170000001`, `"totalCostUSD":"dear"`,
+			"malformed cost-state entry: json: cannot unmarshal string into Go struct field .totalCostUSD of type float64",
+			func(m TranscriptMarks) bool {
+				return m.Cost != nil && *m.Cost.CostUSD == 59.30682170000001 && len(m.Compactions) == 1
+			}},
+		{"compaction time", `"timestamp":"2026-10-04T11:25:58.553Z"`, `"timestamp":"yesterday"`,
+			"mark entry: timestamp of 9 bytes is not RFC 3339",
+			func(m TranscriptMarks) bool {
+				return len(m.Compactions) == 1 && m.Compactions[0].TS == 0 && *m.Compactions[0].PreTokens == 333677
+			}},
+	} {
+		read, err := readMarksVariant(t, c.from, c.to)
+		if err == nil || !strings.HasPrefix(err.Error(), "1 undecodable transcript line(s) skipped, the first: transcript ") ||
+			!strings.HasSuffix(err.Error(), c.err) {
+			t.Errorf("%s: error = %v, want one bad line: %s", c.name, err, c.err)
+		}
+		if len(read.Requests) != 3 || !c.kept(read.Marks) {
+			t.Errorf("%s: kept %d requests, marks %+v; want 3 requests and every other mark", c.name, len(read.Requests), read.Marks)
+		}
 	}
 }
 

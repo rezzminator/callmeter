@@ -85,17 +85,22 @@ func ParseSince(s string, now time.Time) (time.Time, error) {
 
 // PruneExpired prunes every row older than the store's retention window before
 // a report runs, and returns how many rows went. A store with no retention
-// (callmeter.Store.SetRetention) keeps every row: nothing goes.
-func PruneExpired(ctx context.Context, store *callmeter.Store, now time.Time) (int64, error) {
+// (callmeter.Store.SetRetention) keeps every row: nothing goes. A store whose
+// schema is incomplete is left alone (callmeter.Store.Prune), and the note
+// returned says so, with why.
+func PruneExpired(ctx context.Context, store *callmeter.Store, now time.Time) (removed int64, notes []string, err error) {
 	retention := store.Retention()
 	if retention <= 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
-	removed, err := store.Prune(ctx, now.Add(-retention))
+	if !store.SchemaComplete() {
+		return 0, []string{fmt.Sprintf("schema incomplete: prune skipped, rows past retention kept until a later report completes it: %v", store.SchemaError())}, nil
+	}
+	removed, err = store.Prune(ctx, now.Add(-retention))
 	if err != nil {
-		return 0, fmt.Errorf("callmeter report: prune before report: %w", err)
+		return 0, nil, fmt.Errorf("callmeter report: prune before report: %w", err)
 	}
-	return removed, nil
+	return removed, nil, nil
 }
 
 // Table is one topic's answer.
@@ -696,7 +701,7 @@ func gapNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]string, 
 	if unparsedCalls > 0 {
 		notes = append(
 			notes,
-			fmt.Sprintf("%d Bash calls skipped by the parser (relative or missing cwd, or no command)", unparsedCalls),
+			fmt.Sprintf("%d Bash calls skipped by the parser (relative or missing cwd, stored input not JSON, or no command)", unparsedCalls),
 		)
 	}
 	return notes, nil

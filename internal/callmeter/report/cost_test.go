@@ -16,6 +16,7 @@ func TestCostListsSessionsByCostWithRetryAndModels(t *testing.T) {
 	exec(t, store, `INSERT INTO session_costs (session_id, ts, cost_usd, api_ms, wall_ms) VALUES ('s2', ?, 4.5, 1000, 3000)`,
 		ms(2*time.Hour))
 	exec(t, store, `INSERT INTO session_costs (session_id, ts, cost_usd) VALUES ('s3', ?, 9)`, ms(10*24*time.Hour))
+	exec(t, store, `INSERT INTO session_costs (session_id, ts, cost_usd, model_costs) VALUES ('s4', ?, 0.5, 'not json')`, ms(3*time.Hour))
 	table, err := Cost(context.Background(), store, Filter{Since: testNow.Add(-24 * time.Hour)}, chatOf)
 	if err != nil {
 		t.Fatalf("Cost: %v", err)
@@ -25,8 +26,10 @@ func TestCostListsSessionsByCostWithRetryAndModels(t *testing.T) {
 	wantRows(t, table,
 		"chat-s2|-|4.50|-|-|-|1.0|-|-|3.0|-",
 		"chat-s1|-|1.23|-|-|-|100.0|10.0|5.5|200.0|opus=1.00 haiku=0.23",
+		"chat-s4|-|0.50|-|-|-|-|-|-|-|?",
 	)
-	hasNote(t, table, "5.73 USD in total over 2 sessions (Claude Code's own accounting)")
+	hasNote(t, table, "1 chats show MODELS ?: their stored per-model costs do not decode")
+	hasNote(t, table, "6.23 USD in total over 3 sessions (Claude Code's own accounting)")
 }
 
 func hasNote(t *testing.T, table *Table, want string) {
@@ -117,13 +120,15 @@ func TestCostNamesEveryLedgerGap(t *testing.T) {
 	store := openStore(t)
 	seedCostSession(t, store)
 	table, err := Cost(context.Background(), store, Filter{Ledger: &callmeter.LedgerSummary{
-		Dir: "/ledger", Present: true, Files: 2, Rows: 9, Faults: 3, Held: 4, HeldUnrecorded: 2, Side: 5, Unreadable: 1,
+		Dir: "/ledger", Present: true, Files: 2, Rows: 9, Faults: 3, Partial: 2, FilesSkipped: 1, Held: 4, HeldUnrecorded: 2, Side: 5, Unreadable: 1,
 	}}, chatOf)
 	if err != nil {
 		t.Fatalf("Cost: %v", err)
 	}
 	for _, want := range []string{
 		"3 ledger lines were skipped: not a JSON object, or missing a field the ledger contract requires",
+		"2 ledger lines were kept with a field unknown: absent, of another JSON type, past its bound, or a ts that does not parse",
+		"1 ledger file could not be read whole: its unread calls are not counted",
 		"2 ledger calls are held by a transcript the store has not recorded yet: not counted until a hook or recovery writes them",
 		"1 session's transcripts could not be read: its ledger calls the store did not know are counted as side calls",
 	} {

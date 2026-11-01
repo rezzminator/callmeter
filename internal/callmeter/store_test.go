@@ -1132,6 +1132,11 @@ func TestOpenLeavesAStoreItCannotCompleteWorking(t *testing.T) {
 	if store.SchemaComplete() {
 		t.Error("SchemaComplete = true although the open could not write")
 	}
+	// Why it is incomplete is kept for the report that skips the prune.
+	wantWhy := "callmeter store " + path + ": complete the schema: begin: database is locked (5) (SQLITE_BUSY)"
+	if why := store.SchemaError(); why == nil || why.Error() != wantWhy {
+		t.Errorf("SchemaError = %v\nwant %s", why, wantWhy)
+	}
 	if _, err := holder.ExecContext(ctx, "ROLLBACK"); err != nil {
 		t.Fatal(err)
 	}
@@ -1154,8 +1159,9 @@ func TestOpenLeavesAStoreItCannotCompleteWorking(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	reopened := openStoreAt(t, path)
-	if !reopened.SchemaComplete() {
-		t.Error("SchemaComplete = false after a reopen that could write")
+	if !reopened.SchemaComplete() || reopened.SchemaError() != nil {
+		t.Errorf("SchemaComplete = %v, SchemaError = %v after a reopen that could write; want true, nil",
+			reopened.SchemaComplete(), reopened.SchemaError())
 	}
 	for table, want := range storeColumns {
 		if got := keys(t, reopened.DB(), "SELECT name FROM pragma_table_info('"+table+"') ORDER BY cid"); got != want {

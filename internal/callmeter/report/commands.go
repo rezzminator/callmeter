@@ -174,7 +174,7 @@ func percentile(sorted []int64, p int) int64 {
 // Commands ranks Bash command shapes by bytes delivered.
 func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
-	parts, err := loadParts(ctx, store, f)
+	parts, partNotes, err := loadParts(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +248,7 @@ func Commands(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = notes
+	t.Notes = append(notes, partNotes...)
 	if unknown > 0 {
 		t.Notes = append(t.Notes, unknownSizeNote(unknown, "Bash calls", "BYTES, P50 or P95"))
 	}

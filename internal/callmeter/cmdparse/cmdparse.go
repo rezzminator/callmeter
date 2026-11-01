@@ -57,7 +57,7 @@ const (
 // Version names this parser's behaviour. A stored call parsed by an older
 // version is parsed again, so a fix reaches every call still in the window;
 // raise it with every change to the parts or files a command parses to.
-const Version = 8
+const Version = 9
 
 // errHeredocNotStored is the cause on a Python part whose heredoc has no body:
 // the store cuts every heredoc body out of a command.
@@ -95,10 +95,24 @@ type Call struct {
 	ID, Command, Cwd, Home string
 }
 
-// FileRef is one file a part touched. Path is absolute. Exists is false for a
-// path a known reader or writer named that did not exist at parse time (a
-// scratch file since deleted, a write target not yet created); an unknown
-// program's argument is attributed only as an existing regular file.
+// Existence is what the parse-time stat of a FileRef's path found.
+type Existence uint8
+
+const (
+	// ExistsNo is a path that did not exist at parse time.
+	ExistsNo Existence = iota
+	// ExistsYes is a path that existed at parse time.
+	ExistsYes
+	// ExistsUnknown is a path whose stat failed for another cause (permission
+	// denied, an IO error): whether it existed is not known.
+	ExistsUnknown
+)
+
+// FileRef is one file a part touched. Path is absolute. Exists is ExistsNo
+// for a path a known reader or writer named that did not exist at parse time
+// (a scratch file since deleted, a write target not yet created), and
+// ExistsUnknown for one whose stat failed otherwise; an unknown program's
+// argument is attributed only as an existing regular file.
 // Range is set for read-range only, in the reader's own terms: "A,B" or "A"
 // for sed and head ("1,N"), "-N" for tail's last N lines, "K,$" for
 // `tail -n +K`; a byte count is prefixed "bytes ".
@@ -106,7 +120,7 @@ type FileRef struct {
 	Path   string
 	Action string
 	Range  string
-	Exists bool
+	Exists Existence
 }
 
 // Part is one simple command of a call, in source order. Program is the

@@ -81,11 +81,7 @@ func Coverage(ctx context.Context, store *callmeter.Store, f Filter, nameOf Name
 		return nil, err
 	}
 	walk := &walker{since: f.Since, session: f.Session, remaining: walkLimit}
-	dirs, err := projectsDirs(seats)
-	if err != nil {
-		return nil, err
-	}
-	for _, dir := range dirs {
+	for _, dir := range projectsDirs(seats) {
 		if err := walk.seat(ctx, dir); err != nil {
 			return nil, err
 		}
@@ -194,18 +190,17 @@ type projectsDir struct {
 
 // projectsDirs resolves each seat's projects directory through symlinks and
 // groups the seats that share one, so a transcript is walked once and names every
-// seat. A directory that does not exist stays a group of its own under its
-// unresolved path (the walk notes it); any other resolve error is returned.
-func projectsDirs(seats []string) ([]projectsDir, error) {
+// seat. A directory that does not resolve (missing, unreadable, a symlink
+// loop) stays a group of its own under its unresolved path, which the walk
+// notes when it cannot read it: one seat never costs the others.
+func projectsDirs(seats []string) []projectsDir {
 	var dirs []projectsDir
 	index := map[string]int{}
 	for _, seat := range seats {
 		projects := filepath.Join(seat, "projects")
 		real, err := filepath.EvalSymlinks(projects)
-		if errors.Is(err, fs.ErrNotExist) {
+		if err != nil {
 			real = projects
-		} else if err != nil {
-			return nil, fmt.Errorf("callmeter report: resolve %s: %w", projects, err)
 		}
 		i, ok := index[real]
 		if !ok {
@@ -215,7 +210,7 @@ func projectsDirs(seats []string) ([]projectsDir, error) {
 		}
 		dirs[i].seats = append(dirs[i].seats, seat)
 	}
-	return dirs, nil
+	return dirs
 }
 
 // recordedSessions is every session id the sessions or calls table holds.
@@ -276,6 +271,10 @@ func whyMeaning(class string, earliest time.Time) string {
 	}
 }
 
+// openTranscript is os.Open; a variable so a test can make a transcript
+// unreadable even as root, which ignores file modes.
+var openTranscript = os.Open
+
 // classify reads a transcript line by line for when it started (its first
 // top-level timestamp) and why the store holds none of it: before-store when
 // it started before earliest (a non-zero store's first record), no-turn when no
@@ -284,7 +283,7 @@ func whyMeaning(class string, earliest time.Time) string {
 // nothing of the transcript leaves this function but the time and the class. A
 // read failure is the unreadable class and the error.
 func classify(path string, earliest time.Time) (time.Time, string, error) {
-	file, err := os.Open(path)
+	file, err := openTranscript(path)
 	if err != nil {
 		return time.Time{}, whyUnreadable, err
 	}

@@ -100,7 +100,7 @@ func runKeyOf(steps []seqStep) string {
 // times the bytes their calls delivered.
 func Sequences(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameOf) (*Table, error) {
 	n := newNames(nameOf)
-	parts, err := loadParts(ctx, store, f)
+	parts, partNotes, err := loadParts(ctx, store, f)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +164,7 @@ func Sequences(ctx context.Context, store *callmeter.Store, f Filter, nameOf Nam
 	if err != nil {
 		return nil, err
 	}
-	t.Notes = notes
+	t.Notes = append(notes, partNotes...)
 	if unknown > 0 {
 		t.Notes = append(t.Notes, unknownSizeNote(unknown, "calls",
 			"BYTES or MEAN BYTES; a run occurrence holding one is left out whole"))

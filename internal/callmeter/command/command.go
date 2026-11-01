@@ -195,15 +195,18 @@ func reportAction(
 		// No store to ingest into: the lines still waiting in missed.log and its
 		// claims are lost events, counted read-only and named as a failure.
 		counts := map[string]int{}
+		var countErr error
 		if missed != "" {
-			var countErr error
 			if counts, countErr = callmeter.CountMissed(missed); countErr != nil {
 				fmt.Fprintf(stderr, "callmeter: count missed.log: %v\n", countErr)
 				pluginLog(stderr, getenv, "error", "missed-count-failed", "internal/callmeter/command/command.go#reportAction", countErr.Error())
-				return 1
 			}
 		}
-		if err := printNoStore(stdout, values.json, positional[0], path, missedNotes(counts)); err != nil {
+		notes := missedNotes(counts)
+		if countErr != nil {
+			notes = append(notes, noteMissedUnreadable)
+		}
+		if err := printNoStore(stdout, values.json, positional[0], path, notes); err != nil {
 			fmt.Fprintf(stderr, "callmeter: report %s: %v\n", positional[0], err)
 			pluginLog(stderr, getenv, "error", "report-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
 			return 1
@@ -227,17 +230,22 @@ func reportAction(
 	}()
 	db.SetRetention(cfg.Retention())
 	names := &transcriptNames{ctx: ctx, db: db.DB(), getenv: getenv, stderr: stderr}
+	// The upkeep before the topic never voids it: a step that fails is said,
+	// logged and named in a note, and the topic reads the store as it stands.
+	var upkeep []string
 	if missed != "" {
 		if _, err := db.IngestMissed(ctx, missed); err != nil {
 			fmt.Fprintf(stderr, "callmeter: ingest missed.log: %v\n", err)
 			pluginLog(stderr, getenv, "error", "missed-ingest-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-			return 1
+			upkeep = append(upkeep, noteMissedNotIngested)
 		}
 	}
-	if _, err := report.PruneExpired(ctx, db, now); err != nil {
+	if _, pruneNotes, err := report.PruneExpired(ctx, db, now); err != nil {
 		fmt.Fprintf(stderr, "callmeter: %v\n", err)
 		pluginLog(stderr, getenv, "warning", "prune-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-		return 1
+		upkeep = append(upkeep, notePruneFailed)
+	} else {
+		upkeep = append(upkeep, pruneNotes...)
 	}
 	// Sessions gone quiet are settled from their transcripts before the topic
 	// reads the store: a call a killed session left in flight, a request no
@@ -246,7 +254,7 @@ func reportAction(
 	if err != nil {
 		fmt.Fprintf(stderr, "callmeter: recover quiet sessions: %v\n", err)
 		pluginLog(stderr, getenv, "warning", "recover-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-		return 1
+		upkeep = append(upkeep, noteRecoverFailed)
 	}
 	recovery := recoveryNotes(recovered.Skipped)
 	for _, skipped := range recovered.Skipped {
@@ -261,14 +269,14 @@ func reportAction(
 	if _, err := report.EnsureParsed(ctx, db, getenv("HOME"), nil); err != nil {
 		fmt.Fprintf(stderr, "callmeter: parse commands: %v\n", err)
 		pluginLog(stderr, getenv, "error", "parse-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-		return 1
+		upkeep = append(upkeep, noteParseFailed)
 	}
 	// Calls no transcript records come in from the optional cost ledger, and every
 	// settled request gets its price, before the topic reads the store.
 	if _, _, err := db.PriceUnpriced(ctx); err != nil {
 		fmt.Fprintf(stderr, "callmeter: price requests: %v\n", err)
 		pluginLog(stderr, getenv, "error", "price-failed", "internal/callmeter/command/command.go#reportAction", err.Error())
-		return 1
+		upkeep = append(upkeep, notePriceFailed)
 	}
 	filter.Ledger = ingestLedger(ctx, db, getenv, now, stderr)
 	// An own seat that cannot be resolved stays empty: coverage names it in a note.
@@ -277,9 +285,14 @@ func reportAction(
 	if err == nil {
 		table.Notes = append(table.Notes, report.InapplicableNotes(positional[0], filter)...)
 		table.Notes = append(table.Notes, recovery...)
-		var older []string
-		older, err = report.OlderRulesNotes(ctx, db)
-		table.Notes = append(table.Notes, older...)
+		table.Notes = append(table.Notes, upkeep...)
+		// The hint is only a hint: a store read failing here leaves the table whole.
+		if older, olderErr := olderRulesNotes(ctx, db); olderErr != nil {
+			fmt.Fprintf(stderr, "callmeter: count calls under older privacy rules: %v\n", olderErr)
+			pluginLog(stderr, getenv, "warning", "older-rules-failed", "internal/callmeter/command/command.go#reportAction", olderErr.Error())
+		} else {
+			table.Notes = append(table.Notes, older...)
+		}
 	}
 	if err == nil {
 		if values.json {
@@ -295,6 +308,21 @@ func reportAction(
 	}
 	return 0
 }
+
+// olderRulesNotes is report.OlderRulesNotes; a variable so a test can make its
+// store read fail.
+var olderRulesNotes = report.OlderRulesNotes
+
+// The notes of a report whose upkeep step failed (reportAction): each says what
+// the topic's numbers may lack, the error itself on stderr and in the log.
+const (
+	noteMissedUnreadable  = "missed.log could not be read: events it holds are not counted"
+	noteMissedNotIngested = "missed.log not ingested: unrecorded event counts may be low"
+	notePruneFailed       = "prune failed: rows past retention kept"
+	noteRecoverFailed     = "quiet sessions not recovered: calls and requests they left open stay as their hooks wrote them"
+	noteParseFailed       = "commands not parsed: command, file and write counts may be low"
+	notePriceFailed       = "prices not refreshed: requests priced since the last report show no cost"
+)
 
 // ingestLedger brings the cost ledger in. A ledger that cannot be read is one
 // stderr line and a summary naming the failure, never "no ledger": the reports

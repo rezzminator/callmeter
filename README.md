@@ -6,8 +6,8 @@
 
 **Claude Code plugin for tracking token usage and context growth — every tool call and sub-agent in local SQLite**
 
-[![CI](https://github.com/rezzminator/callmeter/actions/workflows/release.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/release.yml)
-[![Version](https://img.shields.io/badge/version-0.5.1-blue)](./CHANGELOG.md)
+[![CI](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/rezzminator/callmeter/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.5.2-blue)](./CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)](#-quick-start)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757)](https://docs.claude.com/en/docs/claude-code/plugins)
@@ -32,7 +32,7 @@ FILE                                READ BYTES  BASH BYTES  READS  CERTAIN  COND
 note: 1 calls denied by permission
 note: 2 calls refused by Claude Code
 note: 2 snippets unparsed: script-body
-note: 1 Bash calls skipped by the parser (relative or missing cwd, or no command)
+note: 1 Bash calls skipped by the parser (relative or missing cwd, stored input not JSON, or no command)
 note: 2 Bash calls read several files or also ran one: their bytes are credited to no file in BASH BYTES
 ```
 
@@ -290,7 +290,7 @@ make release-check                                # every check of a release pul
 CALLMETER_E2E=1 go test ./e2e/... -count=1        # real Claude Code, costs tokens
 ```
 
-Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`release.yml`](.github/workflows/release.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
+Work lands on `develop`, the default branch; `main` is release-only. A release bumps the version places (`plugins/callmeter/.claude-plugin/plugin.json`, the README badge, the CHANGELOG heading), refreshes `plugins/callmeter/libexec/SHA256SUMS` with `scripts/build-release.sh --write-sums` (the sums bake in the sources, so only the release commit carries a fresh set; a plain `scripts/release-check.sh` leaves them uncompared), passes `make release-check`, and goes to `main` as a `develop` -> `main` pull request; merging it is the release: [`publish.yml`](.github/workflows/publish.yml) tags `v{version}`, builds the four binaries and publishes them. No tag is pushed by hand.
 
 ## 🎓 Built with Professor
 
