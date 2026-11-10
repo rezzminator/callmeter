@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -190,8 +191,56 @@ func rewriteColumn(
 // that SanitizeError changes. Both sanitizers leave their own output
 // unchanged, so a call written under the current rules never counts and a
 // rule added later counts every call stored before it. It reads the whole
-// calls table, whatever a report's window, and writes nothing.
+// calls table, whatever a report's window, and writes nothing. The sanitizers
+// run on every CPU the process may use: over half a million calls they are
+// the cost, the read is not.
 func (s *Store) UnredactedCalls(ctx context.Context) (n int64, err error) {
+	type storedCall struct {
+		tool        string
+		input, text sql.NullString
+	}
+	batches := make(chan []storedCall)
+	counts := make(chan int64)
+	workers := runtime.GOMAXPROCS(0)
+	var crash workerPanic
+	for range workers {
+		go func() {
+			var found int64
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					crash.keep(recovered)
+					for range batches {
+					}
+				}
+				counts <- found
+			}()
+			for batch := range batches {
+				for _, c := range batch {
+					if c.input.Valid {
+						if again, err := SanitizeInput(c.tool, json.RawMessage(c.input.String)); err != nil || again != c.input.String {
+							found++
+							continue
+						}
+					}
+					if c.text.Valid && SanitizeError(c.text.String) != c.text.String {
+						found++
+					}
+				}
+			}
+		}()
+	}
+	// The workers end and are summed on every return: a read that fails still
+	// closes batches and waits for them, and a worker's panic is raised here.
+	defer func() {
+		close(batches)
+		for range workers {
+			n += <-counts
+		}
+		crash.rethrow()
+		if err != nil {
+			n = 0
+		}
+	}()
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT COALESCE(tool, ''), input, error FROM calls WHERE input IS NOT NULL OR error IS NOT NULL`)
 	if err != nil {
@@ -202,24 +251,23 @@ func (s *Store) UnredactedCalls(ctx context.Context) (n int64, err error) {
 			err = errors.Join(err, fmt.Errorf("callmeter store %s: close calls read: %w", s.path, closeErr))
 		}
 	}()
+	const batchSize = 512
+	batch := make([]storedCall, 0, batchSize)
 	for rows.Next() {
-		var tool string
-		var input, text sql.NullString
-		if err := rows.Scan(&tool, &input, &text); err != nil {
+		var c storedCall
+		if err := rows.Scan(&c.tool, &c.input, &c.text); err != nil {
 			return 0, fmt.Errorf("callmeter store %s: scan a call's input and error: %w", s.path, err)
 		}
-		if input.Valid {
-			if again, err := SanitizeInput(tool, json.RawMessage(input.String)); err != nil || again != input.String {
-				n++
-				continue
-			}
-		}
-		if text.Valid && SanitizeError(text.String) != text.String {
-			n++
+		if batch = append(batch, c); len(batch) == batchSize {
+			batches <- batch
+			batch = make([]storedCall, 0, batchSize)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("callmeter store %s: read calls to check their privacy form: %w", s.path, err)
 	}
-	return n, nil
+	if len(batch) > 0 {
+		batches <- batch
+	}
+	return 0, nil
 }

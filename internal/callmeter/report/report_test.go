@@ -894,3 +894,54 @@ func TestEmptyTopicsNameWhatTheyFoundNone(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionEventLookupsReadOneSessionByIndex: each term below reads one
+// session's events of one kind, once per row of the topic's query. The store
+// holds no ANALYZE statistics, so SQLite plans from the query's shape alone and
+// a fresh store plans as a full one does; without callmeter.SessionEventIs the
+// planner walks events_event_ts, every session's events of that kind, once per
+// row, which made the cost topic run for minutes on a 1.5 GB store. The cost
+// topic's ledger-priced calls read no events at all: costExit there read a
+// chat's events once per call. The plan is pinned, never the run time, which
+// is the data's.
+func TestSessionEventLookupsReadOneSessionByIndex(t *testing.T) {
+	store := openStore(t)
+	const sessionEvents, everySession = "USING INDEX events_session_ts", "events_event_ts"
+	for _, tc := range []struct {
+		name, query string
+		args        []any
+		want, never string // a step the plan must take, proving it reads what the test guards; one it must not
+	}{
+		{"cost exit", "SELECT " + costExit + " FROM session_costs s", []any{callmeter.EventSessionEnd}, sessionEvents, everySession},
+		{"ended before start", "SELECT 1 FROM sessions s WHERE " + endedBeforeStart("s.session_id"), nil, sessionEvents, everySession},
+		{"ran nothing", "SELECT 1 FROM sessions s WHERE " + ranNothing("s.session_id"), nil, sessionEvents, everySession},
+		{"next event after", "SELECT " + nextEventAfter + " FROM events e", []any{eventUserPromptSubmit}, sessionEvents, everySession},
+		{"event since request", "SELECT " + eventSinceRequest + " FROM requests r", []any{callmeter.EventSessionEnd}, sessionEvents, everySession},
+		{"ledger-priced calls", ledgerPricedCalls("1"), nil, "SCAN r", "events"},
+	} {
+		rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+tc.query, tc.args...)
+		if err != nil {
+			t.Fatalf("%s: explain %s: %v", tc.name, tc.query, err)
+		}
+		var details []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				_ = rows.Close()
+				t.Fatalf("%s: scan the plan: %v", tc.name, err)
+			}
+			details = append(details, detail)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatalf("%s: read the plan: %v", tc.name, err)
+		}
+		plan := strings.Join(details, "\n")
+		if !strings.Contains(plan, tc.want) {
+			t.Errorf("%s plan:\n%s\nwant a step naming %s", tc.name, plan, tc.want)
+		}
+		if strings.Contains(plan, tc.never) {
+			t.Errorf("%s plan:\n%s\nwant no step naming %s", tc.name, plan, tc.never)
+		}
+	}
+}

@@ -1204,23 +1204,7 @@ func TestAgentLookupsSearchTheAgentIndex(t *testing.T) {
 		{"DropRecoveredAgentStop events delete", dropRecoveredAgentStopSQL[1], []any{"a1", RecoveredDetail, int64(10)}},
 	}
 	for _, tc := range statements {
-		rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+tc.query, tc.args...)
-		if err != nil {
-			t.Fatalf("%s: explain: %v", tc.name, err)
-		}
-		var plan []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-				_ = rows.Close()
-				t.Fatalf("%s: scan plan: %v", tc.name, err)
-			}
-			plan = append(plan, detail)
-		}
-		if err := rows.Close(); err != nil {
-			t.Fatalf("%s: read plan: %v", tc.name, err)
-		}
+		plan := planDetails(queryPlan(t, store, tc.query, tc.args...))
 		joined := strings.Join(plan, "\n")
 		if !strings.Contains(joined, "USING INDEX events_agent_ts") && !strings.Contains(joined, "USING COVERING INDEX events_agent_ts") {
 			t.Errorf("%s plan = %v, want a search of events_agent_ts", tc.name, plan)

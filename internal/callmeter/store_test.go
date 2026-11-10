@@ -15,6 +15,46 @@ import (
 	"github.com/rezzminator/callmeter/internal/sqlitedb"
 )
 
+// planStep is one row of EXPLAIN QUERY PLAN: its id, its parent's id and what
+// it does.
+type planStep struct {
+	id, parent int
+	detail     string
+}
+
+// queryPlan is the plan SQLite chooses for query on store, the steps in the
+// order EXPLAIN QUERY PLAN prints them.
+func queryPlan(t *testing.T, store *Store, query string, args ...any) []planStep {
+	t.Helper()
+	rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain %s: %v", query, err)
+	}
+	var plan []planStep
+	for rows.Next() {
+		var step planStep
+		var unused int
+		if err := rows.Scan(&step.id, &step.parent, &unused, &step.detail); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scan the plan of %s: %v", query, err)
+		}
+		plan = append(plan, step)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatalf("read the plan of %s: %v", query, err)
+	}
+	return plan
+}
+
+// planDetails is the detail of each step of plan.
+func planDetails(plan []planStep) []string {
+	details := make([]string, len(plan))
+	for i, step := range plan {
+		details[i] = step.detail
+	}
+	return details
+}
+
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := OpenDB(context.Background(), filepath.Join(t.TempDir(), "state", "callmeter.db"))
@@ -224,7 +264,7 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,faults_tool_use,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes = %s, want %s", gotIndexes, wantIndexes)
@@ -235,33 +275,6 @@ func TestOpenFreshStoreCreatesTheVersionOneTables(t *testing.T) {
 	if got := keys(t, store.DB(), "SELECT CAST(user_version AS TEXT) FROM pragma_user_version"); got != "1" {
 		t.Errorf("user_version = %s, want 1", got)
 	}
-}
-
-// queryPlan is the detail lines of EXPLAIN QUERY PLAN of query, joined by "; ".
-func queryPlan(t *testing.T, db *sql.DB, query string) string {
-	t.Helper()
-	rows, err := db.Query("EXPLAIN QUERY PLAN " + query)
-	if err != nil {
-		t.Fatalf("explain %q: %v", query, err)
-	}
-	defer func() {
-		if err := rows.Close(); err != nil {
-			t.Errorf("close plan rows: %v", err)
-		}
-	}()
-	var details []string
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-			t.Fatalf("scan plan of %q: %v", query, err)
-		}
-		details = append(details, detail)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("read plan of %q: %v", query, err)
-	}
-	return strings.Join(details, "; ")
 }
 
 // TestOpenAddsTheCallsRequestIndexToAVersionOneStore: a version-1 store created
@@ -283,7 +296,7 @@ func TestOpenAddsTheCallsRequestIndexToAVersionOneStore(t *testing.T) {
 	if got := keys(t, store.DB(), "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'calls_request'"); got != "calls_request" {
 		t.Errorf("calls_request after a reopen = %q, want present", got)
 	}
-	plan := queryPlan(t, store.DB(), "SELECT COUNT(*) FROM calls WHERE request_id = 'x'")
+	plan := strings.Join(planDetails(queryPlan(t, store, "SELECT COUNT(*) FROM calls WHERE request_id = 'x'")), "; ")
 	if !strings.Contains(plan, "calls_request") || strings.Contains(plan, "SCAN calls") {
 		t.Errorf("the recount plan = %q, want a search by calls_request and no SCAN calls", plan)
 	}
@@ -1048,7 +1061,7 @@ func makeVersionOneStore(t *testing.T, path string) {
 		"DROP TABLE IF EXISTS compactions", "DROP TABLE IF EXISTS session_costs", "DROP TABLE IF EXISTS stop_hooks",
 		"DROP TABLE IF EXISTS stop_hook_runs", "DROP TABLE IF EXISTS turn_durations", "DROP INDEX IF EXISTS calls_request",
 		"DROP VIEW IF EXISTS request_cache", "DROP TABLE IF EXISTS request_iterations", "DROP INDEX IF EXISTS requests_session_agent_ts",
-		"DROP INDEX IF EXISTS events_agent_ts",
+		"DROP INDEX IF EXISTS events_agent_ts", "DROP INDEX IF EXISTS faults_tool_use",
 		"INSERT INTO requests (request_id, session_id, ts, model, output_tokens) VALUES ('msg_old', 'sess_old', 5, 'm', 9)",
 	} {
 		if _, err := old.DB().Exec(statement); err != nil {
@@ -1076,7 +1089,7 @@ func TestOpenCompletesAVersionOneStore(t *testing.T) {
 	gotIndexes := keys(t, store.DB(),
 		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	wantIndexes := "calls_file_path,calls_prompt,calls_request,calls_session_agent_ts,calls_ts,compactions_session_ts," +
-		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
+		"events_agent_ts,events_event_ts,events_session_ts,faults_session_stage,faults_tool_use,requests_api_request_id,requests_session_agent_pending,requests_session_agent_ts,stop_hooks_session_ts," +
 		"turn_durations_session_ts,turns_session_ts"
 	if gotIndexes != wantIndexes {
 		t.Errorf("indexes after the reopen = %s, want %s", gotIndexes, wantIndexes)

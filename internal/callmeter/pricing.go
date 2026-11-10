@@ -7,7 +7,8 @@ import (
 )
 
 // The price table below is Anthropic's published list in USD per million
-// tokens, as fetched 2026-10-08 (https://platform.claude.com/docs/en/about-claude/pricing.md),
+// tokens, as fetched 2026-10-08 (https://platform.claude.com/docs/en/about-claude/pricing.md;
+// claude-fable-5-2 from the same page as fetched 2026-11-10),
 // and the OpenAI list of the models a Claude Code session can reach through a
 // gateway. It prices a request whose cost Claude Code's own ledger did not give
 // (cost_source 'table'): the request's own usage only, so a server-tool fee
@@ -53,6 +54,7 @@ func openAIRow(key string, in, out, cached, longIn, longOut, longCached float64)
 var priceTable = []priceRow{
 	{"claude-fable-5", rates{10, 50, 1, 12.5, 20}, nil},
 	{"claude-fable-5-1", rates{10, 50, 0.25, 12.5, 20}, nil},
+	{"claude-fable-5-2", rates{8, 40, 0.2, 10, 16}, nil},
 	{"claude-haiku-3-5", rates{0.8, 4, 0.08, 1, 1.6}, nil},
 	{"claude-haiku-4-5", rates{1, 5, 0.1, 1.25, 2}, nil},
 	{"claude-haiku-5-5", rates{0.1, 0.5, 0.01, 0.125, 0.2}, &longTier{above: 100000, rates: rates{0.5, 2.5, 0.05, 0.625, 1}}},

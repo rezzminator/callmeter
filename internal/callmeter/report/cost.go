@@ -66,9 +66,9 @@ const exitGraceMS = 2000
 // across a resume while totalDuration counts no time between launches, so a
 // resumed session's clock lags its exit by those gaps, and the SessionEnd hook,
 // which fires at the exit that wrote the latest cost-state, places it.
-const costExit = `(SELECT MAX(COALESCE(clock, ended), COALESCE(ended, clock)) FROM (SELECT
+var costExit = `(SELECT MAX(COALESCE(clock, ended), COALESCE(ended, clock)) FROM (SELECT
 		CASE WHEN s.started > 0 AND s.wall_ms > 0 THEN s.started + s.wall_ms END AS clock,
-		(SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.session_id AND e.event = ?) AS ended))`
+		(SELECT MAX(e.ts) FROM events e WHERE e.session_id = s.session_id AND ` + callmeter.SessionEventIs("e.event", "?") + `) AS ended))`
 
 // usd is a USD-micros sum as dollars; NULL is "-".
 func usd(micros sql.NullInt64, places int) string {
@@ -83,6 +83,16 @@ func usd(micros sql.NullInt64, places int) string {
 func costWhere(f Filter) (string, []any) {
 	where, args := f.scoped(scope{ts: "r.ts", session: "r.session_id"})
 	return "COALESCE(r.pending, 0) = 0 AND r.session_id IS NOT NULL AND " + where, args
+}
+
+// ledgerPricedCalls is the SQL of the ledger-priced calls of the chats in
+// where: their chat, ts and price. It reads no events: each call is held
+// against its chat's exit, read once per chat (costExit), since costExit here
+// would read the chat's events once for each of hundreds of thousands of calls.
+func ledgerPricedCalls(where string) string {
+	return `SELECT s.session_id, r.ts, r.cost_usd_micros
+		FROM session_costs s JOIN requests r ON r.session_id = s.session_id
+		WHERE r.cost_source = 'ledger' AND r.cost_usd_micros IS NOT NULL AND COALESCE(r.pending, 0) = 0 AND ` + where
 }
 
 type chatCost struct {
@@ -139,21 +149,21 @@ func costChats(ctx context.Context, store *callmeter.Store, f Filter, n *names) 
 	if err != nil {
 		return nil, err
 	}
+	// Each call is held against its chat's exit read above (ledgerPricedCalls).
 	err = query(ctx, store, "ledger-priced calls",
-		`SELECT s.session_id, COUNT(*),
-			COALESCE(SUM(CASE WHEN r.ts <= `+costExit+` + ? THEN r.cost_usd_micros END), 0)
-		FROM session_costs s JOIN requests r ON r.session_id = s.session_id
-		WHERE r.cost_source = 'ledger' AND r.cost_usd_micros IS NOT NULL AND COALESCE(r.pending, 0) = 0 AND `+where+`
-		GROUP BY s.session_id`,
-		append([]any{callmeter.EventSessionEnd, exitGraceMS}, args...),
+		ledgerPricedCalls(where), args,
 		func(r rowSource) error {
 			var session string
-			var count, toExit int64
-			if err := r.Scan(&session, &count, &toExit); err != nil {
+			var ts sql.NullInt64
+			var micros int64
+			if err := r.Scan(&session, &ts, &micros); err != nil {
 				return err
 			}
 			if c := chats[session]; c != nil {
-				c.ledgered, c.ledgeredToExit = count, toExit
+				c.ledgered++
+				if c.exit != nil && ts.Valid && ts.Int64 <= *c.exit+exitGraceMS {
+					c.ledgeredToExit += micros
+				}
 			}
 			return nil
 		})

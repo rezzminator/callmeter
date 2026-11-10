@@ -174,25 +174,37 @@ func (t *Tx) InsertEvent(ctx context.Context, e Event) (bool, error) {
 // SubagentStop's turns row shares its events row's id.
 const RecoveredDetail = `{"from_transcript":true}`
 
+// SessionEventIs is the SQL term that the events column named by column, in a
+// lookup that also pins its session_id, equals the SQL expression event. Its
+// unary + keeps SQLite off events_event_ts for that lookup: the store holds no
+// ANALYZE statistics, so the planner rates events_event_ts (event, ts) as
+// selective as events_session_ts (session_id, ts), takes the first for its ts
+// order, and reads every session's events of that kind (tens of thousands of
+// rows) for one session's few. Without the term's index, events_session_ts is
+// the one the lookup can use.
+func SessionEventIs(column, event string) string {
+	return "+" + column + " = " + event
+}
+
 // latestPromptTS is the SQL ts of session's latest main-chat prompt, 0 when it
 // has none; session is an SQL expression.
 func latestPromptTS(session string) string {
 	return `(SELECT COALESCE(MAX(ts), 0) FROM events WHERE session_id = ` + session +
-		` AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '')`
+		` AND ` + SessionEventIs("event", "'UserPromptSubmit'") + ` AND COALESCE(agent_id, '') = '')`
 }
 
-// latestPromptID is the SQL id of session's latest main-chat prompt, NULL
+// LatestPromptID is the SQL id of session's latest main-chat prompt, NULL
 // when absent; session is an SQL expression.
-func latestPromptID(session string) string {
+func LatestPromptID(session string) string {
 	return `(SELECT prompt_id FROM events WHERE session_id = ` + session +
-		` AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1)`
+		` AND ` + SessionEventIs("event", "'UserPromptSubmit'") + ` AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1)`
 }
 
-// turnEnded is the SQL condition that session's main chat has a turn end, a
+// TurnEnded is the SQL condition that session's main chat has a turn end, a
 // Stop turn or a StopFailure event, at or after since and answering prompt.
 // Missing prompt ids retain the timestamp-only match; arguments are SQL expressions.
-func turnEnded(session, since, prompt string) string {
-	return `(EXISTS (SELECT 1 FROM events f WHERE f.session_id = ` + session + ` AND f.event = 'StopFailure'
+func TurnEnded(session, since, prompt string) string {
+	return `(EXISTS (SELECT 1 FROM events f WHERE f.session_id = ` + session + ` AND ` + SessionEventIs("f.event", "'StopFailure'") + `
 			AND COALESCE(f.agent_id, '') = '' AND f.ts >= ` + since + `
 			AND (f.prompt_id IS NULL OR ` + prompt + ` IS NULL OR f.prompt_id = ` + prompt + `))
 		OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = ` + session + ` AND t.event = 'Stop'
@@ -203,10 +215,15 @@ func turnEnded(session, since, prompt string) string {
 // turnEndMissing is the SQL condition that session's latest main-chat prompt
 // has no turn end; session is an SQL expression.
 func turnEndMissing(session string) string {
-	return `(EXISTS (SELECT 1 FROM events WHERE session_id = ` + session + ` AND event = 'UserPromptSubmit'
+	return `(EXISTS (SELECT 1 FROM events WHERE session_id = ` + session + ` AND ` + SessionEventIs("event", "'UserPromptSubmit'") + `
 			AND COALESCE(agent_id, '') = '')
-		AND NOT ` + turnEnded(session, latestPromptTS(session), latestPromptID(session)) + `)`
+		AND NOT ` + TurnEnded(session, latestPromptTS(session), LatestPromptID(session)) + `)`
 }
+
+// latestPromptSQL reads the prompt_id and ts of the latest main-chat prompt of
+// the session ?1 (LatestPromptID, latestPromptTS).
+var latestPromptSQL = `SELECT prompt_id, ts FROM events WHERE session_id = ?1 AND ` + SessionEventIs("event", "'UserPromptSubmit'") + `
+		AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1`
 
 // RecoverTurnEnd inserts e, whose Event is EventStop or EventStopFailure, as
 // the main chat's turn end for the session's latest prompt, rebuilt from the
@@ -229,9 +246,7 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 	session := *e.SessionID
 	var promptID sql.NullString
 	var asked int64
-	err := t.tx.QueryRowContext(ctx,
-		`SELECT prompt_id, ts FROM events WHERE session_id = ? AND event = 'UserPromptSubmit'
-		AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1`, session).Scan(&promptID, &asked)
+	err := t.tx.QueryRowContext(ctx, latestPromptSQL, session).Scan(&promptID, &asked)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("callmeter store %s: read the latest prompt of session %q: %w", t.path, session, err)
 	}
@@ -239,7 +254,7 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 		return false, nil
 	}
 	var answered int
-	if err := t.tx.QueryRowContext(ctx, `SELECT `+turnEnded("?1", "?2", "?3"), session, asked, promptID).Scan(&answered); err != nil {
+	if err := t.tx.QueryRowContext(ctx, `SELECT `+TurnEnded("?1", "?2", "?3"), session, asked, promptID).Scan(&answered); err != nil {
 		return false, fmt.Errorf("callmeter store %s: read the turn end of session %q: %w", t.path, session, err)
 	}
 	if answered != 0 {
@@ -266,6 +281,21 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 	return inserted, nil
 }
 
+// rebuiltTurnEndSQL lists the event ids DropRecoveredTurnEnd deletes: ?1 the
+// session, ?2 RecoveredDetail, ?3 the hook's ts, ?4 its prompt id or "".
+var rebuiltTurnEndSQL = `SELECT event_id FROM events WHERE event IN ('Stop', 'StopFailure') AND session_id = ?1
+		AND COALESCE(agent_id, '') = '' AND detail = ?2 AND (?4 = '' OR prompt_id = ?4 OR prompt_id IS NULL)
+		AND ts >= COALESCE((SELECT ts FROM events
+			WHERE session_id = ?1 AND ` + SessionEventIs("event", "'UserPromptSubmit'") + ` AND COALESCE(agent_id, '') = ''
+			AND ts <= ?3 AND (?4 = '' OR prompt_id = ?4) ORDER BY ts DESC, event_id DESC LIMIT 1), 0)`
+
+// dropRecoveredTurnEndSQL are the two deletes of DropRecoveredTurnEnd, the
+// turns row first, each taking rebuiltTurnEndSQL's arguments.
+var dropRecoveredTurnEndSQL = []string{
+	`DELETE FROM turns WHERE event_id IN (` + rebuiltTurnEndSQL + `)`,
+	`DELETE FROM events WHERE event_id IN (` + rebuiltTurnEndSQL + `)`,
+}
+
 // DropRecoveredTurnEnd deletes the session's rebuilt turn ends (RecoverTurnEnd)
 // of the prompt a Stop or StopFailure hook delivered at hookTS answers, a
 // rebuilt Stop's turns row with its events row: the hook's own row replaces
@@ -273,15 +303,7 @@ func (t *Tx) RecoverTurnEnd(ctx context.Context, e Event) (bool, error) {
 // goes; a non-empty hook prompt id limits both the prompt and rebuilt row.
 // A rebuilt row with no prompt id matches by timestamp alone.
 func (t *Tx) DropRecoveredTurnEnd(ctx context.Context, sessionID string, hookTS int64, hookPromptID string) error {
-	rebuilt := `SELECT event_id FROM events WHERE event IN ('Stop', 'StopFailure') AND session_id = ?1
-		AND COALESCE(agent_id, '') = '' AND detail = ?2 AND (?4 = '' OR prompt_id = ?4 OR prompt_id IS NULL)
-		AND ts >= COALESCE((SELECT ts FROM events
-			WHERE session_id = ?1 AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = ''
-			AND ts <= ?3 AND (?4 = '' OR prompt_id = ?4) ORDER BY ts DESC, event_id DESC LIMIT 1), 0)`
-	for _, statement := range []string{
-		`DELETE FROM turns WHERE event_id IN (` + rebuilt + `)`,
-		`DELETE FROM events WHERE event_id IN (` + rebuilt + `)`,
-	} {
+	for _, statement := range dropRecoveredTurnEndSQL {
 		if _, err := t.tx.ExecContext(ctx, statement, sessionID, RecoveredDetail, hookTS, hookPromptID); err != nil {
 			return fmt.Errorf("callmeter store %s: drop the rebuilt turn end of session %q: %w", t.path, sessionID, err)
 		}
@@ -764,7 +786,7 @@ func (t *Tx) AgentSpan(ctx context.Context, agentID string) (started, stopped sq
 func sessionModel(session string) string {
 	return `COALESCE(
 				(SELECT model FROM requests WHERE session_id = ` + session + ` AND agent_id IS NULL AND source IS NOT '` + SourceLedger + `' AND model IS NOT NULL ORDER BY ts DESC, request_id DESC LIMIT 1),
-				(SELECT model FROM events WHERE session_id = ` + session + ` AND event = '` + EventSessionStart + `' AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))`
+				(SELECT model FROM events WHERE session_id = ` + session + ` AND ` + SessionEventIs("event", sqlText(EventSessionStart)) + ` AND model IS NOT NULL ORDER BY ts DESC, event_id DESC LIMIT 1))`
 }
 
 // SessionModel reads the latest main-chat request model, else SessionStart's.
@@ -788,19 +810,21 @@ func (t *Tx) RefreshSessionModel(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+// refreshSessionSQL is RefreshSession's update: ?1 the session, ?2
+// EventSessionStart, ?3 EventSessionEnd.
+var refreshSessionSQL = `UPDATE sessions SET
+			start_source = (SELECT source FROM events WHERE session_id = ?1 AND ` + SessionEventIs("event", "?2") + ` ORDER BY ts, event_id LIMIT 1),
+			end_reason = (SELECT reason FROM events WHERE session_id = ?1 AND ` + SessionEventIs("event", "?3") + ` ORDER BY ts DESC, event_id DESC LIMIT 1),
+			model = ` + sessionModel("?1") + `
+		WHERE session_id = ?1`
+
 // RefreshSession recomputes the derived columns of the sessions row of
 // sessionID from the rows stored: start_source is the source of its earliest
 // SessionStart, end_reason the reason of its latest SessionEnd, and model that
 // of its latest main-chat request with a model, else of its latest SessionStart
 // carrying one. A session TouchSession never wrote is an error.
 func (t *Tx) RefreshSession(ctx context.Context, sessionID string) error {
-	result, err := t.tx.ExecContext(ctx,
-		`UPDATE sessions SET
-			start_source = (SELECT source FROM events WHERE session_id = ?1 AND event = ?2 ORDER BY ts, event_id LIMIT 1),
-			end_reason = (SELECT reason FROM events WHERE session_id = ?1 AND event = ?3 ORDER BY ts DESC, event_id DESC LIMIT 1),
-			model = `+sessionModel("?1")+`
-		WHERE session_id = ?1`,
-		sessionID, EventSessionStart, EventSessionEnd)
+	result, err := t.tx.ExecContext(ctx, refreshSessionSQL, sessionID, EventSessionStart, EventSessionEnd)
 	if err != nil {
 		return fmt.Errorf("callmeter store %s: refresh session %q: %w", t.path, sessionID, err)
 	}

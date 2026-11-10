@@ -199,6 +199,8 @@ func TestCostChatNamesWhatCameBeforeTheLedger(t *testing.T) {
 			[]call{ledgered(5*time.Hour, 4_000_000), ledgered(3*time.Hour, 6_000_000), ledgered(time.Hour, 2_000_000)}, "0.00"},
 		{"a launch with a sink, then one without", 15.00, true, 0, []call{ledgered(3*time.Hour, 10_000_000), ledgered(time.Hour, 3_000_000)}, "5.00"},
 		{"the last call's row trails the exit inside the grace", 2.00, true, 0, []call{ledgered(exit-1900*time.Millisecond, 2_000_000)}, "0.00"},
+		{"a call at the grace's last millisecond is the exit's", 2.00, true, 0, []call{ledgered(exit-2*time.Second, 2_000_000)}, "0.00"},
+		{"a call one millisecond past the grace is the next launch's", 2.00, true, 0, []call{ledgered(exit-2*time.Second-time.Millisecond, 2_000_000)}, "2.00"},
 		{"a call beyond the grace belongs to the launch after the exit", 2.00, true, 0, []call{ledgered(exit-3*time.Second, 2_000_000)}, "2.00"},
 		{"a ledger above Claude Code's total floors at zero", 5.00, true, 0, []call{ledgered(3*time.Hour, 9_000_000)}, "0.00"},
 		{"a side call before the exit is ledger spend", 10.00, true, 0,

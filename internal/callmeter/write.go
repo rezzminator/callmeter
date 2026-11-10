@@ -859,6 +859,11 @@ func (t *Tx) RecountRequest(ctx context.Context, requestID string) error {
 	return nil
 }
 
+// clearParseFaultsSQL deletes the parse faults of the call ?1 (?2 StageParse).
+// It searches faults_tool_use: a report caching many calls' parts runs it once
+// per call, and without the index each run read every fault.
+const clearParseFaultsSQL = "DELETE FROM faults WHERE tool_use_id = ? AND stage = ?"
+
 // ReplaceCommandParts deletes toolUseID's command_parts rows and the parse
 // faults an earlier parse of it left, then inserts parts: a call's parse
 // result is replaced whole.
@@ -869,12 +874,7 @@ func (t *Tx) ReplaceCommandParts(ctx context.Context, toolUseID string, parts []
 	if _, err := t.tx.ExecContext(ctx, "DELETE FROM command_parts WHERE tool_use_id = ?", toolUseID); err != nil {
 		return fmt.Errorf("callmeter store %s: clear command parts of %q: %w", t.path, toolUseID, err)
 	}
-	if _, err := t.tx.ExecContext(
-		ctx,
-		"DELETE FROM faults WHERE tool_use_id = ? AND stage = ?",
-		toolUseID,
-		StageParse,
-	); err != nil {
+	if _, err := t.tx.ExecContext(ctx, clearParseFaultsSQL, toolUseID, StageParse); err != nil {
 		return fmt.Errorf("callmeter store %s: clear parse faults of %q: %w", t.path, toolUseID, err)
 	}
 	for _, part := range parts {

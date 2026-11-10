@@ -42,6 +42,11 @@ func (s *waitStats) add(w wait) {
 	s.durations = append(s.durations, *w.end-w.start)
 }
 
+// nextEventAfter is the SQL ts of the first event of the kind ? in the session
+// of the events row e after it, NULL when none follows.
+var nextEventAfter = `(SELECT MIN(u.ts) FROM events u WHERE u.session_id = e.session_id AND ` +
+	callmeter.SessionEventIs("u.event", "?") + ` AND u.ts > e.ts)`
+
 // Waiting lists, per session and kind of wait (idle_prompt, permission_prompt),
 // how long Claude Code waited on the user, longest total first. A wait runs
 // from the Notification to the session's next UserPromptSubmit; a permission
@@ -67,7 +72,7 @@ func Waiting(ctx context.Context, store *callmeter.Store, f Filter, nameOf NameO
 	earliest := map[key]wait{}
 	err := query(ctx, store, "waits",
 		`SELECT e.session_id, `+kind+`, e.ts,
-			(SELECT MIN(u.ts) FROM events u WHERE u.session_id = e.session_id AND u.event = ? AND u.ts > e.ts),
+			`+nextEventAfter+`,
 			(SELECT MIN(r.ts) FROM requests r WHERE r.session_id = e.session_id AND r.source IS NOT 'ledger' AND r.ts > e.ts)
 		FROM events e WHERE e.event = ? AND `+kind+` IN (?, ?) AND e.session_id IS NOT NULL AND e.ts IS NOT NULL AND `+where,
 		append([]any{eventUserPromptSubmit, eventNotification, waitKinds[0], waitKinds[1]}, args...),

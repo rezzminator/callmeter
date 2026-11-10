@@ -519,6 +519,11 @@ func recordingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]st
 	return notes, nil
 }
 
+// eventSinceRequest is the SQL condition that the session of the requests row
+// r has an event of the kind ? at or after it.
+var eventSinceRequest = `EXISTS (SELECT 1 FROM events e WHERE e.session_id = r.session_id AND ` +
+	callmeter.SessionEventIs("e.event", "?") + ` AND e.ts >= r.ts)`
+
 // pendingNotes names the requests whose context size is not yet read, each
 // by why: its transcript faulted, its session ended before the transcript held
 // it, or its session has not ended (still live, or killed before its Stop).
@@ -532,7 +537,7 @@ func pendingNotes(ctx context.Context, store *callmeter.Store, f Filter) ([]stri
 				ft.tool_use_id IN (SELECT c.tool_use_id FROM calls c WHERE c.request_id = r.request_id)
 				OR ? || ft.tool_use_id = r.request_id))
 				THEN 'its transcript could not be read'
-			WHEN EXISTS (SELECT 1 FROM events e WHERE e.session_id = r.session_id AND e.event = ? AND e.ts >= r.ts)
+			WHEN `+eventSinceRequest+`
 				THEN 'its session ended before the transcript held it'
 			ELSE 'its session has not ended: still live, or killed before its Stop'
 		END reason, COUNT(*)

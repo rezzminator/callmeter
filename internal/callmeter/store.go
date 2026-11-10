@@ -276,6 +276,7 @@ CREATE TABLE IF NOT EXISTS faults (
 	error TEXT
 );
 CREATE INDEX IF NOT EXISTS faults_session_stage ON faults(session_id, stage);
+CREATE INDEX IF NOT EXISTS faults_tool_use ON faults(tool_use_id);
 CREATE TABLE IF NOT EXISTS compactions (
 	entry_id TEXT PRIMARY KEY,
 	session_id TEXT,

@@ -4,6 +4,15 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+### Fixed
+
+- `callmeter report` finishes on a large store: on a 1.5 GB store of 4,100 sessions a report ran over fifteen minutes the first time and over eight minutes after, with no output meanwhile, and now ends in about five minutes the first time, which recovers the store's quiet sessions and parses its Bash calls, and in under a minute after. Quiet-session recovery finds its candidates from the indexed side (from six minutes to under two seconds) and reads each session's events by its session index; a Bash call's command parts no longer scan every fault to clear its parse faults; the cost, faults, sessions, waiting and pending-requests views read one session's events by its index; the cost view holds each ledger-priced call against its chat's exit, read once per chat; the cost ledger's transcripts and the older-privacy-rules check run on every CPU, and the ledger's writes reuse their prepared statements. The results are unchanged.
+- The store gains the index `faults_tool_use(tool_use_id)`, added once by the first open of this version (a few milliseconds; the faults table is small).
+
+### Added
+
+- Claude Fable 5.2 has a price-table row: $8 input, $40 output, $0.20 cache reads, $10 and $16 for 5-minute and 1-hour cache writes per million tokens.
+
 ## [0.5.2] — 2026-11-01
 
 ### Fixed
