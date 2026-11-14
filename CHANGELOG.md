@@ -4,6 +4,8 @@ Every release of callmeter. Versions follow [semantic versioning](https://semver
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-11-14
+
 ### Fixed
 
 - `callmeter report` finishes on a large store: on a 1.5 GB store of 4,100 sessions a report ran over fifteen minutes the first time and over eight minutes after, with no output meanwhile, and now ends in about five minutes the first time, which recovers the store's quiet sessions and parses its Bash calls, and in under a minute after. Quiet-session recovery finds its candidates from the indexed side (from six minutes to under two seconds) and reads each session's events by its session index; a Bash call's command parts no longer scan every fault to clear its parse faults; the cost, faults, sessions, waiting and pending-requests views read one session's events by its index; the cost view holds each ledger-priced call against its chat's exit, read once per chat; the cost ledger's transcripts and the older-privacy-rules check run on every CPU, and the ledger's writes reuse their prepared statements. The results are unchanged.
