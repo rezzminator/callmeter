@@ -265,3 +265,22 @@ func TestRedactRewritesProseHookNames(t *testing.T) {
 		}
 	}
 }
+
+// TestUnredactedCallsCountsEveryBatch: the older-rules check sanitizes the
+// calls in batches across workers, so a store of more calls than one batch
+// holds, ending on a part batch, is counted whole: every third of 1,100 calls
+// holds a description stored before its rule (366), the rest a bare command.
+func TestUnredactedCallsCountsEveryBatch(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if _, err := store.DB().ExecContext(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1100)
+		INSERT INTO calls (tool_use_id, tool, ts, input)
+		SELECT 'toolu_' || i, 'Bash', i, CASE WHEN i % 3 = 0
+			THEN '{"command":"ls","description":"private-description"}' ELSE '{"command":"ls"}' END FROM n`); err != nil {
+		t.Fatalf("seed calls: %v", err)
+	}
+	got, err := store.UnredactedCalls(ctx)
+	if err != nil || got != 366 {
+		t.Fatalf("UnredactedCalls = %d, %v; want 366, nil", got, err)
+	}
+}

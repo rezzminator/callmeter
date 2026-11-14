@@ -102,6 +102,8 @@ func TestPriceMicrosTiersSplitsAndModelNames(t *testing.T) {
 		{"short split leaves the rest at 5m", "claude-opus-5-5", 0, 0, 0, 30, ptr(5), ptr(10), 20*5 + 10*8, true},
 		{"snapshot date", "claude-haiku-4-5-20251001", 10, 5, 100, 100, nil, nil, 10*1 + 5*5 + 100*0.1 + 100*1.25, true},
 		{"context suffix", "claude-opus-5-5[1m]", 10, 0, 0, 0, nil, nil, 40, true},
+		// Fable 5.2: 8 in, 40 out, 0.20 cache read, 10 a 5m write, 16 a 1h write.
+		{"fable 5.2", "claude-fable-5-2", 1000, 100, 1000, 30, ptr(10), ptr(20), 1000*8 + 100*40 + 1000*0.2 + 10*10 + 20*16, true},
 		{"unknown model", "claude-nonesuch-9", 10, 5, 0, 0, nil, nil, 0, false},
 		{"synthetic", "<synthetic>", 10, 5, 0, 0, nil, nil, 0, false},
 		{"empty", "", 10, 5, 0, 0, nil, nil, 0, false},

@@ -251,14 +251,24 @@ func agentTurnUnfilled(t string) string {
 // main-chat Stop of a prompt that ended with a reply (a size above 0) and has
 // no final reply request, a main-chat request stamped with that prompt whose
 // stop_reason is not tool_use, and that no transcript fault marks it
-// unfillable.
-func stopReplyUnfilled(t string) string {
+// unfillable. session is the SQL expression of the one session whose turns the
+// caller reads, or "" when it reads every session's.
+//
+// The final replies are one uncorrelated list, read once per statement:
+// requests has no index on prompt_id, so a per-Stop lookup reads every request
+// of the Stop's session again for each of its Stops.
+func stopReplyUnfilled(t, session string) string {
+	scope := ""
+	if session != "" {
+		scope = "r.session_id = " + session + " AND "
+	}
 	return fmt.Sprintf(`(%[1]s.event = '%[2]s' AND COALESCE(%[1]s.agent_id, '') = '' AND %[1]s.prompt_id IS NOT NULL
 		AND COALESCE(%[1]s.last_assistant_message_bytes, 0) > 0
-		AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.session_id = %[1]s.session_id AND COALESCE(r.agent_id, '') = ''
-			AND r.prompt_id = %[1]s.prompt_id AND COALESCE(r.stop_reason, '') <> 'tool_use')
+		AND (%[1]s.session_id, %[1]s.prompt_id) NOT IN (SELECT r.session_id, r.prompt_id FROM requests r WHERE %[5]s
+			r.session_id IS NOT NULL AND r.prompt_id IS NOT NULL
+			AND COALESCE(r.agent_id, '') = '' AND COALESCE(r.stop_reason, '') <> 'tool_use')
 		AND NOT EXISTS (SELECT 1 FROM faults f WHERE f.session_id = %[1]s.session_id AND f.stage = '%[3]s'
-			AND f.error = %[4]s))`, t, EventStop, StageTranscript, stopReplyMarker(t))
+			AND f.error = %[4]s))`, t, EventStop, StageTranscript, stopReplyMarker(t), scope)
 }
 
 // turnEndUnmarked is the SQL condition that the latest main-chat prompt of the
@@ -274,7 +284,7 @@ func turnEndUnmarked(session string) string {
 	return `(` + turnEndMissing(session) + `
 		AND NOT EXISTS (SELECT 1 FROM faults f WHERE f.session_id = ` + session + ` AND f.stage = '` + StageTranscript + `'
 			AND f.ts >= COALESCE((SELECT y.last_ts FROM sessions y WHERE y.session_id = ` + session + `), 0)
-			AND f.error = (SELECT ` + turnEndMarker("p") + ` FROM events p WHERE p.session_id = ` + session + ` AND p.event = 'UserPromptSubmit'
+			AND f.error = (SELECT ` + turnEndMarker("p") + ` FROM events p WHERE p.session_id = ` + session + ` AND ` + SessionEventIs("p.event", "'UserPromptSubmit'") + `
 				AND COALESCE(p.agent_id, '') = '' ORDER BY p.ts DESC, p.event_id DESC LIMIT 1)))`
 }
 
@@ -284,7 +294,7 @@ func (s *Store) unfilledPending(ctx context.Context, sessionID string) (bool, er
 	var pending int
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM agent_turns t WHERE t.session_id = ?1 AND `+agentTurnUnfilled("t")+`)
-			OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = ?1 AND `+stopReplyUnfilled("t")+`)`, sessionID).Scan(&pending); err != nil {
+			OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = ?1 AND `+stopReplyUnfilled("t", "?1")+`)`, sessionID).Scan(&pending); err != nil {
 		return false, fmt.Errorf("callmeter store %s: read the unfilled turns of session %q: %w", s.path, sessionID, err)
 	}
 	return pending != 0, nil
@@ -305,7 +315,7 @@ func (t *Tx) MarkUnfillable(ctx context.Context, sessionID string) (int, error) 
 			FROM agent_turns t WHERE t.session_id = ?1 AND ` + agentTurnUnfilled("t")},
 		{"Stop", `INSERT INTO faults (ts, session_id, stage, error)
 			SELECT t.ts, t.session_id, '` + StageTranscript + `', ` + stopReplyMarker("t") + `
-			FROM turns t WHERE t.session_id = ?1 AND ` + stopReplyUnfilled("t")},
+			FROM turns t WHERE t.session_id = ?1 AND ` + stopReplyUnfilled("t", "?1")},
 	} {
 		result, err := t.tx.ExecContext(ctx, insert.query, sessionID)
 		if err != nil {
@@ -333,7 +343,7 @@ func (t *Tx) MarkTurnEndUnfillable(ctx context.Context, sessionID string) (int, 
 	result, err := t.tx.ExecContext(ctx,
 		`INSERT INTO faults (ts, session_id, stage, error)
 		SELECT COALESCE((SELECT y.last_ts FROM sessions y WHERE y.session_id = ?1), p.ts), p.session_id, '`+StageTranscript+`', `+turnEndMarker("p")+`
-		FROM events p WHERE p.session_id = ?1 AND p.event = 'UserPromptSubmit' AND COALESCE(p.agent_id, '') = ''
+		FROM events p WHERE p.session_id = ?1 AND `+SessionEventIs("p.event", "'UserPromptSubmit'")+` AND COALESCE(p.agent_id, '') = ''
 		AND `+turnEndUnmarked("?1")+`
 		ORDER BY p.ts DESC, p.event_id DESC LIMIT 1`, sessionID)
 	if err != nil {
@@ -528,20 +538,13 @@ func subagentPaths(mainTranscript string, agentIDs []string) []string {
 // marked it (agentStopUnmarked), a latest prompt with no turn
 // end until recovery marked it (turnEndUnmarked), or a latest run with no
 // SessionEnd (endMissing) or a lost one of its own still unmarked (endLost).
+//
+// The agent_turns and Stop terms are uncorrelated IN lists, read once per
+// query: agent_turns has no index on session_id, so a per-session EXISTS over
+// it reads the whole table once for every session in the store, and a Stop's
+// final reply is found by one pass over requests (stopReplyUnfilled).
 func (s *Store) quietCandidates(ctx context.Context, beforeMS int64) ([]quietSession, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT s.session_id, s.transcript_path, s.seat_dir, s.config_dir FROM sessions s
-		WHERE (COALESCE(s.transcript_path, '') <> '' OR COALESCE(s.seat_dir, '') <> '')
-		AND COALESCE(s.last_ts, 0) < ?1
-		AND (EXISTS (SELECT 1 FROM calls c WHERE c.session_id = s.session_id AND `+callOpen("c")+` AND `+callUnmarked("c")+`)
-			OR EXISTS (SELECT 1 FROM requests r WHERE r.session_id = s.session_id AND r.pending = 1)
-			OR EXISTS (SELECT 1 FROM agent_turns t WHERE t.session_id = s.session_id AND `+agentTurnUnfilled("t")+`)
-			OR EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.session_id AND `+stopReplyUnfilled("t")+`)
-			OR EXISTS (SELECT 1 FROM agent_turns t WHERE t.session_id = s.session_id AND `+agentStopUnmarked("t")+`)
-			OR `+turnEndUnmarked("s.session_id")+`
-			OR `+endMissing("s.session_id")+`
-			OR `+endLost("s.session_id")+`)
-		ORDER BY s.session_id`, beforeMS)
+	rows, err := s.db.QueryContext(ctx, quietCandidatesSQL, beforeMS)
 	if err != nil {
 		return nil, fmt.Errorf("callmeter store %s: list quiet sessions: %w", s.path, err)
 	}
@@ -566,6 +569,20 @@ func (s *Store) quietCandidates(ctx context.Context, beforeMS int64) ([]quietSes
 	}
 	return sessions, nil
 }
+
+// quietCandidatesSQL is quietCandidates' query, ?1 its beforeMS.
+var quietCandidatesSQL = `SELECT s.session_id, s.transcript_path, s.seat_dir, s.config_dir FROM sessions s
+		WHERE (COALESCE(s.transcript_path, '') <> '' OR COALESCE(s.seat_dir, '') <> '')
+		AND COALESCE(s.last_ts, 0) < ?1
+		AND (EXISTS (SELECT 1 FROM calls c WHERE c.session_id = s.session_id AND ` + callOpen("c") + ` AND ` + callUnmarked("c") + `)
+			OR EXISTS (SELECT 1 FROM requests r WHERE r.session_id = s.session_id AND r.pending = 1)
+			OR s.session_id IN (SELECT t.session_id FROM agent_turns t WHERE ` + agentTurnUnfilled("t") + `)
+			OR s.session_id IN (SELECT t.session_id FROM turns t WHERE ` + stopReplyUnfilled("t", "") + `)
+			OR s.session_id IN (SELECT t.session_id FROM agent_turns t WHERE ` + agentStopUnmarked("t") + `)
+			OR ` + turnEndUnmarked("s.session_id") + `
+			OR ` + endMissing("s.session_id") + `
+			OR ` + endLost("s.session_id") + `)
+		ORDER BY s.session_id`
 
 // recoverSession reads one candidate's transcripts and writes what they settle,
 // adding to summary. A transcript read that fails is a Skipped entry and the
@@ -1412,17 +1429,21 @@ const lostEndWindowMS = int64(60 * 1000)
 // event since that start, end_reason not EndReasonNever, and no binary or
 // terminated fault of a SessionEnd naming the session since that start, or
 // naming no session from a second before its last hook to lostEndWindowMS
-// after. A lost SessionEnd ran, so its end is unknown, never "never".
+// after. A lost SessionEnd ran, so its end is unknown, never "never". The two
+// fault lookups stay apart so each searches faults_session_stage: one lookup
+// with either session test reads every fault for every session asked about.
 func endMissing(session string) string {
 	return fmt.Sprintf(`(COALESCE((SELECT x.end_reason FROM sessions x WHERE x.session_id = %[1]s), '') <> '%[2]s'
-		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event = '%[3]s'
+		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND %[9]s
 			AND COALESCE(x.agent_id, '') = '' AND x.ts >= %[4]s)
-		AND NOT EXISTS (SELECT 1 FROM faults x WHERE x.stage IN ('%[5]s', '%[6]s') AND x.error LIKE '%[3]s:%%'
-			AND ((x.session_id = %[1]s AND x.ts >= %[4]s / 1000 * 1000)
-				OR (COALESCE(x.session_id, '') = '' AND x.ts BETWEEN %[7]s - 1000 AND %[7]s + %[8]d))))`,
+		AND NOT EXISTS (SELECT 1 FROM faults x WHERE x.session_id = %[1]s AND x.stage IN ('%[5]s', '%[6]s')
+			AND x.error LIKE '%[3]s:%%' AND x.ts >= %[4]s / 1000 * 1000)
+		AND NOT EXISTS (SELECT 1 FROM faults x WHERE (x.session_id IS NULL OR x.session_id = '') AND x.stage IN ('%[5]s', '%[6]s')
+			AND x.error LIKE '%[3]s:%%' AND x.ts BETWEEN %[7]s - 1000 AND %[7]s + %[8]d))`,
 		session, EndReasonNever, EventSessionEnd, latestStartTS(session),
 		StageBinary, StageTerminated,
-		`COALESCE((SELECT y.last_ts FROM sessions y WHERE y.session_id = `+session+`), 0)`, lostEndWindowMS)
+		`COALESCE((SELECT y.last_ts FROM sessions y WHERE y.session_id = `+session+`), 0)`, lostEndWindowMS,
+		SessionEventIs("x.event", sqlText(EventSessionEnd)))
 }
 
 // endIsMissing reads endMissing for sessionID.
@@ -1458,12 +1479,12 @@ func (t *Tx) MarkNoSessionEnd(ctx context.Context, sessionID string) (bool, erro
 // start. A lost SessionEnd naming no session (lostEndWindowMS) never makes it.
 func endLost(session string) string {
 	return fmt.Sprintf(`((SELECT x.end_reason FROM sessions x WHERE x.session_id = %[1]s) IS NULL
-		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event = '%[2]s'
+		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND %[6]s
 			AND COALESCE(x.agent_id, '') = '' AND x.ts >= %[3]s)
 		AND EXISTS (SELECT 1 FROM faults x WHERE x.stage IN ('%[4]s', '%[5]s') AND x.error LIKE '%[2]s:%%'
 			AND x.session_id = %[1]s AND x.ts >= %[3]s / 1000 * 1000))`,
 		session, EventSessionEnd, latestStartTS(session),
-		StageBinary, StageTerminated)
+		StageBinary, StageTerminated, SessionEventIs("x.event", sqlText(EventSessionEnd)))
 }
 
 // latestStartTS is the SQL ts of the session's latest main-chat SessionStart,
@@ -1472,7 +1493,7 @@ func endLost(session string) string {
 // that second (ts / 1000 * 1000): a SessionEnd lost within a second of its
 // start is still this run's.
 func latestStartTS(session string) string {
-	return `COALESCE((SELECT MAX(y.ts) FROM events y WHERE y.session_id = ` + session + ` AND y.event = '` + EventSessionStart + `'
+	return `COALESCE((SELECT MAX(y.ts) FROM events y WHERE y.session_id = ` + session + ` AND ` + SessionEventIs("y.event", sqlText(EventSessionStart)) + `
 			AND COALESCE(y.agent_id, '') = ''), 0)`
 }
 

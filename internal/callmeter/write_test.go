@@ -1722,8 +1722,10 @@ func TestCallResultWriteMicrosIsNullForALedgerPricedRequestOfAnUnlistedModel(t *
 }
 
 // TestPreviousRequestLookupIsIndexed: the hot-path lookups of a stream's
-// previous and next request walk requests_session_agent_ts, and the calls of a request
-// calls_request, never a scan under the write lock.
+// previous and next request walk requests_session_agent_ts, the calls of a request
+// calls_request, and a call's parse faults faults_tool_use (a report caching
+// the parts of every unparsed call clears each one's), never a scan under the
+// write lock.
 func TestPreviousRequestLookupIsIndexed(t *testing.T) {
 	store := openTestStore(t)
 	for _, c := range []struct {
@@ -1734,23 +1736,9 @@ func TestPreviousRequestLookupIsIndexed(t *testing.T) {
 		{nextRequestSQL, "requests_session_agent_ts", []any{"s", "a", 1, "r"}},
 		{previousRequestSQL, "requests_session_agent_ts", []any{"s", nil, 1, "r"}},
 		{requestCallsSQL, "calls_request", []any{"r"}},
+		{clearParseFaultsSQL, "faults_tool_use", []any{"toolu_1", StageParse}},
 	} {
-		rows, err := store.DB().Query("EXPLAIN QUERY PLAN "+c.query, c.args...)
-		if err != nil {
-			t.Fatalf("%s: %v", c.query, err)
-		}
-		var plan []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-				t.Fatal(err)
-			}
-			plan = append(plan, detail)
-		}
-		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-			t.Fatal(err)
-		}
+		plan := planDetails(queryPlan(t, store, c.query, c.args...))
 		if p := strings.Join(plan, "; "); !strings.Contains(p, c.index) || strings.Contains(p, "SCAN") {
 			t.Errorf("plan of %q = %s, want a search of %s", c.query, p, c.index)
 		}

@@ -1274,3 +1274,41 @@ func BenchmarkIngestLedgerSessionNoNewBytes(b *testing.B) {
 		}
 	}
 }
+
+// TestWorkerPanicReachesTheWaiter: a worker that panics hands the panic to the
+// goroutine waiting on the workers (where the report's panic net is), keeps
+// draining so the sender finishes, and the first panic is the one raised.
+func TestWorkerPanicReachesTheWaiter(t *testing.T) {
+	work := make(chan int)
+	done := make(chan struct{})
+	var crash workerPanic
+	for range 2 {
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					crash.keep(recovered)
+					for range work {
+					}
+				}
+				done <- struct{}{}
+			}()
+			for item := range work {
+				panic(fmt.Sprintf("item %d", item))
+			}
+		}()
+	}
+	for item := range 5 {
+		work <- item
+	}
+	close(work)
+	<-done
+	<-done
+	defer func() {
+		got, _ := recover().(string)
+		if first, _, _ := strings.Cut(got, " (in a worker goroutine)\n"); first != "item 0" && first != "item 1" {
+			t.Errorf("rethrow raised %q, want the first item's panic with its worker's stack", got)
+		}
+	}()
+	crash.rethrow()
+	t.Error("rethrow returned, want the worker's panic raised")
+}

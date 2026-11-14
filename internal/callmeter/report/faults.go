@@ -202,20 +202,13 @@ func refusalsOf(ctx context.Context, store *callmeter.Store, f Filter) ([]refusa
 		session, transcript, seatDir string
 	}
 	var open []openTurn
-	prompt := `(SELECT prompt_id FROM events WHERE session_id = s.session_id
-		AND event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' ORDER BY ts DESC, event_id DESC LIMIT 1)`
 	err = query(ctx, store, "sessions ending on an unanswered prompt",
 		`SELECT s.session_id, COALESCE(s.last_ts, 0), COALESCE(s.transcript_path, ''), COALESCE(s.seat_dir, '') FROM sessions s
 		JOIN (SELECT session_id, MAX(ts) AS asked FROM events
 			WHERE event = 'UserPromptSubmit' AND COALESCE(agent_id, '') = '' GROUP BY session_id) u
 			ON u.session_id = s.session_id
 		WHERE `+conds+`
-		AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.session_id = s.session_id AND t.event = 'Stop'
-			AND COALESCE(t.agent_id, '') = '' AND t.ts >= u.asked
-			AND (t.prompt_id IS NULL OR `+prompt+` IS NULL OR t.prompt_id = `+prompt+`))
-		AND NOT EXISTS (SELECT 1 FROM events e WHERE e.session_id = s.session_id AND e.event = 'StopFailure'
-			AND COALESCE(e.agent_id, '') = '' AND e.ts >= u.asked
-			AND (e.prompt_id IS NULL OR `+prompt+` IS NULL OR e.prompt_id = `+prompt+`))`, args,
+		AND NOT `+callmeter.TurnEnded("s.session_id", "u.asked", callmeter.LatestPromptID("s.session_id")), args,
 		func(r rowSource) error {
 			var row openTurn
 			if err := r.Scan(&row.session, &row.ts, &row.transcript, &row.seatDir); err != nil {

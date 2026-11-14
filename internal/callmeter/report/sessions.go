@@ -129,7 +129,7 @@ const lostEventWindowMS = int64(60 * 60 * 1000)
 // no session in the hour before its SessionEnd, rules it out: the lost event
 // may be its SessionStart, and an unknown start is never shown as none.
 func endedBeforeStart(session string) string {
-	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event = '%[2]s')
+	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND %[6]s)
 		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event <> '%[2]s')
 		AND NOT EXISTS (SELECT 1 FROM calls x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM requests x WHERE x.session_id = %[1]s)
@@ -137,8 +137,9 @@ func endedBeforeStart(session string) string {
 		AND NOT EXISTS (SELECT 1 FROM turns x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM faults x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM faults x, events y WHERE x.session_id IS NULL AND x.stage IN ('%[3]s', '%[4]s')
-			AND y.session_id = %[1]s AND y.event = '%[2]s' AND x.ts BETWEEN y.ts - %[5]d AND y.ts))`,
-		session, callmeter.EventSessionEnd, callmeter.StageBinary, callmeter.StageTerminated, lostEventWindowMS)
+			AND y.session_id = %[1]s AND %[7]s AND x.ts BETWEEN y.ts - %[5]d AND y.ts))`,
+		session, callmeter.EventSessionEnd, callmeter.StageBinary, callmeter.StageTerminated, lostEventWindowMS,
+		callmeter.SessionEventIs("x.event", "'"+callmeter.EventSessionEnd+"'"), callmeter.SessionEventIs("y.event", "'"+callmeter.EventSessionEnd+"'"))
 }
 
 // idleEvents are the events a session sends with nothing run in it: its start
@@ -153,7 +154,7 @@ var idleEvents = []string{callmeter.EventSessionStart, callmeter.EventSessionEnd
 // start on, rules it out: the lost event may be its prompt, and an unknown run
 // is never shown as none.
 func ranNothing(session string) string {
-	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event = '%[2]s')
+	return fmt.Sprintf(`(EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND %[6]s)
 		AND NOT EXISTS (SELECT 1 FROM events x WHERE x.session_id = %[1]s AND x.event NOT IN (%[3]s))
 		AND NOT EXISTS (SELECT 1 FROM calls x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM requests x WHERE x.session_id = %[1]s)
@@ -161,8 +162,9 @@ func ranNothing(session string) string {
 		AND NOT EXISTS (SELECT 1 FROM turns x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM faults x WHERE x.session_id = %[1]s)
 		AND NOT EXISTS (SELECT 1 FROM faults x WHERE x.session_id IS NULL AND x.stage IN ('%[4]s', '%[5]s')
-			AND x.ts >= (SELECT MIN(y.ts) FROM events y WHERE y.session_id = %[1]s AND y.event = '%[2]s')))`,
-		session, callmeter.EventSessionStart, "'"+strings.Join(idleEvents, "', '")+"'", callmeter.StageBinary, callmeter.StageTerminated)
+			AND x.ts >= (SELECT MIN(y.ts) FROM events y WHERE y.session_id = %[1]s AND %[7]s)))`,
+		session, callmeter.EventSessionStart, "'"+strings.Join(idleEvents, "', '")+"'", callmeter.StageBinary, callmeter.StageTerminated,
+		callmeter.SessionEventIs("x.event", "'"+callmeter.EventSessionStart+"'"), callmeter.SessionEventIs("y.event", "'"+callmeter.EventSessionStart+"'"))
 }
 
 // zoneCell is the zone name a hook computed, else its UTC offset, else "-".

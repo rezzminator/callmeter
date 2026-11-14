@@ -12,8 +12,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -229,35 +232,62 @@ type ledgerFill struct{ apiID, messageID string }
 // applyLedger writes what an ingest decided, in the order the report run
 // settled on: the requestIds of the transcript requests that lack theirs, the
 // ledger price (and the drop of a ledger row a transcript request now holds)
-// for each held call, and each side call as a 'ledger' request.
-func (t *Tx) applyLedger(ctx context.Context, fills []ledgerFill, overlay, side []ledgerRow) error {
+// for each held call, and each side call as a 'ledger' request. Each statement
+// is prepared once: a report run applies hundreds of thousands of calls, and
+// parsing each statement again for each call was most of the step's time.
+func (t *Tx) applyLedger(ctx context.Context, fills []ledgerFill, overlay, side []ledgerRow) (err error) {
+	prepare := func(query, what string) *sql.Stmt {
+		if err != nil {
+			return nil
+		}
+		stmt, prepErr := t.tx.PrepareContext(ctx, query)
+		if prepErr != nil {
+			err = fmt.Errorf("callmeter store %s: prepare to %s: %w", t.path, what, prepErr)
+			return nil
+		}
+		return stmt
+	}
+	fill := prepare(`UPDATE requests SET api_request_id = ?1 WHERE request_id = ?2 AND api_request_id IS NULL AND source IS NOT ?3`,
+		"give requests their requestId")
+	drop := prepare(`DELETE FROM requests WHERE request_id = ?1 AND source = ?2
+			AND EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?2)`,
+		"drop ledger rows held by a transcript")
+	price := prepare(`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2, query_source = ?3
+			WHERE api_request_id = ?4 AND source IS NOT ?2
+			AND (cost_source IS NOT ?2 OR cost_usd_micros IS NOT ?1 OR query_source IS NOT ?3)`,
+		"price requests from the ledger")
+	upsert := prepare(upsertSideCallSQL, "write ledger requests")
+	defer func() {
+		for _, stmt := range []*sql.Stmt{fill, drop, price, upsert} {
+			if stmt == nil {
+				continue
+			}
+			if closeErr := stmt.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("callmeter store %s: close a ledger statement: %w", t.path, closeErr))
+			}
+		}
+	}()
+	if err != nil {
+		return err
+	}
 	for _, f := range fills {
-		if _, err := t.tx.ExecContext(ctx,
-			`UPDATE requests SET api_request_id = ?1 WHERE request_id = ?2 AND api_request_id IS NULL AND source IS NOT ?3`,
-			f.apiID, f.messageID, SourceLedger); err != nil {
+		if _, err := fill.ExecContext(ctx, f.apiID, f.messageID, SourceLedger); err != nil {
 			return fmt.Errorf("callmeter store %s: give request %q its requestId: %w", t.path, f.messageID, err)
 		}
 	}
 	for _, r := range overlay {
-		if _, err := t.tx.ExecContext(ctx,
-			`DELETE FROM requests WHERE request_id = ?1 AND source = ?2
-			AND EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?2)`,
-			r.id, SourceLedger); err != nil {
+		if _, err := drop.ExecContext(ctx, r.id, SourceLedger); err != nil {
 			return fmt.Errorf("callmeter store %s: drop ledger row %q held by a transcript: %w", t.path, r.id, err)
 		}
 		if r.Cost == nil {
 			continue
 		}
-		if _, err := t.tx.ExecContext(ctx,
-			`UPDATE requests SET cost_usd_micros = ?1, cost_source = ?2, query_source = ?3
-			WHERE api_request_id = ?4 AND source IS NOT ?2
-			AND (cost_source IS NOT ?2 OR cost_usd_micros IS NOT ?1 OR query_source IS NOT ?3)`,
-			*r.Cost, SourceLedger, nullablePtr(r.QuerySource), r.id); err != nil {
+		if _, err := price.ExecContext(ctx, *r.Cost, SourceLedger, nullablePtr(r.QuerySource), r.id); err != nil {
 			return fmt.Errorf("callmeter store %s: price request of %q from the ledger: %w", t.path, r.id, err)
 		}
 	}
 	for _, r := range side {
-		if err := t.upsertSideCall(ctx, r); err != nil {
+		if err := t.upsertSideCall(ctx, upsert, r); err != nil {
 			return err
 		}
 	}
@@ -272,6 +302,26 @@ func nullablePtr(s *string) any {
 	return nullable(*s)
 }
 
+// upsertSideCallSQL is upsertSideCall's statement.
+const upsertSideCallSQL = `INSERT INTO requests (request_id, session_id, agent_id, ts, model, input_tokens, cache_read_tokens,
+			cache_creation_tokens, context_tokens, output_tokens, pending, source, api_request_id, query_source,
+			cost_usd_micros, cost_source)
+		SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?1, ?12, ?13, ?14
+		WHERE NOT EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?11)
+		ON CONFLICT(request_id) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id,
+			ts = excluded.ts, model = excluded.model, input_tokens = excluded.input_tokens,
+			cache_read_tokens = excluded.cache_read_tokens, cache_creation_tokens = excluded.cache_creation_tokens,
+			context_tokens = excluded.context_tokens, output_tokens = excluded.output_tokens,
+			query_source = excluded.query_source, cost_usd_micros = excluded.cost_usd_micros,
+			cost_source = excluded.cost_source
+		WHERE requests.source = ?11
+		AND (requests.session_id IS NOT excluded.session_id OR requests.agent_id IS NOT excluded.agent_id
+			OR requests.ts IS NOT excluded.ts OR requests.model IS NOT excluded.model
+			OR requests.input_tokens IS NOT excluded.input_tokens OR requests.cache_read_tokens IS NOT excluded.cache_read_tokens
+			OR requests.cache_creation_tokens IS NOT excluded.cache_creation_tokens
+			OR requests.output_tokens IS NOT excluded.output_tokens OR requests.query_source IS NOT excluded.query_source
+			OR requests.cost_usd_micros IS NOT excluded.cost_usd_micros OR requests.cost_source IS NOT excluded.cost_source)`
+
 // upsertSideCall writes a ledger row no transcript holds as a requests row,
 // keyed by its request id; a row already there (a source 'ledger' one) is
 // brought up to date, any other row is left alone. The caller decided that no
@@ -280,7 +330,7 @@ func nullablePtr(s *string) any {
 // request of another source holds the call's requestId, the guard the overlay
 // DELETE of applyLedger shares, so a hook that gave a transcript request the
 // call in between leaves it counted once.
-func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
+func (t *Tx) upsertSideCall(ctx context.Context, upsert *sql.Stmt, r ledgerRow) error {
 	var agent any
 	if r.AgentID != nil && *r.AgentID != "" {
 		agent = *r.AgentID
@@ -306,25 +356,7 @@ func (t *Tx) upsertSideCall(ctx context.Context, r ledgerRow) error {
 	if !r.at.IsZero() {
 		ts = r.at.UnixMilli()
 	}
-	_, err := t.tx.ExecContext(ctx,
-		`INSERT INTO requests (request_id, session_id, agent_id, ts, model, input_tokens, cache_read_tokens,
-			cache_creation_tokens, context_tokens, output_tokens, pending, source, api_request_id, query_source,
-			cost_usd_micros, cost_source)
-		SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?1, ?12, ?13, ?14
-		WHERE NOT EXISTS (SELECT 1 FROM requests t WHERE t.api_request_id = ?1 AND t.source IS NOT ?11)
-		ON CONFLICT(request_id) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id,
-			ts = excluded.ts, model = excluded.model, input_tokens = excluded.input_tokens,
-			cache_read_tokens = excluded.cache_read_tokens, cache_creation_tokens = excluded.cache_creation_tokens,
-			context_tokens = excluded.context_tokens, output_tokens = excluded.output_tokens,
-			query_source = excluded.query_source, cost_usd_micros = excluded.cost_usd_micros,
-			cost_source = excluded.cost_source
-		WHERE requests.source = ?11
-		AND (requests.session_id IS NOT excluded.session_id OR requests.agent_id IS NOT excluded.agent_id
-			OR requests.ts IS NOT excluded.ts OR requests.model IS NOT excluded.model
-			OR requests.input_tokens IS NOT excluded.input_tokens OR requests.cache_read_tokens IS NOT excluded.cache_read_tokens
-			OR requests.cache_creation_tokens IS NOT excluded.cache_creation_tokens
-			OR requests.output_tokens IS NOT excluded.output_tokens OR requests.query_source IS NOT excluded.query_source
-			OR requests.cost_usd_micros IS NOT excluded.cost_usd_micros OR requests.cost_source IS NOT excluded.cost_source)`,
+	_, err := upsert.ExecContext(ctx,
 		r.id, r.session, agent, ts, nullablePtr(r.Model), r.Input, r.CacheRead, r.CacheCreation,
 		contextTokens, r.Output, SourceLedger, nullablePtr(r.QuerySource), cost, source)
 	if err != nil {
@@ -537,21 +569,34 @@ func (s *Store) scanUnknownSessions(ctx context.Context, rows []ledgerRow, known
 		ids = append(ids, session)
 	}
 	sort.Strings(ids)
-	for _, session := range ids {
+	// The store's one connection names the files; the files are read on every
+	// CPU, and what each holds is taken in the order a sequential read would.
+	transcripts := make([]transcriptFiles, len(ids))
+	var scans []transcriptScan
+	for i, session := range ids {
 		paths, err := s.sessionTranscripts(ctx, session)
 		if err != nil {
 			return hold, err
 		}
+		transcripts[i] = paths
+		for _, path := range paths.files {
+			scans = append(scans, transcriptScan{path: path})
+		}
+	}
+	scanAll(scans)
+	next := 0
+	for _, paths := range transcripts {
 		readable := paths.main != ""
 		for _, path := range paths.files {
-			found, whole, err := scanRequestIDs(path)
+			scan := scans[next]
+			next++
 			switch {
-			case err == nil:
-				for apiID, messageID := range found {
+			case scan.err == nil:
+				for apiID, messageID := range scan.found {
 					hold.held[apiID] = messageID
 				}
-				readable = readable && whole
-			case errors.Is(err, fs.ErrNotExist) && path != paths.main:
+				readable = readable && scan.whole
+			case errors.Is(scan.err, fs.ErrNotExist) && path != paths.main:
 				// A sub-agent that wrote no transcript holds no request.
 			default:
 				readable = false
@@ -634,6 +679,71 @@ func (s *Store) sessionTranscripts(ctx context.Context, session string) (transcr
 		return out, fmt.Errorf("callmeter store %s: list the sub-agent transcripts of session %q: %w", s.path, session, err)
 	}
 	return out, nil
+}
+
+// transcriptScan is one transcript's scanRequestIDs: its path, then what the
+// scan returned.
+type transcriptScan struct {
+	path  string
+	found map[string]string
+	whole bool
+	err   error
+}
+
+// scanAll runs scanRequestIDs over every scan's path, on every CPU the process
+// may use: a report reads the transcripts of thousands of sessions, and the
+// JSON of their lines, not the disk, is the cost.
+func scanAll(scans []transcriptScan) {
+	work := make(chan *transcriptScan)
+	var wg sync.WaitGroup
+	var crash workerPanic
+	for range runtime.GOMAXPROCS(0) {
+		wg.Go(func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					crash.keep(recovered)
+					for range work {
+					}
+				}
+			}()
+			for scan := range work {
+				scan.found, scan.whole, scan.err = scanRequestIDs(scan.path)
+			}
+		})
+	}
+	for i := range scans {
+		work <- &scans[i]
+	}
+	close(work)
+	wg.Wait()
+	crash.rethrow()
+}
+
+// workerPanic carries the first panic of a worker goroutine to the goroutine
+// that waited on it, so the panic net of the report (runReport) still catches
+// it: a panic left in a worker would end the process past that net. A worker
+// that panicked keeps draining its work channel, so the sender never blocks.
+type workerPanic struct {
+	mu    sync.Mutex
+	value any
+}
+
+// keep records recovered, a worker's recover() value, with the worker's stack;
+// only the first is kept.
+func (p *workerPanic) keep(recovered any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.value == nil {
+		p.value = fmt.Sprintf("%v (in a worker goroutine)\n%s", recovered, debug.Stack())
+	}
+}
+
+// rethrow panics with the kept value, if a worker panicked; called once every
+// worker has ended.
+func (p *workerPanic) rethrow() {
+	if p.value != nil {
+		panic(p.value)
+	}
 }
 
 // scanRequestIDs reads a transcript for the requestId of each assistant message

@@ -2573,3 +2573,67 @@ func TestUnfilledTurnIgnoresLedgerRows(t *testing.T) {
 		t.Fatalf("unfilledPending = %v, %v; want false once a transcript request fills the turn", pending, err)
 	}
 }
+
+// TestRecoveryLookupsReadOneSessionByIndex: quietCandidates runs at every
+// report over every session in the store, and recovery's per-session
+// statements once for each candidate. Their run time is the data's, never a
+// test's, so the plan is pinned: the store holds no ANALYZE statistics, so
+// SQLite plans from the query's shape alone, and a fresh store plans as a full
+// one does. Three reads made a report on a 1.5 GB store spend seven minutes finding its candidates:
+//   - a lookup of one session's events of one kind walking events_event_ts,
+//     every session's events of that kind, never events_session_ts;
+//   - a correlated subquery scanning a table, once per session: agent_turns,
+//     which has no session index, and faults, for a lost SessionEnd naming no
+//     session;
+//   - a Stop's final reply looked up once per Stop through every request of
+//     its session (requests_session_agent_ts on session_id alone).
+func TestRecoveryLookupsReadOneSessionByIndex(t *testing.T) {
+	store := openTestStore(t)
+	const sessionScan = "requests_session_agent_ts (session_id=?)"
+	for _, tc := range []struct {
+		name, query string
+		args        []any
+		want        []string // indexes the plan must search, proving it reads what the test guards
+	}{
+		{"quietCandidates", quietCandidatesSQL, []any{int64(0)}, []string{"events_session_ts", "faults_session_stage", "LIST SUBQUERY"}},
+		{"turnEndUnmarked", "SELECT " + turnEndUnmarked("?1"), []any{"s"}, []string{"events_session_ts"}},
+		{"endMissing", "SELECT " + endMissing("?1"), []any{"s"}, []string{"events_session_ts", "faults_session_stage"}},
+		{"endLost", "SELECT " + endLost("?1"), []any{"s"}, []string{"events_session_ts"}},
+		{"stopReplyUnfilled", "SELECT 1 FROM turns t WHERE t.session_id = ?1 AND " + stopReplyUnfilled("t", "?1"), []any{"s"}, []string{sessionScan}},
+		{"latestPromptSQL", latestPromptSQL, []any{"s"}, []string{"events_session_ts"}},
+		{"rebuiltTurnEndSQL", rebuiltTurnEndSQL, []any{"s", RecoveredDetail, int64(10), ""}, []string{"events_session_ts"}},
+		{"refreshSessionSQL", refreshSessionSQL, []any{"s", EventSessionStart, EventSessionEnd}, []string{"events_session_ts"}},
+		{"sessionModel", "SELECT " + sessionModel("?1"), []any{"s"}, []string{"events_session_ts"}},
+	} {
+		plan := queryPlan(t, store, tc.query, tc.args...)
+		joined := strings.Join(planDetails(plan), "\n")
+		for _, want := range tc.want {
+			if !strings.Contains(joined, want) {
+				t.Errorf("%s plan:\n%s\nwant a step naming %s", tc.name, joined, want)
+			}
+		}
+		parent := map[int]int{}
+		detail := map[int]string{}
+		for _, step := range plan {
+			parent[step.id], detail[step.id] = step.parent, step.detail
+		}
+		correlated := func(id int) bool {
+			for id = parent[id]; id != 0; id = parent[id] {
+				if strings.HasPrefix(detail[id], "CORRELATED ") {
+					return true
+				}
+			}
+			return false
+		}
+		for _, step := range plan {
+			switch {
+			case strings.Contains(step.detail, "events_event_ts"):
+				t.Errorf("%s plan:\n%s\nwant no walk of every session's events of one kind (events_event_ts): %s", tc.name, joined, step.detail)
+			case strings.HasPrefix(step.detail, "SCAN ") && correlated(step.id):
+				t.Errorf("%s plan:\n%s\nwant no table scan once per session: %s", tc.name, joined, step.detail)
+			case strings.HasSuffix(step.detail, sessionScan) && correlated(step.id):
+				t.Errorf("%s plan:\n%s\nwant no read of every request of a session once per row: %s", tc.name, joined, step.detail)
+			}
+		}
+	}
+}
